@@ -43,6 +43,7 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 
 ## Real systems
 
+- Strict XML package checks use quick-xml 0.42 UTF-8 strings through explicit byte boundaries; names, attributes, text, and CDATA retain the existing rejection rules. Invalid UTF-8 remains malformed input.
 - PDF parsing via released `pdf-inspector 1.17.0` (Firecrawl) + `lopdf 0.42.0` — **offline**, no cloud OCR default
 - MCP over stdio for Claude/Codex/Cursor/etc.
 - Demo Sweet packages are **synthetic structured examples**, not live client filings

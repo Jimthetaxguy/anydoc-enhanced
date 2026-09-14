@@ -673,14 +673,16 @@ fn xml_has_uncached_formula(bytes: &[u8]) -> bool {
     false
 }
 
+// quick-xml 0.42 validates UTF-8 and exposes strings. Keep the strict ASCII
+// package predicates byte-oriented using explicit UTF-8 bytes at their boundary.
 fn xml_local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
 }
 
 fn xml_attribute_value(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> Option<String> {
     event.attributes().flatten().find_map(|attribute| {
-        (xml_local_name(attribute.key.as_ref()) == wanted)
-            .then(|| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
+        (xml_local_name(attribute.key.as_ref().as_bytes()) == wanted)
+            .then(|| String::from_utf8_lossy(attribute.value.as_ref().as_bytes()).into_owned())
     })
 }
 
@@ -694,7 +696,7 @@ fn xml_has_odf_spreadsheet(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                match xml_local_name(event.name().as_ref()) {
+                match xml_local_name(event.name().as_ref().as_bytes()) {
                     b"spreadsheet" => spreadsheet = true,
                     b"table" => table = true,
                     _ => {}
@@ -717,7 +719,7 @@ fn xml_has_odf_hidden_content(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 let event_name = event.name();
-                let local = xml_local_name(event_name.as_ref());
+                let local = xml_local_name(event_name.as_ref().as_bytes());
                 if matches!(
                     local,
                     b"table"
@@ -773,8 +775,10 @@ fn xml_has_odf_external_reference(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 for attribute in event.attributes().flatten() {
-                    if xml_local_name(attribute.key.as_ref()) == b"href"
-                        && is_external_uri(&String::from_utf8_lossy(attribute.value.as_ref()))
+                    if xml_local_name(attribute.key.as_ref().as_bytes()) == b"href"
+                        && is_external_uri(&String::from_utf8_lossy(
+                            attribute.value.as_ref().as_bytes(),
+                        ))
                     {
                         return true;
                     }
@@ -797,7 +801,7 @@ fn xml_has_odf_active_content(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 if matches!(
-                    xml_local_name(event.name().as_ref()),
+                    xml_local_name(event.name().as_ref().as_bytes()),
                     b"object"
                         | b"plugin"
                         | b"applet"
@@ -825,7 +829,7 @@ fn xml_has_odf_encryption_data(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"encryption-data" {
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"encryption-data" {
                     return true;
                 }
                 buffer.clear();
@@ -853,7 +857,7 @@ fn xml_has_uncached_odf_formula(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event)) => {
                 depth += 1;
-                if xml_local_name(event.name().as_ref()) == b"table-cell"
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"table-cell"
                     && xml_attribute_value(&event, b"formula").is_some()
                 {
                     let cached_value = [
@@ -877,7 +881,7 @@ fn xml_has_uncached_odf_formula(bytes: &[u8]) -> bool {
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"table-cell"
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"table-cell"
                     && xml_attribute_value(&event, b"formula").is_some()
                 {
                     let cached_value = [
@@ -901,6 +905,7 @@ fn xml_has_uncached_odf_formula(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Text(event)) => {
                 if event
                     .into_inner()
+                    .as_bytes()
                     .iter()
                     .any(|byte| !byte.is_ascii_whitespace())
                 {
@@ -913,6 +918,7 @@ fn xml_has_uncached_odf_formula(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::CData(event)) => {
                 if event
                     .into_inner()
+                    .as_bytes()
                     .iter()
                     .any(|byte| !byte.is_ascii_whitespace())
                 {
@@ -947,7 +953,7 @@ fn xml_has_odf_presentation(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                match xml_local_name(event.name().as_ref()) {
+                match xml_local_name(event.name().as_ref().as_bytes()) {
                     b"presentation" => presentation = true,
                     b"page" => page = true,
                     _ => {}
@@ -972,11 +978,11 @@ fn xml_has_odp_hidden_content(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"page"
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"page"
                     && event.attributes().flatten().any(|attribute| {
-                        let name = xml_local_name(attribute.key.as_ref());
-                        let value =
-                            String::from_utf8_lossy(attribute.value.as_ref()).to_ascii_lowercase();
+                        let name = xml_local_name(attribute.key.as_ref().as_bytes());
+                        let value = String::from_utf8_lossy(attribute.value.as_ref().as_bytes())
+                            .to_ascii_lowercase();
                         (name == b"visibility"
                             && matches!(value.as_str(), "hidden" | "false" | "0"))
                             || (name == b"show" && matches!(value.as_str(), "false" | "0"))
@@ -1001,7 +1007,7 @@ fn xml_has_odf_text(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"text" {
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"text" {
                     return true;
                 }
                 buffer.clear();
@@ -1025,7 +1031,7 @@ fn xml_has_odt_hidden_or_tracked_content(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 let event_name = event.name();
-                let local = xml_local_name(event_name.as_ref());
+                let local = xml_local_name(event_name.as_ref().as_bytes());
                 if matches!(
                     local,
                     b"hidden-text"
@@ -1043,8 +1049,8 @@ fn xml_has_odt_hidden_or_tracked_content(bytes: &[u8]) -> bool {
                     return true;
                 }
                 for attribute in event.attributes().flatten() {
-                    let name = xml_local_name(attribute.key.as_ref());
-                    let value = String::from_utf8_lossy(attribute.value.as_ref());
+                    let name = xml_local_name(attribute.key.as_ref().as_bytes());
+                    let value = String::from_utf8_lossy(attribute.value.as_ref().as_bytes());
                     if (name == b"condition" && !value.trim().is_empty())
                         || (name == b"display"
                             && matches!(
@@ -1072,7 +1078,7 @@ fn xml_has_odt_unsupported_content(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"note" {
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"note" {
                     return true;
                 }
                 buffer.clear();
@@ -1096,14 +1102,14 @@ fn xml_has_odt_active_content(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 if matches!(
-                    xml_local_name(event.name().as_ref()),
+                    xml_local_name(event.name().as_ref().as_bytes()),
                     b"forms" | b"form" | b"control" | b"event-listener" | b"macro" | b"library"
                 ) {
                     return true;
                 }
                 for attribute in event.attributes().flatten() {
-                    let value =
-                        String::from_utf8_lossy(attribute.value.as_ref()).to_ascii_lowercase();
+                    let value = String::from_utf8_lossy(attribute.value.as_ref().as_bytes())
+                        .to_ascii_lowercase();
                     if value.starts_with("vnd.sun.star.script:") || value.starts_with("macro:") {
                         return true;
                     }
@@ -1127,9 +1133,14 @@ fn xml_odf_internal_references(bytes: &[u8]) -> Vec<String> {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 for attribute in event.attributes().flatten() {
-                    if matches!(xml_local_name(attribute.key.as_ref()), b"href" | b"src") {
-                        references
-                            .push(String::from_utf8_lossy(attribute.value.as_ref()).into_owned());
+                    if matches!(
+                        xml_local_name(attribute.key.as_ref().as_bytes()),
+                        b"href" | b"src"
+                    ) {
+                        references.push(
+                            String::from_utf8_lossy(attribute.value.as_ref().as_bytes())
+                                .into_owned(),
+                        );
                     }
                 }
                 buffer.clear();
@@ -1187,7 +1198,7 @@ fn xml_is_well_formed(bytes: &[u8]) -> bool {
                 if open_elements.is_empty() {
                     saw_root = true;
                 }
-                open_elements.push(event.name().as_ref().to_vec());
+                open_elements.push(event.name().as_ref().as_bytes().to_vec());
             }
             Ok(quick_xml::events::Event::Empty(_)) => {
                 if root_closed || (open_elements.is_empty() && saw_root) {
@@ -1202,7 +1213,7 @@ fn xml_is_well_formed(bytes: &[u8]) -> bool {
                 let Some(open) = open_elements.pop() else {
                     return false;
                 };
-                if open.as_slice() != event.name().as_ref() {
+                if open.as_slice() != event.name().as_ref().as_bytes() {
                     return false;
                 }
                 if open_elements.is_empty() {
@@ -1211,7 +1222,7 @@ fn xml_is_well_formed(bytes: &[u8]) -> bool {
             }
             Ok(quick_xml::events::Event::Text(event)) if open_elements.is_empty() => {
                 let text = event.into_inner();
-                if !text.iter().all(u8::is_ascii_whitespace) {
+                if !text.as_bytes().iter().all(u8::is_ascii_whitespace) {
                     return false;
                 }
             }
@@ -1268,11 +1279,12 @@ fn xml_has_ooxml_external_relationship(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event))
-                if xml_local_name(event.name().as_ref()).eq_ignore_ascii_case(b"Relationship") =>
+                if xml_local_name(event.name().as_ref().as_bytes())
+                    .eq_ignore_ascii_case(b"Relationship") =>
             {
                 let external = event.attributes().flatten().any(|attribute| {
-                    let name = xml_local_name(attribute.key.as_ref());
-                    let value = String::from_utf8_lossy(attribute.value.as_ref());
+                    let name = xml_local_name(attribute.key.as_ref().as_bytes());
+                    let value = String::from_utf8_lossy(attribute.value.as_ref().as_bytes());
                     (name.eq_ignore_ascii_case(b"TargetMode")
                         && value.trim().eq_ignore_ascii_case("External"))
                         || (name.eq_ignore_ascii_case(b"Target") && ooxml_external_target(&value))
@@ -1473,7 +1485,7 @@ fn epub_rootfile_paths(bytes: &[u8]) -> Result<Vec<String>, DocumentError> {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event))
-                if xml_local_name(event.name().as_ref()) == b"rootfile" =>
+                if xml_local_name(event.name().as_ref().as_bytes()) == b"rootfile" =>
             {
                 let path =
                     xml_attribute_value(&event, b"full-path").ok_or(DocumentError::Malformed)?;
@@ -1502,7 +1514,7 @@ fn epub_parse_opf(bytes: &[u8]) -> Result<EpubPackageMetadata, DocumentError> {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                match xml_local_name(event.name().as_ref()) {
+                match xml_local_name(event.name().as_ref().as_bytes()) {
                     b"package" => {
                         if package_seen {
                             return Err(DocumentError::Malformed);
@@ -1607,7 +1619,7 @@ fn epub_inspect_chapter(
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 let event_name = event.name();
-                let local = xml_local_name(event_name.as_ref());
+                let local = xml_local_name(event_name.as_ref().as_bytes());
                 match local {
                     b"html" => has_html = true,
                     b"body" => has_body = true,
@@ -1617,8 +1629,9 @@ fn epub_inspect_chapter(
                     _ => {}
                 }
                 for attribute in event.attributes().flatten() {
-                    let name = xml_local_name(attribute.key.as_ref());
-                    let value = String::from_utf8_lossy(attribute.value.as_ref()).into_owned();
+                    let name = xml_local_name(attribute.key.as_ref().as_bytes());
+                    let value =
+                        String::from_utf8_lossy(attribute.value.as_ref().as_bytes()).into_owned();
                     let lower = value.to_ascii_lowercase();
                     if matches!(name, b"href" | b"src" | b"action" | b"data") {
                         epub_check_reference(&value, chapter_path, archive_names, &mut result);
@@ -1650,13 +1663,13 @@ fn epub_inspect_chapter(
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::Text(event)) => {
-                if epub_text_has_external(event.as_ref()) {
+                if epub_text_has_external(event.as_ref().as_bytes()) {
                     result.external_relationships = true;
                 }
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::CData(event)) => {
-                if epub_text_has_external(event.as_ref()) {
+                if epub_text_has_external(event.as_ref().as_bytes()) {
                     result.external_relationships = true;
                 }
                 buffer.clear();
@@ -1696,11 +1709,11 @@ fn epub_nav_spine_mismatch(
             Ok(quick_xml::events::Event::Start(event)) => {
                 depth += 1;
                 let event_name = event.name();
-                let local = xml_local_name(event_name.as_ref());
+                let local = xml_local_name(event_name.as_ref().as_bytes());
                 if local == b"nav" {
                     let is_toc = event.attributes().flatten().any(|attribute| {
-                        let name = xml_local_name(attribute.key.as_ref());
-                        let value = String::from_utf8_lossy(attribute.value.as_ref());
+                        let name = xml_local_name(attribute.key.as_ref().as_bytes());
+                        let value = String::from_utf8_lossy(attribute.value.as_ref().as_bytes());
                         (name == b"type" && value.eq_ignore_ascii_case("toc"))
                             || (name == b"role" && value.eq_ignore_ascii_case("doc-toc"))
                     });
@@ -1732,7 +1745,7 @@ fn epub_nav_spine_mismatch(
             }
             Ok(quick_xml::events::Event::Empty(event)) => {
                 let event_name = event.name();
-                if xml_local_name(event_name.as_ref()) == b"a" && toc_depth.is_some() {
+                if xml_local_name(event_name.as_ref().as_bytes()) == b"a" && toc_depth.is_some() {
                     let Some(href) = xml_attribute_value(&event, b"href") else {
                         invalid = true;
                         buffer.clear();
@@ -3154,6 +3167,52 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn xml_utf8_events_preserve_names_attributes_and_root_boundaries() {
+        let xml = r#"<ns:racine ns:label="café">résumé<![CDATA[été]]></ns:racine>"#;
+        assert!(xml_is_well_formed(xml.as_bytes()));
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let quick_xml::events::Event::Start(event) = reader.read_event().unwrap() else {
+            panic!("expected the root element");
+        };
+        assert_eq!(
+            xml_attribute_value(&event, b"label").as_deref(),
+            Some("café")
+        );
+        for invalid in [
+            "é<root/>",
+            "<root/>é",
+            "<root><child></root>",
+            "<root/><second/>",
+        ] {
+            assert!(!xml_is_well_formed(invalid.as_bytes()));
+        }
+        assert!(!xml_is_well_formed(b"<root>\xff</root>"));
+    }
+
+    #[test]
+    fn epub_string_events_keep_external_reference_guards() {
+        for content in [
+            r#"<a href="https://example.invalid">café</a>"#,
+            "<p>https://example.invalid</p>",
+            "<p><![CDATA[https://example.invalid]]></p>",
+        ] {
+            let chapter = format!("<html><body>{content}</body></html>");
+            let result =
+                epub_inspect_chapter(chapter.as_bytes(), "OPS/chapter.xhtml", &HashSet::new())
+                    .unwrap();
+            assert!(result.external_relationships, "missed {content}");
+        }
+        let result = epub_inspect_chapter(
+            "<html><body><p>café<![CDATA[été]]></p></body></html>".as_bytes(),
+            "OPS/chapter.xhtml",
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(!result.external_relationships);
+        assert!(!result.missing_required_content);
+    }
 
     #[test]
     fn capabilities_enable_docx_and_strict_xlsx() {
