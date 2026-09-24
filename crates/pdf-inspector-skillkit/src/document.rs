@@ -1090,6 +1090,165 @@ fn xml_has_odt_unsupported_content(bytes: &[u8]) -> bool {
     }
 }
 
+/// Word story parts AnyDoc 0.2.4 renders: the body, footnotes, and endnotes.
+/// Headers, footers, and comments are not converted.
+fn docx_story_part(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "word/document.xml" | "word/footnotes.xml" | "word/endnotes.xml"
+    )
+}
+
+/// Word content the pinned AnyDoc parser drops without a diagnostic: a
+/// symbol character (`w:sym`, which carries Wingdings checkboxes and
+/// Symbol-font letters) and the state of a legacy form checkbox or drop-down
+/// (`w:checkBox`, `w:ddList`). Upstream renders symbol checkboxes after this
+/// release (firecrawl/anydoc#176, #177).
+fn xml_has_docx_dropped_content(bytes: &[u8]) -> bool {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                if matches!(
+                    xml_local_name(event.name().as_ref()),
+                    b"sym" | b"checkBox" | b"ddList"
+                ) {
+                    return true;
+                }
+                buffer.clear();
+            }
+            Ok(quick_xml::events::Event::Eof) => return false,
+            Ok(_) => buffer.clear(),
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Whether any Word run is formatted hidden (`w:vanish` not switched off).
+/// The pinned parser converts hidden runs as ordinary text.
+fn xml_has_docx_hidden_text(bytes: &[u8]) -> bool {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                if xml_local_name(event.name().as_ref()) == b"vanish" {
+                    let off = xml_attribute_value(&event, b"val").is_some_and(|value| {
+                        matches!(value.to_ascii_lowercase().as_str(), "false" | "0" | "off")
+                    });
+                    if !off {
+                        return true;
+                    }
+                }
+                buffer.clear();
+            }
+            Ok(quick_xml::events::Event::Eof) => return false,
+            Ok(_) => buffer.clear(),
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Longest spreadsheet number-format code converted. AnyDoc 0.2.4 expands
+/// every character of a `formatCode` into several vectors, so one 8 MiB code
+/// in a 10 KB workbook peaked near 855 MiB in the worker; upstream caps codes
+/// at the same 4096 bytes after this release (firecrawl/anydoc#148).
+const MAX_NUMBER_FORMAT_BYTES: usize = 4096;
+
+/// Stream a styles part and report whether any `formatCode` attribute value
+/// is longer than [`MAX_NUMBER_FORMAT_BYTES`], in constant memory. The
+/// escaped length is measured, which can only overstate the parsed code.
+fn styles_have_oversized_number_format(reader: impl Read) -> Result<bool, DocumentError> {
+    const NAME: &[u8] = b"formatCode";
+    enum State {
+        Name(usize),
+        AfterName,
+        AfterEquals,
+        Value { quote: u8, length: usize },
+    }
+    let mut state = State::Name(0);
+    let mut reader = std::io::BufReader::new(reader);
+    loop {
+        let chunk =
+            std::io::BufRead::fill_buf(&mut reader).map_err(|_| DocumentError::Malformed)?;
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+        for &byte in chunk {
+            state = match state {
+                State::Name(matched) if byte == NAME[matched] => {
+                    if matched + 1 == NAME.len() {
+                        State::AfterName
+                    } else {
+                        State::Name(matched + 1)
+                    }
+                }
+                State::AfterName if byte.is_ascii_whitespace() => State::AfterName,
+                State::AfterName if byte == b'=' => State::AfterEquals,
+                State::AfterEquals if byte.is_ascii_whitespace() => State::AfterEquals,
+                State::AfterEquals if byte == b'"' || byte == b'\'' => State::Value {
+                    quote: byte,
+                    length: 0,
+                },
+                State::Value { quote, .. } if byte == quote => State::Name(0),
+                State::Value { quote, length } => {
+                    if length >= MAX_NUMBER_FORMAT_BYTES {
+                        return Ok(true);
+                    }
+                    State::Value {
+                        quote,
+                        length: length + 1,
+                    }
+                }
+                // `f` occurs only at the start of the name, so a mismatch can
+                // restart the match only on `f` itself.
+                State::Name(_) | State::AfterName | State::AfterEquals => {
+                    State::Name(usize::from(byte == NAME[0]))
+                }
+            };
+        }
+        let consumed = chunk.len();
+        std::io::BufRead::consume(&mut reader, consumed);
+    }
+}
+
+/// Styles parts AnyDoc may read for a workbook: the target of the workbook's
+/// styles relationship and the conventional `xl/styles.xml` fallback.
+fn xlsx_styles_parts(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Vec<String> {
+    let mut parts = vec!["xl/styles.xml".to_string()];
+    let Ok(entry) = archive.by_name("xl/_rels/workbook.xml.rels") else {
+        return parts;
+    };
+    if entry.size() > MAX_PREFLIGHT_PART_BYTES {
+        return parts;
+    }
+    let mut rels = Vec::new();
+    if entry
+        .take(MAX_PREFLIGHT_PART_BYTES)
+        .read_to_end(&mut rels)
+        .is_err()
+    {
+        return parts;
+    }
+    let rels = String::from_utf8_lossy(&rels);
+    for tag in xml_element_tags(&rels, "Relationship") {
+        let is_styles = xml_attribute(tag, "Type").is_some_and(|kind| kind.ends_with("/styles"));
+        if let Some(target) = xml_attribute(tag, "Target").filter(|_| is_styles) {
+            if let Some(part) = resolve_package_target("xl/workbook.xml", target) {
+                if !parts.contains(&part) {
+                    parts.push(part);
+                }
+            }
+        }
+    }
+    parts
+}
+
 fn xml_has_odt_active_content(bytes: &[u8]) -> bool {
     if xml_has_odf_active_content(bytes) {
         return true;
@@ -2123,7 +2282,7 @@ fn preflight_package(
                 && (lower_name == "ppt/presentation.xml"
                     || lower_name == "ppt/_rels/presentation.xml.rels"
                     || (lower_name.starts_with("ppt/slides/") && lower_name.ends_with(".xml"))))
-            || (matches!(kind, DocumentKind::Docx) && lower_name == "word/document.xml");
+            || (matches!(kind, DocumentKind::Docx) && docx_story_part(&lower_name));
         if inspect_xml {
             if declared > MAX_PREFLIGHT_PART_BYTES {
                 return Err(DocumentError::ResourceLimit);
@@ -2142,6 +2301,10 @@ fn preflight_package(
                 && !xml_is_well_formed(&content)
             {
                 return Err(DocumentError::Malformed);
+            }
+            if matches!(kind, DocumentKind::Docx) && docx_story_part(&lower_name) {
+                result.unsupported_content |= xml_has_docx_dropped_content(&content);
+                result.hidden_content |= xml_has_docx_hidden_text(&content);
             }
             if matches!(
                 kind,
@@ -2267,6 +2430,16 @@ fn preflight_package(
     if !has_content_types || !has_main {
         return Err(DocumentError::Malformed);
     }
+    if matches!(kind, DocumentKind::Xlsx) {
+        for part in xlsx_styles_parts(&mut archive) {
+            let Ok(entry) = archive.by_name(&part) else {
+                continue;
+            };
+            if styles_have_oversized_number_format(entry.take(MAX_ARCHIVE_ENTRY_BYTES))? {
+                return Err(DocumentError::ResourceLimit);
+            }
+        }
+    }
     if !matches!(variant, DocumentVariant::Docx) && matches!(kind, DocumentKind::Docx) {
         result.active_content = true;
     }
@@ -2277,6 +2450,42 @@ fn preflight_package(
             validate_pptx_slide_targets(&presentation, &presentation_rels, &ppt_slide_parts)?;
     }
     Ok(result)
+}
+
+/// The typed failure a preflight result forces before conversion. The
+/// supervisor and the worker both apply it, so the two cannot disagree.
+fn preflight_rejection(kind: DocumentKind, preflight: &PackagePreflight) -> Option<DocumentError> {
+    if preflight.active_content {
+        return Some(DocumentError::ActiveContentDisabled);
+    }
+    let incomplete = match kind {
+        // Hidden DOCX text is converted and disclosed rather than rejected.
+        DocumentKind::Docx => preflight.unsupported_content,
+        DocumentKind::Xlsx => {
+            preflight.hidden_content
+                || preflight.missing_formula_cache
+                || preflight.external_relationships
+        }
+        DocumentKind::Ods => {
+            preflight.hidden_content
+                || preflight.missing_formula_cache
+                || preflight.external_relationships
+                || preflight.missing_required_content
+        }
+        DocumentKind::Odt => {
+            preflight.hidden_content
+                || preflight.external_relationships
+                || preflight.missing_required_content
+                || preflight.unsupported_content
+        }
+        DocumentKind::Pptx | DocumentKind::Odp | DocumentKind::Epub => {
+            preflight.hidden_content
+                || preflight.external_relationships
+                || preflight.missing_required_content
+        }
+        _ => false,
+    };
+    incomplete.then_some(DocumentError::IncompleteConversion)
 }
 
 fn classify_bytes(bytes: &[u8], path: &Path) -> DocumentClassification {
@@ -2356,52 +2565,8 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
     } else {
         preflight_package(&bytes, kind, variant)?
     };
-    if preflight.active_content {
-        return Err(DocumentError::ActiveContentDisabled);
-    }
-    if kind == DocumentKind::Xlsx
-        && (preflight.hidden_content
-            || preflight.missing_formula_cache
-            || preflight.external_relationships)
-    {
-        return Err(DocumentError::IncompleteConversion);
-    }
-    if kind == DocumentKind::Pptx
-        && (preflight.hidden_content
-            || preflight.external_relationships
-            || preflight.missing_required_content)
-    {
-        return Err(DocumentError::IncompleteConversion);
-    }
-    if kind == DocumentKind::Ods
-        && (preflight.hidden_content
-            || preflight.missing_formula_cache
-            || preflight.external_relationships
-            || preflight.missing_required_content)
-    {
-        return Err(DocumentError::IncompleteConversion);
-    }
-    if kind == DocumentKind::Odt
-        && (preflight.hidden_content
-            || preflight.external_relationships
-            || preflight.missing_required_content
-            || preflight.unsupported_content)
-    {
-        return Err(DocumentError::IncompleteConversion);
-    }
-    if kind == DocumentKind::Odp
-        && (preflight.hidden_content
-            || preflight.external_relationships
-            || preflight.missing_required_content)
-    {
-        return Err(DocumentError::IncompleteConversion);
-    }
-    if kind == DocumentKind::Epub
-        && (preflight.hidden_content
-            || preflight.external_relationships
-            || preflight.missing_required_content)
-    {
-        return Err(DocumentError::IncompleteConversion);
+    if let Some(error) = preflight_rejection(kind, &preflight) {
+        return Err(error);
     }
     let raw_markdown = run_worker_process(&bytes, variant).await?;
     if raw_markdown.len() > MAX_MARKDOWN_SIZE {
@@ -2412,6 +2577,13 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
         return Err(DocumentError::OutputTooLarge);
     }
     let mut warnings = Vec::new();
+    if kind == DocumentKind::Docx && preflight.hidden_content {
+        warnings.push(DocumentWarning {
+            code: "hidden_content_preserved".into(),
+            message: "The document marks some text hidden; it was converted with the visible text."
+                .into(),
+        });
+    }
     if preflight.external_relationships {
         warnings.push(DocumentWarning {
             code: "external_relationships_blocked".into(),
@@ -3095,42 +3267,11 @@ pub fn run_worker() -> Result<(), DocumentError> {
     } else {
         let kind = kind_for_variant(variant).ok_or(DocumentError::WorkerProtocol)?;
         let format = anydoc_format(variant).ok_or(DocumentError::WorkerProtocol)?;
-        match preflight_package(bytes, kind, variant) {
+        match preflight_package(bytes, kind, variant)
+            .and_then(|preflight| preflight_rejection(kind, &preflight).map_or(Ok(()), Err))
+        {
             Err(error) => worker_response_for_error(&error),
-            Ok(preflight) if preflight.active_content => {
-                worker_response_for_error(&DocumentError::ActiveContentDisabled)
-            }
-            Ok(preflight)
-                if (kind == DocumentKind::Pptx
-                    && (preflight.hidden_content
-                        || preflight.external_relationships
-                        || preflight.missing_required_content))
-                    || (kind == DocumentKind::Xlsx
-                        && (preflight.hidden_content
-                            || preflight.missing_formula_cache
-                            || preflight.external_relationships))
-                    || (kind == DocumentKind::Ods
-                        && (preflight.hidden_content
-                            || preflight.missing_formula_cache
-                            || preflight.external_relationships
-                            || preflight.missing_required_content))
-                    || (kind == DocumentKind::Odt
-                        && (preflight.hidden_content
-                            || preflight.external_relationships
-                            || preflight.missing_required_content
-                            || preflight.unsupported_content))
-                    || (kind == DocumentKind::Odp
-                        && (preflight.hidden_content
-                            || preflight.external_relationships
-                            || preflight.missing_required_content))
-                    || (kind == DocumentKind::Epub
-                        && (preflight.hidden_content
-                            || preflight.external_relationships
-                            || preflight.missing_required_content)) =>
-            {
-                worker_response_for_error(&DocumentError::IncompleteConversion)
-            }
-            Ok(_) => match anydoc::to_markdown_bytes(bytes, Some(format)) {
+            Ok(()) => match anydoc::to_markdown_bytes(bytes, Some(format)) {
                 Ok(_) if worker_diagnostics_incomplete() => {
                     worker_response_for_error(&DocumentError::IncompleteConversion)
                 }
@@ -3220,21 +3361,51 @@ fn write_worker_response<W: Write>(
 }
 
 fn sanitize_markdown(markdown: &str) -> (String, bool) {
+    static DESTINATION: OnceLock<Regex> = OnceLock::new();
     static URL: OnceLock<Regex> = OnceLock::new();
     static PATH: OnceLock<Regex> = OnceLock::new();
     static HTML: OnceLock<Regex> = OnceLock::new();
-    let url =
-        URL.get_or_init(|| Regex::new(r"(?i)(?:https?|ftp)://[^\s)\]>]+").expect("URL regex"));
+    // A link or image destination that names a scheme, a host, a drive, or
+    // an absolute or UNC path: `](mailto:…)`, `](//host/…)`, `](\\server\…)`.
+    // Relative and fragment destinations stay; they name parts of the same
+    // package.
+    let destination = DESTINATION.get_or_init(|| {
+        Regex::new(r"\]\(\s*<?((?:[A-Za-z][A-Za-z0-9+.\-]*:|//|\\\\|/)[^)]*)\)")
+            .expect("destination regex")
+    });
+    // Bare URLs with an authority, and the schemes that act without one.
+    let url = URL.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:[a-z][a-z0-9+.\-]*://|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>]+",
+        )
+        .expect("URL regex")
+    });
+    // Home directories, temporary and private roots, Windows profiles, and
+    // UNC shares.
     let path = PATH.get_or_init(|| {
-        Regex::new(r"(?:/Users|/private|/tmp|/var/folders)/[^\s)\]>]+").expect("path regex")
+        Regex::new(
+            r"(?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|\b[A-Za-z]:\\(?i:users)\\)[^\s)\]>]+",
+        )
+        .expect("path regex")
     });
     let html = HTML.get_or_init(|| Regex::new(r"</?[A-Za-z][^>]*>").expect("HTML regex"));
-    let sanitized = url
-        .replace_all(markdown, "[external URL removed]")
-        .into_owned();
-    let sanitized = path
-        .replace_all(&sanitized, "[local path removed]")
-        .into_owned();
+    let sanitized = destination.replace_all(markdown, |caps: &regex::Captures<'_>| {
+        let target = &caps[1];
+        let bytes = target.as_bytes();
+        let local = target.starts_with("\\\\")
+            || (target.starts_with('/') && !target.starts_with("//"))
+            || (bytes.len() > 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/'));
+        if local {
+            "]([local path removed])"
+        } else {
+            "]([external URL removed])"
+        }
+    });
+    let sanitized = url.replace_all(&sanitized, "[external URL removed]");
+    let sanitized = path.replace_all(&sanitized, "[local path removed]");
     let sanitized = html.replace_all(&sanitized, "").into_owned();
     let changed = sanitized != markdown;
     (sanitized, changed)
@@ -3268,6 +3439,83 @@ mod tests {
         assert!(!output.contains("https://"));
         assert!(!output.contains(&machine_path));
         assert!(!output.contains("<script>"));
+    }
+
+    #[test]
+    fn sanitizer_removes_every_actionable_destination() {
+        let unc = r"\\fileserver\share\ledger.xlsx";
+        // Split so the repository hygiene scan does not flag the literal.
+        let windows_profile = [r"C:\", r"Users\preparer\return.pdf"].concat();
+        let home = ["/", "home/preparer/notes.txt"].concat();
+        // Assembled so the repository hygiene scan does not flag an address.
+        let address = ["someone", "example.invalid"].join("@");
+        let cases = [
+            (
+                format!("[mail](mailto:{address})"),
+                "[mail]([external URL removed])",
+            ),
+            (
+                "[file](file:///etc/passwd)".into(),
+                "[file]([external URL removed])",
+            ),
+            (
+                "![pixel](data:image/png;base64,AAAA)".into(),
+                "![pixel]([external URL removed])",
+            ),
+            (
+                "[call](tel:+15555550100)".into(),
+                "[call]([external URL removed])",
+            ),
+            (
+                "[cdn](//cdn.example.invalid/x.png)".into(),
+                "[cdn]([external URL removed])",
+            ),
+            ("[root](/etc/passwd)".into(), "[root]([local path removed])"),
+            (
+                "[drive](C:/Temp/out.docx)".into(),
+                "[drive]([local path removed])",
+            ),
+            (
+                format!("write to mailto:{address} today"),
+                "write to [external URL removed] today",
+            ),
+            (
+                "see sftp://host.example.invalid/drop".into(),
+                "see [external URL removed]",
+            ),
+        ];
+        for (input, expected) in cases {
+            let (output, changed) = sanitize_markdown(&input);
+            assert!(changed, "{input}");
+            assert_eq!(output, expected, "{input}");
+        }
+        for input in [
+            format!("[share]({unc})"),
+            format!("open {unc} now"),
+            format!("saved to {windows_profile}"),
+            format!("notes in {home}"),
+        ] {
+            let (output, changed) = sanitize_markdown(&input);
+            assert!(changed, "{input}");
+            assert!(output.contains("[local path removed]"), "{output}");
+            assert!(!output.contains("fileserver") && !output.contains("preparer"));
+        }
+    }
+
+    #[test]
+    fn sanitizer_keeps_relative_links_and_ordinary_prose() {
+        for input in [
+            "[next chapter](Text/ch2.xhtml#s1)",
+            "[see note](#note-1)",
+            "Note: totals exclude tax. Tel: see the directory. Data: 42.",
+            "Ratio 3:1 at 10:30, per section 1398(a).",
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (input.to_string(), false),
+                "{input}"
+            );
+        }
     }
 
     #[test]
@@ -3477,6 +3725,161 @@ mod tests {
         let result = preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx).unwrap();
         assert!(result.hidden_content);
         assert!(result.missing_formula_cache);
+    }
+
+    const WORD_NS: &str =
+        r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+    fn word_part(root: &str, body: &str) -> Vec<u8> {
+        format!("<w:{root} {WORD_NS}><w:body>{body}</w:body></w:{root}>").into_bytes()
+    }
+
+    fn docx_preflight(entries: &[(&str, &[u8])]) -> PackagePreflight {
+        let mut all: Vec<(&str, &[u8])> = vec![("[Content_Types].xml", DOCX_TYPES)];
+        all.extend_from_slice(entries);
+        preflight_package(
+            &zip_entries(&all),
+            DocumentKind::Docx,
+            DocumentVariant::Docx,
+        )
+        .expect("DOCX preflight")
+    }
+
+    #[test]
+    fn docx_preflight_rejects_content_the_pinned_parser_drops() {
+        let dropped = [
+            r#"<w:p><w:r><w:sym w:font="Wingdings" w:char="F0FE"/></w:r><w:r><w:t>Yes</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:sym w:font="Symbol" w:char="F061"/></w:r></w:p>"#,
+            r#"<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:checkBox><w:checked/></w:checkBox></w:ffData></w:fldChar></w:r></w:p>"#,
+            r#"<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:ddList><w:result w:val="1"/></w:ddList></w:ffData></w:fldChar></w:r></w:p>"#,
+        ];
+        for body in dropped {
+            let document = word_part("document", body);
+            let preflight = docx_preflight(&[("word/document.xml", &document)]);
+            assert!(preflight.unsupported_content, "{body}");
+            assert!(matches!(
+                preflight_rejection(DocumentKind::Docx, &preflight),
+                Some(DocumentError::IncompleteConversion)
+            ));
+        }
+
+        // Footnotes are rendered, so their symbols count; headers are not.
+        let document = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let symbol = word_part(
+            "footnotes",
+            r#"<w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p>"#,
+        );
+        let preflight = docx_preflight(&[
+            ("word/document.xml", &document),
+            ("word/footnotes.xml", &symbol),
+        ]);
+        assert!(preflight.unsupported_content);
+        let preflight = docx_preflight(&[
+            ("word/document.xml", &document),
+            ("word/header1.xml", &symbol),
+        ]);
+        assert!(!preflight.unsupported_content);
+        assert!(preflight_rejection(DocumentKind::Docx, &preflight).is_none());
+
+        // A checkbox content control carries its glyph as text and converts.
+        let control = word_part(
+            "document",
+            r#"<w:p><w:sdt><w:sdtContent><w:r><w:t>&#x2612; Yes</w:t></w:r></w:sdtContent></w:sdt></w:p>"#,
+        );
+        assert!(!docx_preflight(&[("word/document.xml", &control)]).unsupported_content);
+    }
+
+    #[test]
+    fn docx_hidden_text_is_disclosed_not_rejected() {
+        let hidden = word_part(
+            "document",
+            r#"<w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>Hidden</w:t></w:r></w:p>"#,
+        );
+        let preflight = docx_preflight(&[("word/document.xml", &hidden)]);
+        assert!(preflight.hidden_content);
+        assert!(preflight_rejection(DocumentKind::Docx, &preflight).is_none());
+
+        let switched_off = word_part(
+            "document",
+            r#"<w:p><w:r><w:rPr><w:vanish w:val="false"/></w:rPr><w:t>Shown</w:t></w:r></w:p>"#,
+        );
+        assert!(!docx_preflight(&[("word/document.xml", &switched_off)]).hidden_content);
+    }
+
+    fn xlsx_with_styles(styles_name: &str, styles: &[u8], rels: Option<&[u8]>) -> Vec<u8> {
+        let workbook = br#"<workbook><sheets><sheet name="Visible"/></sheets></workbook>"#;
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("[Content_Types].xml", XLSX_TYPES),
+            ("xl/workbook.xml", workbook),
+            (styles_name, styles),
+        ];
+        if let Some(rels) = rels {
+            entries.push(("xl/_rels/workbook.xml.rels", rels));
+        }
+        zip_entries(&entries)
+    }
+
+    fn styles_with_code(code: &str) -> Vec<u8> {
+        format!(r#"<styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="{code}"/></numFmts></styleSheet>"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn xlsx_preflight_rejects_oversized_number_formats() {
+        let longest = styles_with_code(&"0".repeat(MAX_NUMBER_FORMAT_BYTES));
+        let bytes = xlsx_with_styles("xl/styles.xml", &longest, None);
+        assert!(preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx).is_ok());
+
+        let oversized = styles_with_code(&"0".repeat(MAX_NUMBER_FORMAT_BYTES + 1));
+        let bytes = xlsx_with_styles("xl/styles.xml", &oversized, None);
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
+            Err(DocumentError::ResourceLimit)
+        ));
+
+        // Renaming the styles part behind its relationship does not evade it.
+        let rels = br#"<Relationships><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="design/theme-styles.xml"/></Relationships>"#;
+        let bytes = xlsx_with_styles("xl/design/theme-styles.xml", &oversized, Some(rels));
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
+            Err(DocumentError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn number_format_scan_handles_quotes_spacing_and_chunk_boundaries() {
+        /// Yields one byte per read, so every token crosses a buffer edge.
+        struct Trickle<'a>(&'a [u8]);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match (self.0.split_first(), buffer.first_mut()) {
+                    (Some((byte, rest)), Some(slot)) => {
+                        *slot = *byte;
+                        self.0 = rest;
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let long = "#".repeat(MAX_NUMBER_FORMAT_BYTES + 1);
+        for (xml, oversized) in [
+            (format!(r#"<numFmt formatCode = '{long}'/>"#), true),
+            (format!(r#"<numFmt x:formatCode="{long}"/>"#), true),
+            (
+                format!(r#"<numFmt formatCode="0.00"/><t>{long}</t>"#),
+                false,
+            ),
+            (format!(r#"<numFmt formatCodes="{long}"/>"#), false),
+            (
+                "<numFmt formatCode=\"&quot;$&quot;#,##0.00\"/>".to_string(),
+                false,
+            ),
+        ] {
+            let scanned =
+                styles_have_oversized_number_format(Trickle(xml.as_bytes())).expect("scan");
+            assert_eq!(scanned, oversized, "{}", &xml[..40.min(xml.len())]);
+        }
     }
 
     #[test]

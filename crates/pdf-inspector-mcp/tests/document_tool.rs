@@ -1265,6 +1265,11 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
         ("ods/external-reference.ods", "incomplete_conversion"),
         ("ods/active-content.ods", "active_content_disabled"),
         ("ods/missing-table.ods", "incomplete_conversion"),
+        // Pinned AnyDoc drops these silently or amplifies them (see
+        // scripts/build-anydoc-hardening-corpus.py).
+        ("docx/symbol-checkbox.docx", "incomplete_conversion"),
+        ("docx/legacy-form-checkbox.docx", "incomplete_conversion"),
+        ("xlsx/oversized-number-format.xlsx", "resource_limit"),
     ] {
         let fixture = format!(
             "{}/../../test-corpus/{relative_path}",
@@ -1293,4 +1298,53 @@ fn docx_external_relationship_is_contained_and_reported() {
     let text = document.to_string();
     assert!(!text.contains("https://example.invalid"));
     assert!(!text.contains(&["/", "Users", "/"].concat()));
+}
+
+#[test]
+fn docx_hidden_text_is_converted_and_disclosed() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/hidden-text.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-hidden-integration-test");
+    assert_eq!(document["completeness"], "complete");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("HIDDEN-RUN") && markdown.contains("HARDENING-END"));
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "hidden_content_preserved"));
+}
+
+#[test]
+fn docx_external_link_destinations_are_removed() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/external-link-schemes.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-link-schemes-integration-test");
+    assert_eq!(document["completeness"], "complete");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    for index in 0..5 {
+        assert!(markdown.contains(&format!("LINK-{index}")), "{markdown}");
+    }
+    for leaked in [
+        "mailto:",
+        "file:",
+        "data:",
+        "tel:",
+        "fileserver",
+        "etc/passwd",
+    ] {
+        assert!(!markdown.contains(leaked), "{leaked} survived: {markdown}");
+    }
+    let codes: Vec<_> = document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap_or_default())
+        .collect();
+    assert!(codes.contains(&"external_relationships_blocked"));
+    assert!(codes.contains(&"sanitized_output"));
 }
