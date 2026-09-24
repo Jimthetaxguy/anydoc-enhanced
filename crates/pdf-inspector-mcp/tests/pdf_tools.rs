@@ -1,0 +1,314 @@
+//! PDF tools over MCP stdio, including the bounded worker route.
+
+use std::{
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+fn fixture(relative: &str) -> String {
+    format!(
+        "{}/../../test-corpus/{relative}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// Call several tools in one server session and return each parsed result.
+fn call_tools(
+    calls: &[(&str, serde_json::Value)],
+    worker: Option<&Path>,
+) -> Vec<serde_json::Value> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pdf-inspector-mcp"));
+    if let Some(worker) = worker {
+        command.env("ANYDOC_WORKER_BIN", worker);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("MCP binary must be available to integration tests");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "pdf-tools-test", "version": "1" }
+        }
+    });
+    writeln!(stdin, "{initialize}").expect("write initialize");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .expect("write initialized");
+    stdin.flush().expect("flush requests");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut results = Vec::new();
+    // Calls go one at a time so each response can be tied to its request.
+    for (index, (name, arguments)) in calls.iter().enumerate() {
+        let id = index + 1;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        writeln!(stdin, "{request}").expect("write tool call");
+        stdin.flush().expect("flush tool call");
+        let response = loop {
+            let mut line = String::new();
+            let bytes = stdout.read_line(&mut line).expect("read JSON-RPC response");
+            assert!(bytes > 0, "server closed before answering {name}");
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if value.get("id") == Some(&serde_json::Value::from(id)) {
+                    break value;
+                }
+            }
+        };
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool text result");
+        results.push(serde_json::from_str(text).expect("tool JSON result"));
+    }
+    drop(stdin);
+    assert!(child.wait().expect("wait for MCP server").success());
+    results
+}
+
+#[test]
+fn pdf_tools_return_public_fixture_results() {
+    let pdf = fixture("source/sample-1.pdf");
+    let results = call_tools(
+        &[
+            ("classify_pdf", serde_json::json!({ "path": pdf })),
+            ("pdf_to_markdown", serde_json::json!({ "path": pdf })),
+            ("analyze_layout", serde_json::json!({ "path": pdf })),
+            ("parse_irc_sections", serde_json::json!({ "path": pdf })),
+            (
+                "extract_text_regions",
+                serde_json::json!({
+                    "path": pdf,
+                    "regions": [{ "page": 0, "rects": [[0.0, 0.0, 612.0, 792.0]] }]
+                }),
+            ),
+            (
+                "batch_classify",
+                serde_json::json!({ "paths": [pdf, fixture("scanned/sample-1.pdf"), "missing.pdf"] }),
+            ),
+        ],
+        None,
+    );
+    let [classified, markdown, layout, irc, regions, batch] = results.as_slice() else {
+        panic!("expected six results");
+    };
+    assert_eq!(classified["pdf_type"], "TextBased");
+    assert_eq!(classified["page_count"], 4);
+    assert!(classified.get("layout").is_none());
+    assert!(markdown["markdown"]
+        .as_str()
+        .is_some_and(|text| text.contains("§1398")));
+    assert!(layout["layout"]["pages_with_columns"].is_array());
+    assert_eq!(irc["total_sections"], 2);
+    assert_eq!(irc["sections"][0]["section_number"], "§1398");
+    assert!(regions[0]["regions"][0]["text"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+    assert_eq!(batch[0]["classification"]["pdf_type"], "TextBased");
+    assert_eq!(batch[1]["classification"]["pdf_type"], "Scanned");
+    // The batch echoes each supplied path by design; errors stay path-free.
+    assert_eq!(batch[2]["path"], "missing.pdf");
+    assert_eq!(batch[2]["error"], "File not found or inaccessible");
+}
+
+#[cfg(unix)]
+fn fake_worker(directory: &Path, name: &str, script: &str) -> PathBuf {
+    let worker = directory.join(name);
+    std::fs::write(&worker, script).expect("write fake worker");
+    let mut permissions = std::fs::metadata(&worker)
+        .expect("fake worker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&worker, permissions).expect("make fake worker executable");
+    worker
+}
+
+/// A worker the kernel stops for a resource reason (Rust aborts when an
+/// allocation fails under the address-space ceiling) must surface as a
+/// resource limit, not as a protocol error, and must not leak the path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn pdf_tools_run_in_the_worker_and_map_aborts_to_resource_limits() {
+    let temporary = tempfile::tempdir().expect("temporary worker directory");
+    let aborting = fake_worker(
+        temporary.path(),
+        "aborting-worker.sh",
+        "#!/bin/sh\ncat >/dev/null\nkill -ABRT $$\n",
+    );
+    let silent = fake_worker(
+        temporary.path(),
+        "silent-worker.sh",
+        "#!/bin/sh\ncat >/dev/null\nexit 0\n",
+    );
+    let pdf = fixture("source/sample-1.pdf");
+
+    let aborted = call_tools(
+        &[("classify_pdf", serde_json::json!({ "path": pdf }))],
+        Some(&aborting),
+    );
+    assert_eq!(
+        aborted[0]["error"],
+        "PDF processing exceeded a resource limit"
+    );
+    let unanswered = call_tools(
+        &[("parse_irc_sections", serde_json::json!({ "path": pdf }))],
+        Some(&silent),
+    );
+    assert_eq!(
+        unanswered[0]["error"],
+        "PDF worker returned an invalid response"
+    );
+    for result in aborted.iter().chain(&unanswered) {
+        assert!(!result.to_string().contains("worker.sh"));
+    }
+}
+
+/// A page whose content stream inflates to 1 GiB from about 1 MB drove the
+/// in-process server past 2 GiB on pdf-inspector 1.24.0. Behind the worker's
+/// address-space ceiling it fails alone and the server keeps serving.
+#[cfg(target_os = "linux")]
+#[test]
+fn pdf_page_content_bomb_is_contained_by_the_worker() {
+    let temporary = tempfile::tempdir().expect("temporary bomb directory");
+    let bomb = temporary.path().join("page-content-bomb.pdf");
+    std::fs::write(&bomb, page_content_bomb(1024)).expect("write bomb");
+
+    let started = Instant::now();
+    let results = call_tools(
+        &[
+            ("pdf_to_markdown", serde_json::json!({ "path": bomb })),
+            ("classify_pdf", serde_json::json!({ "path": bomb })),
+            (
+                "classify_pdf",
+                serde_json::json!({ "path": fixture("source/sample-1.pdf") }),
+            ),
+        ],
+        None,
+    );
+    assert_eq!(
+        results[0]["error"],
+        "PDF processing exceeded a resource limit"
+    );
+    assert_eq!(
+        results[1]["error"],
+        "PDF processing exceeded a resource limit"
+    );
+    assert_eq!(results[2]["pdf_type"], "TextBased");
+    assert!(started.elapsed() < Duration::from_secs(60));
+}
+
+/// A zlib stream that inflates to `mib` MiB of spaces. One MiB is compressed
+/// once with a full flush, which ends its blocks on a byte boundary and resets
+/// the dictionary, so copies of it concatenate into a valid stream without
+/// compressing a gibibyte in a debug build.
+#[cfg(target_os = "linux")]
+fn zlib_spaces(mib: usize) -> Vec<u8> {
+    use flate2::{Compress, Compression, FlushCompress};
+
+    let block = vec![b' '; 1024 * 1024];
+    let mut compressor = Compress::new(Compression::best(), false);
+    let mut chunk = Vec::with_capacity(64 * 1024);
+    compressor
+        .compress_vec(&block, &mut chunk, FlushCompress::Full)
+        .expect("compress block");
+    assert_eq!(compressor.total_in(), block.len() as u64);
+    let mut last = Vec::with_capacity(64);
+    Compress::new(Compression::best(), false)
+        .compress_vec(&[], &mut last, FlushCompress::Finish)
+        .expect("final block");
+
+    // Adler-32 of `n` bytes of value 32: A = 1 + 32n, B = n + 32 n(n+1)/2.
+    let n = (mib as u128) * 1024 * 1024;
+    let a = (1 + 32 * n) % 65521;
+    let b = (n + 32 * n * (n + 1) / 2) % 65521;
+    let adler = ((b << 16) | a) as u32;
+
+    let mut stream = vec![0x78, 0xDA];
+    for _ in 0..mib {
+        stream.extend_from_slice(&chunk);
+    }
+    stream.extend_from_slice(&last);
+    stream.extend_from_slice(&adler.to_be_bytes());
+    stream
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_full_flush_blocks_form_a_valid_zlib_stream() {
+    use std::io::Read;
+
+    let mut inflated = Vec::new();
+    flate2::read::ZlibDecoder::new(zlib_spaces(3).as_slice())
+        .read_to_end(&mut inflated)
+        .expect("stream and checksum must verify");
+    assert_eq!(inflated.len(), 3 * 1024 * 1024);
+    assert!(inflated.iter().all(|byte| *byte == b' '));
+}
+
+/// A one-page PDF whose Flate page content inflates to `mib` MiB of spaces.
+#[cfg(target_os = "linux")]
+fn page_content_bomb(mib: usize) -> Vec<u8> {
+    let content = zlib_spaces(mib);
+
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut object = |pdf: &mut Vec<u8>, body: &[u8]| {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", offsets.len()).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    };
+    object(&mut pdf, b"<< /Type /Catalog /Pages 2 0 R >>");
+    object(&mut pdf, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    object(
+        &mut pdf,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    let mut stream = format!(
+        "<< /Filter /FlateDecode /Length {} >>\nstream\n",
+        content.len()
+    )
+    .into_bytes();
+    stream.extend_from_slice(&content);
+    stream.extend_from_slice(b"\nendstream");
+    object(&mut pdf, &stream);
+    object(
+        &mut pdf,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}

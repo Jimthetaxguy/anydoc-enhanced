@@ -102,14 +102,21 @@ pub fn parse_irc_sections(
     path: impl AsRef<std::path::Path>,
 ) -> Result<IrcParseResult, SkillkitError> {
     let info = crate::process(&path)?;
-    let text = info.markdown.unwrap_or_default();
-    let path_hint = path.as_ref().to_string_lossy().to_uppercase();
-    Ok(parse_markdown(&text, &path_hint))
+    Ok(parse_irc_markdown_with_source(
+        info.markdown.as_deref().unwrap_or_default(),
+        path.as_ref(),
+    ))
 }
 
 /// Parse IRC sections from Markdown already produced by `pdf_to_markdown`.
 pub fn parse_irc_markdown(markdown: &str) -> IrcParseResult {
     parse_markdown(markdown, "")
+}
+
+/// Like [`parse_irc_markdown`], falling back to the source file name for a
+/// subtitle, chapter, or subchapter the text does not state.
+pub fn parse_irc_markdown_with_source(markdown: &str, source: &std::path::Path) -> IrcParseResult {
+    parse_markdown(markdown, &source.to_string_lossy().to_uppercase())
 }
 
 /// One Markdown line with heading markers and a leading bold opener removed.

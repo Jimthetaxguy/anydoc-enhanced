@@ -227,6 +227,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 
 pub mod document;
 pub mod domain;
+pub mod pdf_worker;
 
 /// Errors from the facade layer.
 #[derive(Debug, thiserror::Error)]
@@ -264,18 +265,34 @@ pub fn validate_path(path: impl AsRef<Path>) -> Result<std::path::PathBuf, Skill
     Ok(canonical)
 }
 
+/// Read a validated PDF into memory, re-checking the size cap against the
+/// bytes actually read in case the file grew after validation.
+pub fn read_validated(path: impl AsRef<Path>) -> Result<Vec<u8>, SkillkitError> {
+    let canonical = validate_path(&path)?;
+    let buffer = std::fs::read(&canonical)
+        .map_err(|_| SkillkitError::FileNotFound(canonical.display().to_string()))?;
+    check_size(&buffer)?;
+    Ok(buffer)
+}
+
+fn check_size(buffer: &[u8]) -> Result<(), SkillkitError> {
+    if buffer.len() as u64 > MAX_FILE_SIZE {
+        return Err(SkillkitError::FileTooLarge {
+            size_bytes: buffer.len() as u64,
+            limit_bytes: MAX_FILE_SIZE,
+        });
+    }
+    Ok(())
+}
+
 /// Classify a PDF without extracting text.
 pub fn classify(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
-    let canonical = validate_path(&path)?;
-    let result = pdf_inspector::detect_pdf(&canonical)?;
-    Ok(PdfInfo::from_result(result, &ProcessMode::DetectOnly))
+    classify_bytes(&read_validated(path)?)
 }
 
 /// Full pipeline: classify + extract + markdown.
 pub fn process(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
-    let canonical = validate_path(&path)?;
-    let result = pdf_inspector::process_pdf(&canonical)?;
-    Ok(PdfInfo::from_result(result, &ProcessMode::Full))
+    process_bytes(&read_validated(path)?)
 }
 
 /// Process with custom options (page filter, process mode, etc.).
@@ -283,18 +300,12 @@ pub fn process_with_options(
     path: impl AsRef<Path>,
     options: PdfOptions,
 ) -> Result<PdfInfo, SkillkitError> {
-    let canonical = validate_path(&path)?;
-    let mode = options.mode.clone();
-    let result = pdf_inspector::process_pdf_with_options(&canonical, options)?;
-    Ok(PdfInfo::from_result(result, &mode))
+    process_bytes_with_options(&read_validated(path)?, options)
 }
 
 /// Analyze layout complexity of a PDF without full text extraction.
 pub fn analyze(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
-    let canonical = validate_path(&path)?;
-    let options = PdfOptions::new().mode(ProcessMode::Analyze);
-    let result = pdf_inspector::process_pdf_with_options(&canonical, options)?;
-    Ok(PdfInfo::from_result(result, &ProcessMode::Analyze))
+    analyze_bytes(&read_validated(path)?)
 }
 
 /// Extract text within bounding-box regions from a PDF.
@@ -305,14 +316,7 @@ pub fn extract_text_regions(
     path: impl AsRef<Path>,
     regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
-    let canonical = validate_path(&path)?;
-    let buffer = std::fs::read(&canonical)
-        .map_err(|_| SkillkitError::FileNotFound(canonical.display().to_string()))?;
-    let results = pdf_inspector::extract_text_in_regions_mem(&buffer, regions)?;
-    Ok(results
-        .into_iter()
-        .map(PageRegionResultOutput::from)
-        .collect())
+    extract_text_regions_bytes(&read_validated(path)?, regions)
 }
 
 /// Extract tables within bounding-box regions from a PDF as markdown pipe-tables.
@@ -323,10 +327,58 @@ pub fn extract_table_regions(
     path: impl AsRef<Path>,
     regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
-    let canonical = validate_path(&path)?;
-    let buffer = std::fs::read(&canonical)
-        .map_err(|_| SkillkitError::FileNotFound(canonical.display().to_string()))?;
-    let results = pdf_inspector::extract_tables_in_regions_mem(&buffer, regions)?;
+    extract_table_regions_bytes(&read_validated(path)?, regions)
+}
+
+// Byte-level entry points shared by the path functions above and the PDF
+// worker, so both routes run one implementation.
+
+/// Classify PDF bytes without extracting text.
+pub fn classify_bytes(buffer: &[u8]) -> Result<PdfInfo, SkillkitError> {
+    process_bytes_with_options(buffer, PdfOptions::detect_only())
+}
+
+/// Classify, extract, and render Markdown from PDF bytes.
+pub fn process_bytes(buffer: &[u8]) -> Result<PdfInfo, SkillkitError> {
+    process_bytes_with_options(buffer, PdfOptions::new())
+}
+
+/// Analyze layout complexity of PDF bytes without rendering Markdown.
+pub fn analyze_bytes(buffer: &[u8]) -> Result<PdfInfo, SkillkitError> {
+    process_bytes_with_options(buffer, PdfOptions::new().mode(ProcessMode::Analyze))
+}
+
+/// Process PDF bytes with custom options.
+pub fn process_bytes_with_options(
+    buffer: &[u8],
+    options: PdfOptions,
+) -> Result<PdfInfo, SkillkitError> {
+    check_size(buffer)?;
+    let mode = options.mode.clone();
+    let result = pdf_inspector::process_pdf_mem_with_options(buffer, options)?;
+    Ok(PdfInfo::from_result(result, &mode))
+}
+
+/// Extract text within bounding-box regions from PDF bytes.
+pub fn extract_text_regions_bytes(
+    buffer: &[u8],
+    regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
+    check_size(buffer)?;
+    let results = pdf_inspector::extract_text_in_regions_mem(buffer, regions)?;
+    Ok(results
+        .into_iter()
+        .map(PageRegionResultOutput::from)
+        .collect())
+}
+
+/// Extract tables within bounding-box regions from PDF bytes.
+pub fn extract_table_regions_bytes(
+    buffer: &[u8],
+    regions: &[(u32, Vec<[f32; 4]>)],
+) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
+    check_size(buffer)?;
+    let results = pdf_inspector::extract_tables_in_regions_mem(buffer, regions)?;
     Ok(results
         .into_iter()
         .map(PageRegionResultOutput::from)

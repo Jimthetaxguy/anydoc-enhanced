@@ -41,6 +41,12 @@ const FRAME_HEADER_BYTES: usize = 16;
 const PROTOCOL_MAGIC: [u8; 4] = *b"ADW1";
 const PROTOCOL_VERSION: u8 = 2;
 const MAX_IN_FLIGHT_WORKERS: usize = 2;
+const MAX_IN_FLIGHT_PDF_WORKERS: usize = 4;
+/// Parser threads and glibc malloc arenas per worker process.
+const WORKER_PARSER_THREADS: &str = "4";
+/// Largest operation-parameter block (such as PDF regions) a worker frame
+/// may carry ahead of the document bytes.
+pub(crate) const MAX_WORKER_PARAMS_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREFLIGHT_PART_BYTES: u64 = 4 * 1024 * 1024;
@@ -2431,6 +2437,15 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
     })
 }
 
+/// One request to the private worker: the frame's operation code, the bytes
+/// that follow it, and the bounds the supervisor enforces for it.
+pub(crate) struct WorkerJob {
+    pub(crate) code: u8,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) timeout: Duration,
+    pub(crate) max_response_bytes: usize,
+}
+
 async fn run_worker_process(
     bytes: &[u8],
     variant: DocumentVariant,
@@ -2451,15 +2466,44 @@ async fn run_worker_process_with_executable(
         .acquire_owned()
         .await
         .map_err(|_| DocumentError::WorkerBusy)?;
-    run_worker_process_with_permit(bytes, variant, executable, permit).await
+    let job = WorkerJob {
+        code: variant.worker_code(),
+        payload: bytes.to_vec(),
+        timeout: WORKER_TIMEOUT,
+        max_response_bytes: MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
+    };
+    let response = run_worker_job(job, executable, permit).await?;
+    match (response.markdown, response.error) {
+        (Some(markdown), None) => Ok(markdown),
+        (None, Some(error)) => Err(error.into_document_error()),
+        _ => Err(DocumentError::WorkerProtocol),
+    }
 }
 
-async fn run_worker_process_with_permit(
-    bytes: &[u8],
-    variant: DocumentVariant,
+/// Whether this host can run the private worker under its sandbox.
+pub(crate) fn worker_available() -> bool {
+    worker_sandbox_available()
+}
+
+/// Run a PDF job in the private worker under the PDF lane's own concurrency
+/// bound, so PDF calls and document conversions cannot starve each other.
+pub(crate) async fn run_pdf_worker_job(job: WorkerJob) -> Result<WorkerResponse, DocumentError> {
+    if !worker_sandbox_available() {
+        return Err(DocumentError::WorkerUnavailable);
+    }
+    let executable = worker_executable()?;
+    let permit = pdf_worker_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| DocumentError::WorkerBusy)?;
+    run_worker_job(job, executable, permit).await
+}
+
+async fn run_worker_job(
+    job: WorkerJob,
     executable: PathBuf,
     permit: OwnedSemaphorePermit,
-) -> Result<String, DocumentError> {
+) -> Result<WorkerResponse, DocumentError> {
     let worker_dir = tempfile::Builder::new()
         .prefix("anydoc-worker-")
         .tempdir()
@@ -2467,6 +2511,12 @@ async fn run_worker_process_with_permit(
     let mut command = worker_command(executable);
     command
         .env_clear()
+        // pdf-inspector parses on a rayon pool sized to the host, and glibc
+        // reserves address space per malloc arena; both would otherwise let
+        // the core count, not the document, decide how close a worker runs
+        // to its address-space ceiling.
+        .env("RAYON_NUM_THREADS", WORKER_PARSER_THREADS)
+        .env("MALLOC_ARENA_MAX", WORKER_PARSER_THREADS)
         .current_dir(worker_dir.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2479,13 +2529,7 @@ async fn run_worker_process_with_permit(
     let (result_tx, result_rx) = oneshot::channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     tokio::spawn(supervise_worker(
-        child,
-        worker_dir,
-        bytes.to_vec(),
-        variant,
-        permit,
-        cancel_rx,
-        result_tx,
+        child, worker_dir, job, permit, cancel_rx, result_tx,
     ));
 
     let cancellation_guard = WorkerCancellationGuard::new(cancel_tx);
@@ -2517,18 +2561,18 @@ impl Drop for WorkerCancellationGuard {
 async fn supervise_worker(
     mut child: Child,
     _worker_dir: tempfile::TempDir,
-    input: Vec<u8>,
-    variant: DocumentVariant,
+    job: WorkerJob,
     _permit: OwnedSemaphorePermit,
     mut cancel_rx: oneshot::Receiver<()>,
-    result_tx: oneshot::Sender<Result<String, DocumentError>>,
+    result_tx: oneshot::Sender<Result<WorkerResponse, DocumentError>>,
 ) {
     let result = {
-        let exchange = worker_exchange(&mut child, input, variant);
+        let deadline = job.timeout;
+        let exchange = worker_exchange(&mut child, job);
         tokio::pin!(exchange);
         tokio::select! {
             _ = &mut cancel_rx => Err(DocumentError::WorkerTimeout),
-            result = timeout(WORKER_TIMEOUT, &mut exchange) => {
+            result = timeout(deadline, &mut exchange) => {
                 match result {
                     Ok(result) => result,
                     Err(_) => Err(DocumentError::WorkerTimeout),
@@ -2544,9 +2588,8 @@ async fn supervise_worker(
 
 async fn worker_exchange(
     child: &mut Child,
-    input: Vec<u8>,
-    variant: DocumentVariant,
-) -> Result<String, DocumentError> {
+    job: WorkerJob,
+) -> Result<WorkerResponse, DocumentError> {
     let mut stdin = child.stdin.take().ok_or(DocumentError::WorkerProtocol)?;
     let mut stdout = child.stdout.take().ok_or(DocumentError::WorkerProtocol)?;
     stdin
@@ -2558,27 +2601,28 @@ async fn worker_exchange(
         .await
         .map_err(|_| DocumentError::WorkerProtocol)?;
     stdin
-        .write_all(&((input.len() as u64) + 1).to_le_bytes())
+        .write_all(&((job.payload.len() as u64) + 1).to_le_bytes())
         .await
         .map_err(|_| DocumentError::WorkerProtocol)?;
     stdin
-        .write_all(&[variant.worker_code()])
+        .write_all(&[job.code])
         .await
         .map_err(|_| DocumentError::WorkerProtocol)?;
     stdin
-        .write_all(&input)
+        .write_all(&job.payload)
         .await
         .map_err(|_| DocumentError::WorkerProtocol)?;
     stdin
         .shutdown()
         .await
         .map_err(|_| DocumentError::WorkerProtocol)?;
+    // Shutting down a pipe does not close it; drop it so the worker sees EOF.
+    drop(stdin);
 
     let mut header = [0u8; FRAME_HEADER_BYTES];
-    stdout
-        .read_exact(&mut header)
-        .await
-        .map_err(|_| DocumentError::WorkerProtocol)?;
+    if stdout.read_exact(&mut header).await.is_err() {
+        return Err(unanswered_worker_error(child).await);
+    }
     if header[..4] != PROTOCOL_MAGIC || header[4] != PROTOCOL_VERSION {
         return Err(DocumentError::WorkerProtocol);
     }
@@ -2587,14 +2631,13 @@ async fn worker_exchange(
             .try_into()
             .map_err(|_| DocumentError::WorkerProtocol)?,
     );
-    if response_len > MAX_SERIALIZED_WORKER_RESPONSE_BYTES as u64 {
+    if response_len > job.max_response_bytes as u64 {
         return Err(DocumentError::OutputTooLarge);
     }
     let mut response = vec![0u8; response_len as usize];
-    stdout
-        .read_exact(&mut response)
-        .await
-        .map_err(|_| DocumentError::WorkerProtocol)?;
+    if stdout.read_exact(&mut response).await.is_err() {
+        return Err(unanswered_worker_error(child).await);
+    }
     let response: WorkerResponse =
         serde_json::from_slice(&response).map_err(|_| DocumentError::WorkerProtocol)?;
     let status = child
@@ -2604,11 +2647,29 @@ async fn worker_exchange(
     if !status.success() {
         return Err(DocumentError::ConversionFailed);
     }
-    match (response.markdown, response.error) {
-        (Some(markdown), None) => Ok(markdown),
-        (None, Some(error)) => Err(error.into_document_error()),
-        _ => Err(DocumentError::WorkerProtocol),
+    Ok(response)
+}
+
+/// Classify a worker that exited without a complete response. Under the
+/// Linux address-space ceiling an oversized allocation aborts the process,
+/// and stack exhaustion faults it; either is a resource limit rather than a
+/// protocol failure. Any other exit keeps the protocol error.
+async fn unanswered_worker_error(child: &mut Child) -> DocumentError {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Ok(status) = child.wait().await {
+            if matches!(
+                status.signal(),
+                Some(libc::SIGABRT | libc::SIGKILL | libc::SIGSEGV | libc::SIGBUS)
+            ) {
+                return DocumentError::ResourceLimit;
+            }
+        }
     }
+    #[cfg(not(unix))]
+    let _ = child;
+    DocumentError::WorkerProtocol
 }
 
 #[cfg(target_os = "macos")]
@@ -2852,6 +2913,13 @@ fn worker_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 
+fn pdf_worker_semaphore() -> Arc<Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_PDF_WORKERS)))
+        .clone()
+}
+
 fn worker_executable() -> Result<PathBuf, DocumentError> {
     if let Ok(path) = std::env::var("ANYDOC_WORKER_BIN") {
         let path = PathBuf::from(path);
@@ -2864,22 +2932,26 @@ fn worker_executable() -> Result<PathBuf, DocumentError> {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct WorkerResponse {
-    markdown: Option<String>,
-    error: Option<WorkerError>,
+pub(crate) struct WorkerResponse {
+    pub(crate) markdown: Option<String>,
+    pub(crate) error: Option<WorkerError>,
+    /// Serialized result of a structured (PDF) operation, carried verbatim so
+    /// the caller returns exactly what the operation produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resource: Option<WorkerResourceEvidence>,
+    pub(crate) json: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resource: Option<WorkerResourceEvidence>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct WorkerResourceEvidence {
+pub(crate) struct WorkerResourceEvidence {
     peak_rss_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct WorkerError {
-    code: String,
-    pages: Vec<u32>,
+pub(crate) struct WorkerError {
+    pub(crate) code: String,
+    pub(crate) pages: Vec<u32>,
 }
 
 impl WorkerError {
@@ -2909,7 +2981,7 @@ fn worker_error_for(error: &DocumentError) -> WorkerError {
     }
 }
 
-fn worker_response_for_error(error: &DocumentError) -> WorkerResponse {
+pub(crate) fn worker_response_for_error(error: &DocumentError) -> WorkerResponse {
     WorkerResponse {
         markdown: None,
         error: Some(worker_error_for(error)),
@@ -2962,10 +3034,13 @@ pub fn run_worker() -> Result<(), DocumentError> {
             .try_into()
             .map_err(|_| DocumentError::WorkerProtocol)?,
     );
-    if input_len == 0 || input_len > MAX_DOCUMENT_SIZE + 1 {
+    // Code byte, optional parameter block with its length prefix, document.
+    let max_frame = MAX_DOCUMENT_SIZE + 1 + 4 + MAX_WORKER_PARAMS_BYTES as u64;
+    if input_len == 0 || input_len > max_frame {
         write_worker_response(
             &mut output,
             worker_response_for_error(&DocumentError::ResourceLimit),
+            MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
         )?;
         return Ok(());
     }
@@ -2974,6 +3049,21 @@ pub fn run_worker() -> Result<(), DocumentError> {
         .read_exact(&mut frame)
         .map_err(|_| DocumentError::WorkerProtocol)?;
     let (code, bytes) = frame.split_first().ok_or(DocumentError::WorkerProtocol)?;
+    if let Some(response) = crate::pdf_worker::execute(*code, bytes) {
+        return write_worker_response(
+            &mut output,
+            response,
+            crate::pdf_worker::MAX_PDF_RESPONSE_BYTES,
+        );
+    }
+    if bytes.len() as u64 > MAX_DOCUMENT_SIZE {
+        write_worker_response(
+            &mut output,
+            worker_response_for_error(&DocumentError::ResourceLimit),
+            MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
+        )?;
+        return Ok(());
+    }
     let variant = match code {
         1 => DocumentVariant::Docx,
         2 => DocumentVariant::Xlsx,
@@ -2987,6 +3077,7 @@ pub fn run_worker() -> Result<(), DocumentError> {
             write_worker_response(
                 &mut output,
                 worker_response_for_error(&DocumentError::Unsupported),
+                MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
             )?;
             return Ok(());
         }
@@ -3066,7 +3157,7 @@ pub fn run_worker() -> Result<(), DocumentError> {
             },
         }
     };
-    write_worker_response(&mut output, response)
+    write_worker_response(&mut output, response, MAX_SERIALIZED_WORKER_RESPONSE_BYTES)
 }
 
 fn resource_evidence_enabled() -> bool {
@@ -3099,18 +3190,18 @@ fn current_process_peak_rss_bytes() -> Option<u64> {
 
 fn write_worker_response<W: Write>(
     output: &mut W,
-    response: WorkerResponse,
+    mut response: WorkerResponse,
+    max_payload_bytes: usize,
 ) -> Result<(), DocumentError> {
-    let mut value = serde_json::to_value(response).map_err(|_| DocumentError::WorkerProtocol)?;
     if resource_evidence_enabled() {
         if let Some(peak_rss_bytes) = current_process_peak_rss_bytes() {
-            value["resource"] = serde_json::json!({
-                "peak_rss_bytes": peak_rss_bytes,
-            });
+            response.resource = Some(WorkerResourceEvidence { peak_rss_bytes });
         }
     }
-    let payload = serde_json::to_vec(&value).map_err(|_| DocumentError::WorkerProtocol)?;
-    let payload = if payload.len() > MAX_SERIALIZED_WORKER_RESPONSE_BYTES {
+    // Serialize the typed response directly: a structured result travels as
+    // raw JSON and must not be re-parsed on the way out.
+    let payload = serde_json::to_vec(&response).map_err(|_| DocumentError::WorkerProtocol)?;
+    let payload = if payload.len() > max_payload_bytes {
         // Preserve a parseable frame so the supervisor can return the stable
         // output_too_large code instead of turning an oversized JSON envelope
         // into a misleading worker_protocol error.
@@ -3195,7 +3286,8 @@ mod tests {
             ..Default::default()
         };
         let mut frame = Vec::new();
-        write_worker_response(&mut frame, response).expect("bounded worker frame");
+        write_worker_response(&mut frame, response, MAX_SERIALIZED_WORKER_RESPONSE_BYTES)
+            .expect("bounded worker frame");
         let payload = &frame[FRAME_HEADER_BYTES..];
         assert!(payload.len() > MAX_MARKDOWN_SIZE * 2);
         assert!(payload.len() <= MAX_SERIALIZED_WORKER_RESPONSE_BYTES);

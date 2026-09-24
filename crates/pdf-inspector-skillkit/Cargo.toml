@@ -17,7 +17,7 @@ anydoc = { workspace = true }
 pdf-inspector = { workspace = true }
 regex = "1"
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 quick-xml = { workspace = true }
 tokio = { workspace = true }
