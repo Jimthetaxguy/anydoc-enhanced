@@ -16,7 +16,7 @@
 use pdf_inspector_skillkit::pdf_worker::{self, PdfOperation, PdfToolError};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
@@ -299,7 +299,16 @@ impl PdfInspectorServer {
 #[tool_router]
 impl PdfInspectorServer {
     /// Return the generic document contract for one known format.
-    #[tool(description = "Return capabilities and safety boundaries for a generic document format")]
+    #[tool(
+        description = "Return capabilities and safety boundaries for a generic document format",
+        annotations(
+            title = "Document format capabilities",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn document_capabilities(&self, params: Parameters<DocumentCapabilitiesInput>) -> String {
         let kind = params.0.kind;
         dispatch_document_sync("document_capabilities", move || {
@@ -314,7 +323,14 @@ impl PdfInspectorServer {
 
     /// Classify a local document without converting it.
     #[tool(
-        description = "Classify a local document by content signature and report whether its generic route is enabled"
+        description = "Classify a local document by content signature and report whether its generic route is enabled",
+        annotations(
+            title = "Classify document",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn classify_document(&self, params: Parameters<DocumentPathInput>) -> String {
         let path = params.0.path;
@@ -326,7 +342,14 @@ impl PdfInspectorServer {
 
     /// Convert an enabled DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV package through the supervised document worker.
     #[tool(
-        description = "Convert an enabled local DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV input to sanitized Markdown through a bounded worker"
+        description = "Convert an enabled local DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV input to sanitized Markdown through a bounded worker",
+        annotations(
+            title = "Document to Markdown",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn document_to_markdown(&self, params: Parameters<DocumentPathInput>) -> String {
         let path = params.0.path;
@@ -338,7 +361,14 @@ impl PdfInspectorServer {
 
     /// Classify a PDF as TextBased, Scanned, ImageBased, or Mixed.
     #[tool(
-        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score, the pages that need OCR and why, and the software that produced the file"
+        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score, the pages that need OCR and why, and the software that produced the file",
+        annotations(
+            title = "Classify PDF",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn classify_pdf(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -351,7 +381,14 @@ impl PdfInspectorServer {
 
     /// Convert a PDF to clean Markdown.
     #[tool(
-        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled"
+        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled",
+        annotations(
+            title = "PDF to Markdown",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn pdf_to_markdown(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -364,7 +401,14 @@ impl PdfInspectorServer {
 
     /// Analyze layout complexity of a PDF (tables, multi-column, etc.).
     #[tool(
-        description = "Analyze layout complexity of a PDF — returns pages with tables, pages with multiple columns, per-page OCR reasons, and fonts whose text may be garbled, without Markdown"
+        description = "Analyze layout complexity of a PDF — returns pages with tables, pages with multiple columns, per-page OCR reasons, and fonts whose text may be garbled, without Markdown",
+        annotations(
+            title = "Analyze PDF layout",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn analyze_layout(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -382,7 +426,14 @@ impl PdfInspectorServer {
     /// Items run concurrently within the PDF worker bound and are reported in
     /// input order.
     #[tool(
-        description = "Classify multiple PDFs — returns array of {path, classification} objects"
+        description = "Classify multiple PDFs — returns array of {path, classification} objects",
+        annotations(
+            title = "Batch classify PDFs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn batch_classify(&self, params: Parameters<BatchClassifyInput>) -> String {
         let paths = params.0.paths;
@@ -430,7 +481,14 @@ impl PdfInspectorServer {
     /// Each region is defined by a page number (0-indexed) and a list of
     /// bounding rectangles `[x1, y1, x2, y2]` in PDF points with top-left origin.
     #[tool(
-        description = "Extract text from specified rectangular regions of a PDF — returns text per region with OCR hints"
+        description = "Extract text from specified rectangular regions of a PDF — returns text per region with OCR hints",
+        annotations(
+            title = "Extract PDF text regions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn extract_text_regions(&self, params: Parameters<RegionInput>) -> String {
         let path = params.0.path;
@@ -447,7 +505,14 @@ impl PdfInspectorServer {
     /// Similar to extract_text_regions but runs table detection and returns
     /// markdown pipe-tables instead of flat text.
     #[tool(
-        description = "Extract tables from specified rectangular regions of a PDF as markdown pipe-tables"
+        description = "Extract tables from specified rectangular regions of a PDF as markdown pipe-tables",
+        annotations(
+            title = "Extract PDF table regions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn extract_table_regions(&self, params: Parameters<RegionInput>) -> String {
         let path = params.0.path;
@@ -461,7 +526,14 @@ impl PdfInspectorServer {
 
     /// Identify the type of tax form in a PDF (W-2, 1099, K-1, 1040, schedules).
     #[tool(
-        description = "Identify the type of tax form in a PDF (W-2, 1099, K-1, 1040, schedules)"
+        description = "Identify the type of tax form in a PDF (W-2, 1099, K-1, 1040, schedules)",
+        annotations(
+            title = "Identify tax form",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn identify_tax_form(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -476,7 +548,14 @@ impl PdfInspectorServer {
 
     /// Split a SEC 10-K/10-Q filing into sections by Item number.
     #[tool(
-        description = "Split a SEC 10-K/10-Q filing into sections by Item number — returns array of {name, item_number, content, char_offset}"
+        description = "Split a SEC 10-K/10-Q filing into sections by Item number — returns array of {name, item_number, content, char_offset}",
+        annotations(
+            title = "Split SEC filing",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn split_sec_filing(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -491,7 +570,14 @@ impl PdfInspectorServer {
 
     /// Parse IRC (Internal Revenue Code) sections from a Title 26 PDF.
     #[tool(
-        description = "Parse IRC (Internal Revenue Code) sections from a Title 26 PDF — returns sections with §numbers, titles, provisions labeled by full citation such as (d)(2)(A)(i), repeal flags, and editorial notes kept apart from statutory text"
+        description = "Parse IRC (Internal Revenue Code) sections from a Title 26 PDF — returns sections with §numbers, titles, provisions labeled by full citation such as (d)(2)(A)(i), repeal flags, and editorial notes kept apart from statutory text",
+        annotations(
+            title = "Parse IRC sections",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn parse_irc_sections(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -509,7 +595,14 @@ impl PdfInspectorServer {
 
     /// List built-in Sweet tax review demo packages.
     #[tool(
-        description = "List built-in Sweet tax review demo packages across 1040, 1120, 1065, 1120-S, K-1, and 1099 workflows"
+        description = "List built-in Sweet tax review demo packages across 1040, 1120, 1065, 1120-S, K-1, and 1099 workflows",
+        annotations(
+            title = "List Sweet demo packages",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_tax_packages(&self) -> String {
         dispatch("list_tax_packages", || {
@@ -522,7 +615,14 @@ impl PdfInspectorServer {
 
     /// Review a built-in Sweet tax package and return structured findings.
     #[tool(
-        description = "Run deterministic Sweet tax review checks for a built-in demo package and return structured findings"
+        description = "Run deterministic Sweet tax review checks for a built-in demo package and return structured findings",
+        annotations(
+            title = "Review Sweet demo package",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn review_tax_package(&self, params: Parameters<SweetPackageInput>) -> String {
         let package_id = params.0.package_id;
@@ -534,7 +634,14 @@ impl PdfInspectorServer {
 
     /// Compare one return line item against one source document value.
     #[tool(
-        description = "Compare one tax return line against one source document line with an optional tolerance"
+        description = "Compare one tax return line against one source document line with an optional tolerance",
+        annotations(
+            title = "Compare line items",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn compare_line_items(&self, params: Parameters<SweetCompareLineItemsInput>) -> String {
         let input = params.0;
@@ -556,7 +663,16 @@ impl PdfInspectorServer {
     }
 
     /// Render a Markdown review memo for a built-in Sweet demo package.
-    #[tool(description = "Render a Markdown tax review memo for a built-in Sweet demo package")]
+    #[tool(
+        description = "Render a Markdown tax review memo for a built-in Sweet demo package",
+        annotations(
+            title = "Render review memo",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn render_review_memo(&self, params: Parameters<SweetPackageInput>) -> String {
         let package_id = params.0.package_id;
         dispatch("render_review_memo", move || {
@@ -568,11 +684,13 @@ impl PdfInspectorServer {
 
 #[tool_handler]
 impl ServerHandler for PdfInspectorServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "PDF classification, text extraction, and layout analysis. \
-             Local and offline, with no bundled OCR engine. \
+             Local and offline, with no bundled OCR engine; classification \
+             reports which pages need OCR and why. PDF and document parsing \
+             runs in a bounded worker process. \
              Also exposes bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion paths. \
              Includes Sweet tax-review demo tools for deterministic package \
              review, line-item comparison, and Markdown memo rendering.",

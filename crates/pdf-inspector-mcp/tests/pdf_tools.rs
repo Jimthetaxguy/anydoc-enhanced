@@ -312,3 +312,83 @@ fn page_content_bomb(mib: usize) -> Vec<u8> {
     );
     pdf
 }
+
+/// Tool names are a compatibility contract, and every tool only reads local
+/// files: clients may rely on the annotations to allow calls without asking.
+#[test]
+fn tools_list_keeps_names_and_declares_read_only_annotations() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pdf-inspector-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("MCP binary must be available to integration tests");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    for request in [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "tools-list-test", "version": "1" }
+            }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    ] {
+        writeln!(stdin, "{request}").expect("write request");
+    }
+    stdin.flush().expect("flush requests");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let listing = loop {
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).expect("read response") > 0);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            if value.get("id") == Some(&serde_json::Value::from(1)) {
+                break value;
+            }
+        }
+    };
+    drop(stdin);
+    assert!(child.wait().expect("wait for MCP server").success());
+
+    let tools = listing["result"]["tools"].as_array().expect("tool array");
+    let mut names: Vec<_> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "analyze_layout",
+            "batch_classify",
+            "classify_document",
+            "classify_pdf",
+            "compare_line_items",
+            "document_capabilities",
+            "document_to_markdown",
+            "extract_table_regions",
+            "extract_text_regions",
+            "identify_tax_form",
+            "list_tax_packages",
+            "parse_irc_sections",
+            "pdf_to_markdown",
+            "render_review_memo",
+            "review_tax_package",
+            "split_sec_filing",
+        ]
+    );
+    for tool in tools {
+        let annotations = &tool["annotations"];
+        assert_eq!(annotations["readOnlyHint"], true, "{tool}");
+        assert_eq!(annotations["destructiveHint"], false, "{tool}");
+        assert_eq!(annotations["idempotentHint"], true, "{tool}");
+        assert_eq!(annotations["openWorldHint"], false, "{tool}");
+        assert!(annotations["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty()));
+    }
+}
