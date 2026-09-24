@@ -25,7 +25,8 @@ pub const ANYDOC_VERSION: &str = "0.2.4";
 
 /// Unified result for classification + optional extraction.
 ///
-/// Wraps `PdfProcessResult` with serialization support for MCP tools.
+/// Wraps `PdfProcessResult` with serialization support for MCP tools. Fields
+/// after `processing_time_ms` are additive: older callers can ignore them.
 #[derive(Debug, Serialize)]
 pub struct PdfInfo {
     pub pdf_type: String,
@@ -36,20 +37,155 @@ pub struct PdfInfo {
     pub title: Option<String>,
     pub markdown: Option<String>,
     pub processing_time_ms: u64,
+    /// Why each page in `pages_needing_ocr` needs OCR, as upstream's fixed
+    /// reason identifiers (`scanned`, `no_text`, `vector_text`,
+    /// `suspected_garbled_text`, `invisible_text_layer`).
+    pub ocr_reasons_by_page: Vec<PageOcrReasonsOutput>,
+    /// Tables and columns found on each page. Absent for classification,
+    /// which runs detection only and never analyzes layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutOutput>,
+    /// Fonts whose Unicode mapping lacked entries for codes the document
+    /// shows, and how many were guessed or lost. Absent for
+    /// classification, which decodes no text; empty when every code mapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmap_gaps: Option<Vec<FontCMapGapsOutput>>,
+    /// Provenance fields from the document information dictionary.
+    #[serde(skip_serializing_if = "PdfProvenance::is_empty")]
+    pub provenance: PdfProvenance,
 }
 
-impl From<PdfProcessResult> for PdfInfo {
-    fn from(r: PdfProcessResult) -> Self {
+/// OCR reasons for one 1-indexed page.
+#[derive(Debug, Serialize)]
+pub struct PageOcrReasonsOutput {
+    pub page: u32,
+    pub reasons: Vec<String>,
+}
+
+/// Layout complexity with 1-indexed page numbers.
+#[derive(Debug, Serialize)]
+pub struct LayoutOutput {
+    /// True when any page has tables or multiple text columns.
+    pub is_complex: bool,
+    pub pages_with_tables: Vec<u32>,
+    pub pages_with_columns: Vec<u32>,
+}
+
+/// Unicode-mapping gaps for one font; `codes - interpolated - unmapped`
+/// codes had an entry, and each `unmapped` code is a U+FFFD in the text.
+#[derive(Debug, Serialize)]
+pub struct FontCMapGapsOutput {
+    pub font: String,
+    pub codes: u32,
+    pub interpolated: u32,
+    pub unmapped: u32,
+}
+
+/// Which software wrote the PDF and when, as recorded by the document.
+///
+/// Free-text `/Author`, `/Subject`, and `/Keywords` entries are withheld:
+/// they are invisible on the rendered page, commonly carry personal names,
+/// and give a document a channel to address the agent that no reader of the
+/// page would see.
+#[derive(Debug, Default, Serialize)]
+pub struct PdfProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+    /// PDF date string as written, such as `D:20240115103000+01'00'`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mod_date: Option<String>,
+}
+
+impl PdfProvenance {
+    pub fn is_empty(&self) -> bool {
+        self.creator.is_none()
+            && self.producer.is_none()
+            && self.creation_date.is_none()
+            && self.mod_date.is_none()
+    }
+}
+
+/// Upper bounds on document-controlled strings copied out of the PDF
+/// structure, so a crafted document cannot inflate responses through them.
+const MAX_TITLE_CHARS: usize = 1024;
+const MAX_PROVENANCE_CHARS: usize = 256;
+const MAX_FONT_NAME_CHARS: usize = 128;
+const MAX_CMAP_GAP_FONTS: usize = 64;
+
+fn truncate_chars(value: String, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((end, _)) => value[..end].to_string(),
+        None => value,
+    }
+}
+
+fn bounded(value: Option<String>, max_chars: usize) -> Option<String> {
+    value.map(|value| truncate_chars(value, max_chars))
+}
+
+impl PdfInfo {
+    /// Convert an upstream result, keeping only the signals `mode` computed:
+    /// detection alone leaves layout and Unicode-mapping gaps at defaults
+    /// that would otherwise read as "no tables" and "no gaps".
+    pub fn from_result(r: PdfProcessResult, mode: &ProcessMode) -> Self {
+        let analyzed = !matches!(mode, ProcessMode::DetectOnly);
+        let layout = analyzed.then_some(LayoutOutput {
+            is_complex: r.layout.is_complex,
+            pages_with_tables: r.layout.pages_with_tables,
+            pages_with_columns: r.layout.pages_with_columns,
+        });
+        let cmap_gaps = analyzed.then(|| {
+            // Keep the fonts that lost the most text when the list is capped.
+            let mut gaps = r.cmap_gaps;
+            gaps.sort_by_key(|gap| std::cmp::Reverse((gap.unmapped, gap.interpolated)));
+            gaps.into_iter()
+                .take(MAX_CMAP_GAP_FONTS)
+                .map(|gap| FontCMapGapsOutput {
+                    font: truncate_chars(gap.font, MAX_FONT_NAME_CHARS),
+                    codes: gap.codes,
+                    interpolated: gap.interpolated,
+                    unmapped: gap.unmapped,
+                })
+                .collect()
+        });
         Self {
             pdf_type: format!("{:?}", r.pdf_type),
             confidence: r.confidence,
             page_count: r.page_count,
             pages_needing_ocr: r.pages_needing_ocr,
             has_encoding_issues: r.has_encoding_issues,
-            title: r.title,
+            title: bounded(r.title, MAX_TITLE_CHARS),
             markdown: r.markdown,
             processing_time_ms: r.processing_time_ms,
+            ocr_reasons_by_page: r
+                .ocr_reasons_by_page
+                .into_iter()
+                .map(|page| PageOcrReasonsOutput {
+                    page: page.page,
+                    reasons: page.reasons,
+                })
+                .collect(),
+            layout,
+            cmap_gaps,
+            provenance: PdfProvenance {
+                creator: bounded(r.creator, MAX_PROVENANCE_CHARS),
+                producer: bounded(r.producer, MAX_PROVENANCE_CHARS),
+                creation_date: bounded(r.creation_date, MAX_PROVENANCE_CHARS),
+                mod_date: bounded(r.mod_date, MAX_PROVENANCE_CHARS),
+            },
         }
+    }
+}
+
+impl From<PdfProcessResult> for PdfInfo {
+    /// Treats the result as a full-pipeline run; prefer
+    /// [`PdfInfo::from_result`] when the mode is known.
+    fn from(r: PdfProcessResult) -> Self {
+        Self::from_result(r, &ProcessMode::Full)
     }
 }
 
@@ -58,6 +194,9 @@ impl From<PdfProcessResult> for PdfInfo {
 pub struct RegionTextOutput {
     pub text: String,
     pub needs_ocr: bool,
+    /// Upstream OCR reason identifier when `needs_ocr` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_reason: Option<String>,
 }
 
 impl From<pdf_inspector::RegionText> for RegionTextOutput {
@@ -65,6 +204,7 @@ impl From<pdf_inspector::RegionText> for RegionTextOutput {
         Self {
             text: r.text,
             needs_ocr: r.needs_ocr,
+            ocr_reason: r.ocr_reason,
         }
     }
 }
@@ -128,14 +268,14 @@ pub fn validate_path(path: impl AsRef<Path>) -> Result<std::path::PathBuf, Skill
 pub fn classify(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
     let canonical = validate_path(&path)?;
     let result = pdf_inspector::detect_pdf(&canonical)?;
-    Ok(PdfInfo::from(result))
+    Ok(PdfInfo::from_result(result, &ProcessMode::DetectOnly))
 }
 
 /// Full pipeline: classify + extract + markdown.
 pub fn process(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
     let canonical = validate_path(&path)?;
     let result = pdf_inspector::process_pdf(&canonical)?;
-    Ok(PdfInfo::from(result))
+    Ok(PdfInfo::from_result(result, &ProcessMode::Full))
 }
 
 /// Process with custom options (page filter, process mode, etc.).
@@ -144,8 +284,9 @@ pub fn process_with_options(
     options: PdfOptions,
 ) -> Result<PdfInfo, SkillkitError> {
     let canonical = validate_path(&path)?;
+    let mode = options.mode.clone();
     let result = pdf_inspector::process_pdf_with_options(&canonical, options)?;
-    Ok(PdfInfo::from(result))
+    Ok(PdfInfo::from_result(result, &mode))
 }
 
 /// Analyze layout complexity of a PDF without full text extraction.
@@ -153,7 +294,7 @@ pub fn analyze(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
     let canonical = validate_path(&path)?;
     let options = PdfOptions::new().mode(ProcessMode::Analyze);
     let result = pdf_inspector::process_pdf_with_options(&canonical, options)?;
-    Ok(PdfInfo::from(result))
+    Ok(PdfInfo::from_result(result, &ProcessMode::Analyze))
 }
 
 /// Extract text within bounding-box regions from a PDF.
@@ -195,6 +336,13 @@ pub fn extract_table_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_respects_character_boundaries() {
+        assert_eq!(truncate_chars("§§§§".to_string(), 2), "§§");
+        assert_eq!(truncate_chars("short".to_string(), 16), "short");
+        assert_eq!(bounded(None, 4), None);
+    }
 
     #[test]
     fn provider_versions_match_lockfile() {

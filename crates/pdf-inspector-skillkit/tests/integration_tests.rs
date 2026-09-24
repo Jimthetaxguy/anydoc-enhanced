@@ -1,4 +1,6 @@
-use pdf_inspector_skillkit::{classify, process, validate_path, PdfInfo, SkillkitError};
+use pdf_inspector_skillkit::{
+    analyze, classify, process, validate_path, PdfInfo, PdfProvenance, SkillkitError,
+};
 use std::path::PathBuf;
 
 /// A redistributable U.S. Code fixture tracked in this repository.
@@ -60,6 +62,10 @@ fn test_pdf_info_serialization() {
         title: Some("Test Document".to_string()),
         markdown: Some("# Test\n\nHello world".to_string()),
         processing_time_ms: 123,
+        ocr_reasons_by_page: vec![],
+        layout: None,
+        cmap_gaps: None,
+        provenance: PdfProvenance::default(),
     };
     let json = serde_json::to_string(&info).expect("serialize failed");
     assert!(json.contains("\"pdf_type\""));
@@ -70,4 +76,104 @@ fn test_pdf_info_serialization() {
     assert!(json.contains("\"title\""));
     assert!(json.contains("\"markdown\""));
     assert!(json.contains("\"processing_time_ms\""));
+    assert!(json.contains("\"ocr_reasons_by_page\""));
+    // Signals a mode did not compute, and empty provenance, stay off the wire.
+    assert!(!json.contains("\"layout\""));
+    assert!(!json.contains("\"cmap_gaps\""));
+    assert!(!json.contains("\"provenance\""));
+}
+
+#[test]
+fn classification_omits_signals_detection_does_not_compute() {
+    let info = classify(public_test_pdf()).expect("classify failed");
+    assert!(info.layout.is_none(), "detect-only mode analyzes no layout");
+    assert!(info.cmap_gaps.is_none(), "detect-only mode decodes no text");
+}
+
+#[test]
+fn analysis_reports_layout_for_the_public_fixture() {
+    let info = analyze(public_test_pdf()).expect("analyze failed");
+    let layout = info.layout.expect("analyze must report layout");
+    let json = serde_json::to_value(&layout).expect("serialize layout");
+    assert!(json["pages_with_tables"].is_array());
+    assert!(json["pages_with_columns"].is_array());
+    assert!(info.cmap_gaps.is_some(), "analysis decodes text");
+    assert!(info.markdown.is_none(), "analysis skips Markdown");
+}
+
+#[test]
+fn scanned_fixture_reports_why_it_needs_ocr() {
+    let scanned =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-corpus/scanned/sample-1.pdf");
+    let info = classify(&scanned).expect("classify failed");
+    assert_eq!(info.pages_needing_ocr, vec![1]);
+    let page = info
+        .ocr_reasons_by_page
+        .iter()
+        .find(|page| page.page == 1)
+        .expect("page 1 must carry OCR reasons");
+    assert!(
+        !page.reasons.is_empty(),
+        "an OCR-flagged page must say why it needs OCR"
+    );
+}
+
+#[test]
+fn irc_parser_reads_sections_from_the_public_title_26_fixture() {
+    // pdf-inspector renders sections as Markdown headings (`# §1398. …`);
+    // the parser previously matched none of them on this fixture.
+    let result = pdf_inspector_skillkit::domain::irc::parse_irc_sections(public_test_pdf())
+        .expect("parse failed");
+    let numbers: Vec<_> = result
+        .sections
+        .iter()
+        .map(|section| section.section_number.as_str())
+        .collect();
+    assert_eq!(numbers, ["§1398", "§1399"]);
+    assert_eq!(result.chapter.as_deref(), Some("Chapter 1"));
+
+    let section = &result.sections[0];
+    let labels: Vec<_> = section
+        .subsections
+        .iter()
+        .map(|provision| provision.label.as_str())
+        .collect();
+    for expected in [
+        "(a)",
+        "(b)(2)",
+        "(d)(2)(A)(i)",
+        "(h)(2)(D)",
+        "(i)",
+        "(j)(2)(C)(ii)",
+    ] {
+        assert!(labels.contains(&expected), "missing provision {expected}");
+    }
+    let mut unique = labels.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        labels.len(),
+        "provision labels must be unique"
+    );
+    assert!(!section.content.contains("Editorial Notes"));
+    assert!(section
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.contains("Amendments")));
+}
+
+#[test]
+fn irc_parser_flags_repealed_placeholders() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-corpus/source/sample-3.pdf");
+    let result =
+        pdf_inspector_skillkit::domain::irc::parse_irc_sections(&fixture).expect("parse failed");
+    let repealed: Vec<_> = result
+        .sections
+        .iter()
+        .filter(|section| section.repealed)
+        .map(|section| section.section_number.as_str())
+        .collect();
+    assert_eq!(repealed, ["§1551", "§1562", "§1564"]);
 }

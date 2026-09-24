@@ -302,7 +302,7 @@ impl PdfInspectorServer {
 
     /// Classify a PDF as TextBased, Scanned, ImageBased, or Mixed.
     #[tool(
-        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score and per-page OCR hints"
+        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score, the pages that need OCR and why, and the software that produced the file"
     )]
     async fn classify_pdf(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -314,7 +314,7 @@ impl PdfInspectorServer {
 
     /// Convert a PDF to clean Markdown.
     #[tool(
-        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks"
+        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled"
     )]
     async fn pdf_to_markdown(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -326,7 +326,7 @@ impl PdfInspectorServer {
 
     /// Analyze layout complexity of a PDF (tables, multi-column, etc.).
     #[tool(
-        description = "Analyze layout complexity of a PDF — returns tables detected, multi-column indicators, and other layout metrics"
+        description = "Analyze layout complexity of a PDF — returns pages with tables, pages with multiple columns, per-page OCR reasons, and fonts whose text may be garbled, without Markdown"
     )]
     async fn analyze_layout(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
@@ -435,7 +435,7 @@ impl PdfInspectorServer {
 
     /// Parse IRC (Internal Revenue Code) sections from a Title 26 PDF.
     #[tool(
-        description = "Parse IRC (Internal Revenue Code) sections from a Title 26 PDF — returns structured sections with §numbers, titles, and subsections"
+        description = "Parse IRC (Internal Revenue Code) sections from a Title 26 PDF — returns sections with §numbers, titles, provisions labeled by full citation such as (d)(2)(A)(i), repeal flags, and editorial notes kept apart from statutory text"
     )]
     async fn parse_irc_sections(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
