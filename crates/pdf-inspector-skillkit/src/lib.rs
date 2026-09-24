@@ -13,6 +13,16 @@ pub use pdf_inspector::{
     ProcessMode, ScanStrategy, TextItem,
 };
 
+/// Exact Firecrawl `pdf-inspector` release resolved in `Cargo.lock`.
+///
+/// Provider records on the wire read this constant; the
+/// `provider_versions_match_lockfile` test fails if a dependency bump leaves
+/// it behind.
+pub const PDF_INSPECTOR_VERSION: &str = "1.24.0";
+
+/// Exact Firecrawl AnyDoc release resolved in `Cargo.lock`.
+pub const ANYDOC_VERSION: &str = "0.2.4";
+
 /// Unified result for classification + optional extraction.
 ///
 /// Wraps `PdfProcessResult` with serialization support for MCP tools.
@@ -185,6 +195,27 @@ pub fn extract_table_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_versions_match_lockfile() {
+        let lock = include_str!("../../../Cargo.lock");
+        for (name, expected) in [
+            ("pdf-inspector", PDF_INSPECTOR_VERSION),
+            ("anydoc", ANYDOC_VERSION),
+        ] {
+            let marker = format!("name = \"{name}\"\nversion = \"");
+            let start = lock
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{name} is missing from Cargo.lock"))
+                + marker.len();
+            let end = start + lock[start..].find('"').expect("closing quote");
+            assert_eq!(
+                &lock[start..end],
+                expected,
+                "{name} provider version drifted from Cargo.lock"
+            );
+        }
+    }
 
     #[test]
     fn validate_path_rejects_missing_file() {

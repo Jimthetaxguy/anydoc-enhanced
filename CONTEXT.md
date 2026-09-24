@@ -43,7 +43,7 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 
 ## Real systems
 
-- PDF parsing via released `pdf-inspector 1.17.0` (Firecrawl) + `lopdf 0.42.0` — **offline**, no cloud OCR default
+- PDF parsing via released `pdf-inspector 1.24.0` (Firecrawl) + `lopdf 0.45.0` — **offline**, no cloud OCR default
 - MCP over stdio for Claude/Codex/Cursor/etc.
 - Demo Sweet packages are **synthetic structured examples**, not live client filings
 - AnyDoc `0.2.4` is resolved and used by the bounded DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB worker; strict CSV is a local bounded adapter selected after reviewing AnyDoc `0.2.4` behavior; PDF remains on the dedicated PDF facade

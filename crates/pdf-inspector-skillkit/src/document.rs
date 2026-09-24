@@ -219,7 +219,7 @@ fn provider_for(kind: DocumentKind) -> DocumentProvider {
     match kind {
         DocumentKind::Pdf => DocumentProvider {
             name: "pdf-inspector".into(),
-            version: "1.17.0".into(),
+            version: crate::PDF_INSPECTOR_VERSION.into(),
             source: "firecrawl/pdf-inspector".into(),
         },
         DocumentKind::Csv => DocumentProvider {
@@ -237,7 +237,7 @@ fn provider_for(kind: DocumentKind) -> DocumentProvider {
         | DocumentKind::Rtf
         | DocumentKind::LegacyOffice => DocumentProvider {
             name: "anydoc".into(),
-            version: "0.2.4".into(),
+            version: crate::ANYDOC_VERSION.into(),
             source: "firecrawl/anydoc".into(),
         },
     }

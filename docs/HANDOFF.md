@@ -2,7 +2,7 @@
 
 **Last reconciled:** 2026-08-28
 **Repository:** <https://github.com/Jimthetaxguy/anydoc-enhanced>
-**Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.17.0; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion.
+**Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.24.0; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion.
 
 This is the public, repository-relative entry point for future work. Do not add
 home-directory paths, private corpus locations, credentials, internal agent
@@ -26,7 +26,7 @@ pdf-inspector-mcp
         |
 pdf-inspector-skillkit
         |
-firecrawl/pdf-inspector 1.17.0 (released, exact Cargo lock resolution)
+firecrawl/pdf-inspector 1.24.0 (released, exact Cargo lock resolution)
         |
         +-- anydoc 0.2.4 via bounded DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB worker; local strict CSV adapter shares the worker boundary
 ```
@@ -62,10 +62,10 @@ MCP handlers and domain modules must depend on the skillkit boundary.
   Filesystem isolation and non-Linux memory containment remain follow-up gates
   before broader hostile-format enablement.
 - AnyDoc `v0.2.4` is a native Rust library, MIT licensed, and is resolved
-  alongside the workspace `pdf-inspector 1.17.0` release. Its typed `NeedsOcr`
+  alongside the workspace `pdf-inspector 1.24.0` release. Its typed `NeedsOcr`
   result remains available for future PDF-specific evaluation and is not used to bypass the
   dedicated PDF facade.
-- This workspace now uses released `pdf-inspector 1.17.0` with `lopdf 0.42.0`.
+- This workspace now uses released `pdf-inspector 1.24.0` with `lopdf 0.45.0`.
   The existing 13-tool PDF surface compiles and passes its regression suite.
   The AnyDoc dependency, provider contract, worker, DOCX happy path, strict PPTX path, strict XLSX path, strict ODS path, strict ODT path, strict ODP path, and strict EPUB path are implemented; the local strict CSV adapter is implemented through worker code 6 on Linux.
 - AnyDoc CSV and RTF parsing remain unexposed because upstream issue #104 documents materialization and memory-exhaustion risk; the local strict CSV adapter is separate and Linux-memory-gated.

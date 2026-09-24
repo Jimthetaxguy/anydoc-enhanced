@@ -19,7 +19,7 @@ for the verified upstream constraints, architecture, measured baseline, and acce
 
 ## Real systems
 
-- Released Firecrawl `pdf-inspector 1.17.0` plus `lopdf 0.42.0` for local PDF parsing.
+- Released Firecrawl `pdf-inspector 1.24.0` plus `lopdf 0.45.0` for local PDF parsing.
 - Released Firecrawl `anydoc 0.2.4` for local DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, and strict EPUB conversion through a supervised child process; the CSV route is a separate local strict adapter.
 - Strict CSV accepts bounded UTF-8 delimiter-separated text with deterministic delimiter sniffing, equal-width rows, RFC-4180-style quoting, and Markdown escaping; malformed, ragged, oversized, or unsupported inputs fail closed. The route is enabled only where the worker address-space ceiling is enforceable (currently Linux).
 - MCP uses local stdio JSON-RPC; no hosted API, OCR service, telemetry, or network fetch is enabled by default.
@@ -173,7 +173,7 @@ the upstream surface.
    |       +-- domain::irc      (parse_irc_sections)
    |       +-- domain::sweet    (demo review packages + comparisons)
    v
-  pdf-inspector 1.17.0 (released, exact lock resolution)
+  pdf-inspector 1.24.0 (released, exact lock resolution)
 ```
 
 ## Development

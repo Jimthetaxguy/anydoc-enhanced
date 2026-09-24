@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.dependencies]
-pdf-inspector = "=1.17.0"
+pdf-inspector = "=1.24.0"
 anydoc = "=0.2.4"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tempfile = "3"

@@ -1,7 +1,7 @@
 # Iterative document-capability roadmap
 
 **Baseline:** `agent/codex-align-firecrawl-20260828`
-**Upstream:** Firecrawl `pdf-inspector 1.17.0` and AnyDoc `0.2.4`
+**Upstream:** Firecrawl `pdf-inspector 1.24.0` and AnyDoc `0.2.4`
 **Status:** Stages 1-9, including the DOCX happy-path slice, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict CSV, strict ODP, and strict EPUB slices, are implemented; HTML/MHTML, RTF, and OCR remain gated.
 
 ## Objective
@@ -16,7 +16,7 @@ available through MCP.
 
 | Stage | Capability | Primary use cases | Upstream basis | Gate |
 |---|---|---|---|---|
-| 0 | PDF alignment | Preserve existing PDF classification, extraction, tax, IRC, and SEC workflows while tracking Firecrawl improvements | `pdf-inspector 1.17.0` | Complete on this branch; rerun locked verification before merge |
+| 0 | PDF alignment | Preserve existing PDF classification, extraction, tax, IRC, and SEC workflows while tracking Firecrawl improvements | `pdf-inspector 1.24.0` | Complete on this branch; rerun locked verification before merge |
 | 1 | Contract and worker skeleton | One stable interface for multiple parsers; bounded conversion of untrusted bytes | AnyDoc `to_markdown_bytes`, `ConvertError`, local PDF facade | Implemented with versioned worker IPC, caps, sanitizer, process-group cleanup, and typed errors; full hostile-input promotion remains gated |
 | 2 | DOCX | Tax workpapers, client correspondence, engagement letters, operating procedures, research documents | AnyDoc DOC/DOCX parser and shared Markdown renderer | Exact main-part XML preflight plus public happy/adversarial fixtures; broader completeness oracle and platform sandbox evidence remain |
 | 3 | PPTX | Sales/procurement decks, process walkthroughs, post-mortems, training material | AnyDoc PPT/PPTX parser, notes and slide model | Exact `.pptx` only; declared-slide completeness, visible/active/external-content policy, stable output and resource budgets implemented; broader adversarial/platform gates remain |
