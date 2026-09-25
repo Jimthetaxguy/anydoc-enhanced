@@ -794,6 +794,10 @@ enum Property {
     Width,
     FlexBasis,
     FlexBasisAuto,
+    /// A custom property (`--gutter`), read for the margins, padding, and
+    /// gaps that take their size from it: whether it is a length wider
+    /// than none.
+    Custom,
 }
 
 impl Property {
@@ -912,6 +916,95 @@ struct Declaration {
     /// For `content`, what the box shows; `None` when not known until run
     /// time.
     generated: Option<Generated>,
+    /// For a custom property (`--gutter`), its name; for a margin,
+    /// padding, or gap that takes its size from one (`var(--gutter)`,
+    /// `calc(var(--gutter) * .5)`), that one's, `flow` then telling what
+    /// it says where the custom property is not set (see
+    /// [`Cascade::resolved`]). Names are hashed ([`custom_name`]).
+    var: Option<u64>,
+}
+
+/// The key a custom property's name is known by: its name, whose case
+/// counts, hashed.
+fn custom_name(name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How a length takes its size from a custom property (see
+/// [`var_sign`]).
+#[derive(Clone, Copy)]
+enum VarSign {
+    /// It is wider than none where the property's value is: the property,
+    /// and what it says where the property is not set (its fallback's, or
+    /// none).
+    Takes(u64, Tri),
+    /// It is none or less however the property is set (a negative multiple).
+    Never,
+}
+
+/// How a length written with a custom property takes its size from it:
+/// `var(--x)`, with or without a fallback, and `calc()` multiplying or
+/// dividing it by a number; `None` for anything else.
+fn var_sign(part: &[Token]) -> Option<VarSign> {
+    let (Token::Function(function), true) = (part.first()?, true) else {
+        return None;
+    };
+    let (arguments, end) = block_at(part, 0);
+    if end != part.len() {
+        return None;
+    }
+    let arguments = trim_whitespace(arguments);
+    if function.eq_ignore_ascii_case("var") {
+        let [Token::Ident(name), rest @ ..] = arguments else {
+            return None;
+        };
+        if !name.starts_with("--") {
+            return None;
+        }
+        let unset = match trim_whitespace(rest) {
+            [] => Tri::No,
+            [Token::Comma, fallback @ ..] => positive_length(trim_whitespace(fallback))?,
+            _ => return None,
+        };
+        return Some(VarSign::Takes(custom_name(name), unset));
+    }
+    if !function.eq_ignore_ascii_case("calc") {
+        return None;
+    }
+    let terms: Vec<&[Token]> = {
+        let mut terms = Vec::new();
+        let mut index = 0;
+        while index < arguments.len() {
+            let end = skip_component(arguments, index);
+            if arguments[index] != Token::Whitespace {
+                terms.push(&arguments[index..end]);
+            }
+            index = end;
+        }
+        terms
+    };
+    let number = |term: &[Token]| match term {
+        [Token::Numeric(number)] => number.parse::<f64>().ok(),
+        _ => None,
+    };
+    let (variable, factor) = match terms.as_slice() {
+        [first, [Token::Delim(operator @ ('*' | '/'))], second] => {
+            match (number(first), number(second)) {
+                (None, Some(factor)) => (*first, factor),
+                (Some(factor), None) if *operator == '*' => (*second, factor),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    match var_sign(variable)? {
+        VarSign::Takes(..) if factor < 0.0 => Some(VarSign::Never),
+        VarSign::Takes(_, _) if factor == 0.0 => Some(VarSign::Never),
+        sign => Some(sign),
+    }
 }
 
 /// `display` keywords that lay a box's children out as flex items, as the
@@ -1354,6 +1447,7 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
         layout,
         side,
         generated,
+        var: None,
     })
 }
 
@@ -1380,6 +1474,9 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
     let [Token::Ident(name), rest @ ..] = trim_whitespace(tokens) else {
         return [None, None];
     };
+    if name.starts_with("--") {
+        return [custom_declaration(name, rest), None];
+    }
     let name = name.to_ascii_lowercase();
     let reads = match name.as_str() {
         "flex-direction" | "-webkit-flex-direction" => {
@@ -1444,9 +1541,46 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             layout: None,
             side: None,
             generated: None,
+            var: None,
         })
     };
+    // A margin, padding, or gap written with a custom property takes its
+    // size from it.
+    let spaced = |property: Property, part: &[Token]| match var_sign(part) {
+        Some(VarSign::Takes(name, unset)) => Some(Declaration {
+            property,
+            effect: Effect::Neutral,
+            important,
+            flow: Some(unset),
+            layout: None,
+            side: None,
+            generated: None,
+            var: Some(name),
+        }),
+        Some(VarSign::Never) => Some(Declaration {
+            property,
+            effect: Effect::Neutral,
+            important,
+            flow: Some(Tri::No),
+            layout: None,
+            side: None,
+            generated: None,
+            var: None,
+        }),
+        None => declare(property, positive_length(part)),
+    };
     match reads {
+        Reads::One(
+            property @ (Property::MarginLeft
+            | Property::MarginRight
+            | Property::PaddingLeft
+            | Property::PaddingRight
+            | Property::ColumnGap),
+            _,
+        ) => match parts.as_slice() {
+            [part] => [spaced(property, part), None],
+            _ => [None, None],
+        },
         Reads::One(property, says) => [declare(property, says(&parts)), None],
         Reads::Sides(left, right, clockwise) => {
             let (start, end) = match (clockwise, parts.as_slice()) {
@@ -1456,22 +1590,16 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
                 (false, [start, end]) => (start, end),
                 _ => return [None, None],
             };
-            [
-                declare(left, positive_length(start)),
-                declare(right, positive_length(end)),
-            ]
+            [spaced(left, start), spaced(right, end)]
         }
         Reads::FlexFlow => [
             declare(Property::FlexDirection, flex_direction(&parts)),
             declare(Property::FlexWrap, flex_wrap(&parts)),
         ],
-        Reads::Gap => [
-            declare(
-                Property::ColumnGap,
-                parts.last().and_then(|gap| positive_length(gap)),
-            ),
-            None,
-        ],
+        Reads::Gap => match parts.last() {
+            Some(gap) => [spaced(Property::ColumnGap, gap), None],
+            None => [None, None],
+        },
         Reads::Basis => match keyword(&parts).as_deref() {
             Some("auto" | "content") => [declare(Property::FlexBasisAuto, Some(Tri::No)), None],
             _ => [declare(Property::FlexBasis, one_full_line(&parts)), None],
@@ -1504,6 +1632,38 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             }
         },
     }
+}
+
+/// A custom property's declaration (`--gutter: 1.5rem`): whether its value
+/// is a length wider than none, `Maybe` for anything else.
+fn custom_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
+    let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
+        return None;
+    };
+    let mut value = trim_whitespace(value);
+    let mut important = false;
+    if let [before @ .., Token::Ident(word)] = value {
+        if word.eq_ignore_ascii_case("important") {
+            if let [before @ .., Token::Delim('!')] = trim_whitespace(before) {
+                important = true;
+                value = trim_whitespace(before);
+            }
+        }
+    }
+    let wide = match value {
+        [Token::Numeric(_)] => positive_length(value).unwrap_or(Tri::Maybe),
+        _ => Tri::Maybe,
+    };
+    Some(Declaration {
+        property: Property::Custom,
+        effect: Effect::Neutral,
+        important,
+        flow: Some(wide),
+        layout: None,
+        side: None,
+        generated: None,
+        var: Some(custom_name(name)),
+    })
 }
 
 /// The keyword a value holds, lowercased, if it is one keyword.
@@ -3004,7 +3164,9 @@ pub(super) struct Stylesheet {
     rules: Vec<Rc<StyleRule>>,
     spacing: Vec<Rc<StyleRule>>,
     painting: Vec<Rc<StyleRule>>,
-    /// The rules kept only for their spacing or painting.
+    customs: Vec<Rc<StyleRule>>,
+    /// The rules kept only for their spacing, painting, or custom
+    /// properties.
     others: usize,
     pub(super) imports: Vec<String>,
     /// The cascade layers it declares, in order, each by its names from the
@@ -3332,9 +3494,12 @@ fn parse_style_block(
             !declaration.property.spaces()
                 && !matches!(
                     declaration.property,
-                    Property::Content | Property::WhiteSpace
+                    Property::Content | Property::WhiteSpace | Property::Custom
                 )
         });
+        let customizes = declarations
+            .iter()
+            .any(|declaration| declaration.property == Property::Custom);
         let spaces = declarations
             .iter()
             .any(|declaration| declaration.property.spaces());
@@ -3346,7 +3511,8 @@ fn parse_style_block(
             };
             let spacing = spaces && selector.pseudo_element == PseudoElement::None;
             let painting = !paintings.is_empty() && selector.pseudo_element == PseudoElement::None;
-            if kept || spacing || painting {
+            let custom = customizes && selector.pseudo_element == PseudoElement::None;
+            if kept || spacing || painting || custom {
                 let ancestor_keys = ancestor_keys(&selector, selector.compounds.len() - 1);
                 let rule = Rc::new(StyleRule {
                     selector,
@@ -3358,6 +3524,9 @@ fn parse_style_block(
                 });
                 if painting {
                     sheet.painting.push(rule.clone());
+                }
+                if custom {
+                    sheet.customs.push(rule.clone());
                 }
                 if spacing {
                     sheet.spacing.push(rule.clone());
@@ -3751,7 +3920,12 @@ pub(super) struct Cascade {
     painting_by_key: HashMap<u64, Vec<usize>>,
     painting_anywhere: Vec<usize>,
     painted_ids: std::collections::HashSet<Rc<str>>,
-    /// The rules kept only for their spacing or painting.
+    /// Rules that set a custom property, by its name, each with its place
+    /// among them and its layer (see [`Cascade::custom_value`]).
+    custom_rules: HashMap<u64, Vec<(Rc<StyleRule>, u32, u32)>>,
+    custom_order: u32,
+    /// The rules kept only for their spacing, painting, or custom
+    /// properties.
     others: usize,
     /// The cascade layers of its sheets, by the names and sublayers of
     /// each, the unlayered rules' first; and each layer's place, found
@@ -3862,6 +4036,24 @@ impl Cascade {
             }
             self.spacing_rules
                 .push((rule.clone(), index as u32 + 1, layer(rule)));
+        }
+        for rule in &sheet.customs {
+            self.custom_order += 1;
+            let mut names: Vec<u64> = rule
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.property == Property::Custom)
+                .filter_map(|declaration| declaration.var)
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            for name in names {
+                self.custom_rules.entry(name).or_default().push((
+                    rule.clone(),
+                    self.custom_order,
+                    layer(rule),
+                ));
+            }
         }
         for rule in &sheet.painting {
             let index = self.painting_rules.len();
@@ -3988,6 +4180,102 @@ impl Cascade {
             specificity: rule.selector.specificity,
             order,
         }
+    }
+
+    /// A declaration with what a custom property it takes its size from
+    /// says at the element at the top of the tree (see [`Declaration::var`]).
+    fn resolved(
+        &self,
+        declaration: &Declaration,
+        tree: &Tree,
+        work: &mut u64,
+    ) -> Result<Declaration, DocumentError> {
+        match declaration.var {
+            Some(name) if declaration.property != Property::Custom => {
+                let unset = declaration.flow.unwrap_or(Tri::Maybe);
+                Ok(Declaration {
+                    flow: Some(self.custom_value(tree, name, work)?.unwrap_or(unset)),
+                    var: None,
+                    ..*declaration
+                })
+            }
+            _ => Ok(*declaration),
+        }
+    }
+
+    /// What the custom property of this name says at the element at the
+    /// top of the tree: set by a rule or its inline style, or inherited
+    /// from the nearest element around it that sets it; `Maybe` where only
+    /// a rule that may apply sets it there, or one above the one that
+    /// certainly does says otherwise; `None` where nothing sets it.
+    fn custom_value(
+        &self,
+        tree: &Tree,
+        name: u64,
+        work: &mut u64,
+    ) -> Result<Option<Tri>, DocumentError> {
+        let rules = self.custom_rules.get(&name);
+        for depth in (0..tree.stack.len()).rev() {
+            let node = Node {
+                depth,
+                sibling: None,
+            };
+            let mut applied: Vec<(Precedence, Tri, Tri)> = Vec::new();
+            for (rule, order, layer) in rules.into_iter().flatten() {
+                let certainty =
+                    match_complex_at(&rule.selector, &[], tree, node, work).min(rule.condition);
+                if certainty == Tri::No {
+                    continue;
+                }
+                for declaration in rule.declarations.iter().filter(|declaration| {
+                    declaration.property == Property::Custom && declaration.var == Some(name)
+                }) {
+                    let precedence = self.precedence(declaration, rule, *order, *layer);
+                    let says = declaration.flow.unwrap_or(Tri::Maybe);
+                    applied.push((precedence, certainty, says));
+                }
+            }
+            if *work > MAX_MATCH_WORK {
+                return Err(DocumentError::ResourceLimit);
+            }
+            for (prefixed, style) in tree.stack[depth].values("style") {
+                let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+                for declaration in inline_declarations(style)? {
+                    if declaration.property != Property::Custom || declaration.var != Some(name) {
+                        continue;
+                    }
+                    let tier = if declaration.important {
+                        TIER_INLINE_IMPORTANT
+                    } else {
+                        TIER_INLINE
+                    };
+                    let precedence = Precedence {
+                        tier,
+                        layer: 0,
+                        specificity: (0, 0, 0),
+                        order: 0,
+                    };
+                    applied.push((
+                        precedence,
+                        certainty,
+                        declaration.flow.unwrap_or(Tri::Maybe),
+                    ));
+                }
+            }
+            if applied.is_empty() {
+                continue;
+            }
+            let certain = applied
+                .iter()
+                .any(|(_, certainty, _)| *certainty == Tri::Yes);
+            let (value, contested) = resolve_value(&applied, Tri::Maybe);
+            return Ok(Some(if certain && !contested {
+                value
+            } else {
+                Tri::Maybe
+            }));
+        }
+        Ok(None)
     }
 
     /// Whether a rule may name the SVG resource of this id to paint with,
@@ -4167,7 +4455,11 @@ impl Cascade {
             }
             for declaration in rule.declarations.iter() {
                 let precedence = self.precedence(declaration, rule, *order, *layer);
-                add(declaration, precedence, certainty);
+                add(
+                    &self.resolved(declaration, tree, work)?,
+                    precedence,
+                    certainty,
+                );
             }
         }
         if *work > MAX_MATCH_WORK {
@@ -4187,7 +4479,11 @@ impl Cascade {
                     specificity: (0, 0, 0),
                     order: 0,
                 };
-                add(&declaration, precedence, certainty);
+                add(
+                    &self.resolved(&declaration, tree, work)?,
+                    precedence,
+                    certainty,
+                );
             }
         }
         // A reader's own margins and padding (HTML's rendering section): a
@@ -4411,6 +4707,7 @@ impl Cascade {
                 // grid items (see [`Cascade::item_box`]).
                 Property::Content
                 | Property::WhiteSpace
+                | Property::Custom
                 | Property::Width
                 | Property::FlexBasis
                 | Property::FlexBasisAuto
@@ -4476,6 +4773,7 @@ impl Cascade {
                 pseudo_styled[slot] = true;
                 for declaration in rule.declarations.iter() {
                     let precedence = self.precedence(declaration, rule, *order, *layer);
+                    let declaration = &self.resolved(declaration, tree, work)?;
                     match (declaration.property, declaration.flow) {
                         (Property::Content, _) => {
                             pseudo_content[slot].push((
@@ -4553,7 +4851,11 @@ impl Cascade {
             }
             for declaration in rule.declarations.iter() {
                 let precedence = self.precedence(declaration, rule, *order, *layer);
-                add(declaration, precedence, certainty);
+                add(
+                    &self.resolved(declaration, tree, work)?,
+                    precedence,
+                    certainty,
+                );
             }
         }
         if *work > MAX_MATCH_WORK {
@@ -4568,7 +4870,7 @@ impl Cascade {
                     TIER_INLINE
                 };
                 add(
-                    &declaration,
+                    &self.resolved(&declaration, tree, work)?,
                     Precedence {
                         tier,
                         layer: 0,
@@ -4605,6 +4907,7 @@ impl Cascade {
                     layout: None,
                     side: None,
                     generated: None,
+                    var: None,
                 },
                 presentation,
                 certainty,
@@ -4627,6 +4930,7 @@ impl Cascade {
                     layout: None,
                     side: None,
                     generated: None,
+                    var: None,
                 },
                 presentation,
                 certainty,
@@ -4645,6 +4949,7 @@ impl Cascade {
                     layout: None,
                     side: None,
                     generated: None,
+                    var: None,
                 },
                 presentation,
                 certainty,
@@ -4689,6 +4994,7 @@ impl Cascade {
                     layout: None,
                     side: None,
                     generated: None,
+                    var: None,
                 },
                 user_agent,
                 Tri::Yes,
@@ -8572,6 +8878,46 @@ mod tests {
         assert!(fuses(
             &[".r { display: inline-flex; flex-wrap: wrap } .r > * { width: 100% }"],
             r#"<p>Due <span class="r"><span>Balance</span><span>1,250.00</span></span>Grand total</p>"#
+        ));
+    }
+
+    #[test]
+    fn spacing_takes_its_size_from_the_custom_properties_it_names() {
+        let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
+        // A grid's gutter, as Bootstrap 5 sets it: a custom property on the
+        // row that its columns' padding takes half of.
+        let grid = ".row { --gutter: 1.5rem; display: flex; flex-wrap: wrap; margin-left: calc(-.5 * var(--gutter)) } .row > * { width: 100%; padding-left: calc(var(--gutter) * .5); padding-right: calc(var(--gutter) * .5) } .col { flex: 1 0 0% } .g-0 { --gutter: 0 }";
+        let row = |class: &str, style: &str| {
+            format!(
+                r#"<div class="{class}" style="{style}"><div class="col">Opening balance</div><div class="col">Closing balance</div></div>"#
+            )
+        };
+        assert!(fuses(&[grid], &row("row", "")));
+        // No gutter, from a class or an inline style, and one that may not
+        // hold, set nothing apart for certain.
+        assert!(!fuses(&[grid], &row("row g-0", "")));
+        assert!(!fuses(&[grid], &row("row", "--gutter: 0")));
+        assert!(!fuses(
+            &[grid, "@media (min-width: 40em) { .row { --gutter: 0 } }"],
+            &row("row", "")
+        ));
+        // A fallback where nothing sets the property, and a gap.
+        let rows = r#"<div class="r"><span>Balance due</span><span>Grand total</span></div>"#;
+        assert!(fuses(
+            &[".r { display: flex } .r > * { padding-left: var(--pad, 6px) }"],
+            rows
+        ));
+        assert!(!fuses(
+            &[".r { display: flex } .r > * { padding-left: var(--pad) }"],
+            rows
+        ));
+        assert!(fuses(
+            &[".r { display: flex; --g: 1em; gap: var(--g) }"],
+            rows
+        ));
+        assert!(!fuses(
+            &[".r { display: flex; --g: 0; gap: var(--g) }"],
+            rows
         ));
     }
 
