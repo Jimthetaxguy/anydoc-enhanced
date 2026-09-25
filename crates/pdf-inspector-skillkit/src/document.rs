@@ -517,8 +517,10 @@ struct PackagePreflight {
     missing_required_content: bool,
     unsupported_content: bool,
     /// Characters the pinned parser drops while the text around them
-    /// converts, so the result is usable but partial.
+    /// converts, so the result is usable but partial: non-breaking hyphens,
+    /// and page numbers or dates Word fills in.
     omitted_characters: bool,
+    omitted_page_blocks: bool,
     /// List numbers the pinned parser renders differently from Word, while
     /// the list text converts.
     list_numbering_differs: bool,
@@ -2393,6 +2395,9 @@ struct DocxStoryScan {
     /// A non-breaking hyphen (`w:noBreakHyphen`), which the pinned parser
     /// drops, joining its neighbors: "Form 1040‑SR" converts as "Form 1040SR".
     omitted_hyphen: bool,
+    /// A page number or date Word fills in where a run shows it (`w:pgNum`,
+    /// the date blocks), which the pinned parser drops.
+    omitted_page_block: bool,
     /// Character, paragraph, and table styles applied to content.
     styles_used: HashSet<String>,
     /// The mark properties of the paragraph being read.
@@ -2755,6 +2760,19 @@ fn scan_docx_element(
         // opening) loses all of its content.
         b"sym" | b"checkBox" | b"ddList" | b"ruby" | b"altChunk" if !omitted => {
             scan.dropped = true;
+        }
+        // A page number or date Word fills in where the run shows it
+        // (`w:pgNum`, and the date blocks), which AnyDoc's run walker drops
+        // and LibreOffice does not show either. The text around it converts.
+        // In a header or footer, which AnyDoc does not convert, nothing is
+        // lost.
+        b"pgNum" | b"dayShort" | b"dayLong" | b"monthShort" | b"monthLong" | b"yearShort"
+        | b"yearLong"
+            if !omitted
+                && node.vocabulary == WordVocabulary::Word
+                && word_path_ends_with(stack, &[b"r"]) =>
+        {
+            scan.omitted_page_block = true;
         }
         // AnyDoc reads a table's rows only as its direct children, so a row
         // wrapped in a content control, custom XML, or a compatibility block
@@ -6019,6 +6037,7 @@ fn preflight_package(
                 .any(|style| hidden_styles.contains(style));
         result.unsupported_content |= docx_scan.dropped;
         result.omitted_characters |= docx_scan.omitted_hyphen;
+        result.omitted_page_blocks |= docx_scan.omitted_page_block;
         result.hidden_content |= docx_scan.has_unreferenced_note();
         result.hidden_content |= docx_scan.hidden_run
             || defaults_hidden
@@ -6194,12 +6213,17 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
     }
     let mut warnings = Vec::new();
     let mut completeness = Completeness::Complete;
-    if kind == DocumentKind::Docx && preflight.omitted_characters {
+    if kind == DocumentKind::Docx && (preflight.omitted_characters || preflight.omitted_page_blocks)
+    {
         completeness = Completeness::Partial;
+        let message = match (preflight.omitted_characters, preflight.omitted_page_blocks) {
+            (true, false) => "The document uses non-breaking hyphens, which the converter drops; hyphenated terms such as form numbers may appear joined.",
+            (false, _) => "The document shows page numbers or dates Word fills in where the text stands, which the converter drops.",
+            (true, true) => "The document uses non-breaking hyphens and page numbers or dates Word fills in, which the converter drops; hyphenated terms such as form numbers may appear joined.",
+        };
         warnings.push(DocumentWarning {
             code: "characters_omitted".into(),
-            message: "The document uses non-breaking hyphens, which the converter drops; hyphenated terms such as form numbers may appear joined."
-                .into(),
+            message: message.into(),
         });
     }
     if kind == DocumentKind::Docx && preflight.list_numbering_differs {
@@ -8788,6 +8812,24 @@ mod tests {
                 Some(DocumentError::IncompleteConversion)
             ));
         }
+        // A page number or date Word fills in is dropped with the text
+        // around it converted: partial, like a dropped hyphen.
+        for body in [
+            r#"<w:p><w:r><w:t xml:space="preserve">Page </w:t><w:pgNum/></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">Signed </w:t><w:monthLong/><w:t xml:space="preserve"> </w:t><w:dayShort/></w:r></w:p>"#,
+        ] {
+            let preflight = preflight_for(body);
+            assert!(preflight.omitted_page_blocks, "{body}");
+            assert!(!preflight.unsupported_content, "{body}");
+            assert!(preflight_rejection(DocumentKind::Docx, &preflight).is_none());
+        }
+        // A page number in a header, which AnyDoc does not convert, loses
+        // nothing.
+        let header = word_part("hdr", "<w:p><w:r><w:pgNum/></w:r></w:p>");
+        let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let preflight =
+            docx_preflight(&[("word/document.xml", &body), ("word/header1.xml", &header)]);
+        assert!(!preflight.unsupported_content && !preflight.omitted_page_blocks);
         // A dropped non-breaking hyphen leaves usable, partial text.
         let preflight = preflight_for(
             "<w:p><w:r><w:t>Form 1040</w:t><w:noBreakHyphen/><w:t>SR</w:t></w:r></w:p>",

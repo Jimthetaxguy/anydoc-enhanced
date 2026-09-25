@@ -280,11 +280,10 @@ came back clean. The evidence and dispositions are in
 ## Next slices
 
 1. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
-   chunks, and non-breaking hyphens are handled. Elements AnyDoc 0.2.4's walker
-   also skips, which are candidates to confirm with fixtures: `w:contentPart`
-   ink, and date or page-number fields placed in the body (`w:pgNum`,
-   `w:dayShort` and related elements). Master-document `w:subDoc` links
-   reference files outside the package and are reported as external
+   chunks, non-breaking hyphens, and page-number and date blocks in the body
+   (`w:pgNum`, `w:dayShort` and related elements) are handled. `w:contentPart`
+   ink holds no text; it drops like a picture. Master-document `w:subDoc`
+   links reference files outside the package and are reported as external
    relationships.
 2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
    non-exhaustive `Format` arms, the four Wingdings codes from #177, a

@@ -187,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- A DOCX page number or date that Word fills in where a run shows it
+  (`w:pgNum` and the legacy date blocks), which AnyDoc drops, is disclosed:
+  the document converts as `partial` with the `characters_omitted` warning.
+  LibreOffice does not show them either; in headers and footers, which
+  AnyDoc does not convert, nothing is reported.
 - The Markdown sanitizer keeps the anchors AnyDoc writes for link targets
   (`<a id="…"></a>`, with ids of its own characters), so a document's own
   links still land and a bookmark no longer raises `sanitized_output`. A web
