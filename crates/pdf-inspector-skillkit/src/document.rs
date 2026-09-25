@@ -3672,6 +3672,9 @@ enum DocxMarker {
     /// A count in a format AnyDoc renders as a plain number: ordinals,
     /// words, zero-padded numbers, and the rest.
     Other,
+    /// A level the list does not define, where what Word shows is
+    /// uncertain: LibreOffice numbers it in decimal.
+    Undefined,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3778,11 +3781,12 @@ impl DocxCount {
 }
 
 impl DocxMarker {
-    /// What Word shows: a level defined without a format is numbered, and
-    /// one without number text shows no number.
+    /// What Word shows: a level defined without a format is numbered, one
+    /// without number text shows no number, and what a level not defined
+    /// shows is uncertain.
     fn word(level: Option<&DocxLevel>) -> Self {
         let Some(level) = level else {
-            return DocxMarker::Nothing;
+            return DocxMarker::Undefined;
         };
         if level
             .number_text()
@@ -3844,8 +3848,9 @@ enum DocxLabel {
     /// A bullet, which shows no count.
     Bullet,
     Text(String),
-    /// A number in a format AnyDoc does not write, such as an ordinal, which
-    /// differs from anything AnyDoc shows.
+    /// A number in a format AnyDoc does not write, such as an ordinal, or
+    /// a label Word shows uncertainly, which differs from anything AnyDoc
+    /// shows.
     Unknown,
 }
 
@@ -3897,6 +3902,7 @@ impl DocxShape {
         match self.markers[level] {
             DocxMarker::Nothing => return self.word_literal(level),
             DocxMarker::Bullet => return DocxLabel::Bullet,
+            DocxMarker::Undefined => return DocxLabel::Unknown,
             DocxMarker::Count(_) | DocxMarker::Other => {}
         }
         let own = &self.levels[level];
@@ -3980,7 +3986,9 @@ impl DocxShape {
         let own_count = match self.markers[level] {
             DocxMarker::Count(count) => count,
             DocxMarker::Bullet => return DocxLabel::Bullet,
-            DocxMarker::Nothing | DocxMarker::Other => return DocxLabel::Nothing,
+            DocxMarker::Nothing | DocxMarker::Other | DocxMarker::Undefined => {
+                return DocxLabel::Nothing
+            }
         };
         let own = &self.levels[level];
         let Some(text) = own.number_text() else {
@@ -4176,6 +4184,8 @@ impl<'a> DocxReading<'a> {
     /// `style`: the list given directly or the style chain's, and the level
     /// given directly or read from the style chain (see
     /// [`DocxStyleChains::level`]). A list instance of 0 removes numbering.
+    /// AnyDoc numbers a level past the ninth at the ninth; Word's is kept
+    /// as read, for the replay to show uncertainly.
     fn resolve(&mut self, used: &DocxListUse, style: Option<&str>) -> Option<(u64, usize)> {
         let (list, level) = if self.word {
             (used.list, used.level)
@@ -4195,7 +4205,11 @@ impl<'a> DocxReading<'a> {
             (None, Some(style)) => self.chains.level(style, &bound, self.word),
             (None, None) => 0,
         };
-        Some((list, level.min(DOCX_LIST_LEVELS - 1)))
+        if self.word {
+            Some((list, level))
+        } else {
+            Some((list, level.min(DOCX_LIST_LEVELS - 1)))
+        }
     }
 }
 
@@ -4319,6 +4333,10 @@ impl DocxNumberings {
                 continue;
             }
             let word_label = match resolved.word {
+                // A level past the ninth, which ECMA-376 leaves undefined:
+                // LibreOffice numbers the tenth as a level of its own that
+                // shows nothing, and a deeper one at the first.
+                Some((_, level)) if level >= DOCX_LIST_LEVELS => DocxLabel::Unknown,
                 Some((list, level)) => match word.instance(list) {
                     Some(instance) => {
                         let shape = &instance.shape;
@@ -11740,6 +11758,40 @@ mod tests {
         let letters = formatted(r#"<w:numFmt w:val="lowerLetter"/>"#);
         assert!(!differs(item(1, 0, "").repeat(26), letters.clone(), ""));
         assert!(differs(item(1, 0, "").repeat(27), letters, ""));
+        // What Word shows at a level the list does not define, and at a
+        // level past the ninth, is uncertain: LibreOffice numbers the first
+        // in decimal, the tenth as a level that shows nothing, and a deeper
+        // one at the first. AnyDoc bullets the first and numbers the others
+        // at the ninth.
+        assert!(differs(
+            format!("{}{}", item(1, 0, ""), item(1, 1, "")),
+            one_list.clone(),
+            ""
+        ));
+        let nine_levels = format!(
+            r#"<w:abstractNum w:abstractNumId="0">{}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+            (1..=9)
+                .map(|shown| format!(
+                    r#"<w:lvl w:ilvl="{}"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%{shown}."/></w:lvl>"#,
+                    shown - 1
+                ))
+                .collect::<String>()
+        );
+        for level in [9, 12] {
+            assert!(
+                differs(
+                    format!("{}{}", item(1, 0, ""), item(1, level, "")),
+                    nine_levels.clone(),
+                    ""
+                ),
+                "{level}"
+            );
+        }
+        assert!(!differs(
+            format!("{}{}", item(1, 0, ""), item(1, 8, "")),
+            nine_levels,
+            ""
+        ));
         // A list style's definitions share counters through the style.
         let linked = format!(
             r#"{}<w:abstractNum w:abstractNumId="1"><w:numStyleLink w:val="Outline"/></w:abstractNum><w:abstractNum w:abstractNumId="2"><w:styleLink w:val="Outline"/><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="2"/></w:num>"#,
