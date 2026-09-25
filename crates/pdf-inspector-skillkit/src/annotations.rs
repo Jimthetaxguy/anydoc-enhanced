@@ -174,16 +174,124 @@ fn name(token: &[u8]) -> Vec<u8> {
     name
 }
 
+/// The operators of a content stream.
+const OPERATORS: [&[u8]; 73] = [
+    b"b", b"B", b"b*", b"B*", b"BDC", b"BI", b"BMC", b"BT", b"BX", b"c", b"cm", b"CS", b"cs", b"d",
+    b"d0", b"d1", b"Do", b"DP", b"EI", b"EMC", b"ET", b"EX", b"f", b"F", b"f*", b"G", b"g", b"gs",
+    b"h", b"i", b"ID", b"j", b"J", b"K", b"k", b"l", b"m", b"M", b"MP", b"n", b"q", b"Q", b"re",
+    b"RG", b"rg", b"ri", b"s", b"S", b"SC", b"sc", b"SCN", b"scn", b"sh", b"T*", b"Tc", b"Td",
+    b"TD", b"Tf", b"Tj", b"TJ", b"TL", b"Tm", b"Tr", b"Ts", b"Tw", b"Tz", b"v", b"w", b"W", b"W*",
+    b"y", b"'", b"\"",
+];
+/// Bytes after the white space ending an `EI` that must be text for
+/// content to follow it, as pdf.js reads them; and bytes looked through
+/// for the operator content begins with.
+const AFTER_IMAGE_TEXT: usize = 10;
+const AFTER_IMAGE: usize = 64;
+
+/// Whether content, not an inline image's data, follows an `EI` and the
+/// white space after it, `rest` being what follows the `EI`, as pdf.js
+/// tells them apart: the end of the stream, or bytes that are text, but for
+/// a NUL standing alone, for `AFTER_IMAGE_TEXT` bytes, and in which an
+/// operator comes before any other word, the operands before it passed
+/// over.
+fn content_follows(rest: &[u8]) -> bool {
+    let text = rest.get(1..).unwrap_or_default();
+    let text = &text[..text.len().min(AFTER_IMAGE_TEXT)];
+    let binary = text.iter().enumerate().any(|(index, &byte)| {
+        let lone_nul = byte == 0 && text.get(index + 1) != Some(&0);
+        !(byte.is_ascii_graphic() || byte.is_ascii_whitespace() || lone_nul)
+    });
+    if binary {
+        return false;
+    }
+    let window = &rest[..rest.len().min(AFTER_IMAGE)];
+    let mut at = 0;
+    while at < window.len() {
+        match window[at] {
+            b'(' => {
+                let mut depth = 0usize;
+                while at < window.len() {
+                    match window[at] {
+                        b'\\' => at += 1,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    at += 1;
+                }
+                at += 1;
+            }
+            b'<' if window.get(at + 1) != Some(&b'<') => {
+                while at < window.len() && window[at] != b'>' {
+                    at += 1;
+                }
+                at += 1;
+            }
+            b'/' => {
+                at += 1;
+                while at < window.len() && !delimits(window[at]) {
+                    at += 1;
+                }
+            }
+            b'%' => return true,
+            byte if delimits(byte) => at += 1,
+            _ => {
+                let start = at;
+                while at < window.len() && !delimits(window[at]) {
+                    at += 1;
+                }
+                let word = &window[start..at];
+                if !matches!(word[0], b'0'..=b'9' | b'+' | b'-' | b'.') {
+                    return OPERATORS.contains(&word) && (at < window.len() || at == rest.len());
+                }
+            }
+        }
+    }
+    // Nothing but operands, or nothing at all, to the end of the stream.
+    window.len() == rest.len()
+}
+
+/// Where an inline image's data ends, from `start`, past the white space
+/// after `ID`, where its dictionary gives no length: at the first `EI` set
+/// apart by white space that content follows (see `content_follows`), or
+/// the end of the stream.
+fn image_end(content: &[u8], start: usize) -> usize {
+    let mut at = start.max(1);
+    while at + 2 <= content.len() {
+        if content[at - 1].is_ascii_whitespace()
+            && content[at..].starts_with(b"EI")
+            && content
+                .get(at + 2)
+                .is_none_or(|next| next.is_ascii_whitespace())
+            && content_follows(&content[at + 2..])
+        {
+            return at + 2;
+        }
+        at += 1;
+    }
+    content.len()
+}
+
 /// Whether `content` shows a string with `Tj`, `TJ`, `'`, or `"`; the names
 /// of the XObjects it draws with `Do` go in `drawn`, up to
 /// `MAX_FORMS_DRAWN`. The content is read token by token, its strings,
-/// comments, and inline images passed over whole.
+/// comments, and inline images passed over whole: an image's data for the
+/// length its dictionary gives, else to the `EI` that ends it (see
+/// `image_end`).
 fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
     let mut at = 0;
     // The last name, and whether a string with text in it came, since the
-    // last operator.
+    // last operator; and the length the dictionary of an inline image
+    // being read gives its data.
     let mut operand: Option<&[u8]> = None;
     let mut string = false;
+    let mut length: Option<usize> = None;
     while at < content.len() {
         match content[at] {
             b'%' => {
@@ -235,6 +343,11 @@ fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
                 }
                 let token = &content[start..at];
                 if matches!(token[0], b'0'..=b'9' | b'+' | b'-' | b'.') {
+                    if matches!(operand, Some(b"L" | b"Length")) {
+                        length = std::str::from_utf8(token)
+                            .ok()
+                            .and_then(|length| length.parse().ok());
+                    }
                     continue;
                 }
                 match token {
@@ -244,18 +357,15 @@ fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
                             drawn.push(name(operand));
                         }
                     }
-                    // An inline image's data runs from after `ID` to an
-                    // `EI` set apart by white space.
+                    b"BI" => length = None,
+                    // An inline image's data runs from past the white space
+                    // after `ID`.
                     b"ID" => {
-                        at += 1;
-                        while at < content.len()
-                            && !(content[at - 1].is_ascii_whitespace()
-                                && content[at..].starts_with(b"EI")
-                                && content.get(at + 2).is_none_or(|next| delimits(*next)))
-                        {
-                            at += 1;
-                        }
-                        at += 2;
+                        let start = at + 1;
+                        at = match length.take() {
+                            Some(length) => start.saturating_add(length).min(content.len()),
+                            None => image_end(content, start),
+                        };
                     }
                     _ => {}
                 }
@@ -830,6 +940,21 @@ mod tests {
         assert!(!shows(b"BT () Tj <> Tj ET"));
         assert!(!shows(b"(Tj) pop % (x) Tj\n"));
         assert!(!shows(b"BI /W 1 /H 1 ID \x00(x) Tj\xFF EI Q"));
+        // An `EI` in an image's data that data, not content, follows, and
+        // data as long as the image's dictionary says, which looks like
+        // content, do not end it; content after the image is read.
+        assert!(!shows(
+            b"BI /W 12 /H 1 /BPC 8 /CS /G ID \x00 EI x(ZZ) Tj\x00\x00\x00\n EI Q"
+        ));
+        assert!(!shows(b"BI /W 9 /H 1 /BPC 8 /CS /G /L 9 ID EI (x) Tj EI Q"));
+        assert!(shows(b"BI /W 1 /H 1 /BPC 8 /CS /G ID \x00 EI BT (x) Tj ET"));
+        assert!(shows(b"BI /W 1 /H 1 /L 1 ID \x00 EI BT (x) Tj ET"));
+        // Binary bytes just after an `EI` are the image's data; a string's
+        // bytes past ASCII further on are content's.
+        assert!(!shows(b"BI /W 9 /H 1 ID \x00 EI Q\x00\x00(x) Tj EI Q"));
+        assert!(shows(
+            b"BI /W 1 /H 1 ID \x00 EI q BT /F1 12 Tf (Re\xe7u) Tj ET Q"
+        ));
         assert!(!shows(b"(unclosed Tj"));
         let mut drawn = Vec::new();
         assert!(!shows_text(b"q /Im1 Do /Fm#231 Do Q", &mut drawn));
