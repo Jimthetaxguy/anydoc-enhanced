@@ -137,9 +137,21 @@ fn pdf_tools_return_public_fixture_results() {
 }
 
 /// A one-page PDF displayed turned by `/Rotate 90`, with `ROTATED-MARKER`
-/// near the top-left of the unturned page.
+/// near the top-left of the unturned page and a small ledger table below it.
 fn rotated_page_pdf() -> Vec<u8> {
-    let content = "BT /F1 12 Tf 72 700 Td (ROTATED-MARKER) Tj ET";
+    let mut content = String::from("BT /F1 12 Tf 72 700 Td (ROTATED-MARKER) Tj ET");
+    let rows = [
+        ["Account", "Opening", "Closing"],
+        ["Cash", "100", "150"],
+        ["Receivables", "200", "250"],
+        ["Inventory", "300", "350"],
+    ];
+    for (row, cells) in rows.iter().enumerate() {
+        for (cell, x) in cells.iter().zip([72, 200, 300]) {
+            let y = 500 - 15 * row;
+            content.push_str(&format!("\nBT /F1 10 Tf {x} {y} Td ({cell}) Tj ET"));
+        }
+    }
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
@@ -184,6 +196,8 @@ fn region_tools_read_rectangles_in_the_requested_frame() {
     let pdf = pdf.to_str().expect("UTF-8 path").to_string();
     // The text runs down the right margin of the rendered page.
     let display = serde_json::json!([{ "page": 0, "rects": [[690.0, 60.0, 720.0, 260.0]] }]);
+    // The table sits left of it once the page is turned.
+    let table = serde_json::json!([{ "page": 0, "rects": [[445.0, 60.0, 520.0, 360.0]] }]);
     let results = call_tools(
         &[
             (
@@ -196,11 +210,15 @@ fn region_tools_read_rectangles_in_the_requested_frame() {
             ),
             (
                 "extract_table_regions",
-                serde_json::json!({ "path": pdf, "regions": display, "frame": "display" }),
+                serde_json::json!({ "path": pdf, "regions": table, "frame": "display" }),
             ),
             (
                 "extract_text_regions",
                 serde_json::json!({ "path": pdf, "regions": display, "frame": "rotated" }),
+            ),
+            (
+                "extract_table_regions",
+                serde_json::json!({ "path": pdf, "regions": table }),
             ),
         ],
         None,
@@ -222,11 +240,14 @@ fn region_tools_read_rectangles_in_the_requested_frame() {
         "{}",
         results[1]
     );
+    // Table regions take the frame too.
+    let ledger = text(&results[2]);
     assert!(
-        results[2][0]["regions"][0]["text"].is_string(),
+        ledger.contains("Receivables") && ledger.contains("350"),
         "{}",
         results[2]
     );
+    assert!(!text(&results[4]).contains("Receivables"), "{}", results[4]);
     // An unknown frame is rejected, not ignored.
     assert_eq!(results[3]["is_error"], true, "{}", results[3]);
     assert!(results[3]["reason"]
