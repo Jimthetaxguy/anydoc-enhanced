@@ -1776,6 +1776,15 @@ enum Property {
     Width,
     FlexBasis,
     FlexBasisAuto,
+    /// For a flex item: whether its flex basis is wider than none, and
+    /// whether it grows into the room its line leaves (`flex-grow`,
+    /// `flex`), which size it apart from what it shows.
+    BasisWidth,
+    FlexGrow,
+    /// A left or right margin of `auto`, which a flex item's free room
+    /// fills, and an inline box's is none.
+    AutoMarginLeft,
+    AutoMarginRight,
     /// A custom property (`--gutter`), read for the margins, padding, and
     /// gaps that take their size from it: whether it is a length wider
     /// than none.
@@ -1804,19 +1813,24 @@ enum Property {
 }
 
 impl Property {
-    /// A margin or padding, or a flex item's width or basis, which only a
-    /// flex or grid item, and an inline box laying such items out, is read
-    /// for.
+    /// A margin or padding, or a flex item's width, basis, or growth,
+    /// which only a flex or grid item, and an inline box laying such items
+    /// out, is read for.
     fn spaces(self) -> bool {
         matches!(
             self,
             Property::MarginLeft
                 | Property::MarginRight
+                | Property::AutoMarginLeft
+                | Property::AutoMarginRight
                 | Property::PaddingLeft
                 | Property::PaddingRight
                 | Property::Width
+                | Property::BoxWidth
                 | Property::FlexBasis
                 | Property::FlexBasisAuto
+                | Property::BasisWidth
+                | Property::FlexGrow
         )
     }
 
@@ -2516,13 +2530,14 @@ enum Reads {
 
 /// The declarations a token run holds that the check reads. Most set one
 /// property; `margin`, `padding`, and their inline forms set a box's left
-/// and right, `flex-flow` a flex box's direction and wrapping.
-fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
+/// and right, `flex-flow` a flex box's direction and wrapping, and `flex`
+/// a flex item's basis and growth.
+fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 3] {
     let [Token::Ident(name), rest @ ..] = trim_whitespace(tokens) else {
-        return [None, None];
+        return [None, None, None];
     };
     if name.starts_with("--") {
-        return [custom_declaration(name, rest), None];
+        return [custom_declaration(name, rest), None, None];
     }
     let name = name.to_ascii_lowercase();
     let reads = match name.as_str() {
@@ -2564,11 +2579,12 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
         "container-type" => Reads::One(Property::Container, size_container),
         "container" => Reads::One(Property::Container, container_shorthand),
         "flex-basis" | "-webkit-flex-basis" => Reads::Basis,
+        "flex-grow" | "-webkit-flex-grow" => Reads::One(Property::FlexGrow, grows),
         "flex" | "-webkit-flex" | "-ms-flex" => Reads::Flex,
-        _ => return [parse_declaration(&name, rest), None],
+        _ => return [parse_declaration(&name, rest), None, None],
     };
     let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
-        return [None, None];
+        return [None, None, None];
     };
     let mut value = trim_whitespace(value);
     let mut important = false;
@@ -2600,7 +2616,8 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
         })
     };
     // A margin, padding, or gap written with a custom property takes its
-    // size from it.
+    // size from it. An `auto` margin is read apart (see
+    // [`Cascade::item_box`]).
     let spaced = |property: Property, part: &[Token]| match var_sign(part) {
         Some(VarSign::Takes(name, unset)) => Some(Declaration {
             property,
@@ -2622,7 +2639,28 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             generated: None,
             var: None,
         }),
-        None => declare(property, positive_length(part)),
+        None => match (property, part) {
+            (Property::MarginLeft, [Token::Ident(word)]) if word.eq_ignore_ascii_case("auto") => {
+                declare(Property::AutoMarginLeft, Some(Tri::Yes))
+            }
+            (Property::MarginRight, [Token::Ident(word)]) if word.eq_ignore_ascii_case("auto") => {
+                declare(Property::AutoMarginRight, Some(Tri::Yes))
+            }
+            _ => declare(property, positive_length(part)),
+        },
+    };
+    // A flex basis: whether it takes a whole line of wrapping items, or
+    // takes the width (`auto`, `content`); and whether it is wider than
+    // none.
+    let basis = |parts: &[&[Token]]| match keyword(parts).as_deref() {
+        Some("auto" | "content") => [
+            declare(Property::FlexBasisAuto, Some(Tri::No)),
+            declare(Property::BasisWidth, Some(Tri::No)),
+        ],
+        _ => [
+            declare(Property::FlexBasis, one_full_line(parts)),
+            declare(Property::BasisWidth, box_width(parts)),
+        ],
     };
     match reads {
         Reads::One(
@@ -2633,23 +2671,26 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             | Property::ColumnGap),
             _,
         ) => match parts.as_slice() {
-            [part] => [spaced(property, part), None],
-            _ => [None, None],
+            [part] => [spaced(property, part), None, None],
+            _ => [None, None, None],
         },
-        Reads::One(property, says) => [declare(property, says(&parts)), None],
+        Reads::One(property, says) => [declare(property, says(&parts)), None, None],
         Reads::Also(property, says) => [
             parse_declaration(&name, rest),
             declare(property, says(&parts)),
+            None,
         ],
         Reads::Width => [
             declare(Property::Width, one_full_line(&parts)),
             declare(Property::BoxWidth, box_width(&parts)),
+            None,
         ],
         // A positive `left` moves a box toward the line's end, a positive
         // `right` toward its start.
         Reads::Shift(left) => [
             declare(Property::ShiftStart, shifts(&parts, !left)),
             declare(Property::ShiftEnd, shifts(&parts, left)),
+            None,
         ],
         Reads::Sides(left, right, clockwise) => {
             let (start, end) = match (clockwise, parts.as_slice()) {
@@ -2657,46 +2698,58 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
                 (true, [_, across] | [_, across, _]) => (across, across),
                 (true, [_, right, _, left]) => (left, right),
                 (false, [start, end]) => (start, end),
-                _ => return [None, None],
+                _ => return [None, None, None],
             };
-            [spaced(left, start), spaced(right, end)]
+            [spaced(left, start), spaced(right, end), None]
         }
         Reads::FlexFlow => [
             declare(Property::FlexDirection, flex_direction(&parts)),
             declare(Property::FlexWrap, flex_wrap(&parts)),
+            None,
         ],
         Reads::Gap => match parts.last() {
-            Some(gap) => [spaced(Property::ColumnGap, gap), None],
-            None => [None, None],
+            Some(gap) => [spaced(Property::ColumnGap, gap), None, None],
+            None => [None, None, None],
         },
-        Reads::Basis => match keyword(&parts).as_deref() {
-            Some("auto" | "content") => [declare(Property::FlexBasisAuto, Some(Tri::No)), None],
-            _ => [declare(Property::FlexBasis, one_full_line(&parts)), None],
-        },
-        // `flex: none`, `auto`, and `initial` take the width; a basis
-        // after the numbers, or 0% where none is written (`flex: 1`).
+        Reads::Basis => {
+            let [basis, wide] = basis(&parts);
+            [basis, wide, None]
+        }
+        // `flex: none` and `initial` take the width and do not grow, `auto`
+        // grows; after one or two numbers, the first the growth, a basis,
+        // or 0% where none is written (`flex: 1`); a basis alone grows.
         Reads::Flex => match keyword(&parts).as_deref() {
-            Some("none" | "auto" | "initial") => {
-                [declare(Property::FlexBasisAuto, Some(Tri::No)), None]
+            Some(keyword @ ("none" | "auto" | "initial" | "unset")) => {
+                let grow = if keyword == "auto" { Tri::Yes } else { Tri::No };
+                [
+                    declare(Property::FlexBasisAuto, Some(Tri::No)),
+                    declare(Property::BasisWidth, Some(Tri::No)),
+                    declare(Property::FlexGrow, Some(grow)),
+                ]
             }
+            Some("inherit" | "revert" | "revert-layer") => [
+                declare(Property::FlexBasis, Some(Tri::Maybe)),
+                declare(Property::BasisWidth, Some(Tri::Maybe)),
+                declare(Property::FlexGrow, Some(Tri::Maybe)),
+            ],
             _ => {
                 let number = |part: &&[Token]| matches!(part, [Token::Numeric(number)] if number.parse::<f64>().is_ok());
                 match parts.iter().position(|part| !number(part)) {
-                    None if !parts.is_empty() && parts.len() <= 2 => {
-                        [declare(Property::FlexBasis, Some(Tri::No)), None]
-                    }
+                    None if !parts.is_empty() && parts.len() <= 2 => [
+                        declare(Property::FlexBasis, Some(Tri::No)),
+                        declare(Property::BasisWidth, Some(Tri::No)),
+                        declare(Property::FlexGrow, grows(&parts[..1])),
+                    ],
                     Some(at) if at == parts.len() - 1 && at <= 2 => {
-                        match keyword(&parts[at..]).as_deref() {
-                            Some("auto" | "content") => {
-                                [declare(Property::FlexBasisAuto, Some(Tri::No)), None]
-                            }
-                            _ => [
-                                declare(Property::FlexBasis, one_full_line(&parts[at..])),
-                                None,
-                            ],
-                        }
+                        let [basis, wide] = basis(&parts[at..]);
+                        let grow = if at == 0 {
+                            Some(Tri::Yes)
+                        } else {
+                            grows(&parts[..1])
+                        };
+                        [basis, wide, declare(Property::FlexGrow, grow)]
                     }
-                    _ => [None, None],
+                    _ => [None, None, None],
                 }
             }
         },
@@ -2845,6 +2898,24 @@ fn box_width(parts: &[&[Token]]) -> Option<Tri> {
             _ => None,
         },
         [part] => positive_length(part),
+        _ => None,
+    }
+}
+
+/// Whether a `flex-grow` value, or the first number of `flex`, lets a flex
+/// item grow: a number above zero.
+fn grows(parts: &[&[Token]]) -> Option<Tri> {
+    match parts {
+        [[Token::Numeric(number)]] => {
+            let grow: f64 = number.parse().ok()?;
+            Some(if grow > 0.0 { Tri::Yes } else { Tri::No })
+        }
+        [[Token::Ident(word)]] => match word.to_ascii_lowercase().as_str() {
+            "initial" | "unset" => Some(Tri::No),
+            "inherit" | "revert" | "revert-layer" => Some(Tri::Maybe),
+            _ => None,
+        },
+        [[Token::Function(_), ..]] => Some(Tri::Maybe),
         _ => None,
     }
 }
@@ -5516,18 +5587,23 @@ struct ItemLayout {
     spaced: Tri,
     /// They may wrap onto more lines.
     wraps: Tri,
+    /// Their growth and set widths size them apart from what they show:
+    /// in a block's line, not an inline box's, which is as wide as they are.
+    sizes: Tri,
 }
 
 /// How an item's own box stands among the items beside it (see
 /// [`Cascade::item_box`]): whether its left and its right margin or
-/// padding set it apart, and whether its width or flex basis takes a
-/// whole line, so that where the items wrap, it stands on a line of its
-/// own.
+/// padding set it apart; whether its width or flex basis takes a whole
+/// line, so that where the items wrap, it stands on a line of its own; and
+/// whether it grows, or its width, minimum width, or flex basis sizes it,
+/// so that room may stand between what it shows and its right edge.
 #[derive(Clone, Copy, Debug, Default)]
 struct ItemBox {
     left: Tri,
     right: Tri,
     full: Tri,
+    sized: Tri,
 }
 
 /// What a `::before` or `::after` box does, as far as the check reads it.
@@ -6422,11 +6498,14 @@ impl Cascade {
     /// How the box of the element at the top of the tree stands among the
     /// items beside it: read only for flex and grid items, and for an
     /// inline box laying them out, from the rules that set a margin,
-    /// padding, width, or flex basis and its inline style.
+    /// padding, width, or flex basis or growth, and its inline style. An
+    /// `auto` margin sets an item apart, which free room fills, and not an
+    /// inline box that is not one (`item`).
     fn item_box(
         &self,
         tree: &Tree,
         ancestors: &AncestorKeys,
+        item: bool,
         work: &mut u64,
     ) -> Result<ItemBox, DocumentError> {
         let element = tree.stack.last().expect("an element to style");
@@ -6444,13 +6523,36 @@ impl Cascade {
         // takes the width.
         let mut sides: [Vec<(Precedence, Applies, Tri)>; 5] = Default::default();
         let mut bases: Vec<(Precedence, Applies, Option<Tri>)> = Vec::new();
+        // Whether it grows, and whether its width or minimum width, and its
+        // flex basis, are wider than none.
+        let mut sizes: [Vec<(Precedence, Applies, Tri)>; 3] = Default::default();
+        let auto = if item { Tri::Yes } else { Tri::No };
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Applies| {
             let slot = match declaration.property {
                 Property::MarginLeft => 0,
                 Property::MarginRight => 1,
+                Property::AutoMarginLeft => {
+                    sides[0].push((precedence, certainty, auto));
+                    return;
+                }
+                Property::AutoMarginRight => {
+                    sides[1].push((precedence, certainty, auto));
+                    return;
+                }
                 Property::PaddingLeft => 2,
                 Property::PaddingRight => 3,
                 Property::Width => 4,
+                Property::FlexGrow | Property::BoxWidth | Property::BasisWidth => {
+                    let size = match declaration.property {
+                        Property::FlexGrow => 0,
+                        Property::BoxWidth => 1,
+                        _ => 2,
+                    };
+                    if let Some(wide) = declaration.flow {
+                        sizes[size].push((precedence, certainty, wide));
+                    }
+                    return;
+                }
                 Property::FlexBasis => {
                     bases.push((precedence, certainty, declaration.flow));
                     return;
@@ -6522,10 +6624,12 @@ impl Cascade {
             (None, false) => side(4),
             (Some(basis), false) => basis,
         };
+        let size = |slot: usize| resolve_flow(&sizes[slot], false);
         Ok(ItemBox {
             left: side(0).max(side(2)),
             right: side(1).max(side(3)),
             full,
+            sized: size(0).max(size(1)).max(size(2)),
         })
     }
 
@@ -6744,8 +6848,12 @@ impl Cascade {
                 | Property::Width
                 | Property::FlexBasis
                 | Property::FlexBasisAuto
+                | Property::BasisWidth
+                | Property::FlexGrow
                 | Property::MarginLeft
                 | Property::MarginRight
+                | Property::AutoMarginLeft
+                | Property::AutoMarginRight
                 | Property::PaddingLeft
                 | Property::PaddingRight => return,
             };
@@ -6831,8 +6939,12 @@ impl Cascade {
                     // A box's margin and padding are read on the side that
                     // faces the element's content.
                     let facing = match declaration.property {
-                        Property::MarginRight | Property::PaddingRight => slot == 0,
-                        Property::MarginLeft | Property::PaddingLeft => slot == 1,
+                        Property::MarginRight
+                        | Property::AutoMarginRight
+                        | Property::PaddingRight => slot == 0,
+                        Property::MarginLeft | Property::AutoMarginLeft | Property::PaddingLeft => {
+                            slot == 1
+                        }
                         _ => true,
                     };
                     if !facing {
@@ -6901,6 +7013,12 @@ impl Cascade {
                         }
                         (Property::MarginLeft, Some(wide)) if slot == 1 => {
                             pseudo_margin[slot].push((precedence, certainty, wide));
+                            continue;
+                        }
+                        // An inline box's `auto` margin is none; a flex
+                        // item's is not read.
+                        (Property::AutoMarginLeft | Property::AutoMarginRight, _) => {
+                            pseudo_margin[slot].push((precedence, certainty, Tri::Maybe));
                             continue;
                         }
                         (Property::PaddingRight, Some(wide)) if slot == 0 => {
@@ -7129,6 +7247,7 @@ impl Cascade {
                     turned: flag(0),
                     spaced: flag(4).max(spread),
                     wraps: flag(1),
+                    sizes: inline.not(),
                 };
                 (Tri::Yes, item_layout)
             }
@@ -7141,6 +7260,7 @@ impl Cascade {
                     turned: Tri::Yes,
                     spaced: Tri::Yes,
                     wraps: Tri::No,
+                    sizes: Tri::No,
                 };
                 (Tri::Yes, item_layout)
             }
@@ -9613,11 +9733,17 @@ pub(super) fn chapter_text(
                 stack: &elements,
                 earlier: &earlier,
             };
-            reader.item_box(&tree, &ancestors, work)?
+            reader.item_box(&tree, &ancestors, item, work)?
         } else {
             ItemBox::default()
         };
-        let edges = (item_box.left, item_box.right);
+        // An item a block's line sizes apart from what it shows may leave
+        // room at its right edge, before the next item.
+        let sized = match open.last() {
+            Some(parent) if item => item_box.sized.min(parent.row.layout.sizes),
+            _ => Tri::No,
+        };
+        let edges = (item_box.left, item_box.right.max(sized));
         let apart = match open.last_mut() {
             Some(parent) if item => parent.row.next(item_box),
             _ if inline_items => item_box.left,
@@ -11273,15 +11399,42 @@ mod tests {
         ] {
             assert!(fuses(&[sheet], rows), "{sheet}");
         }
-        // Items that fit on one line, or do not wrap, may touch; a basis
-        // other than auto sets aside the width.
+        // On one line, an item stands apart from the next where it grows,
+        // or its width, minimum width, or basis sizes it wider than what it
+        // shows, and where an auto margin takes the room between them.
         for sheet in [
             ".r { display: flex; flex-wrap: wrap } .r > * { width: 50% }",
             ".r { display: flex } .r > * { width: 100% }",
             ".r { display: flex; flex-wrap: wrap } .r > * { width: 100%; flex: 1 0 0% }",
             ".r { display: flex; flex-wrap: wrap } .r > * { width: 30em }",
+            ".r { display: flex; flex-wrap: wrap } .r > * { min-width: 100% }",
+            ".r { display: flex } .r > * { flex: auto }",
+            ".r { display: flex } .l { flex-grow: 1 }",
+            ".r { display: flex } .l { flex: 0 0 200px }",
+            ".r { display: flex } .l { margin-right: auto }",
+            ".r { display: flex } .a { margin: 0 auto }",
+        ] {
+            assert!(fuses(&[sheet], rows), "{sheet}");
+        }
+        // Items as wide as what they show may touch, as where only the
+        // later one grows, and in an inline box, as wide as its items,
+        // whose auto margins are none.
+        for sheet in [
+            ".r { display: flex } .r > * { flex: none }",
+            ".r { display: flex } .r > * { width: auto }",
+            ".r { display: flex } .r > * { width: max-content }",
+            ".r { display: flex } .a { flex-grow: 1 }",
+            ".r { display: flex } .a { width: 50% }",
         ] {
             assert!(!fuses(&[sheet], rows), "{sheet}");
+        }
+        let inline =
+            r#"<p>Due<span class="r"><span>Balance</span><span>Grand total</span></span></p>"#;
+        for sheet in [
+            ".r { display: inline-flex } .r > * { flex-grow: 1 }",
+            ".r { display: inline-flex; margin-left: auto }",
+        ] {
+            assert!(!fuses(&[sheet], inline), "{sheet}");
         }
         // An inline box whose items wrap so ends below its first line.
         assert!(fuses(
@@ -11294,8 +11447,9 @@ mod tests {
     fn spacing_takes_its_size_from_the_custom_properties_it_names() {
         let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
         // A grid's gutter, as Bootstrap 5 sets it: a custom property on the
-        // row that its columns' padding takes half of.
-        let grid = ".row { --gutter: 1.5rem; display: flex; flex-wrap: wrap; margin-left: calc(-.5 * var(--gutter)) } .row > * { width: 100%; padding-left: calc(var(--gutter) * .5); padding-right: calc(var(--gutter) * .5) } .col { flex: 1 0 0% } .g-0 { --gutter: 0 }";
+        // row that its columns' padding takes half of, the columns as wide
+        // as what they show (`col-auto`).
+        let grid = ".row { --gutter: 1.5rem; display: flex; flex-wrap: wrap; margin-left: calc(-.5 * var(--gutter)) } .row > * { width: 100%; padding-left: calc(var(--gutter) * .5); padding-right: calc(var(--gutter) * .5) } .col { flex: 0 0 auto; width: auto } .g-0 { --gutter: 0 }";
         let row = |class: &str, style: &str| {
             format!(
                 r#"<div class="{class}" style="{style}"><div class="col">Opening balance</div><div class="col">Closing balance</div></div>"#
