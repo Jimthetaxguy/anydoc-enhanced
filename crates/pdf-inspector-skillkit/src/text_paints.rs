@@ -63,6 +63,8 @@ const MAX_PAGE_TREE_DEPTH: usize = 32;
 const MAX_RUNS_PER_PAGE: usize = 100_000;
 /// Repeated runs recorded per page.
 const MAX_REPEATS_PER_PAGE: usize = 16;
+/// Placed run starts kept per document, for the table check.
+const MAX_PLACED_RUNS: usize = 400_000;
 /// How near a run must start again to repeat one, as a share of its size,
 /// and at least.
 const REPEAT_SHARE: f64 = 0.1;
@@ -155,6 +157,46 @@ struct Runs {
     noted: usize,
     /// Where repeated runs start, with their size.
     repeats: Vec<Repeat>,
+    /// Where every placed run starts, whatever its bytes, and whether it
+    /// is plain.
+    placed: Vec<([f64; 2], bool)>,
+}
+
+/// Where a visible run placed on a page starts, measured from the page's
+/// visible box, and whether it is plain: one string, or strings no word
+/// gap apart, which pdf-inspector reads as one item as the producer wrote
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Placed {
+    pub(crate) page: u32,
+    pub(crate) at: [f64; 2],
+    pub(crate) plain: bool,
+}
+
+/// Least pen travel between two strings of a `TJ` array, in thousandths of
+/// the font size, that pdf-inspector may read as a word gap.
+const WORD_GAP_TRAVEL: f64 = 80.0;
+
+/// Whether a text-showing operand is plain (see [`Placed`]).
+fn plain(text: Option<&Object>) -> bool {
+    let Some(Object::Array(elements)) = text else {
+        return true;
+    };
+    let (mut shown, mut travel) = (false, 0.0);
+    for element in elements {
+        match element {
+            Object::Integer(offset) => travel -= *offset as f64,
+            Object::Real(offset) => travel -= f64::from(*offset),
+            Object::String(bytes, _) if !bytes.is_empty() => {
+                if shown && travel >= WORD_GAP_TRAVEL {
+                    return false;
+                }
+                (shown, travel) = (true, 0.0);
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Where a repeated run starts, in user space, and its size.
@@ -331,7 +373,7 @@ impl PageText {
     }
 
     /// Note a visible run whose start the text matrix says.
-    fn note_run(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8]) {
+    fn note_run(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], plain: bool) {
         let Some(runs) = self.runs.as_mut() else {
             return;
         };
@@ -348,6 +390,9 @@ impl PageText {
         ];
         let size = state.size.abs() * matrix[2].hypot(matrix[3]);
         if at.iter().all(|value| value.is_finite()) && size.is_finite() {
+            if runs.placed.len() < MAX_RUNS_PER_PAGE {
+                runs.placed.push((at, plain));
+            }
             runs.note(bytes, at, size);
         }
     }
@@ -400,6 +445,9 @@ pub(crate) struct Findings {
     /// Pages with a gap between glyphs that pdf-inspector judges against
     /// the wrong space width.
     pub(crate) gaps_misread: Vec<u32>,
+    /// Where the visible runs placed on the pages read for repeats start,
+    /// up to `MAX_PLACED_RUNS`.
+    pub(crate) placed: Vec<Placed>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -447,6 +495,17 @@ pub(crate) fn scan(
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
                 }
+                let room = MAX_PLACED_RUNS.saturating_sub(found.placed.len());
+                found.placed.extend(
+                    page.placed
+                        .into_iter()
+                        .take(room)
+                        .map(|(at, plain)| Placed {
+                            page: number,
+                            at,
+                            plain,
+                        }),
+                );
                 if !page.repeats.is_empty() {
                     found.painted_twice.push(number);
                     found
@@ -478,6 +537,9 @@ struct PageFindings {
     gaps_misread: bool,
     /// Runs painted again over themselves, measured from the visible box.
     repeats: Vec<Repeat>,
+    /// Where placed runs start, measured from the visible box, and whether
+    /// they are plain.
+    placed: Vec<([f64; 2], bool)>,
 }
 
 fn scan_page(
@@ -540,9 +602,20 @@ fn scan_page(
     *gap_fonts = std::mem::take(&mut page.gap_fonts);
     executed?;
     page.ended();
+    let placed = page
+        .runs
+        .as_ref()
+        .map(|runs| {
+            runs.placed
+                .iter()
+                .map(|(at, plain)| ([at[0] - page_box[0], at[1] - page_box[1]], *plain))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(PageFindings {
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
+        placed,
         repeats: page
             .runs
             .map(|runs| {
@@ -761,7 +834,7 @@ fn execute<'a>(
                 // After a run, the next starts where it ended, which the
                 // glyph widths decide.
                 if placed {
-                    page.note_run(state, text_matrix, &bytes);
+                    page.note_run(state, text_matrix, &bytes, plain(text));
                 }
                 placed = false;
             }

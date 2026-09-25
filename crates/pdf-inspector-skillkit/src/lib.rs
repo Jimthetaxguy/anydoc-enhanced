@@ -261,8 +261,114 @@ impl PdfInfo {
     /// that, and a page it listed for sparse text alone is, so it gains the
     /// reason. In a full run with Markdown, pages not needing OCR are also
     /// checked for text painted twice, which the Markdown repeats, and for
-    /// word gaps judged against the wrong space width (see `word_gaps`).
-    fn scan_text_paints(&mut self, buffer: &[u8], only: Option<&HashSet<u32>>, mode: &ProcessMode) {
+    /// word gaps judged against the wrong space width (see `word_gaps`);
+    /// then the Markdown's tables are checked (see `markdown_tables`). The
+    /// pages whose text both read again are read once.
+    fn check_pages(&mut self, buffer: &[u8], only: Option<&HashSet<u32>>, mode: &ProcessMode) {
+        let found = self.scan_text_paints(buffer, only, mode);
+        let tables = self
+            .markdown
+            .as_deref()
+            .map(markdown_tables::check)
+            .unwrap_or_default();
+        let items = self.positions(
+            buffer,
+            &found.painted_twice,
+            !tables.merged.is_empty(),
+            only,
+        );
+        let painted_twice =
+            self.confirm_painted_twice(found.painted_twice, &found.repeats, items.as_deref());
+        if !painted_twice.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TEXT_PAINTED_TWICE,
+                "Text these pages paint twice over itself appears twice in the Markdown, as in \"TToottaall\" or \"84.19 84.19\"; read it once.",
+                painted_twice,
+            ));
+        }
+        if tables.row_repeated {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TABLE_ROW_REPEATED,
+                "A table's first row also ends the paragraph before it, so its amounts appear twice; count them once.",
+                Vec::new(),
+            ));
+        }
+        let runs: Vec<markdown_tables::Run<'_>> = items
+            .iter()
+            .flatten()
+            .map(|item| markdown_tables::Run {
+                page: item.page,
+                text: &item.text,
+                x: f64::from(item.x),
+                y: f64::from(item.y),
+                width: f64::from(item.width),
+                size: f64::from(item.font_size.abs().max(item.height.abs())),
+            })
+            .collect();
+        let values_merged = tables.merged.iter().any(|cell| {
+            if items.is_none() {
+                return cell.in_table;
+            }
+            match markdown_tables::merged_on_one_line(cell, &runs, &found.placed) {
+                markdown_tables::Placement::OneLine => true,
+                markdown_tables::Placement::AsSet => false,
+                markdown_tables::Placement::Unread => cell.in_table,
+            }
+        });
+        if values_merged {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TABLE_VALUES_MERGED,
+                "A table cell holds two or more amounts, as when adjacent columns merge; which column each belongs to is uncertain.",
+                Vec::new(),
+            ));
+        }
+    }
+
+    /// The positioned text of the pages the checks read again: the first
+    /// `MAX_CONFIRMED_PAGES` pages painting text twice, and, when a table
+    /// cell holds two amounts, as many of the pages converted. `None` when
+    /// it cannot be read.
+    fn positions(
+        &self,
+        buffer: &[u8],
+        painted_twice: &[u32],
+        tables: bool,
+        only: Option<&HashSet<u32>>,
+    ) -> Option<Vec<pdf_inspector::TextItem>> {
+        let mut wanted: HashSet<u32> = painted_twice
+            .iter()
+            .take(MAX_CONFIRMED_PAGES)
+            .copied()
+            .collect();
+        if tables {
+            wanted.extend(
+                (1..=self.page_count)
+                    .filter(|page| only.is_none_or(|only| only.contains(page)))
+                    .take(MAX_CONFIRMED_PAGES),
+            );
+        }
+        if wanted.is_empty() {
+            return Some(Vec::new());
+        }
+        std::panic::catch_unwind(|| {
+            pdf_inspector::extract_text_with_positions_mem_in_frame(
+                buffer,
+                Some(&wanted),
+                pdf_inspector::PositionFrame::Sheet,
+            )
+        })
+        .ok()?
+        .ok()
+    }
+
+    /// Scan what the pages paint and report what the scan finds but a
+    /// repeat, which the Markdown confirms.
+    fn scan_text_paints(
+        &mut self,
+        buffer: &[u8],
+        only: Option<&HashSet<u32>>,
+        mode: &ProcessMode,
+    ) -> text_paints::Findings {
         let layer_skip: HashSet<u32> = self
             .ocr_reasons_by_page
             .iter()
@@ -276,7 +382,7 @@ impl PdfInfo {
                 .is_some_and(|markdown| !markdown.trim().is_empty()))
         .then(|| self.pages_needing_ocr.iter().copied().collect());
         if layer_skip.len() as u64 >= u64::from(self.page_count) && twice_skip.is_none() {
-            return;
+            return text_paints::Findings::default();
         }
         // The scan only adds signals: if it fails, the result stands as
         // pdf-inspector gave it.
@@ -291,19 +397,11 @@ impl PdfInfo {
                 found.gaps_misread.clone(),
             ));
         }
-        let painted_twice = self.confirm_painted_twice(buffer, found.painted_twice, &found.repeats);
-        if !painted_twice.is_empty() {
-            self.warnings.push(PdfWarning::new(
-                PDF_WARNING_TEXT_PAINTED_TWICE,
-                "Text these pages paint twice over itself appears twice in the Markdown, as in \"TToottaall\" or \"84.19 84.19\"; read it once.",
-                painted_twice,
-            ));
-        }
         if found.hidden_layer.is_empty() {
-            return;
+            return found;
         }
         let reason = pdf_inspector::OCR_REASON_INVISIBLE_TEXT_LAYER;
-        for page in found.hidden_layer {
+        for &page in &found.hidden_layer {
             self.pages_needing_ocr.push(page);
             match self
                 .ocr_reasons_by_page
@@ -324,17 +422,18 @@ impl PdfInfo {
         self.pages_needing_ocr.sort_unstable();
         self.pages_needing_ocr.dedup();
         self.ocr_reasons_by_page.sort_by_key(|entry| entry.page);
+        found
     }
 
     /// The pages painting text twice whose repeat the Markdown shows (see
-    /// `doubled_text`), read from the pages' own text. Past
-    /// `MAX_CONFIRMED_PAGES`, or when their text cannot be read, pages stand
-    /// as the scan found them.
+    /// `doubled_text`), the first `MAX_CONFIRMED_PAGES` read from `items`,
+    /// their positioned text. Past them, or when their text cannot be read,
+    /// a page stands while doubled text is left in the Markdown.
     fn confirm_painted_twice(
         &self,
-        buffer: &[u8],
         pages: Vec<u32>,
         repeats: &[(u32, text_paints::Repeat)],
+        items: Option<&[pdf_inspector::TextItem]>,
     ) -> Vec<u32> {
         let Some(markdown) = self.markdown.as_deref() else {
             return pages;
@@ -342,44 +441,11 @@ impl PdfInfo {
         if pages.is_empty() {
             return pages;
         }
-        let checked = &pages[..pages.len().min(MAX_CONFIRMED_PAGES)];
-        let wanted: HashSet<u32> = checked.iter().copied().collect();
-        let items = std::panic::catch_unwind(|| {
-            pdf_inspector::extract_text_with_positions_mem_in_frame(
-                buffer,
-                Some(&wanted),
-                pdf_inspector::PositionFrame::Sheet,
-            )
-        });
-        let Ok(Ok(items)) = items else {
-            return pages;
+        let (checked, items) = match items {
+            Some(items) => (pages.len().min(MAX_CONFIRMED_PAGES), items),
+            None => (0, &[][..]),
         };
-        let mut confirmed = doubled_text::confirm(checked, repeats, &items, markdown);
-        confirmed.extend_from_slice(&pages[checked.len()..]);
-        confirmed
-    }
-
-    /// Check the Markdown's tables for rows pdf-inspector repeats and
-    /// amounts it merges (see `markdown_tables`).
-    fn check_markdown_tables(&mut self) {
-        let Some(markdown) = self.markdown.as_deref() else {
-            return;
-        };
-        let found = markdown_tables::check(markdown);
-        if found.row_repeated {
-            self.warnings.push(PdfWarning::new(
-                PDF_WARNING_TABLE_ROW_REPEATED,
-                "A table's first row also ends the paragraph before it, so its amounts appear twice; count them once.",
-                Vec::new(),
-            ));
-        }
-        if found.values_merged {
-            self.warnings.push(PdfWarning::new(
-                PDF_WARNING_TABLE_VALUES_MERGED,
-                "A table cell holds two or more amounts, as when adjacent columns merge; which column each belongs to is uncertain.",
-                Vec::new(),
-            ));
-        }
+        doubled_text::confirm(&pages, checked, repeats, items, markdown)
     }
 }
 
@@ -602,8 +668,7 @@ pub fn process_bytes_with_options(
     let pages = options.page_filter.clone();
     let result = pdf_inspector::process_pdf_mem_with_options(buffer, options)?;
     let mut info = PdfInfo::from_result(result, &mode);
-    info.scan_text_paints(buffer, pages.as_ref(), &mode);
-    info.check_markdown_tables();
+    info.check_pages(buffer, pages.as_ref(), &mode);
     Ok(info)
 }
 

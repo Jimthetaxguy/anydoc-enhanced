@@ -262,6 +262,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round seven checked the round-six fixes again:
+  - PDF: the evidence round six required for the table and repeat warnings
+    missed real cases and still passed some by-design layouts. A table cell
+    holding two amounts is now judged by where the page sets them. Separate
+    runs on one baseline, like a 1099-B's wash-sale column in the basis
+    cell, were merged and are reported; this now covers a one-row table and
+    a column merged in every row. Rows the detector merged also count: two
+    lines of amounts where the label cell joins both lines ("Capital gain
+    distributions Total income"). So does one item that a second run starts
+    inside. Amounts stacked by design (federal over state withholding, a
+    discount under its price) and one string the producer wrote ("10.000
+    25.50") are no longer reported. Short values doubled glyph by glyph
+    ("22", "77", "$$55") are confirmed. An unrelated doubled amount elsewhere
+    on the page no longer confirms a repeat: the text at the repeat must
+    show it twice. Past the 64 pages read again, a page is named only while
+    doubled text is left in the Markdown; an 80-page document with a
+    doubled header had named 16 pages its Markdown does not repeat. A
+    first row repeated after a line of form fields ("Acct: 5678 Period:
+    April 2025"), which the detector keeps out of the table, is reported;
+    the upstream #406 fixtures now show it.
 - Review round six found four missed losses and seven false positives in
   loops 12 and 13 and the round-five fixes; all are fixed:
   - EPUB: AnyDoc flattens a link's content into the text around it, so
@@ -378,7 +398,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#339). The table checks read the Markdown and name no page; the repeat
   check reads runs whose position is set, and stops after 4 million
   operations per document. A repeat is confirmed in the Markdown on up to
-  64 pages; later pages are named unconfirmed. The word-gap check runs on
+  64 pages; a later page is named while doubled text is left in the
+  Markdown, so an amount a paragraph legitimately repeats ("0.00 0.00") can
+  name one. A table cell's amounts are placed from the first 64 pages
+  converted; past them, and where the amounts are not read as runs of
+  their own, a cell counts beside an empty cell or in a column whose other
+  rows hold one amount. The word-gap check runs on
   the same pages; a page listed as needing OCR is not checked, and a
   dependent sign's placement and return count as two gaps, where
   pdf-inspector nets them into one.

@@ -105,8 +105,8 @@ still present; #299 is mostly fixed by 1.24.0's superscript handling.
 | PR | Defect in 1.24.0 | Local disposition |
 |---|---|---|
 | #377, #317 | Text painted twice over itself is kept twice: "TToottaall aammoouunntt", "84.19 84.19", a line three times where the page shows two | Reported: the page scan notes where each placed visible run starts and adds a `text_painted_twice` warning for a page where the same run starts again within a tenth of its size (overprints, glyph-by-glyph replays, fake bold 0.3 pt off). |
-| #406 | A compact table's first row is also left in the paragraph above it, so amounts appear twice (a 14 pt row gap duplicates, 16 pt does not) | Reported from the Markdown as `table_row_repeated` when the paragraph before a table ends with its first or second row and the row holds a digit. The public Title 26 sample (`sample-2.pdf`) has it in a rate table. |
-| #424 | Adjacent numeric columns merge: a 1099-B's wash-sale column 28 pt from the basis reads "2,610.25 205.25" in one cell; a ruled table puts both years in one cell | Reported as `table_values_merged` when a body cell holds only amounts, two or more. Values pushed out of their rows after the table (30 pt pitch) are not detected. |
+| #406 | A compact table's first row is also left in the paragraph above it, so amounts appear twice (a 14 pt row gap duplicates, 16 pt does not) | Reported from the Markdown as `table_row_repeated` when the paragraph before a table ends with its first or second row and the row holds a digit, where the detector leaves it: on a line of its own, after a label or a line of form fields, or as an emphasized span. The public Title 26 sample (`sample-2.pdf`) has it in a rate table, and the upstream fixtures after an account line. |
+| #424 | Adjacent numeric columns merge: a 1099-B's wash-sale column 28 pt from the basis reads "2,610.25 205.25" in one cell; a ruled table puts both years in one cell | Reported as `table_values_merged` when a body cell's amounts are separate runs on one baseline, one item a second run starts inside, or two lines whose label cell joins both; amounts stacked by design or written as one string are not. Values pushed out of their rows after the table (30 pt pitch) are not detected. |
 | #443 | A text PDF whose Markdown is dropped as garbage keeps the detector's confidence 1.0 | Confidence 0 for a full run of a text PDF with no Markdown; `has_encoding_issues` set when a page carries `suspected_garbled_text`. |
 | #407, #312 | A form XObject with indirect `/Resources`, or none, loses its fonts' Unicode maps or the text itself | Partly: the garbled-text reason, now also an encoding issue, covers the high-code case. A check for the exact precondition is a next slice. |
 | #445 | A page with a small image and fewer than 10 text operators is read as a scan with no text, though region extraction reads it | Not detected; the page is listed for OCR, so nothing reads as complete. |
@@ -272,7 +272,7 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 248 tests pass (194 skillkit unit, 13
+- `cargo test --workspace --locked`: 251 tests pass (197 skillkit unit, 13
   skillkit integration, 29 document-tool and 9 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared

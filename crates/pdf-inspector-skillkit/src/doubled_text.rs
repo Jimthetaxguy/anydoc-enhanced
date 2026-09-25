@@ -7,7 +7,9 @@
 //! pages), a white copy it hides inside a form, a copy its clip hides. A
 //! reported page stands only while the Markdown shows twice the text
 //! pdf-inspector reads where the page's repeated runs start; each doubled
-//! occurrence counts for one page.
+//! occurrence counts for one page. Past the pages read again, a page stands
+//! while doubled text is left over, but for short words doubled glyph by
+//! glyph, as a page number "11" reads.
 
 use pdf_inspector::TextItem;
 
@@ -17,12 +19,17 @@ use crate::text_paints::Repeat;
 const MAX_REPEATED_WORDS: usize = 64;
 /// Doubled occurrences read from one document.
 const MAX_OCCURRENCES: usize = 10_000;
+/// The least word doubled glyph by glyph, in characters, that names a page
+/// not read again: shorter, it reads as a page number ("11", "22").
+const MIN_UNCHECKED_GLYPHS: usize = 6;
 
 /// Text the Markdown shows doubled, one entry per occurrence, with white
 /// space removed: a run of words repeated at once ("84.19 84.19", "Total due
 /// 12.00 Total due 12.00"), a word written twice without a space
 /// ("84.1984.19"), and a word whose every character is doubled
-/// ("TToottaall", kept doubled, as the page's own text writes it).
+/// ("TToottaall", kept doubled, as the page's own text writes it): six
+/// characters or more, or fewer with a digit or a currency sign ("22",
+/// "$$55").
 pub(crate) fn doubled(markdown: &str) -> Vec<String> {
     let mut found = Vec::new();
     // Text outside tables runs on across lines, as a heading repeated on
@@ -118,11 +125,21 @@ fn doubled_words(words: &[String], found: &mut Vec<String>) {
             if substantial(&text) {
                 found.push(text);
             }
-        } else if word.len() >= 6 && every_character_doubled(&words[index]) {
+        } else if every_character_doubled(&words[index])
+            && (word.len() >= 6
+                || word
+                    .iter()
+                    .any(|character| character.is_ascii_digit() || currency(*character)))
+        {
             found.push(words[index].clone());
         }
         index += 1;
     }
+}
+
+/// A currency sign.
+fn currency(character: char) -> bool {
+    matches!(character, '$' | '\u{20ac}' | '\u{a3}' | '\u{a5}')
 }
 
 /// Text worth counting: a number, or a word of four characters or more.
@@ -131,19 +148,25 @@ fn substantial(text: &str) -> bool {
 }
 
 /// The reported pages, in order, that the Markdown's doubled text confirms.
-/// A page counts when text doubled in the Markdown is the text of an item
-/// pdf-inspector reads where one of the page's repeated runs starts, or,
-/// when it reads none there, any text of the page. Each occurrence counts
-/// for the first page left that it matches.
+/// Of the first `checked` pages, whose text `items` holds, a page counts
+/// when text doubled in the Markdown is where pdf-inspector reads one of
+/// the page's repeated runs start: an item there shows it twice, or lies
+/// within it, as each paint's own item does. When pdf-inspector reads no
+/// item there, the page's text must show it twice. Each occurrence counts
+/// for the first page left that it matches; the pages past `checked` count
+/// while occurrences are left, but for words shorter than
+/// `MIN_UNCHECKED_GLYPHS` doubled glyph by glyph.
 pub(crate) fn confirm(
     pages: &[u32],
+    checked: usize,
     repeats: &[(u32, Repeat)],
     items: &[TextItem],
     markdown: &str,
 ) -> Vec<u32> {
+    let checked = checked.min(pages.len());
     let mut occurrences = doubled(markdown);
     let mut confirmed = Vec::new();
-    for &page in pages {
+    for &page in &pages[..checked] {
         let on_page: Vec<&TextItem> = items.iter().filter(|item| item.page == page).collect();
         let at_repeats: Vec<String> = on_page
             .iter()
@@ -157,11 +180,12 @@ pub(crate) fn confirm(
             .collect();
         let page_text: String = on_page.iter().map(|item| compact(&item.text)).collect();
         let found = occurrences.iter().position(|occurrence| {
+            let twice = shown_twice(occurrence);
             if at_repeats.is_empty() {
-                return page_text.contains(occurrence.as_str());
+                return page_text.contains(twice.as_str());
             }
             at_repeats.iter().any(|text| {
-                text.contains(occurrence.as_str())
+                text.contains(twice.as_str())
                     || ((text.chars().count() >= 2 || every_character_doubled(occurrence))
                         && occurrence.contains(text.as_str()))
             })
@@ -171,7 +195,25 @@ pub(crate) fn confirm(
             confirmed.push(page);
         }
     }
+    let left = occurrences
+        .iter()
+        .filter(|occurrence| {
+            !every_character_doubled(occurrence)
+                || occurrence.chars().count() >= MIN_UNCHECKED_GLYPHS
+        })
+        .count();
+    confirmed.extend(pages[checked..].iter().take(left));
     confirmed
+}
+
+/// Doubled text as the page's items show it: a word whose every character
+/// is doubled as it is, other text twice over.
+fn shown_twice(occurrence: &str) -> String {
+    if every_character_doubled(occurrence) {
+        occurrence.to_string()
+    } else {
+        occurrence.repeat(2)
+    }
 }
 
 /// Whether a repeated run starts within an item's box, on its baseline.
@@ -228,8 +270,22 @@ mod tests {
             doubled("approaching.<u>Deadline: April 15 Deadline: April 15</u> Please"),
             vec!["Deadline:April15"]
         );
+        // Short values doubled glyph by glyph, with a digit or a currency
+        // sign.
+        assert_eq!(doubled("Dependents claimed: 22"), vec!["22"]);
+        assert_eq!(doubled("Fee: $$55 and 1122"), vec!["$$55", "1122"]);
         // Short words, and prose without repeats, are not doubled text.
         assert!(doubled("the the cat").is_empty());
         assert!(doubled("A statement of account for the year").is_empty());
+        assert!(doubled("see all book").is_empty());
+    }
+
+    #[test]
+    fn pages_not_read_again_count_while_long_doubled_text_is_left() {
+        let markdown = "Total due 12.00 Total due 12.00\n\n## Page 22\n\n| 04/06 04/06 |\n";
+        // Without the pages' text, each doubled text names one page, in
+        // order, but for a short word doubled glyph by glyph.
+        assert_eq!(confirm(&[3, 7, 9], 0, &[], &[], markdown), vec![3, 7]);
+        assert!(confirm(&[3, 7], 0, &[], &[], "## Page 22\n\nBox 11\n").is_empty());
     }
 }
