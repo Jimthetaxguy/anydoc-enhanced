@@ -611,13 +611,25 @@ enum Generated {
     /// Such a box holding a line feed (`"\A"`), which breaks the line where
     /// the box keeps white space (`white-space: pre`).
     LineFeed,
-    /// A sign an amount reads by ("−", "(", "%"), which a reader shows
-    /// beside the digits after or before it, and otherwise an ornament,
-    /// such as a hyphen for a bullet.
-    Sign,
+    /// A sign an amount reads by, which a reader shows beside the digits
+    /// after or before it, and otherwise an ornament, such as a hyphen for
+    /// a bullet.
+    Sign(Sign),
     /// Text a reader shows: letters or digits, a counter, or an attribute's
     /// value.
     Text,
+}
+
+/// Where a sign that generated content shows reads as part of an amount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Sign {
+    /// A decimal point or thousands separator ending the box: part of a
+    /// number where a digit follows it directly, as "1" and ".99" read
+    /// "1.99"; after a number, as in "1.", it only closes it.
+    Separator,
+    /// A minus or plus, a parenthesis, a percent or currency sign, or a
+    /// dash ("−", "(", "%", "$"): beside digits on either side.
+    Amount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -666,11 +678,23 @@ const ITEM_DISPLAY_KEYWORDS: [&str; 14] = [
     "-ms-inline-grid",
 ];
 
-/// Signs an amount reads by, which generated content may add to it.
+/// Signs an amount reads by, which generated content may add to it: a
+/// minus or plus, parentheses, a percent sign, currency signs (`¢` to `¥`
+/// and the currency block, `€` and `₹` among them), and the hyphens and
+/// dashes set as a minus or between figures.
 fn amount_sign(character: char) -> bool {
     matches!(
         character,
-        '\u{2212}' | '-' | '+' | '(' | ')' | '%' | '$' | '\u{20ac}' | '\u{a3}' | '\u{a5}'
+        '\u{2212}'
+            | '-'
+            | '+'
+            | '('
+            | ')'
+            | '%'
+            | '$'
+            | '\u{a2}'..='\u{a5}'
+            | '\u{2010}'..='\u{2013}'
+            | '\u{20a0}'..='\u{20cf}'
     )
 }
 
@@ -688,7 +712,9 @@ fn generated_content(value: &[Token]) -> Option<Generated> {
                 if text.chars().any(char::is_alphanumeric) {
                     generated = Generated::Text;
                 } else if text.chars().any(amount_sign) {
-                    generated = generated.max(Generated::Sign);
+                    generated = generated.max(Generated::Sign(Sign::Amount));
+                } else if text.ends_with(['.', ',']) {
+                    generated = generated.max(Generated::Sign(Sign::Separator));
                 } else if text.contains('\n') {
                     generated = generated.max(Generated::LineFeed);
                 }
@@ -2385,10 +2411,10 @@ pub(super) struct ReaderStyle {
     /// A `::before` or `::after` box certainly shows text that carries
     /// meaning, which AnyDoc does not convert.
     generates_text: bool,
-    /// A `::before` or `::after` box certainly shows a sign an amount reads
-    /// by, which matters beside a digit.
-    sign_before: bool,
-    sign_after: bool,
+    /// A sign an amount reads by that a `::before` or `::after` box
+    /// certainly shows, which matters beside a digit.
+    sign_before: Option<Sign>,
+    sign_after: Option<Sign>,
 }
 
 /// How a reader lays an element out beside the text around it, as far as
@@ -2857,10 +2883,12 @@ impl Cascade {
                 resolve_flow(&pseudo_none[slot], false).not(),
                 Tri::Yes,
             );
-            let shown = |generated: Generated| {
-                content == Some(generated) && !contested && exists == Tri::Yes
+            let certain = !contested && exists == Tri::Yes;
+            let text = certain && content == Some(Generated::Text);
+            let sign = match content {
+                Some(Generated::Sign(sign)) if certain => Some(sign),
+                _ => None,
             };
-            let (text, sign) = (shown(Generated::Text), shown(Generated::Sign));
             let line_feed = match content {
                 Some(Generated::LineFeed) if !contested => {
                     match resolve_value(&pseudo_line_feeds[slot], Tri::Maybe) {
@@ -3133,9 +3161,9 @@ struct Effects {
     /// A reader floats it: the glyphs and digits taken in before it, to
     /// tell a drop cap, beside which the text after it continues.
     glyphs_at: Option<(u64, u64)>,
-    /// Its `::after` box shows a sign, lost where the text before it ends
-    /// in a digit.
-    sign_after: bool,
+    /// Its `::after` box shows a sign, lost beside a digit: the one the text
+    /// before it ends in, or the one the text after it starts with.
+    sign_after: Option<Sign>,
 }
 
 /// One inline run of AnyDoc's walker (a `Builder`): the text it last
@@ -3160,8 +3188,9 @@ struct Run {
     alt: Option<String>,
     /// A floated drop cap ended, and the next text starts beside it.
     beside_float: Option<DropCap>,
-    /// A `::before` box showing a sign sits before the next text.
-    sign_before: bool,
+    /// A sign a `::before` or `::after` box shows sits before the next
+    /// text.
+    sign_before: Option<Sign>,
     /// A generated sign met a digit, which AnyDoc then shows without it.
     lost_sign: bool,
 }
@@ -3326,18 +3355,24 @@ impl Run {
         };
         if kept().all(char::is_whitespace) {
             self.space(' ');
+            if self.sign_before == Some(Sign::Separator) {
+                self.sign_before = None;
+            }
             return false;
         }
         let at_space = self.at_space();
         let mut from_first = kept().skip_while(|character| at_space && character.is_whitespace());
         let (first, second) = (from_first.next(), from_first.next());
-        if std::mem::take(&mut self.sign_before)
-            && kept()
+        // A separator joins only the digits right after it; another sign
+        // reads with the amount after the white space too.
+        let meets_sign = match self.sign_before.take() {
+            Some(Sign::Separator) => kept().next().is_some_and(char::is_numeric),
+            Some(Sign::Amount) => kept()
                 .find(|character| !character.is_whitespace())
-                .is_some_and(char::is_numeric)
-        {
-            self.lost_sign = true;
-        }
+                .is_some_and(char::is_numeric),
+            None => false,
+        };
+        self.lost_sign |= meets_sign;
         self.content();
         let (joined, number) = meeting([self.before_last, self.last], [first, second]);
         let beside = match self.beside_float {
@@ -3853,10 +3888,10 @@ fn meet_run(
 }
 
 /// Apply what an element does to AnyDoc's inline run as it ends, with the
-/// glyphs taken in so far; whether a sign its `::after` box shows meets a
-/// digit, which AnyDoc then shows without it.
+/// glyphs taken in so far; whether a sign its `::after` box shows meets the
+/// digit the text before it ends in, which AnyDoc then shows without it.
 fn end_element(effects: &Effects, runs: &mut Vec<Run>, glyphs: (u64, u64)) -> bool {
-    let lost_sign = effects.sign_after
+    let lost_sign = effects.sign_after == Some(Sign::Amount)
         && runs
             .last()
             .is_some_and(|run| run.last.is_some_and(char::is_numeric));
@@ -3878,6 +3913,12 @@ fn end_element(effects: &Effects, runs: &mut Vec<Run>, glyphs: (u64, u64)) -> bo
     match effects.glyphs_at.and_then(|start| drop_cap(start, glyphs)) {
         Some(cap) => run.beside_float = Some(cap),
         None => run.mark(effects.boundary_after),
+    }
+    // Otherwise the sign sits before the text that goes on in the line,
+    // unless the element ends a paragraph or a block of its own.
+    let in_line = !effects.opens_run && !effects.flush_after && effects.boundary_after != Tri::Yes;
+    if !lost_sign && in_line {
+        run.sign_before = run.sign_before.max(effects.sign_after);
     }
     lost_sign
 }
@@ -4206,19 +4247,29 @@ pub(super) fn chapter_text(
             }
         };
         // What a shown `::before` or `::after` box adds, which AnyDoc never
-        // converts: text, such as a label, and a sign beside digits.
+        // converts: text, such as a label, and a sign beside digits. AnyDoc
+        // writes a list item with a list marker of its own, which stands in
+        // for a sign before or after it.
         let hidden = state.undisplayed || state.invisible || state.contents_hidden;
         let generated = style
             .as_ref()
             .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
         found.drops_shown |= generated.is_some_and(|style| style.generates_text);
-        let sign_before = generated.is_some_and(|style| style.sign_before);
-        effects.sign_after = generated.is_some_and(|style| style.sign_after);
+        let list_item = parent_reach == Some(Reach::List) && reach == Reach::Walk && !spliced;
+        let signs = generated.filter(|_| !list_item);
+        let sign_before = signs.and_then(|style| style.sign_before);
+        effects.sign_after = signs.and_then(|style| style.sign_after);
         state.effects.sign_after = effects.sign_after;
+        // A sign before the element's content sits before the text after
+        // it, and after the text the line holds before it.
         let mark_sign = |runs: &mut Vec<Run>| {
-            if let Some(run) = runs.last_mut().filter(|_| sign_before) {
-                run.sign_before = true;
-            }
+            let Some(run) = runs.last_mut().filter(|_| sign_before.is_some()) else {
+                return false;
+            };
+            run.sign_before = run.sign_before.max(sign_before);
+            sign_before == Some(Sign::Amount)
+                && !run.boundary
+                && run.last.is_some_and(char::is_numeric)
         };
         // An empty element holds no text to check.
         if !has_children {
@@ -4230,7 +4281,7 @@ pub(super) fn chapter_text(
                 }
             }
             effects.opens_run = false;
-            mark_sign(&mut runs);
+            found.drops_shown |= mark_sign(&mut runs);
             found.drops_shown |= end_element(&effects, &mut runs, glyphs);
             buffer.clear();
             continue;
@@ -4238,7 +4289,7 @@ pub(super) fn chapter_text(
         if effects.opens_run {
             runs.push(Run::default());
         }
-        mark_sign(&mut runs);
+        found.drops_shown |= mark_sign(&mut runs);
         open.push(state);
         buffer.clear();
     }
@@ -5111,6 +5162,96 @@ mod tests {
             ),
         ] {
             assert!(!drops_shown(&[sheets], body), "{sheets}");
+        }
+    }
+
+    #[test]
+    fn generated_signs_are_lost_beside_the_digits_they_meet() {
+        for (sheets, body) in [
+            // A decimal point or thousands separator before digits, from
+            // the box before them or the box after the digits before it.
+            (
+                r#".c::before { content: "." }"#,
+                r#"<p>Price 1<span class="c">99</span></p>"#,
+            ),
+            (
+                r#".d::after { content: "." }"#,
+                r#"<p>Price <span class="d">1</span>99</p>"#,
+            ),
+            (
+                r#".b::before { content: "," }"#,
+                r#"<p>Total <span class="a">1</span><span class="b">250</span> units</p>"#,
+            ),
+            // A sign on an empty element meets the digits on either side.
+            (
+                r#".s::after { content: "$" }"#,
+                r#"<p>Total <span class="s"/>1,250.00</p>"#,
+            ),
+            (
+                r#".p::before { content: "%" }"#,
+                r#"<p>Rate 12<span class="p"/> of total</p>"#,
+            ),
+            (
+                r#".s::after { content: "$" }"#,
+                r#"<p>Total <span class="s">due</span>1,250.00</p>"#,
+            ),
+            // Currency signs and dashes past the ASCII ones.
+            (
+                r#".c::before { content: "\20B9" }"#,
+                r#"<p>Fee <span class="c">1,250</span> due</p>"#,
+            ),
+            (
+                r#".r::before { content: "\2013" }"#,
+                r#"<p>Years 1914<span class="r">1918</span></p>"#,
+            ),
+            // Separators between spans, and between list items inside a
+            // link, which AnyDoc joins with a space and no marker.
+            (
+                r#".years span:not(:last-child)::after { content: " - " }"#,
+                r#"<p class="years"><span>1914</span><span>1918</span></p>"#,
+            ),
+            (
+                r#"li + li::before { content: "- " }"#,
+                "<div>Years <a><ul><li>1914</li><li>1918</li></ul></a></div>",
+            ),
+        ] {
+            assert!(drops_shown(&[sheets], body), "{sheets} {body}");
+        }
+        for (sheets, body) in [
+            // A period closing a number, or a separator apart from the
+            // digits after it.
+            (
+                r#".n::after { content: "." }"#,
+                r#"<p><span class="n">1</span> Keep copies.</p>"#,
+            ),
+            (
+                r#".c::before { content: "." }"#,
+                r#"<p>Price 1<span class="c"> each</span></p>"#,
+            ),
+            (
+                r#".s::after { content: "." }"#,
+                r#"<p>Total <span class="s"/> 250</p>"#,
+            ),
+            // A sign after a block, which starts a line of its own.
+            (
+                r#".s::after { content: "$" } .s { display: block }"#,
+                r#"<div><span class="s">Total</span> 1,250.00</div>"#,
+            ),
+            // A list item's sign: AnyDoc's list marker stands in for it.
+            (
+                r#"li::before { content: "- " }"#,
+                "<ul><li>2 cups flour</li></ul>",
+            ),
+            (
+                r#"li { display: inline } li + li::before { content: " - " }"#,
+                "<ul><li>2024</li><li>2025</li></ul>",
+            ),
+            (
+                r#"li { display: inline } li:not(:last-child)::after { content: " - " }"#,
+                "<ul><li>1914</li><li>1918</li></ul>",
+            ),
+        ] {
+            assert!(!drops_shown(&[sheets], body), "{sheets} {body}");
         }
     }
 
