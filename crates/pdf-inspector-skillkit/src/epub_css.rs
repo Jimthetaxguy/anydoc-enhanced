@@ -1958,7 +1958,9 @@ struct Declaration {
     /// padding, or gap that takes its size from one (`var(--gutter)`,
     /// `calc(var(--gutter) * .5)`), that one's, `flow` then telling what
     /// it says where the custom property is not set (see
-    /// [`Cascade::resolved`]). Names are hashed ([`custom_name`]).
+    /// [`Cascade::resolved`]); for `content` taken from one, that one's,
+    /// which a `::before` or `::after` box reads where it sets it. Names
+    /// are hashed ([`custom_name`]).
     var: Option<u64>,
 }
 
@@ -2494,6 +2496,10 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
     if property == Property::Content && generated.is_none() && !computed {
         return None;
     }
+    let var = match property {
+        Property::Content => content_var(value),
+        _ => None,
+    };
     Some(Declaration {
         property,
         effect,
@@ -2502,8 +2508,29 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
         layout,
         side,
         generated,
-        var: None,
+        var,
     })
+}
+
+/// The custom property a `content` value is taken from where it is that
+/// alone (`var(--tw-content)`), by its hashed name.
+fn content_var(value: &[Token]) -> Option<u64> {
+    let [Token::Function(function), ..] = value else {
+        return None;
+    };
+    let (arguments, end) = block_at(value, 0);
+    if !function.eq_ignore_ascii_case("var") || end != value.len() {
+        return None;
+    }
+    match trim_whitespace(arguments) {
+        [Token::Ident(name), rest @ ..]
+            if name.starts_with("--")
+                && matches!(trim_whitespace(rest), [] | [Token::Comma, ..]) =>
+        {
+            Some(custom_name(name))
+        }
+        _ => None,
+    }
 }
 
 /// What a declaration of flex items' layout, or a margin or padding, says
@@ -2783,7 +2810,8 @@ fn custom_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
         flow: Some(wide),
         layout: None,
         side: None,
-        generated: None,
+        // What `content` taken from it shows.
+        generated: generated_content(value),
         var: Some(custom_name(name)),
     })
 }
@@ -5436,6 +5464,11 @@ fn inline_precedence(important: bool) -> Precedence {
     }
 }
 
+/// A custom property a `::before` or `::after` box sets: where its
+/// declaration stands, how it applies, its name, and what `content` taken
+/// from it shows.
+type CustomContent = (Precedence, Applies, u64, Option<Generated>);
+
 #[derive(Clone, Copy)]
 struct Applied {
     precedence: Precedence,
@@ -6230,7 +6263,7 @@ impl Cascade {
         work: &mut u64,
     ) -> Result<Declaration, DocumentError> {
         match declaration.var {
-            Some(name) if declaration.property != Property::Custom => {
+            Some(name) if !matches!(declaration.property, Property::Custom | Property::Content) => {
                 let unset = declaration.flow.unwrap_or(Tri::Maybe);
                 let value = self.custom_value(tree, ancestors, name, work)?;
                 Ok(Declaration {
@@ -6896,6 +6929,11 @@ impl Cascade {
         let mut pseudo_none: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
         let mut pseudo_content: [Vec<(Precedence, Applies, Option<Generated>)>; 2] =
             Default::default();
+        // And the custom properties it sets, by name, with what `content`
+        // taken from each shows; and the `content` declarations taken from
+        // one, by their place among its own.
+        let mut pseudo_customs: [Vec<CustomContent>; 2] = Default::default();
+        let mut pseudo_content_vars: [Vec<(usize, u64)>; 2] = Default::default();
         let mut pseudo_out: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
         let mut pseudo_floats: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
         let mut pseudo_line_feeds: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
@@ -6970,11 +7008,25 @@ impl Cascade {
                     }
                     match (declaration.property, declaration.flow) {
                         (Property::Content, _) => {
+                            if let Some(name) = declaration.var {
+                                pseudo_content_vars[slot].push((pseudo_content[slot].len(), name));
+                            }
                             pseudo_content[slot].push((
                                 precedence,
                                 certainty,
                                 declaration.generated,
                             ));
+                            continue;
+                        }
+                        (Property::Custom, _) => {
+                            if let Some(name) = declaration.var {
+                                pseudo_customs[slot].push((
+                                    precedence,
+                                    certainty,
+                                    name,
+                                    declaration.generated,
+                                ));
+                            }
                             continue;
                         }
                         (Property::Position, Some(out)) => {
@@ -7075,6 +7127,24 @@ impl Cascade {
         }
         if *work > MAX_MATCH_WORK {
             return Err(DocumentError::ResourceLimit);
+        }
+        // `content` taken from a custom property its box sets, as Tailwind
+        // sets it (`--tw-content: '−'; content: var(--tw-content)`), shows
+        // what the one that wins says, where it is settled.
+        for (content, (vars, customs)) in pseudo_content
+            .iter_mut()
+            .zip(pseudo_content_vars.iter().zip(&pseudo_customs))
+        {
+            for &(at, name) in vars {
+                let set: Vec<(Precedence, Applies, Option<Generated>)> = customs
+                    .iter()
+                    .filter(|(_, _, custom, _)| *custom == name)
+                    .map(|&(precedence, applies, _, generated)| (precedence, applies, generated))
+                    .collect();
+                if let (Some(generated), false) = resolve_value(&set, None) {
+                    content[at].2 = Some(generated);
+                }
+            }
         }
         for (prefixed, declaration) in element.inline_style(work)? {
             if declaration.property.spaces() {
@@ -11861,6 +11931,38 @@ mod tests {
             ),
         ] {
             assert!(!drops_shown(&[sheets], body), "{sheets} {body}");
+        }
+    }
+
+    #[test]
+    fn content_a_box_takes_from_a_custom_property_it_sets_is_read() {
+        let net = r#"<p>Net change <span class="neg">1,250.00</span> this year.</p>"#;
+        let rate = r#"<p>Rate <span class="pct">12</span> this year.</p>"#;
+        // Tailwind's content utilities set the property on the box they
+        // show it in.
+        for (sheet, body) in [
+            (
+                ".neg::before { --tw-content: '\u{2212}'; content: var(--tw-content) }",
+                net,
+            ),
+            (
+                ".pct::after { --tw-content: '%'; content: var(--tw-content) }",
+                rate,
+            ),
+            (
+                ".neg::before { --tw-content: ''; content: var(--tw-content) } p .neg::before { --tw-content: '-'; content: var(--tw-content) }",
+                net,
+            ),
+        ] {
+            assert!(drops_shown(&[sheet], body), "{sheet}");
+        }
+        // One that shows nothing, and one set where it may not hold, are
+        // no sign for certain.
+        for sheet in [
+            ".neg::before { --tw-content: ''; content: var(--tw-content) }",
+            ".neg::before { content: var(--tw-content) } @media (min-width: 5000px) { .neg::before { --tw-content: '-' } }",
+        ] {
+            assert!(!drops_shown(&[sheet], net), "{sheet}");
         }
     }
 
