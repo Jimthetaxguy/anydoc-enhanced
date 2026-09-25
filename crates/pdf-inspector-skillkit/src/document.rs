@@ -3666,7 +3666,7 @@ impl DocxInstance {
     /// counts on (`aa`, `ab`).
     fn word_label(&self, level: usize, value: u64, counters: &DocxCounters) -> DocxLabel {
         match self.markers[level] {
-            DocxMarker::Nothing => return DocxLabel::Nothing,
+            DocxMarker::Nothing => return self.word_literal(level),
             DocxMarker::Bullet => return DocxLabel::Bullet,
             DocxMarker::Count(_) | DocxMarker::Other => {}
         }
@@ -3701,6 +3701,32 @@ impl DocxInstance {
             label.push_str(&count.text(number));
         }
         DocxLabel::Text(label)
+    }
+
+    /// The label Word shows at a level without a number (`w:numFmt` of
+    /// `none`), which AnyDoc does not number at all: the level's literal
+    /// text, as in "WHEREAS,". What a number there shows is uncertain:
+    /// nothing for the level's own, and for another level's nothing in
+    /// LibreOffice and that level's number in Word, probably. So only words
+    /// and digits of the text count; punctuation alone, such as the `.` of
+    /// `%1.`, is taken to show nothing, as a bullet shows no count.
+    fn word_literal(&self, level: usize) -> DocxLabel {
+        let own = &self.levels[level];
+        if own.format.as_deref() != Some("none") {
+            return DocxLabel::Nothing;
+        }
+        let literal: String = docx_number_text(own.text.as_deref().unwrap_or(""))
+            .into_iter()
+            .filter_map(|piece| match piece {
+                DocxTextPiece::Literal(text) => Some(text),
+                DocxTextPiece::Number(_) => None,
+            })
+            .collect();
+        if literal.chars().any(char::is_alphanumeric) {
+            DocxLabel::Text(literal)
+        } else {
+            DocxLabel::Nothing
+        }
     }
 
     /// The label AnyDoc shows: its level's number text, or the number and a
@@ -10573,6 +10599,26 @@ mod tests {
             &outline,
             ""
         ));
+        // A level without a number (`none`) still shows its literal words in
+        // Word, which AnyDoc drops with the number; punctuation alone, left
+        // where the text shows a number, counts as nothing.
+        let none = |text: &str| {
+            format!(
+                r#"{}<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="none"/><w:lvlText w:val="{text}"/></w:lvl>"#,
+                level(0, Some("%1."))
+            )
+        };
+        let recital = format!(
+            "{}{}{}",
+            paragraph(1, 0, ""),
+            paragraph(1, 1, ""),
+            paragraph(1, 0, "")
+        );
+        assert!(differs(recital.clone(), &none("WHEREAS,"), ""));
+        assert!(differs(recital.clone(), &none("Recital %2:"), ""));
+        for text in ["%2", "(%2)", "%1."] {
+            assert!(!differs(recital.clone(), &none(text), ""), "{text}");
+        }
         // A level's own number is compared only where its text shows it.
         let chapter = format!("{}{}", level(0, Some("%1.")), level(1, Some("Part %1")));
         assert!(!differs(
