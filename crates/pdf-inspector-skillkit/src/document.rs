@@ -29,6 +29,8 @@ use zip::ZipArchive;
 
 #[path = "epub_css.rs"]
 mod epub_css;
+#[path = "odf_walk.rs"]
+mod odf_walk;
 #[path = "tabular_csv.rs"]
 mod tabular_csv;
 
@@ -1334,6 +1336,10 @@ fn xml_has_odf_hidden_content(bytes: &[u8]) -> bool {
                             && matches!(value.as_str(), "collapse" | "filter" | "hidden"))
                             || (attribute.local() == b"display"
                                 && matches!(value.as_str(), "none" | "false" | "0" | "hidden"))
+                            || (matches!(attribute.local(), b"row-height" | b"column-width")
+                                && odf_length_points(&value).is_some_and(|points| {
+                                    !(points.is_finite() && points >= MIN_VISIBLE_ROW_POINTS)
+                                }))
                     });
                     if hidden {
                         return true;
@@ -1346,6 +1352,27 @@ fn xml_has_odf_hidden_content(bytes: &[u8]) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// An ODF length (`0.178in`, `4.5mm`, `12pt`) in points. `None` for a value
+/// without a unit this check knows.
+fn odf_length_points(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| character.is_ascii_alphabetic() || character == '%')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number: f64 = number.trim().parse().ok()?;
+    let scale = match unit.trim().to_ascii_lowercase().as_str() {
+        "pt" => 1.0,
+        "in" => 72.0,
+        "cm" => 72.0 / 2.54,
+        "mm" => 72.0 / 25.4,
+        "pc" => 12.0,
+        "px" => 0.75,
+        _ => return None,
+    };
+    Some(number * scale)
 }
 
 fn is_external_uri(value: &str) -> bool {
@@ -1432,106 +1459,6 @@ fn xml_has_odf_encryption_data(bytes: &[u8]) -> bool {
     }
 }
 
-fn xml_has_uncached_odf_formula(bytes: &[u8]) -> bool {
-    struct FormulaCell {
-        depth: usize,
-        cached_value: bool,
-        display_text: bool,
-    }
-
-    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
-    reader.config_mut().trim_text(false);
-    let mut buffer = Vec::new();
-    let mut depth = 0usize;
-    let mut formulas = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(event)) => {
-                depth += 1;
-                if xml_local_name(event.name().as_ref()) == b"table-cell"
-                    && xml_attribute_value(&event, b"formula").is_some()
-                {
-                    let cached_value = [
-                        b"value".as_slice(),
-                        b"string-value".as_slice(),
-                        b"date-value".as_slice(),
-                        b"time-value".as_slice(),
-                        b"boolean-value".as_slice(),
-                    ]
-                    .iter()
-                    .any(|name| {
-                        xml_attribute_value(&event, name)
-                            .is_some_and(|value| !value.trim().is_empty())
-                    });
-                    formulas.push(FormulaCell {
-                        depth,
-                        cached_value,
-                        display_text: false,
-                    });
-                }
-                buffer.clear();
-            }
-            Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"table-cell"
-                    && xml_attribute_value(&event, b"formula").is_some()
-                {
-                    let cached_value = [
-                        b"value".as_slice(),
-                        b"string-value".as_slice(),
-                        b"date-value".as_slice(),
-                        b"time-value".as_slice(),
-                        b"boolean-value".as_slice(),
-                    ]
-                    .iter()
-                    .any(|name| {
-                        xml_attribute_value(&event, name)
-                            .is_some_and(|value| !value.trim().is_empty())
-                    });
-                    if !cached_value {
-                        return true;
-                    }
-                }
-                buffer.clear();
-            }
-            Ok(quick_xml::events::Event::Text(event)) => {
-                if event
-                    .into_inner()
-                    .iter()
-                    .any(|byte| !byte.is_ascii_whitespace())
-                {
-                    for formula in &mut formulas {
-                        formula.display_text = true;
-                    }
-                }
-                buffer.clear();
-            }
-            Ok(quick_xml::events::Event::CData(event)) => {
-                if event
-                    .into_inner()
-                    .iter()
-                    .any(|byte| !byte.is_ascii_whitespace())
-                {
-                    for formula in &mut formulas {
-                        formula.display_text = true;
-                    }
-                }
-                buffer.clear();
-            }
-            Ok(quick_xml::events::Event::End(_)) => {
-                if let Some(formula) = formulas.pop_if(|formula| formula.depth == depth) {
-                    if !formula.cached_value && !formula.display_text {
-                        return true;
-                    }
-                }
-                depth = depth.saturating_sub(1);
-                buffer.clear();
-            }
-            Ok(quick_xml::events::Event::Eof) => return false,
-            Ok(_) => buffer.clear(),
-            Err(_) => return false,
-        }
-    }
-}
 fn xml_has_odf_presentation(bytes: &[u8]) -> bool {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
@@ -1587,41 +1514,131 @@ fn xml_has_odp_hidden_content(bytes: &[u8]) -> bool {
     }
 }
 
-/// Drawing-page styles that hide a slide, and the styles slides use, across
-/// an ODP package's content and styles parts. LibreOffice hides a slide with
-/// `presentation:visibility="hidden"` in its drawing-page style.
+/// A drawing-page style definition: its parent, and its visibility where
+/// set (`true` hides).
+type OdpPageStyle = (Option<String>, Option<bool>);
+
+/// What hides slide content across an ODP package's content and styles
+/// parts. LibreOffice hides a slide with `presentation:visibility="hidden"`
+/// in its drawing-page style, which a style inherits from its parent and
+/// from the default drawing-page style; a shape with `draw:display` set to
+/// `none` or `printer` (shown only in print); and a shape on a layer whose
+/// `draw:display` hides it. AnyDoc converts all of them.
 #[derive(Default)]
-struct OdpPageStyles {
-    hidden: HashSet<String>,
-    used: HashSet<String>,
+struct OdpVisibility {
+    /// Drawing-page style definitions by name. A name defined more than
+    /// once, as in both parts, hides a slide if any definition does.
+    page_styles: HashMap<String, Vec<OdpPageStyle>>,
+    default_hidden: Option<bool>,
+    /// The drawing-page styles slides use; `None` for a slide with none.
+    pages: HashSet<Option<String>>,
+    hidden_layers: HashSet<String>,
+    used_layers: HashSet<String>,
+    hidden_shape: bool,
 }
 
-impl OdpPageStyles {
-    fn hides_a_page(&self) -> bool {
-        self.used.iter().any(|style| self.hidden.contains(style))
+/// Distinct drawing-page styles, layers, and slide styles recorded; a real
+/// deck has a few dozen.
+const MAX_ODP_STYLE_RECORDS: usize = 65_536;
+
+/// Styles followed from one slide's style through its parents. A real deck
+/// chains two or three; a longer chain is treated as hiding the slide.
+const MAX_ODP_STYLE_CHAIN: usize = 64;
+
+impl OdpVisibility {
+    fn page_hidden(&self, style: Option<&str>) -> bool {
+        // Every definition of every style on the way is followed; a chain
+        // that ends without a setting falls back to the default style.
+        let mut pending: Vec<&str> = style.into_iter().collect();
+        let mut seen = HashSet::new();
+        let mut unset = style.is_none();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name) {
+                continue;
+            }
+            if seen.len() > MAX_ODP_STYLE_CHAIN {
+                return true;
+            }
+            let Some(definitions) = self.page_styles.get(name) else {
+                unset = true;
+                continue;
+            };
+            for (parent, hidden) in definitions {
+                match (hidden, parent) {
+                    (Some(true), _) => return true,
+                    (Some(false), _) => {}
+                    (None, Some(parent)) => pending.push(parent),
+                    (None, None) => unset = true,
+                }
+            }
+        }
+        unset && self.default_hidden.unwrap_or(false)
+    }
+
+    fn hides_content(&self) -> bool {
+        self.hidden_shape
+            || self
+                .used_layers
+                .iter()
+                .any(|layer| self.hidden_layers.contains(layer))
+            || self
+                .pages
+                .iter()
+                .any(|style| self.page_hidden(style.as_deref()))
+    }
+
+    fn within_bounds(&self, definitions: usize) -> bool {
+        definitions + self.pages.len() + self.hidden_layers.len() + self.used_layers.len()
+            <= MAX_ODP_STYLE_RECORDS
     }
 }
 
-fn scan_odp_page_styles(bytes: &[u8], styles: &mut OdpPageStyles) {
+/// A style definition open while an ODP part is read.
+enum OdpOpenStyle {
+    /// A drawing-page style: its name and which of its definitions this is.
+    Page(String, usize),
+    /// A named style of another family, and its parent.
+    Other(String, Option<String>),
+    /// A default style.
+    Default,
+    /// A style without a name, which nothing can apply.
+    Unnamed,
+}
+
+fn odp_display_hides(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "none" | "printer"
+    )
+}
+
+/// Record what an ODP part says about visibility. Shapes and slides count
+/// only in the content part, which is what AnyDoc converts.
+fn scan_odp_visibility(
+    bytes: &[u8],
+    content: bool,
+    visibility: &mut OdpVisibility,
+) -> Result<(), DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    // Names of the open `style:style` elements, innermost last.
-    let mut open_styles: Vec<String> = Vec::new();
+    // For each open element, whether it is a style definition.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut open_styles: Vec<OdpOpenStyle> = Vec::new();
+    let mut definitions = visibility.page_styles.values().map(Vec::len).sum::<usize>();
     loop {
         let (event, start) = match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event)) => (event, true),
             Ok(quick_xml::events::Event::Empty(event)) => (event, false),
             Ok(quick_xml::events::Event::End(_)) => {
-                if stack.pop().as_deref() == Some(b"style".as_slice()) {
+                if stack.pop() == Some(true) {
                     open_styles.pop();
                 }
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::Eof) | Err(_) => return,
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
             Ok(_) => {
                 buffer.clear();
                 continue;
@@ -1629,36 +1646,113 @@ fn scan_odp_page_styles(bytes: &[u8], styles: &mut OdpPageStyles) {
         };
         let local = xml_local_name(event.name().as_ref()).to_vec();
         let attributes = xml_attributes(&event);
+        let value = |wanted: &[u8]| {
+            attributes
+                .iter()
+                .find(|attribute| attribute.local() == wanted)
+                .map(|attribute| attribute.value.trim().to_string())
+        };
         match local.as_slice() {
-            b"style" if start => open_styles.push(
-                attributes
-                    .iter()
-                    .find(|attribute| attribute.local() == b"name")
-                    .map(|attribute| attribute.value.clone())
-                    .unwrap_or_default(),
-            ),
-            b"drawing-page-properties" => {
-                let hidden = attributes.iter().any(|attribute| {
-                    attribute.local() == b"visibility"
-                        && attribute.value.trim().eq_ignore_ascii_case("hidden")
-                });
-                if let Some(style) = open_styles.last().filter(|_| hidden) {
-                    styles.hidden.insert(style.clone());
+            b"style" => {
+                let open = match value(b"name") {
+                    None => OdpOpenStyle::Unnamed,
+                    Some(name) => {
+                        let parent = value(b"parent-style-name");
+                        if value(b"family")
+                            .is_some_and(|family| family.eq_ignore_ascii_case("drawing-page"))
+                        {
+                            let entries = visibility.page_styles.entry(name.clone()).or_default();
+                            entries.push((parent, None));
+                            definitions += 1;
+                            OdpOpenStyle::Page(name, entries.len() - 1)
+                        } else {
+                            OdpOpenStyle::Other(name, parent)
+                        }
+                    }
+                };
+                if start {
+                    open_styles.push(open);
                 }
             }
-            b"page" => styles.used.extend(
-                attributes
-                    .into_iter()
+            b"default-style" => {
+                if start {
+                    open_styles.push(OdpOpenStyle::Default);
+                }
+            }
+            b"drawing-page-properties" => {
+                if let (Some(open), Some(setting)) = (open_styles.last_mut(), value(b"visibility"))
+                {
+                    let hidden = setting.eq_ignore_ascii_case("hidden");
+                    match open {
+                        OdpOpenStyle::Page(name, index) => {
+                            if let Some(definition) = visibility
+                                .page_styles
+                                .get_mut(name.as_str())
+                                .and_then(|entries| entries.get_mut(*index))
+                            {
+                                definition.1 = Some(definition.1.unwrap_or(false) || hidden);
+                            }
+                        }
+                        // Page properties under a style of another family
+                        // are recorded as a page style too.
+                        OdpOpenStyle::Other(name, parent) => {
+                            let entries = visibility.page_styles.entry(name.clone()).or_default();
+                            entries.push((parent.take(), Some(hidden)));
+                            definitions += 1;
+                            *open = OdpOpenStyle::Page(name.clone(), entries.len() - 1);
+                        }
+                        OdpOpenStyle::Default => {
+                            visibility.default_hidden =
+                                Some(visibility.default_hidden.unwrap_or(false) || hidden);
+                        }
+                        OdpOpenStyle::Unnamed => {}
+                    }
+                }
+            }
+            b"layer" => {
+                if attributes.iter().any(|attribute| {
+                    attribute.local() == b"display" && odp_display_hides(&attribute.value)
+                }) {
+                    visibility.hidden_layers.extend(value(b"name"));
+                }
+            }
+            b"page" if content => {
+                let styles: Vec<String> = attributes
+                    .iter()
                     .filter(|attribute| attribute.local() == b"style-name")
-                    .map(|attribute| attribute.value),
-            ),
+                    .map(|attribute| attribute.value.trim().to_string())
+                    .collect();
+                if styles.is_empty() {
+                    visibility.pages.insert(None);
+                }
+                visibility.pages.extend(styles.into_iter().map(Some));
+            }
+            _ if content => {
+                for attribute in &attributes {
+                    match attribute.local() {
+                        b"display" if odp_display_hides(&attribute.value) => {
+                            visibility.hidden_shape = true;
+                        }
+                        b"layer" => {
+                            visibility
+                                .used_layers
+                                .insert(attribute.value.trim().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
+        if !visibility.within_bounds(definitions) {
+            return Err(DocumentError::ResourceLimit);
+        }
         if start {
-            stack.push(local);
+            stack.push(matches!(local.as_slice(), b"style" | b"default-style"));
         }
         buffer.clear();
     }
+    Ok(())
 }
 
 const ODF_OFFICE_NAMESPACE: &[u8] = b"urn:oasis:names:tc:opendocument:xmlns:office:1.0";
@@ -1791,7 +1885,10 @@ fn xml_has_odt_hidden_or_tracked_content(bytes: &[u8]) -> bool {
                     let value = attribute.value.trim().to_ascii_lowercase();
                     if (attribute.local() == b"condition" && !value.is_empty())
                         || (attribute.local() == b"display"
-                            && matches!(value.as_str(), "none" | "false" | "0" | "hidden"))
+                            && matches!(
+                                value.as_str(),
+                                "none" | "false" | "0" | "hidden" | "printer"
+                            ))
                     {
                         return true;
                     }
@@ -4257,7 +4354,7 @@ fn preflight_package(
 
     let layout = ooxml_layout(&mut archive, kind)?;
     let mut docx_scan = DocxStoryScan::default();
-    let mut odp_page_styles = OdpPageStyles::default();
+    let mut odp_visibility = OdpVisibility::default();
     let mut result = PackagePreflight::default();
     let mut ppt_presentation = None;
     let mut ppt_presentation_rels = None;
@@ -4423,14 +4520,25 @@ fn preflight_package(
                     // follows the body, so a package whose body belongs to
                     // another lane lacks the content its own lane requires.
                     result.missing_required_content |= odf_body_kind(&content) != Some(kind);
-                    if matches!(kind, DocumentKind::Odp) {
-                        scan_odp_page_styles(&content, &mut odp_page_styles);
+                    if matches!(kind, DocumentKind::Odp) && name == "content.xml" {
+                        scan_odp_visibility(&content, true, &mut odp_visibility)?;
                     }
                     result.external_relationships |= xml_has_odf_external_reference(&content);
                     result.active_content |= xml_has_odf_active_content(&content);
+                    if name == "content.xml" {
+                        let (body, spreadsheet) = match kind {
+                            DocumentKind::Odt => (odf_walk::OdfBody::Text, false),
+                            DocumentKind::Ods => (odf_walk::OdfBody::Spreadsheet, true),
+                            _ => (odf_walk::OdfBody::Presentation, false),
+                        };
+                        let walk = odf_walk::walk_content(&content, body, spreadsheet)?;
+                        result.unsupported_content |= walk.dropped_text;
+                        if spreadsheet {
+                            result.missing_formula_cache |= walk.uncached_formula;
+                        }
+                    }
                     if matches!(kind, DocumentKind::Ods) {
                         result.hidden_content |= xml_has_odf_hidden_content(&content);
-                        result.missing_formula_cache |= xml_has_uncached_odf_formula(&content);
                         result.missing_required_content |= !xml_has_odf_spreadsheet(&content);
                     } else if matches!(kind, DocumentKind::Odt) {
                         result.hidden_content |= xml_has_odt_hidden_or_tracked_content(&content);
@@ -4468,7 +4576,7 @@ fn preflight_package(
                         result.hidden_content |= xml_has_odp_hidden_content(&content);
                         result.external_relationships |= xml_has_odf_external_reference(&content);
                         odf_references.extend(xml_odf_internal_references(&content));
-                        scan_odp_page_styles(&content, &mut odp_page_styles);
+                        scan_odp_visibility(&content, false, &mut odp_visibility)?;
                     }
                 }
             }
@@ -4527,7 +4635,7 @@ fn preflight_package(
         kind,
         DocumentKind::Odt | DocumentKind::Ods | DocumentKind::Odp
     ) {
-        result.hidden_content |= odp_page_styles.hides_a_page();
+        result.hidden_content |= odp_visibility.hides_content();
         let mimetype = odf_mimetype.ok_or(DocumentError::Malformed)?;
         let mimetype = std::str::from_utf8(&mimetype)
             .map_err(|_| DocumentError::Malformed)?
@@ -4642,6 +4750,7 @@ fn preflight_rejection(kind: DocumentKind, preflight: &PackagePreflight) -> Opti
                 || preflight.missing_formula_cache
                 || preflight.external_relationships
                 || preflight.missing_required_content
+                || preflight.unsupported_content
         }
         DocumentKind::Odt => {
             preflight.hidden_content
@@ -4649,10 +4758,16 @@ fn preflight_rejection(kind: DocumentKind, preflight: &PackagePreflight) -> Opti
                 || preflight.missing_required_content
                 || preflight.unsupported_content
         }
-        DocumentKind::Pptx | DocumentKind::Odp | DocumentKind::Epub => {
+        DocumentKind::Pptx | DocumentKind::Epub => {
             preflight.hidden_content
                 || preflight.external_relationships
                 || preflight.missing_required_content
+        }
+        DocumentKind::Odp => {
+            preflight.hidden_content
+                || preflight.external_relationships
+                || preflight.missing_required_content
+                || preflight.unsupported_content
         }
         _ => false,
     };
@@ -6702,6 +6817,90 @@ mod tests {
         assert!(!Rc::ptr_eq(&first, &other));
         assert_eq!(stylesheets.linked.len(), 1);
         assert_eq!(stylesheets.rules, 1);
+    }
+
+    #[test]
+    fn odp_visibility_follows_styles_layers_and_display() {
+        let hides = |content: &str, styles: &str| {
+            let mut visibility = OdpVisibility::default();
+            scan_odp_visibility(styles.as_bytes(), false, &mut visibility).unwrap();
+            scan_odp_visibility(content.as_bytes(), true, &mut visibility).unwrap();
+            visibility.hides_content()
+        };
+        let style = |name: &str, parent: &str, visibility: &str| {
+            let parent = if parent.is_empty() {
+                String::new()
+            } else {
+                format!(r#" style:parent-style-name="{parent}""#)
+            };
+            let properties = if visibility.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<style:drawing-page-properties presentation:visibility="{visibility}"/>"#
+                )
+            };
+            format!(
+                r#"<style:style style:name="{name}" style:family="drawing-page"{parent}>{properties}</style:style>"#
+            )
+        };
+        let page = |style: &str, shapes: &str| {
+            format!(r#"<draw:page draw:style-name="{style}">{shapes}</draw:page>"#)
+        };
+        // A slide style hides a slide itself or through its parent.
+        assert!(hides(&(style("dp1", "", "hidden") + &page("dp1", "")), ""));
+        assert!(hides(
+            &(style("dp2", "base", "") + &page("dp2", "")),
+            &style("base", "", "hidden")
+        ));
+        assert!(!hides(
+            &(style("dp3", "base", "visible") + &page("dp3", "")),
+            &style("base", "", "hidden")
+        ));
+        // A style defined in both parts hides if either definition does.
+        assert!(hides(
+            &(style("dp4", "", "") + &page("dp4", "")),
+            &(style("dp4", "base", "") + &style("base", "", "hidden"))
+        ));
+        // A chain too long to follow is taken to hide the slide.
+        let chain: String = (0..=MAX_ODP_STYLE_CHAIN)
+            .map(|link| style(&format!("s{link}"), &format!("s{}", link + 1), ""))
+            .collect();
+        assert!(hides(&(chain.clone() + &page("s0", "")), ""));
+        assert!(!hides(&(chain + &page("s50", "")), ""));
+        // Page properties count under a style of another family, but not
+        // under a style nothing can apply.
+        let graphic = r#"<style:style style:name="gr1" style:family="graphic"><style:drawing-page-properties presentation:visibility="hidden"/></style:style>"#;
+        assert!(hides(&page("gr1", ""), graphic));
+        let unnamed = r#"<style:style style:family="drawing-page"><style:drawing-page-properties presentation:visibility="hidden"/></style:style>"#;
+        assert!(!hides(&page("none", ""), unnamed));
+        // The default drawing-page style hides slides that set nothing.
+        let default = r#"<style:default-style style:family="drawing-page"><style:drawing-page-properties presentation:visibility="hidden"/></style:default-style>"#;
+        assert!(hides(&page("none", ""), default));
+        assert!(!hides(&page("none", ""), ""));
+        // A shape shown only in print, or on a hidden layer.
+        assert!(hides(
+            &page("x", r#"<draw:frame draw:display="printer"/>"#),
+            ""
+        ));
+        assert!(hides(
+            &page("x", r#"<draw:custom-shape draw:display="none"/>"#),
+            ""
+        ));
+        let layers = r#"<draw:layer-set><draw:layer draw:name="Secret" draw:display="none"/></draw:layer-set>"#;
+        assert!(hides(
+            &page("x", r#"<draw:custom-shape draw:layer="Secret"/>"#),
+            layers
+        ));
+        assert!(!hides(
+            &page("x", r#"<draw:custom-shape draw:layer="layout"/>"#),
+            layers
+        ));
+        // Master-page shapes in the styles part are not converted.
+        assert!(!hides(
+            &page("x", ""),
+            r#"<style:master-page><draw:frame draw:display="none"/></style:master-page>"#
+        ));
     }
 
     #[test]
