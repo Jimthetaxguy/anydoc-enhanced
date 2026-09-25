@@ -3543,13 +3543,18 @@ impl DocxMarker {
 }
 
 /// A list instance as one side of the replay counts it: the definition its
-/// levels come from, which Word shares counters through, and its levels and
-/// markers.
+/// levels come from, which Word shares counters through, its levels and
+/// markers, and the styles its levels are bound to, each with the first
+/// level bound to it.
 struct DocxInstance {
     definition: String,
     levels: [DocxLevel; DOCX_LIST_LEVELS],
     markers: [DocxMarker; DOCX_LIST_LEVELS],
+    bound: Vec<(usize, usize)>,
 }
+
+/// The list instances the replay has read, for one side.
+type DocxInstances = HashMap<u64, Option<DocxInstance>>;
 
 /// A paragraph's list label as one side shows it.
 #[derive(Debug, PartialEq, Eq)]
@@ -3764,12 +3769,19 @@ impl DocxNumbering {
     }
 
     /// A list instance as Word or as AnyDoc counts it.
-    fn instance(&self, list: u64, styles: &DocxStyleNumbering, word: bool) -> Option<DocxInstance> {
+    fn instance(
+        &self,
+        list: u64,
+        styles: &DocxStyleNumbering,
+        chains: &DocxStyleChains,
+        word: bool,
+    ) -> Option<DocxInstance> {
         let instance = self.lists.get(&list)?;
         let definition = self.resolve_definition(&instance.definition, styles, word)?;
         let levels = self.levels_from(instance, definition)?;
         Some(DocxInstance {
             definition: definition.to_string(),
+            bound: chains.bound(&levels),
             markers: levels.each_ref().map(|level| {
                 if word {
                     DocxMarker::word(level.as_ref())
@@ -3790,10 +3802,17 @@ impl DocxNumbering {
     /// along the chain that is bound or names its own level
     /// (`w:numPr/w:ilvl`); a style that does both is numbered at the level
     /// bound to it. A list instance of 0 removes numbering.
-    fn resolve_use(&self, used: &DocxListUse, styles: &DocxStyleNumbering) -> DocxResolved {
+    fn resolve_use(
+        &self,
+        used: &DocxListUse,
+        styles: &DocxStyleNumbering,
+        chains: &DocxStyleChains,
+        word_instances: &mut DocxInstances,
+        anydoc_instances: &mut DocxInstances,
+    ) -> DocxResolved {
         let list = match (used.list, used.style.as_deref()) {
             (Some(list), _) => list,
-            (None, Some(style)) => match styles.list(style) {
+            (None, Some(style)) => match chains.list(style) {
                 Some(list) => list,
                 None => return DocxResolved::default(),
             },
@@ -3802,42 +3821,21 @@ impl DocxNumbering {
         if list == 0 {
             return DocxResolved::default();
         }
-        let side = |word: bool| {
-            let instance = self.lists.get(&list)?;
-            let levels = self.levels_from(
-                instance,
-                self.resolve_definition(&instance.definition, styles, word)?,
-            )?;
+        let side = |word: bool, instances: &mut DocxInstances| {
+            let instance = instances
+                .entry(list)
+                .or_insert_with(|| self.instance(list, styles, chains, word))
+                .as_ref()?;
             let level = match (used.level, used.style.as_deref()) {
                 (Some(level), _) => level,
-                (None, Some(style)) => styles
-                    .chain(style)
-                    .find_map(|style| {
-                        let bound = levels.iter().position(|level| {
-                            level
-                                .as_ref()
-                                .is_some_and(|level| level.style.as_deref() == Some(style))
-                        });
-                        let named = || {
-                            styles
-                                .styles
-                                .get(style)
-                                .and_then(|definition| definition.level)
-                        };
-                        if word {
-                            bound.or_else(named)
-                        } else {
-                            bound
-                        }
-                    })
-                    .unwrap_or(0),
+                (None, Some(style)) => chains.level(style, &instance.bound, word),
                 (None, None) => 0,
             };
             Some((list, level.min(DOCX_LIST_LEVELS - 1)))
         };
         DocxResolved {
-            word: side(true),
-            anydoc: side(false),
+            word: side(true, word_instances),
+            anydoc: side(false, anydoc_instances),
         }
     }
 
@@ -3897,16 +3895,25 @@ impl DocxNumbering {
         if scan.padded_numbering || self.padded || styles.padded {
             return !scan.list_paragraphs.is_empty();
         }
+        let chains = DocxStyleChains::new(styles);
+        let mut word_instances = DocxInstances::new();
+        let mut anydoc_instances = DocxInstances::new();
         let resolved: Vec<DocxResolved> = scan
             .list_uses
             .iter()
-            .map(|used| self.resolve_use(used, styles))
+            .map(|used| {
+                self.resolve_use(
+                    used,
+                    styles,
+                    &chains,
+                    &mut word_instances,
+                    &mut anydoc_instances,
+                )
+            })
             .collect();
         if Self::notes_out_of_order(scan, &resolved) {
             return true;
         }
-        let mut word_instances: HashMap<u64, Option<DocxInstance>> = HashMap::new();
-        let mut anydoc_instances: HashMap<u64, Option<DocxInstance>> = HashMap::new();
         // Word's stories: a part, or `None` for the text boxes.
         let mut word: HashMap<(Option<DocxPart>, String), DocxCounters> = HashMap::new();
         let mut anydoc: HashMap<u64, DocxCounters> = HashMap::new();
@@ -3931,7 +3938,7 @@ impl DocxNumbering {
             let anydoc_label = match resolved.anydoc.filter(|_| paragraph.anydoc) {
                 Some((list, level)) => match anydoc_instances
                     .entry(list)
-                    .or_insert_with(|| self.instance(list, styles, false))
+                    .or_insert_with(|| self.instance(list, styles, &chains, false))
                 {
                     Some(instance) if matches!(instance.markers[level], DocxMarker::Count(_)) => {
                         let start = |level: usize| {
@@ -3959,7 +3966,7 @@ impl DocxNumbering {
             let word_label = match resolved.word {
                 Some((list, level)) => match word_instances
                     .entry(list)
-                    .or_insert_with(|| self.instance(list, styles, true))
+                    .or_insert_with(|| self.instance(list, styles, &chains, true))
                 {
                     Some(instance) => {
                         let story = (!paragraph.in_text_box).then_some(paragraph.part);
@@ -3997,7 +4004,7 @@ impl DocxNumbering {
                 return true;
             }
         }
-        styles.exhausted()
+        false
     }
 }
 
@@ -4010,8 +4017,6 @@ struct DocxStyleNumbering {
     styles: HashMap<String, DocxStyleList>,
     /// A style's list instance written with white space around it.
     padded: bool,
-    /// Styles stepped through along chains, across the document.
-    steps: std::cell::Cell<usize>,
 }
 
 #[derive(Default)]
@@ -4022,45 +4027,167 @@ struct DocxStyleList {
     level: Option<usize>,
 }
 
-/// Styles stepped through along `w:basedOn` chains in one document. AnyDoc
-/// follows a chain to its end, stopping only at a cycle; past this budget
-/// the numbering is taken to differ.
-const MAX_DOCX_CHAIN_STEPS: usize = 1 << 22;
+/// Paragraph styles' numbering read along their `w:basedOn` chains once,
+/// in one walk over the styles, so that a paragraph's style costs nothing
+/// to follow however long its chain. A chain ends at a style the parts do
+/// not define, and where it would pass a style again; AnyDoc refuses a
+/// document whose converted text reaches such a cycle.
+struct DocxStyleChains<'a> {
+    index: HashMap<&'a str, usize>,
+    /// Each style's list instance: the first along its chain naming one.
+    list: Vec<Option<u64>>,
+    /// The first style along each chain that names its own level, and the
+    /// level.
+    named: Vec<Option<(usize, usize)>>,
+    /// Each style's distance from the end of its chain, and when the walk
+    /// entered it and left the styles based on it, which tell whether a
+    /// style lies on another's chain.
+    depth: Vec<usize>,
+    entered: Vec<usize>,
+    left: Vec<usize>,
+}
 
-impl DocxStyleNumbering {
-    /// A style and those it is based on, child first, to the chain's end or
-    /// a style it already passed.
-    fn chain<'a>(&'a self, style: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        let mut current = Some(style);
-        let mut seen = HashSet::new();
-        std::iter::from_fn(move || {
-            let style = current?;
-            let steps = self.steps.get() + 1;
-            self.steps.set(steps);
-            if !seen.insert(style) || steps > MAX_DOCX_CHAIN_STEPS {
-                return None;
+impl<'a> DocxStyleChains<'a> {
+    fn new(styles: &'a DocxStyleNumbering) -> Self {
+        let mut ids: Vec<&str> = styles.styles.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        let index: HashMap<&str, usize> =
+            ids.iter().enumerate().map(|(at, &id)| (id, at)).collect();
+        let definitions: Vec<&DocxStyleList> = ids.iter().map(|&id| &styles.styles[id]).collect();
+        let mut bases: Vec<Option<usize>> = definitions
+            .iter()
+            .map(|definition| {
+                definition
+                    .based_on
+                    .as_deref()
+                    .and_then(|base| index.get(base).copied())
+            })
+            .collect();
+        // Cut each cycle where a walk along a chain meets it.
+        let mut walked = vec![0u8; ids.len()];
+        for start in 0..ids.len() {
+            let mut path = Vec::new();
+            let mut current = Some(start);
+            while let Some(style) = current {
+                match walked[style] {
+                    0 => {
+                        walked[style] = 1;
+                        path.push(style);
+                        current = bases[style];
+                    }
+                    1 => {
+                        if let Some(&last) = path.last() {
+                            bases[last] = None;
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
             }
-            current = self
-                .styles
-                .get(style)
-                .and_then(|definition| definition.based_on.as_deref());
-            Some(style)
-        })
+            for style in path {
+                walked[style] = 2;
+            }
+        }
+        let mut derived: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+        for (style, base) in bases.iter().enumerate() {
+            if let Some(base) = base {
+                derived[*base].push(style);
+            }
+        }
+        let mut chains = DocxStyleChains {
+            index,
+            list: vec![None; ids.len()],
+            named: vec![None; ids.len()],
+            depth: vec![0; ids.len()],
+            entered: vec![0; ids.len()],
+            left: vec![0; ids.len()],
+        };
+        // Walk from each chain's end to the styles based on it, so that a
+        // style's base is read before the style.
+        let mut clock = 0;
+        let mut pending: Vec<(usize, bool)> = (0..ids.len())
+            .filter(|&style| bases[style].is_none())
+            .map(|style| (style, false))
+            .collect();
+        while let Some((style, done)) = pending.pop() {
+            if done {
+                chains.left[style] = clock;
+                continue;
+            }
+            chains.entered[style] = clock;
+            clock += 1;
+            let base = bases[style];
+            let definition = definitions[style];
+            chains.depth[style] = base.map_or(0, |base| chains.depth[base] + 1);
+            chains.list[style] = definition
+                .list
+                .or_else(|| base.and_then(|base| chains.list[base]));
+            chains.named[style] = definition
+                .level
+                .map(|level| (style, level))
+                .or_else(|| base.and_then(|base| chains.named[base]));
+            pending.push((style, true));
+            pending.extend(derived[style].iter().map(|&style| (style, false)));
+        }
+        chains
     }
 
-    /// Whether the chains stepped through ran past their budget.
-    fn exhausted(&self) -> bool {
-        self.steps.get() > MAX_DOCX_CHAIN_STEPS
-    }
-
-    /// The list instance a paragraph style numbers with: the first along its
-    /// chain that names one.
+    /// The list instance a paragraph style numbers with.
     fn list(&self, style: &str) -> Option<u64> {
-        self.chain(style).find_map(|style| {
-            self.styles
-                .get(style)
-                .and_then(|definition| definition.list)
-        })
+        self.index.get(style).and_then(|&style| self.list[style])
+    }
+
+    /// The styles a list's levels are bound to (`w:lvl/w:pStyle`), each
+    /// with the first level bound to it.
+    fn bound(&self, levels: &[Option<DocxLevel>; DOCX_LIST_LEVELS]) -> Vec<(usize, usize)> {
+        let mut bound: Vec<(usize, usize)> = Vec::new();
+        for (at, level) in levels.iter().enumerate() {
+            let Some(&style) = level
+                .as_ref()
+                .and_then(|level| level.style.as_deref())
+                .and_then(|style| self.index.get(style))
+            else {
+                continue;
+            };
+            if !bound.iter().any(|&(already, _)| already == style) {
+                bound.push((style, at));
+            }
+        }
+        bound
+    }
+
+    /// The level a paragraph style numbers at in a list whose levels are
+    /// bound to `bound`. AnyDoc takes the level bound to the first style
+    /// along the chain that a level names, else the first, reading no
+    /// style's own level, as ECMA-376 says. Word, as LibreOffice shows it,
+    /// takes the nearest style along the chain that is bound or names its
+    /// own level (`w:numPr/w:ilvl`); a style that does both is numbered at
+    /// the level bound to it.
+    fn level(&self, style: &str, bound: &[(usize, usize)], word: bool) -> usize {
+        let Some(&style) = self.index.get(style) else {
+            return 0;
+        };
+        let on_chain = |ancestor: usize| {
+            self.entered[ancestor] <= self.entered[style]
+                && self.entered[style] < self.left[ancestor]
+        };
+        let binding = bound
+            .iter()
+            .filter(|&&(ancestor, _)| on_chain(ancestor))
+            .max_by_key(|&&(ancestor, _)| self.depth[ancestor]);
+        let named = self.named[style].filter(|_| word);
+        match (binding, named) {
+            (Some(&(ancestor, level)), Some((nearer, own))) => {
+                if self.depth[ancestor] >= self.depth[nearer] {
+                    level
+                } else {
+                    own
+                }
+            }
+            (Some(&(_, level)), None) => level,
+            (None, Some((_, own))) => own,
+            (None, None) => 0,
+        }
     }
 }
 
@@ -10693,6 +10820,58 @@ mod tests {
             assert!(!composite(parent, "<w:isLgl/>"), "{parent}");
         }
         assert!(!composite("upperRoman", ""));
+    }
+
+    #[test]
+    fn docx_style_chains_are_read_once_per_style() {
+        let differs = |styles: &str| {
+            // Each paragraph names a style farther along one chain of
+            // thousands, as a crafted document can.
+            let body: String = (0..3000)
+                .map(|index| {
+                    format!(
+                        r#"<w:p><w:pPr><w:pStyle w:val="S{}"/></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#,
+                        2999 - index
+                    )
+                })
+                .collect();
+            let document = word_part("document", &body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let chain = |root: &str| -> String {
+            (0..3000)
+                .map(|index| {
+                    if index == 0 {
+                        format!(
+                            r#"<w:style w:type="paragraph" w:styleId="S0"><w:pPr>{root}</w:pPr></w:style>"#
+                        )
+                    } else {
+                        format!(
+                            r#"<w:style w:type="paragraph" w:styleId="S{index}"><w:basedOn w:val="S{}"/></w:style>"#,
+                            index - 1
+                        )
+                    }
+                })
+                .collect()
+        };
+        // A document with no list is not disclosed, and a list at the
+        // chain's end numbers every paragraph alike on both sides.
+        assert!(!differs(&chain("")));
+        assert!(!differs(&chain(
+            r#"<w:numPr><w:numId w:val="1"/></w:numPr>"#
+        )));
+        // A cycle ends the chain.
+        let cycle = r#"<w:style w:type="paragraph" w:styleId="S2999"><w:basedOn w:val="S2998"/></w:style><w:style w:type="paragraph" w:styleId="S2998"><w:basedOn w:val="S2999"/></w:style>"#;
+        assert!(!differs(cycle));
     }
 
     #[test]
