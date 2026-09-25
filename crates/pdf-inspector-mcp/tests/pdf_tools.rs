@@ -711,10 +711,158 @@ fn text_drawn_through_forms_pdf_inspector_misses_is_reported() {
     );
 }
 
+/// A one-page PDF showing each of `runs`, a string in 9-point Helvetica
+/// placed at its left end and baseline.
+fn helvetica_runs_pdf(runs: &[(f64, u32, &str)]) -> Vec<u8> {
+    let content: String = runs
+        .iter()
+        .map(|(x, y, text)| {
+            let text = text.replace('(', "\\(").replace(')', "\\)");
+            format!("BT /F1 9 Tf 1 0 0 1 {x} {y} Tm ({text}) Tj ET\n")
+        })
+        .collect();
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", content.as_bytes()),
+    ])
+}
+
+/// A 1099-B page whose wash-sale column starts 3 points past the cost basis,
+/// every lot holding both, under "Cost basis" right-aligned over the basis
+/// and "Wash sale" starting over the adjustments, 3 points past it too
+/// (pdf-inspector #424).
+fn dense_1099b_pdf() -> Vec<u8> {
+    let title = "Form 1099-B proceeds from broker transactions, sample account";
+    let mut runs = vec![(72.0, 590, title)];
+    let headings = [72.0, 190.0, 291.98, 357.99, 403.0].into_iter().zip([
+        "Description",
+        "Date sold",
+        "Proceeds",
+        "Cost basis",
+        "Wash sale",
+    ]);
+    runs.extend(headings.map(|(x, heading)| (x, 560, heading)));
+    // Each lot's description, date sold, proceeds, basis, and adjustment.
+    let lots = [
+        "100 sh Sample Co|03/14/2025|2,810.25|2,610.25|205.25",
+        "50 sh Example Inc|04/02/2025|1,450.00|1,300.00|112.40",
+        "20 sh Demo Corp|05/20/2025|980.40|1,020.10|380.15",
+        "75 sh Test Ltd|06/11/2025|3,300.00|3,120.00|240.00",
+    ];
+    for (index, lot) in lots.iter().enumerate() {
+        let y = 546 - 14 * index as u32;
+        let fields: Vec<&str> = lot.split('|').collect();
+        // The proceeds are right-aligned at 330, the basis at 400.
+        let proceeds = if fields[2].len() == 6 { 302.48 } else { 294.97 };
+        let columns = [72.0, 190.0, proceeds, 364.97, 403.0];
+        runs.extend(
+            columns
+                .into_iter()
+                .zip(fields)
+                .map(|(x, text)| (x, y, text)),
+        );
+    }
+    runs.push((
+        72.0,
+        440,
+        "Totals carry to Form 8949 for the sample account.",
+    ));
+    helvetica_runs_pdf(&runs)
+}
+
+/// A holdings page whose gain column shows each gain with its percentage
+/// beside it, one cell under one heading: "Gain/loss" right-aligned over
+/// both, or, with `folio`, "Gain/loss (percent)" over both and the page's
+/// folio right-aligned far above the percentages.
+fn gain_and_percent_pdf(folio: bool) -> Vec<u8> {
+    let mut runs = vec![(72.0, 740, "Portfolio holdings as of April 30, 2025")];
+    let headings = [72.0, 271.49, 348.48]
+        .into_iter()
+        .zip(["Security", "Shares", "Market value"]);
+    runs.extend(headings.map(|(x, heading)| (x, 712, heading)));
+    if folio {
+        runs.extend([(511.5, 770, "Page 1"), (443.4, 712, "Gain/loss (percent)")]);
+    } else {
+        runs.push((502.49, 712, "Gain/loss"));
+    }
+    // Each holding's runs, by where they start: its name, shares, market
+    // value, and gain and percentage, right-aligned as a pair at 540.
+    let holdings = [
+        [
+            (72.0, "Sample Growth Fund"),
+            (267.47, "100.000"),
+            (359.97, "12,450.00"),
+            (470.46, "1,234.56"),
+            (508.49, "(9.02%)"),
+        ],
+        [
+            (72.0, "Sample Income Fund"),
+            (267.47, "250.000"),
+            (364.97, "8,100.25"),
+            (471.98, "-310.40"),
+            (505.49, "(-3.69%)"),
+        ],
+    ];
+    for (index, holding) in holdings.iter().enumerate() {
+        let y = 698 - 14 * index as u32;
+        runs.extend(holding.iter().map(|&(x, text)| (x, y, text)));
+    }
+    helvetica_runs_pdf(&runs)
+}
+
+#[test]
+fn table_amounts_merged_across_columns_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for (name, pdf) in [
+        ("dense.pdf", dense_1099b_pdf()),
+        ("gain.pdf", gain_and_percent_pdf(false)),
+        ("folio.pdf", gain_and_percent_pdf(true)),
+    ] {
+        let path = temporary.path().join(name);
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| {
+        result["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "table_values_merged")
+        })
+    };
+    // pdf-inspector 1.24.0 joins the two headings, and each lot's basis and
+    // adjustment, into one cell; when a release fixes #424, this
+    // expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("|Cost basis Wash sale|") && markdown.contains("|2,610.25 205.25|"),
+        "{markdown}"
+    );
+    assert!(reported(&results[0]), "{}", results[0]);
+    // A gain beside its percentage is one cell's text, under one heading
+    // over both, and the folio above heads nothing.
+    for result in &results[1..] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("1,234.56 (9.02%)"), "{markdown}");
+        assert!(!reported(result), "{result}");
+    }
+}
+
 /// A card statement page listing `rows` purchases under Date, Description
 /// and Amount headings, with the amounts right-aligned at the far edge and
 /// the new balance on a line of its own below them (pdf-inspector #424).
 fn card_statement_pdf(rows: usize) -> Vec<u8> {
+    card_statement_marked_pdf(rows, false)
+}
+
+/// `card_statement_pdf`, with a dollar sign set apart at the left of each
+/// amount's cell when `dollars` is set.
+fn card_statement_marked_pdf(rows: usize, dollars: bool) -> Vec<u8> {
     let text = |font: &str, x: &str, y: usize, text: &str| {
         format!("BT /{font} 9 Tf 1 0 0 1 {x} {y} Tm ({text}) Tj ET\n")
     };
@@ -727,6 +875,9 @@ fn card_statement_pdf(rows: usize) -> Vec<u8> {
         content.push_str(&text("F1", "72", y, &format!("03/{:02}", row + 1)));
         let purchase = format!("Purchase at merchant {}", row + 1);
         content.push_str(&text("F1", "130", y, &purchase));
+        if dollars {
+            content.push_str(&text("F1", "470", y, "$"));
+        }
         content.push_str(&text("F1", "514.98", y, &format!("{}.40", 12 + 3 * row)));
     }
     content.push_str(&text("F1", "499.97", 690 - 14 * rows, "1,106.00"));
@@ -744,10 +895,14 @@ fn card_statement_pdf(rows: usize) -> Vec<u8> {
 fn table_amounts_pushed_out_of_their_rows_are_reported() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");
     let mut calls = Vec::new();
-    for rows in [20, 12] {
-        let pdf = temporary.path().join(format!("statement-{rows}.pdf"));
-        std::fs::write(&pdf, card_statement_pdf(rows)).expect("write PDF");
-        let path = pdf.to_str().expect("UTF-8 path").to_string();
+    for (name, pdf) in [
+        ("statement-20.pdf", card_statement_pdf(20)),
+        ("statement-12.pdf", card_statement_pdf(12)),
+        ("dollars.pdf", card_statement_marked_pdf(20, true)),
+    ] {
+        let path = temporary.path().join(name);
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
         calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
     }
     let results = call_tools(&calls, None);
@@ -776,6 +931,11 @@ fn table_amounts_pushed_out_of_their_rows_are_reported() {
         "{markdown}"
     );
     assert!(!reported(&results[1]), "{}", results[1]);
+    // With the dollar signs set apart, the dropped amounts follow as a
+    // table of their own beside them.
+    let markdown = results[2]["markdown"].as_str().unwrap_or_default();
+    assert!(markdown.contains("|$|15.40|"), "{markdown}");
+    assert!(reported(&results[2]), "{}", results[2]);
 }
 
 /// A consolidated statement with a page for each account, each headed by

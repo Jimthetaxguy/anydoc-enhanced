@@ -14,8 +14,9 @@
 //!
 //! **Amounts pushed out of their rows.** A column the grid drops, such as a
 //! 1099-B's sparse wash-sale adjustments or a long statement's amounts,
-//! follows the table instead, an amount a line, apart from the rows the
-//! page sets them on (open upstream #424).
+//! follows the table instead, apart from the rows the page sets them on:
+//! an amount a line, several to a line, after the column's heading, or as
+//! a table of their own beside their currency signs (open upstream #424).
 //!
 //! All are read from the Markdown and reported, never repaired. A repeat
 //! counts where it stands as the detector leaves it: on a line of its own,
@@ -25,13 +26,13 @@
 //! after the heading words the detector left there too. A sentence that
 //! restates a shorter first row does not. A cell holding two
 //! amounts is a candidate, which the page's positioned text decides (see
-//! `Layout::placement`): amounts of separate runs on one baseline under a
-//! heading of their own were merged, while amounts stacked one above the
-//! other, or written as one run, stand as the page sets them. Where the
-//! text cannot be read there, a candidate counts beside an empty cell, or
-//! in a column whose other rows hold one amount. Amounts on lines of their
-//! own right after a table, which its cells do not hold, count where the
-//! page sets most of them on the lines of its body rows (see
+//! `Layout::placement`): amounts of separate runs on one baseline, each
+//! under a heading of its own in the table's header, were merged, while
+//! amounts stacked one above the other, or written as one run, stand as the
+//! page sets them. Where the text cannot be read there, a candidate counts
+//! beside an empty cell, or in a column whose other rows hold one amount.
+//! Amounts right after a table, which its cells do not hold, count where
+//! the page sets most of them on the lines of its body rows (see
 //! `Layout::detached`).
 
 /// What the checks found.
@@ -40,13 +41,12 @@ pub(crate) struct TableFindings {
     pub(crate) row_repeated: bool,
     /// Body cells holding two or more amounts.
     pub(crate) merged: Vec<MergedCell>,
-    /// Amounts on lines of their own right after a table.
+    /// Amounts right after a table.
     pub(crate) detached: Vec<Detached>,
 }
 
-/// Amounts the Markdown shows on lines of their own right after a table,
-/// and the table's body cells that hold more than amounts, such as its
-/// labels and dates.
+/// Amounts the Markdown shows right after a table, and the table's body
+/// cells that hold more than amounts, such as its labels and dates.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Detached {
     pub(crate) amounts: Vec<String>,
@@ -75,7 +75,7 @@ pub(crate) struct MergedCell {
 /// Merged-cell candidates read per document.
 const MAX_MERGED_CELLS: usize = 256;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crate::text_paints::Placed;
@@ -180,19 +180,85 @@ pub(crate) fn check(markdown: &str) -> TableFindings {
     found
 }
 
-/// The amounts on lines of their own that `lines` opens with, blank lines
-/// aside.
+/// The amounts `lines` open with, blank lines aside, as pdf-inspector sets
+/// out a column the grid drops: lines of amounts, one or more to a line and
+/// each with a credit or debit mark if any ("12.40 CR"), which may follow a
+/// heading line, such as the column's own ("## Amount"); or a table of
+/// amounts alone, with the currency signs set apart ("|$|12.40|").
 fn amounts_after<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut amounts = Vec::new();
-    for line in lines {
-        let line = normalize(line);
+    let mut headed = false;
+    let mut lines = lines.map(str::trim).peekable();
+    while let Some(line) = lines.next() {
         if line.is_empty() {
             continue;
         }
-        if line.contains(' ') || !is_amount(&line) || amounts.len() >= MAX_DETACHED_AMOUNTS {
-            break;
+        if is_table_row(line) {
+            if !amounts.is_empty() {
+                break;
+            }
+            let mut rows = vec![line];
+            while let Some(&next) = lines.peek() {
+                if !is_table_row(next) {
+                    break;
+                }
+                rows.push(next);
+                lines.next();
+            }
+            return table_amounts(&rows);
         }
-        amounts.push(line);
+        if line.starts_with('#') && amounts.is_empty() && !headed {
+            headed = true;
+            continue;
+        }
+        let Some(found) = line_amounts(&normalize(line)) else {
+            break;
+        };
+        for amount in found {
+            if amounts.len() >= MAX_DETACHED_AMOUNTS {
+                return amounts;
+            }
+            amounts.push(amount);
+        }
+    }
+    amounts
+}
+
+/// The amounts a line holds, when it holds nothing else but a credit or
+/// debit mark after an amount.
+fn line_amounts(line: &str) -> Option<Vec<String>> {
+    let mut amounts = Vec::new();
+    let mut marked = true;
+    for token in line.split_whitespace() {
+        if is_amount(token) {
+            amounts.push(token.to_string());
+            marked = false;
+        } else if !marked && (token.eq_ignore_ascii_case("CR") || token.eq_ignore_ascii_case("DR"))
+        {
+            marked = true;
+        } else {
+            return None;
+        }
+    }
+    (!amounts.is_empty()).then_some(amounts)
+}
+
+/// The amounts a table holds, up to `MAX_DETACHED_AMOUNTS`, when its cells
+/// hold nothing else but currency signs; none otherwise.
+fn table_amounts(rows: &[&str]) -> Vec<String> {
+    let mut amounts = Vec::new();
+    for row in rows.iter().filter(|row| !is_separator(row)) {
+        for cell in cells(row) {
+            for token in cell.split_whitespace().map(normalize) {
+                if is_amount(&token) {
+                    if amounts.len() < MAX_DETACHED_AMOUNTS {
+                        amounts.push(token);
+                    }
+                } else if !matches!(token.as_str(), "$" | "\u{20ac}" | "\u{a3}") {
+                    return Vec::new();
+                }
+            }
+        }
     }
     amounts
 }
@@ -341,16 +407,22 @@ pub(crate) struct Run<'a> {
 }
 
 /// Steps placing candidates may take per document; past them, a candidate
-/// is unread.
+/// is unread. Placing the amounts after tables takes steps of its own, as
+/// many.
 const MAX_PLACEMENT_STEPS: usize = 4_000_000;
+/// How far above the lowest line of a table's header its other lines sit,
+/// in sizes: a heading of three lines.
+const HEADER_LINES: f64 = 2.5;
 
 /// The positioned text of the pages read, indexed for placing candidates:
-/// runs by their text, a word they hold, and their line, the text runs that
-/// may head a column, and the placed run starts by line.
+/// runs by their text, a word they hold, and their line, whether each may
+/// head a column, and the placed run starts by line.
 pub(crate) struct Layout<'a> {
     runs: &'a [Run<'a>],
     /// Each run's words.
     words: Vec<Vec<&'a str>>,
+    /// Whether each run holds more than amounts, as a heading does.
+    heading: Vec<bool>,
     /// Runs by their text, by page and baseline.
     by_text: HashMap<&'a str, Vec<usize>>,
     /// Runs by page and text, by baseline.
@@ -359,16 +431,24 @@ pub(crate) struct Layout<'a> {
     by_word: HashMap<&'a str, Vec<usize>>,
     /// Runs by page, by baseline.
     lines: HashMap<u32, Vec<usize>>,
-    /// Runs holding more than amounts, by page, by left edge.
-    headings: HashMap<u32, Vec<usize>>,
     /// Placed run starts by page, by baseline.
     placed: HashMap<u32, Vec<Placed>>,
+    /// What the header above two amounts decided, by their page, line, and
+    /// ends in quarter points: the pages repeat a cell's amounts in row
+    /// after row.
+    headed: RefCell<HashMap<(u32, [i64; 5]), bool>>,
     steps: Cell<usize>,
+    /// The steps placing the amounts after tables took.
+    detached_steps: Cell<usize>,
 }
 
 impl<'a> Layout<'a> {
     pub(crate) fn new(runs: &'a [Run<'a>], placed: &[Placed]) -> Self {
         let words: Vec<Vec<&'a str>> = runs.iter().map(|run| words(run.text)).collect();
+        let heading = runs
+            .iter()
+            .map(|run| amount_count(run.text) == 0 && !run.text.trim().is_empty())
+            .collect();
         let mut order: Vec<usize> = (0..runs.len()).collect();
         order.sort_by(|&a, &b| {
             (runs[a].page, runs[a].y)
@@ -378,13 +458,15 @@ impl<'a> Layout<'a> {
         let mut layout = Layout {
             runs,
             words,
+            heading,
             by_text: HashMap::new(),
             by_page_text: HashMap::new(),
             by_word: HashMap::new(),
             lines: HashMap::new(),
-            headings: HashMap::new(),
             placed: HashMap::new(),
+            headed: RefCell::new(HashMap::new()),
             steps: Cell::new(0),
+            detached_steps: Cell::new(0),
         };
         let mut firsts: HashSet<&str> = HashSet::new();
         for &index in &order {
@@ -403,17 +485,6 @@ impl<'a> Layout<'a> {
                 }
             }
             layout.lines.entry(run.page).or_default().push(index);
-            if amount_count(run.text) == 0 && !text.is_empty() {
-                layout.headings.entry(run.page).or_default().push(index);
-            }
-        }
-        for headings in layout.headings.values_mut() {
-            headings.sort_by(|&a, &b| {
-                runs[a]
-                    .x
-                    .partial_cmp(&runs[b].x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
         }
         for start in placed {
             layout.placed.entry(start.page).or_default().push(*start);
@@ -428,11 +499,9 @@ impl<'a> Layout<'a> {
         layout
     }
 
-    /// Take a step, while steps are left.
+    /// Take a step placing candidates, while steps are left.
     fn step(&self) -> bool {
-        let steps = self.steps.get() + 1;
-        self.steps.set(steps);
-        steps <= MAX_PLACEMENT_STEPS
+        take_step(&self.steps)
     }
 
     /// The runs of `indices`, ordered by baseline, from `low` to `high`.
@@ -444,12 +513,12 @@ impl<'a> Layout<'a> {
 
     /// Where the page sets a candidate's amounts. Two consecutive amounts
     /// as separate runs on one baseline, the second to the right of the
-    /// first, were merged by the detector where a line above heads a column
-    /// over the second (see `heads_column`); so were amounts on two lines
-    /// when another cell of the row joins text from both, as the detector
-    /// merges rows, and amounts read as one item that a second placed run
-    /// starts inside, as pdf-inspector joins close runs, under such a
-    /// heading. Without the heading, runs side by side are unread: an amount
+    /// first, were merged by the detector where the table's header heads
+    /// them as two columns (see `columns_headed`); so were amounts on two
+    /// lines when another cell of the row joins text from both, as the
+    /// detector merges rows, and amounts read as one item that a second
+    /// placed run starts inside, as pdf-inspector joins close runs, under
+    /// such a header. Without it, runs side by side are unread: an amount
     /// with its percentage in parentheses is one cell's text. Amounts
     /// stacked on two lines otherwise, or one plain run, stand as the page
     /// sets them. Anything else, such as one run with a word gap between its
@@ -475,8 +544,9 @@ impl<'a> Layout<'a> {
                         if right.x < left.x + left.width - near {
                             continue;
                         }
+                        let first = [left.x, left.x + left.width];
                         let second = [right.x, right.x + right.width];
-                        if self.heads_column(left.page, left.y, left.x + left.width, second, near) {
+                        if self.columns_headed(left.page, left.y, first, second, size) {
                             return Placement::OneLine;
                         }
                         beside = true;
@@ -516,8 +586,9 @@ impl<'a> Layout<'a> {
                 if inside {
                     // The first amount ends a word gap or so before the
                     // second starts.
+                    let first = [run.x, start.at[0] - near];
                     let second = [start.at[0], run.x + run.width];
-                    if self.heads_column(run.page, run.y, start.at[0] - size, second, near) {
+                    if self.columns_headed(run.page, run.y, first, second, size) {
                         return Placement::OneLine;
                     }
                     beside = true;
@@ -538,7 +609,9 @@ impl<'a> Layout<'a> {
     /// table, of those it reads, on the lines of the table's body rows: each
     /// on a line that, read left to right, holds a whole label cell, such as
     /// a row's date or description. Amounts that only share a baseline with
-    /// a row by chance, as a column beside the table may, are fewer.
+    /// a row by chance, as a column beside the table may, are fewer. The
+    /// steps this takes are its own, so tables are read after any number of
+    /// candidates were placed; once they run out, no table is detached.
     pub(crate) fn detached(&self, table: &Detached) -> bool {
         let labels: HashSet<Vec<&str>> = table.labels.iter().map(|label| words(label)).collect();
         let mut lengths: Vec<usize> = labels
@@ -562,7 +635,7 @@ impl<'a> Layout<'a> {
                 };
                 beside.clear();
                 for &other in self.band(line, run.y - near, run.y + near) {
-                    if !self.step() {
+                    if !take_step(&self.detached_steps) {
                         return false;
                     }
                     if other != index {
@@ -581,7 +654,7 @@ impl<'a> Layout<'a> {
                 }
                 for &length in &lengths {
                     for window in line_words.windows(length) {
-                        if !self.step() {
+                        if !take_step(&self.detached_steps) {
                             return false;
                         }
                         if labels.contains(window) {
@@ -595,25 +668,148 @@ impl<'a> Layout<'a> {
         on_rows > 0 && 2 * on_rows > read
     }
 
-    /// Whether a line above the line at `y` heads a column over the second
-    /// of two amounts: text, not amounts alone, that starts past the end of
-    /// the first (`first_end`), before the second's right edge, and reaches
-    /// over the second, as a 1099-B's "Wash sale" heads its column.
-    fn heads_column(&self, page: u32, y: f64, first_end: f64, second: [f64; 2], near: f64) -> bool {
-        let Some(headings) = self.headings.get(&page) else {
+    /// Whether the table's header heads two amounts on the line at `y`,
+    /// each given by its left and right ends, as two columns: on the
+    /// header's lowest line, the first above them holding text over them,
+    /// or a line just above it (`HEADER_LINES`), one heading lies over the
+    /// first amount and ends before the second starts, and another,
+    /// starting and ending past it, lies over the second, as a 1099-B's
+    /// "Cost basis" and "Wash sale" head theirs, joined by pdf-inspector or
+    /// not (see `heading_parts`). One heading over both, such as "Gain/loss
+    /// (percent)" over an amount and its percentage, heads one column, and
+    /// text further up, such as a page's folio, heads none.
+    fn columns_headed(
+        &self,
+        page: u32,
+        y: f64,
+        first: [f64; 2],
+        second: [f64; 2],
+        size: f64,
+    ) -> bool {
+        let quarter = |value: f64| (4.0 * value).round() as i64;
+        let key = (
+            page,
+            [y, first[0], first[1], second[0], second[1]].map(quarter),
+        );
+        if let Some(&headed) = self.headed.borrow().get(&key) {
+            return headed;
+        }
+        let headed = self.header_heads(page, y, first, second, size);
+        self.headed.borrow_mut().insert(key, headed);
+        headed
+    }
+
+    /// [`Layout::columns_headed`], worked out.
+    fn header_heads(
+        &self,
+        page: u32,
+        y: f64,
+        first: [f64; 2],
+        second: [f64; 2],
+        size: f64,
+    ) -> bool {
+        let near = 0.25 * size;
+        let Some(line) = self.lines.get(&page) else {
             return false;
         };
-        let from = headings.partition_point(|&index| self.runs[index].x < first_end - near);
-        for &index in &headings[from..] {
+        let over = |index: usize| {
             let run = &self.runs[index];
-            if run.x >= second[1] || !self.step() {
+            self.heading[index] && run.x < second[1] && run.x + run.width > first[0]
+        };
+        // The header's lowest line is the first above holding text over the
+        // amounts; the lines between hold the amounts of the rows above.
+        let above = line.partition_point(|&index| self.runs[index].y <= y + near);
+        let mut lowest = None;
+        for &index in &line[above..] {
+            if !self.step() {
+                return false;
+            }
+            if over(index) {
+                lowest = Some(self.runs[index].y);
                 break;
             }
-            if run.y > y + near && run.x + run.width > second[0] {
-                return true;
+        }
+        let Some(lowest) = lowest else {
+            return false;
+        };
+        let header = self.band(line, lowest - near, lowest + HEADER_LINES * size);
+        let mut parts = Vec::new();
+        for &index in header {
+            if over(index) && !self.heading_parts(index, header, &mut parts) {
+                return false;
             }
         }
-        false
+        parts.iter().any(|one| {
+            spans_over(*one, first)
+                && one[1] <= second[0] + near
+                && parts.iter().any(|other| {
+                    other[0] >= one[0] + near
+                        && other[1] >= one[1] + near
+                        && spans_over(*other, second)
+                })
+        })
+    }
+
+    /// Add a heading run of the header to `parts`, by the left and right
+    /// ends of each heading it holds. Where pdf-inspector joins runs the
+    /// page places apart, fewer runs than the heading has words, each run's
+    /// text is a heading, from where it starts to where the next starts;
+    /// otherwise, as when the page places every word or glyph apart, the
+    /// run is one heading. A placed run that starts another heading of the
+    /// header belongs to that heading. False once the steps run out.
+    fn heading_parts(&self, index: usize, header: &[usize], parts: &mut Vec<[f64; 2]>) -> bool {
+        let run = &self.runs[index];
+        let near = 0.25 * run.size.abs().max(1.0);
+        let (left, right) = (run.x, run.x + run.width);
+        let starts = self
+            .placed
+            .get(&run.page)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let from = starts.partition_point(|start| start.at[1] < run.y - near);
+        let mut cuts: Vec<f64> = Vec::new();
+        for start in &starts[from..] {
+            if start.at[1] > run.y + near {
+                break;
+            }
+            if !self.step() {
+                return false;
+            }
+            let x = start.at[0];
+            if x <= left + near || x >= right - near {
+                continue;
+            }
+            let mut begins_other = false;
+            for &other in header {
+                if !self.step() {
+                    return false;
+                }
+                let other_run = &self.runs[other];
+                if other != index
+                    && (other_run.x - x).abs() <= near
+                    && (other_run.y - run.y).abs() <= near
+                {
+                    begins_other = true;
+                    break;
+                }
+            }
+            if !begins_other {
+                cuts.push(x);
+            }
+        }
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|later, earlier| *later - *earlier <= near);
+        if cuts.is_empty() || cuts.len() + 1 >= self.words[index].len() {
+            parts.push([left, right]);
+            return true;
+        }
+        let mut from = left;
+        for cut in cuts {
+            parts.push([from, cut]);
+            from = cut;
+        }
+        parts.push([from, right]);
+        true
     }
 
     /// Whether another cell of a candidate's row joins text from the line of
@@ -645,6 +841,20 @@ impl<'a> Layout<'a> {
                 .any(|a| there.iter().any(|b| a.1 <= b.0 || b.1 <= a.0))
         })
     }
+}
+
+/// Take a step counted in `steps`, while steps are left.
+fn take_step(steps: &Cell<usize>) -> bool {
+    let taken = steps.get() + 1;
+    steps.set(taken);
+    taken <= MAX_PLACEMENT_STEPS
+}
+
+/// Whether a heading lies over an amount, each given by its left and right
+/// ends: they overlap by half the narrower of the two at least.
+fn spans_over(heading: [f64; 2], amount: [f64; 2]) -> bool {
+    let overlap = heading[1].min(amount[1]) - heading[0].max(amount[0]);
+    overlap > 0.0 && 2.0 * overlap >= (heading[1] - heading[0]).min(amount[1] - amount[0])
 }
 
 /// Where the page sets a candidate's amounts (see [`Layout::placement`]).
@@ -866,8 +1076,9 @@ mod tests {
             in_table: false,
         };
         let basis = cell(&["2,610.25", "205.25"]);
-        // Two columns' runs on one baseline, under a heading over the second,
-        // were merged; without the heading they are unread.
+        // Two columns' runs on one baseline, each under a heading of its own,
+        // were merged; without the headings, or under the second's alone,
+        // they are unread.
         let heading = |x: f64| run("Wash sale", x, 701.0, 42.0);
         let columns = [
             run("Cost basis", 352.5, 701.0, 42.0),
@@ -883,8 +1094,51 @@ mod tests {
             merged_on_one_line(&basis, &columns[2..], &[]),
             Placement::Unread
         );
+        assert_eq!(
+            merged_on_one_line(&basis, &columns[1..], &[]),
+            Placement::Unread
+        );
+        // Headings that overlap, the second right-aligned over its narrower
+        // amounts, head two columns too.
+        let overlapping = [
+            run("Cost basis", 358.0, 701.0, 42.0),
+            run("Wash sale", 388.5, 701.0, 42.0),
+            run("2,610.25", 365.0, 685.0, 35.0),
+            run("205.25", 403.0, 685.0, 27.5),
+        ];
+        assert_eq!(
+            merged_on_one_line(&basis, &overlapping, &[]),
+            Placement::OneLine
+        );
+        // Headings pdf-inspector joins from two runs of whole words head two
+        // columns; one the page places word by word heads one.
+        let joined_headings = [
+            run("Cost basis Wash sale", 358.0, 701.0, 87.0),
+            run("2,610.25", 365.0, 685.0, 35.0),
+            run("205.25", 403.0, 685.0, 27.5),
+        ];
+        let header_start = |x: f64| Placed {
+            page: 1,
+            at: [x, 701.0],
+            plain: true,
+        };
+        assert_eq!(
+            merged_on_one_line(
+                &basis,
+                &joined_headings,
+                &[header_start(358.0), header_start(403.0)]
+            ),
+            Placement::OneLine
+        );
+        let by_word = [358.0, 377.5, 403.0, 425.0].map(header_start);
+        assert_eq!(
+            merged_on_one_line(&basis, &joined_headings, &by_word),
+            Placement::Unread
+        );
         // An amount with its percentage, both under one heading, is one
-        // cell's text.
+        // cell's text, whether the heading spans both or is right-aligned
+        // over them, on two lines; text further up, such as a folio over
+        // the percentages, heads nothing.
         let gain = cell(&["1,234.56", "(9.02%)"]);
         let percent = [
             run("Gain/loss (percent)", 430.0, 712.0, 76.0),
@@ -892,6 +1146,24 @@ mod tests {
             run("(9.02%)", 468.0, 698.0, 31.5),
         ];
         assert_eq!(merged_on_one_line(&gain, &percent, &[]), Placement::Unread);
+        let right_aligned = [
+            run("Unrealized", 497.0, 723.0, 43.0),
+            run("Market value", 348.5, 712.0, 51.5),
+            run("gain/(loss)", 498.5, 712.0, 41.5),
+            run("1,234.56", 470.5, 698.0, 35.0),
+            run("(9.02%)", 508.5, 698.0, 31.5),
+        ];
+        assert_eq!(
+            merged_on_one_line(&gain, &right_aligned, &[]),
+            Placement::Unread
+        );
+        let folio = [
+            run("Page 1", 511.5, 770.0, 28.5),
+            run("Gain/loss (percent)", 443.4, 712.0, 76.0),
+            run("1,234.56", 470.5, 698.0, 35.0),
+            run("(9.02%)", 508.5, 698.0, 31.5),
+        ];
+        assert_eq!(merged_on_one_line(&gain, &folio, &[]), Placement::Unread);
         // Stacked one above the other, or written as one run, they stand as
         // the page sets them.
         let stacked = [
@@ -912,12 +1184,13 @@ mod tests {
             ),
             Placement::AsSet
         );
-        // One item that a second run starts inside, under a heading over
-        // the second, was joined from two; one plain run is as written, and
-        // one with a word gap in it unread.
+        // One item that a second run starts inside, under headings over
+        // each, was joined from two; one plain run is as written, and one
+        // with a word gap in it unread.
         let joined = [
             run("2,610.25 205.25", 308.9, 686.0, 59.1),
             run("Wash", 347.5, 700.0, 21.0),
+            run("Cost basis", 300.0, 700.0, 42.0),
         ];
         let start = |x: f64, plain: bool| Placed {
             page: 1,
@@ -1054,10 +1327,48 @@ mod tests {
             run("105.80", 380.0, 626.0),
         ];
         assert!(!Layout::new(&aside, &[]).detached(&three));
-        // A line after the table holding more than an amount ends them.
+        // A line after the table holding more than amounts ends them.
         assert!(check("|a|1.00|\n|---|---|\n|b|2.00|\nTotal 3.00\n4.00\n")
             .detached
             .is_empty());
+        // pdf-inspector also sets a dropped column's amounts several to a
+        // line, with a credit mark, after the column's heading, or as a
+        // table of their own beside their currency signs.
+        let after = |text: &str| -> Vec<Vec<String>> {
+            check(&format!(
+                "|Date|Description|\n|---|---|\n|03/01|Purchase at merchant 1|\n{text}"
+            ))
+            .detached
+            .into_iter()
+            .map(|table| table.amounts)
+            .collect()
+        };
+        let amounts = |list: &[&str]| -> Vec<Vec<String>> {
+            vec![list.iter().map(|amount| amount.to_string()).collect()]
+        };
+        assert_eq!(
+            after("\n$12.40 $15.40 -18.40\n"),
+            amounts(&["$12.40", "$15.40", "-18.40"])
+        );
+        assert_eq!(after("\n12.40 CR\n15.40\n"), amounts(&["12.40", "15.40"]));
+        assert_eq!(
+            after("\n## Amount\n\n12.40\n15.40\n## Payments\n\n9.10\n"),
+            amounts(&["12.40", "15.40"])
+        );
+        assert_eq!(
+            after("\n|$|12.40|\n|---|---|\n|$|15.40|\n"),
+            amounts(&["12.40", "15.40"])
+        );
+        // A table holding more than amounts, a second heading, or a mark
+        // before any amount is text of its own.
+        for text in [
+            "\n|$|12.40|\n|---|---|\n|Total|12.40|\n",
+            "\n## Amount\n## Purchases\n12.40\n",
+            "\nCR 12.40\n",
+            "\n12.40 CR CR\n",
+        ] {
+            assert!(after(text).is_empty(), "{text}");
+        }
         // An amount the table holds, as a total restating its one row, is
         // not pushed out of it; nor does a cell of a mark or two label a
         // row.

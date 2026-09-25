@@ -447,7 +447,7 @@ impl PdfInfo {
         if items.is_some() && tables.detached.iter().any(|table| layout.detached(table)) {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_TABLE_VALUES_DETACHED,
-                "Amounts the page sets in a table's rows follow the table, an amount a line, as when a column is dropped from the grid; which row each belongs to is lost.",
+                "Amounts the page sets in a table's rows follow the table instead, as when a column is dropped from the grid; which row each belongs to is lost.",
                 Vec::new(),
             ));
         }
