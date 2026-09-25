@@ -52,6 +52,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::glyph_words::{Glyph, GlyphFonts, GlyphWords, KeptWords, ShownWord};
+use crate::optional_content::Layers;
 use crate::repeated_lines::EdgeRun;
 use crate::word_gaps::{leading_travel, shows_glyphs, Candidate, GapFont, GapFonts, Shown};
 
@@ -81,6 +82,8 @@ const COVERED_SHARE: f64 = 0.5;
 const MAX_PAGE_TREE_DEPTH: usize = 32;
 /// Runs noted per page for the repeat check.
 const MAX_RUNS_PER_PAGE: usize = 100_000;
+/// Bytes of text in hidden layers noted a page, at most.
+const MAX_HIDDEN_TEXT: usize = 64 << 10;
 /// Repeated runs recorded per page.
 const MAX_REPEATS_PER_PAGE: usize = 16;
 /// Placed run starts kept per document, for the table check.
@@ -179,6 +182,9 @@ struct State {
     horizontal_scale: f64,
     leading: f64,
     rise: f64,
+    /// Whether a layer a reader hides holds what is drawn here, as a form
+    /// in such a layer does.
+    hidden: bool,
 }
 
 impl State {
@@ -198,6 +204,7 @@ impl State {
         horizontal_scale: 1.0,
         leading: 0.0,
         rise: 0.0,
+        hidden: false,
     };
 }
 
@@ -623,6 +630,11 @@ struct PageText {
     /// The runs pdf-inspector reads, for the running-header check's gate,
     /// when the page is read for repeats.
     edges: Option<Vec<EdgeRun>>,
+    /// The document's layers, and the text pdf-inspector reads in layers a
+    /// reader hides, when the page is read for repeats and the document has
+    /// layers.
+    layers: Option<std::rc::Rc<Layers>>,
+    hidden_text: Option<Vec<String>>,
 }
 
 impl PageText {
@@ -828,6 +840,32 @@ impl PageText {
         }
     }
 
+    /// Note text pdf-inspector reads in a layer a reader hides: a run where
+    /// the text matrix was just set, else more of the run before; its text
+    /// where its font can be read, to `MAX_HIDDEN_TEXT` bytes a page.
+    fn note_hidden(&mut self, state: State, bytes: &[u8], placed: bool) {
+        let room = self
+            .hidden_text
+            .as_ref()
+            .is_some_and(|texts| texts.iter().map(String::len).sum::<usize>() < MAX_HIDDEN_TEXT);
+        if !(room && state.font && state.reached && state.read_mode != 3) {
+            return;
+        }
+        let Some(text) = state
+            .glyph_font
+            .and_then(|font| self.glyph_fonts.text(font, bytes))
+        else {
+            return;
+        };
+        let Some(texts) = self.hidden_text.as_mut() else {
+            return;
+        };
+        match texts.last_mut().filter(|_| !placed) {
+            Some(last) => last.push_str(&text),
+            None => texts.push(text),
+        }
+    }
+
     /// Note a run pdf-inspector reads for the running-header check's gate:
     /// where it starts, when the text matrix was just set, else as more of
     /// the run before; with its text, where its font can be read.
@@ -993,6 +1031,9 @@ pub(crate) struct Findings {
     /// when every page pdf-inspector reads, to `MAX_REPEAT_PAGES`, is read
     /// for repeats; else `None`.
     pub(crate) edges: Option<Vec<(u32, Vec<EdgeRun>)>>,
+    /// Text pdf-inspector reads in layers a reader hides (see
+    /// `optional_content`), by page, on the pages read for repeats.
+    pub(crate) hidden_layer_texts: Vec<(u32, Vec<String>)>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -1033,9 +1074,10 @@ pub(crate) fn scan_document(
     let mut gap_fonts = GapFonts::default();
     let mut glyph_fonts = GlyphFonts::default();
     let mut found = Findings::default();
+    let layers = Layers::new(&document).map(std::rc::Rc::new);
     if twice_skip.is_some() {
         found.form_values = crate::form_fields::misread(&document);
-        found.annotation_texts = crate::annotations::unread(&document, only);
+        found.annotation_texts = crate::annotations::unread(&document, only, layers.as_deref());
     }
     if whole {
         found.xfa_dynamic = crate::form_fields::dynamic_xfa(&document);
@@ -1075,7 +1117,7 @@ pub(crate) fn scan_document(
             twice: check_twice,
             forms: check_forms,
         };
-        match scan_page(&document, page_id, checks, budgets) {
+        match scan_page(&document, page_id, checks, budgets, layers.as_ref()) {
             Ok(page) => {
                 if page.hidden_layer {
                     found.hidden_layer.push(number);
@@ -1087,6 +1129,9 @@ pub(crate) fn scan_document(
                     found.gaps_misread.push(number);
                 }
                 glyph_words.page(number, page.glyph_words, page.glyph_spaces);
+                if !page.hidden_text.is_empty() {
+                    found.hidden_layer_texts.push((number, page.hidden_text));
+                }
                 if let Some(edges) = edges
                     .as_mut()
                     .filter(|edges| edges.len() < crate::repeated_lines::MAX_REPEAT_PAGES)
@@ -1164,6 +1209,8 @@ struct PageFindings {
     /// The runs at the page's edges, measured from the visible box, when
     /// it is read for repeats.
     edges: Vec<EdgeRun>,
+    /// Text pdf-inspector reads in layers a reader hides.
+    hidden_text: Vec<String>,
 }
 
 fn scan_page(
@@ -1171,6 +1218,7 @@ fn scan_page(
     page_id: ObjectId,
     checks: Checks,
     budgets: Budgets<'_>,
+    layers: Option<&std::rc::Rc<Layers>>,
 ) -> Result<PageFindings, Exhausted> {
     let Some(page_box) = page_box(document, page_id) else {
         return Ok(PageFindings::default());
@@ -1216,6 +1264,8 @@ fn scan_page(
     let mut page = PageText {
         runs: check_twice.then(Runs::default),
         edges: check_twice.then(Vec::new),
+        layers: layers.cloned(),
+        hidden_text: (check_twice && layers.is_some()).then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
@@ -1272,6 +1322,7 @@ fn scan_page(
     );
     Ok(PageFindings {
         edges,
+        hidden_text: page.hidden_text.take().unwrap_or_default(),
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
@@ -1328,6 +1379,9 @@ fn execute<'a>(
     // The marked-content spans open, and whether each gives the text its
     // glyphs stand for, which pdf-inspector reads in place of the glyphs.
     let mut spans: Vec<bool> = Vec::new();
+    // The marked-content spans open, and whether each is in a layer a
+    // reader hides.
+    let mut layered: Vec<bool> = Vec::new();
     for operation in &content.operations {
         let operands = &operation.operands;
         let operator = operation.operator.as_str();
@@ -1379,19 +1433,45 @@ fn execute<'a>(
                     state.read_mode = mode;
                 }
             }
-            "BMC" => spans.push(false),
-            "BDC" => spans.push(
-                operands
-                    .get(1)
-                    .and_then(|properties| match properties {
-                        Object::Dictionary(properties) => Some(properties),
-                        Object::Reference(id) => document.get_dictionary(*id).ok(),
-                        _ => None,
-                    })
-                    .is_some_and(gives_actual_text),
-            ),
+            "BMC" => {
+                spans.push(false);
+                layered.push(false);
+            }
+            "BDC" => {
+                spans.push(
+                    operands
+                        .get(1)
+                        .and_then(|properties| match properties {
+                            Object::Dictionary(properties) => Some(properties),
+                            Object::Reference(id) => document.get_dictionary(*id).ok(),
+                            _ => None,
+                        })
+                        .is_some_and(gives_actual_text),
+                );
+                // A span marked /OC names its layer, or a membership
+                // dictionary, among the resources' properties.
+                let optional = operands
+                    .first()
+                    .and_then(|tag| tag.as_name().ok())
+                    .is_some_and(|tag| tag == b"OC");
+                let properties = match operands.get(1) {
+                    Some(Object::Name(name)) => resources
+                        .find(document, b"Properties", name)
+                        .map(|(properties, _)| properties),
+                    other => other,
+                };
+                layered.push(
+                    optional
+                        && page
+                            .layers
+                            .as_ref()
+                            .zip(properties)
+                            .is_some_and(|(layers, properties)| layers.hides(document, properties)),
+                );
+            }
             "EMC" => {
                 spans.pop();
+                layered.pop();
             }
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
@@ -1518,6 +1598,9 @@ fn execute<'a>(
                 page.show(state, &bytes);
                 if in_text {
                     page.note_edge(state, text_matrix, &bytes, placed);
+                    if state.hidden || layered.contains(&true) {
+                        page.note_hidden(state, &bytes, placed);
+                    }
                 }
                 if in_text && !forms.is_empty() {
                     page.note_form_text(state, text, &bytes);
@@ -1631,9 +1714,16 @@ fn execute<'a>(
                         // pdf-inspector reads a form's text from no font and
                         // no spacing, with the fonts of its own resources,
                         // and reads it at all only where it finds the form.
+                        let hidden = state.hidden
+                            || layered.contains(&true)
+                            || page
+                                .layers
+                                .as_ref()
+                                .is_some_and(|layers| layers.hide(document, &stream.dict));
                         let inner = State {
                             ctm: multiply(form_matrix, state.ctm),
                             reached: state.reached && read,
+                            hidden,
                             raw: true,
                             gaps: None,
                             glyph_font: None,

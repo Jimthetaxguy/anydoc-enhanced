@@ -428,6 +428,7 @@ fn page_box(document: &Document, page: ObjectId) -> Option<[f32; 4]> {
 pub(crate) fn unread(
     document: &Document,
     only: Option<&std::collections::HashSet<u32>>,
+    layers: Option<&crate::optional_content::Layers>,
 ) -> Vec<AnnotationText> {
     let mut texts = Vec::new();
     let mut appearances = Appearances::new(document);
@@ -460,7 +461,10 @@ pub(crate) fn unread(
                 .and_then(|flags| resolve(document, flags))
                 .and_then(|flags| flags.as_i64().ok())
                 .unwrap_or(0);
-            if flags & (HIDDEN | NO_VIEW) != 0 {
+            // Hidden by its flags, or by a layer a reader hides.
+            if flags & (HIDDEN | NO_VIEW) != 0
+                || layers.is_some_and(|layers| layers.hide(document, annotation))
+            {
                 continue;
             }
             let subtype = annotation
@@ -595,7 +599,7 @@ mod tests {
                 },
             ]
         });
-        let texts: Vec<String> = unread(&found, None)
+        let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
             .map(|annotation| annotation.text)
             .collect();
@@ -607,7 +611,7 @@ mod tests {
                 "RECEIVED APR 15 2025"
             ]
         );
-        assert!(unread(&found, Some(&[2].into_iter().collect())).is_empty());
+        assert!(unread(&found, Some(&[2].into_iter().collect()), None).is_empty());
     }
 
     #[test]
@@ -675,7 +679,7 @@ mod tests {
                 },
             ]
         });
-        let texts: Vec<String> = unread(&found, None)
+        let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
             .map(|annotation| annotation.text)
             .collect();

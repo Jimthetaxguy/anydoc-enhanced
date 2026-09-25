@@ -1259,6 +1259,90 @@ fn lines_dropped_beneath_a_logo_are_reported_as_without_it() {
     }
 }
 
+/// A statement page whose superseded balance sits in a layer that is off
+/// unless `shown`, in a marked-content span, with a draft note in a form in
+/// that layer and a text box the layer holds.
+fn layered_statement_pdf(shown: bool) -> Vec<u8> {
+    let state = if shown { "/ON [6 0 R]" } else { "/OFF [6 0 R]" };
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << {state} >> >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> /XObject << /Fm1 7 0 R >> >> /Contents 5 0 R /Annots [8 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Checking account statement) Tj ET \
+              BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET \
+              /OC /MC0 BDC BT /F1 10 Tf 72 680 Td (Ending balance 1,000.00 superseded) Tj ET EMC \
+              q /Fm1 Do Q",
+        ),
+        b"<< /Type /OCG /Name (Superseded) >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /OC 6 0 R /Resources << /Font << /F1 4 0 R >> >>",
+            b"BT /F1 10 Tf 72 640 Td (Draft figures pending review) Tj ET",
+        ),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [300 600 560 620] /OC 6 0 R /Contents (Reviewer note on the draft) >>".to_vec(),
+    ])
+}
+
+#[test]
+fn text_in_layers_a_reader_hides_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for shown in [false, true] {
+        let path = temporary.path().join(format!("layered-{shown}.pdf"));
+        std::fs::write(&path, layered_statement_pdf(shown)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value, code: &str| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == code)
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // pdf-inspector 1.24.0 reads no layer settings: the hidden balance and
+    // the note are in the Markdown; when a release reads them, this
+    // expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("1,000.00 superseded") && markdown.contains("Draft figures"),
+        "{markdown}"
+    );
+    assert_eq!(
+        reported(&results[0], "hidden_layer_text_read"),
+        Some(serde_json::json!([1])),
+        "{}",
+        results[0]
+    );
+    // A text box in the hidden layer is not what the page shows; with the
+    // layer shown, it is, and the layer's text is no longer hidden.
+    assert_eq!(
+        reported(&results[0], "annotation_text_unread"),
+        None,
+        "{}",
+        results[0]
+    );
+    assert_eq!(
+        reported(&results[1], "hidden_layer_text_read"),
+        None,
+        "{}",
+        results[1]
+    );
+    assert_eq!(
+        reported(&results[1], "annotation_text_unread"),
+        Some(serde_json::json!([1])),
+        "{}",
+        results[1]
+    );
+}
+
 /// A filled one-page form whose fields are `fields`, objects 6 on, each
 /// given its number; `annotations` lists the page's widgets (pdf-inspector
 /// issue #504).

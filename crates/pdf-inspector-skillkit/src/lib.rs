@@ -105,6 +105,11 @@ const MAX_NOTICE_WORDS: usize = 150;
 /// The files a PDF embeds, such as a portfolio's documents, are not in the
 /// Markdown.
 pub const PDF_WARNING_EMBEDDED_FILES_UNREAD: &str = "embedded_files_unread";
+/// The Markdown holds text set in a layer a reader hides by default.
+pub const PDF_WARNING_HIDDEN_LAYER_TEXT_READ: &str = "hidden_layer_text_read";
+/// Characters a text in a hidden layer needs, bare, for the Markdown's
+/// showing it to count.
+const MIN_HIDDEN_CHARS: usize = 6;
 
 /// Pages the running-header check reads again at a time, and groups into
 /// lines at a time; and how long the call may run, reading them, before
@@ -666,6 +671,17 @@ impl PdfInfo {
     /// The pages of `texts`, each a text and the pages it belongs to, whose
     /// text the Markdown does not show, among the pages `only` names.
     fn unshown(&self, texts: &[(&[u32], &str)], only: Option<&HashSet<u32>>) -> Vec<u32> {
+        self.showing(texts, only, false)
+    }
+
+    /// The pages of `texts` whose text the Markdown shows, if `shown`, or
+    /// does not, among the pages `only` names.
+    fn showing(
+        &self,
+        texts: &[(&[u32], &str)],
+        only: Option<&HashSet<u32>>,
+        shown: bool,
+    ) -> Vec<u32> {
         let Some(markdown) = self.markdown.as_deref() else {
             return Vec::new();
         };
@@ -677,16 +693,40 @@ impl PdfInfo {
         let mut patterns: Vec<&str> = texts.iter().map(|(_, text)| text.as_str()).collect();
         patterns.sort_unstable();
         patterns.dedup();
-        let shown = repeated_lines::found_in(&patterns, markdown);
+        let found = repeated_lines::found_in(&patterns, markdown);
         let mut pages: Vec<u32> = texts
             .iter()
-            .filter(|(_, text)| !shown.contains(text.as_str()))
+            .filter(|(_, text)| found.contains(text.as_str()) == shown)
             .flat_map(|(pages, _)| pages.iter().copied())
             .filter(|page| only.is_none_or(|only| only.contains(page)))
             .collect();
         pages.sort_unstable();
         pages.dedup();
         pages
+    }
+
+    /// Report the pages whose text in layers a reader hides (see
+    /// `optional_content`) the Markdown shows: pdf-inspector read it.
+    fn check_hidden_layers(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
+        let pages: Vec<[u32; 1]> = texts.iter().map(|(page, _)| [*page]).collect();
+        let texts: Vec<(&[u32], &str)> = pages
+            .iter()
+            .zip(texts)
+            .flat_map(|(page, (_, texts))| {
+                texts
+                    .iter()
+                    .filter(|text| repeated_lines::bare(text).chars().count() >= MIN_HIDDEN_CHARS)
+                    .map(move |text| (page.as_slice(), text.as_str()))
+            })
+            .collect();
+        let pages = self.showing(&texts, only, true);
+        if !pages.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_HIDDEN_LAYER_TEXT_READ,
+                "On these pages the Markdown holds text set in a layer a reader hides by default, such as a superseded figure or a draft note beside the one shown: pdf-inspector 1.24.0 reads every layer as shown; read these pages another way to see what a reader shows.",
+                pages,
+            ));
+        }
     }
 
     /// Report the pages of text annotations show (see `annotations`) that
@@ -775,6 +815,8 @@ impl PdfInfo {
         self.check_form_values(&values, only);
         let annotations = std::mem::take(&mut found.annotation_texts);
         self.check_annotation_texts(&annotations);
+        let hidden = std::mem::take(&mut found.hidden_layer_texts);
+        self.check_hidden_layers(&hidden, only);
         if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
@@ -897,6 +939,7 @@ mod doubled_text;
 mod form_fields;
 mod glyph_words;
 mod markdown_tables;
+mod optional_content;
 pub mod pdf_worker;
 mod repeated_lines;
 mod text_paints;
