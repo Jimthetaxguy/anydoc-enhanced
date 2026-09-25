@@ -1996,6 +1996,10 @@ pub(super) struct Earlier {
     /// By step: the places, counted from 0, of the first sibling that may
     /// fit it and of the first that certainly does (`u32::MAX` for none).
     steps: HashMap<u32, (u32, u32)>,
+    /// The `~` steps a later sibling may still settle, by the key their
+    /// compound requires (`None` for those requiring none): listed when a
+    /// sibling first carries the key, and left as each is settled.
+    open_steps: HashMap<Option<u64>, Vec<u32>>,
 }
 
 /// Earlier siblings kept at each depth: the first, which rules such as
@@ -2053,14 +2057,6 @@ impl Earlier {
             Some(&(possible, _)) if possible < place => Tri::Maybe,
             _ => Tri::No,
         }
-    }
-
-    /// Whether a sibling taken in certainly fits a `~` step, which settles
-    /// it for all the siblings after.
-    fn step_settled(&self, step: u32) -> bool {
-        self.steps
-            .get(&step)
-            .is_some_and(|&(_, certain)| certain != u32::MAX)
     }
 
     /// Note how the sibling at `place` fits a `~` step.
@@ -3361,70 +3357,104 @@ impl Cascade {
     /// the top of `earlier` fits each `~` step of the rules, with the part
     /// of the selector before it: its siblings before it, and its
     /// ancestors, are those a later sibling's match would reach through
-    /// it. A step one sibling certainly fits is settled for all after it,
-    /// and not tried again; one whose ancestors the open elements lack is
-    /// set aside with a lookup per key.
+    /// it. A sibling is tried against the steps whose compound requires no
+    /// key it lacks: those requiring none, and those by each of its keys.
+    /// Each such group is listed for the siblings of one parent the first
+    /// time one of them carries its key, and a step leaves the list once a
+    /// sibling certainly fits it, which settles it for all after, or once
+    /// the open elements lack the ancestors it requires, which they lack for
+    /// every sibling of this parent. So a sibling costs a try of each step
+    /// still open, however many rules others settled, and all of it counts
+    /// as work: past the bound, the chapter is refused as a resource limit.
     fn note_sibling(
         &self,
         stack: &[Element],
         earlier: &mut [Earlier],
         ancestors: &AncestorKeys,
         work: &mut u64,
-    ) {
-        if self.sibling_steps.is_empty() || *work > MAX_MATCH_WORK {
-            return;
+    ) -> Result<(), DocumentError> {
+        if self.sibling_steps.is_empty() {
+            return Ok(());
         }
         let depth = stack.len();
-        let fits: Vec<(u32, Tri)> = {
-            let tree = Tree {
-                stack,
-                earlier: &*earlier,
-            };
-            let siblings = &tree.earlier[depth];
-            let node = Node {
-                depth,
-                sibling: Some(siblings.len() - 1),
-            };
-            let keyed = AncestorKeys::keys(tree.element(node))
-                .filter(|key| {
-                    let (word, bit) = key_bit(*key);
-                    self.step_key_bits[word] & bit != 0
-                })
-                .filter_map(|key| self.steps_by_key.get(&key))
-                .flatten();
-            let mut fits = Vec::new();
-            for &step in self.steps_anywhere.iter().chain(keyed) {
-                if siblings.step_settled(step) {
-                    continue;
-                }
-                if *work > MAX_MATCH_WORK {
-                    break;
-                }
-                let sibling_step = &self.sibling_steps[step as usize];
-                if !ancestors.hold(&sibling_step.ancestor_keys) {
-                    *work += 1;
-                    continue;
-                }
-                let CascadeRule { rule, recorded, .. } = &self.rules[sibling_step.rule as usize];
-                let fit = match_prefix_at(
-                    &rule.selector,
-                    recorded,
-                    sibling_step.compound as usize,
-                    &tree,
-                    node,
-                    work,
-                );
-                if fit != Tri::No {
-                    fits.push((step, fit));
-                }
-            }
-            fits
+        let mut groups: Vec<Option<u64>> = {
+            let siblings = &earlier[depth];
+            let element = siblings.get(siblings.len() - 1);
+            std::iter::once(None)
+                .chain(
+                    AncestorKeys::keys(element)
+                        .filter(|key| {
+                            let (word, bit) = key_bit(*key);
+                            self.step_key_bits[word] & bit != 0
+                                && self.steps_by_key.contains_key(key)
+                        })
+                        .map(Some),
+                )
+                .collect()
         };
-        let siblings = &mut earlier[depth];
-        let place = siblings.count - 1;
-        for (step, fit) in fits {
-            siblings.note_step(step, fit, place);
+        groups.sort_unstable();
+        groups.dedup();
+        for group in groups {
+            let steps = match group {
+                None => &self.steps_anywhere,
+                Some(key) => &self.steps_by_key[&key],
+            };
+            if steps.is_empty() {
+                continue;
+            }
+            let mut open = match earlier[depth].open_steps.remove(&group) {
+                Some(open) => open,
+                None => {
+                    *work += steps.len() as u64;
+                    steps.clone()
+                }
+            };
+            let mut fits = Vec::new();
+            {
+                let tree = Tree {
+                    stack,
+                    earlier: &*earlier,
+                };
+                let node = Node {
+                    depth,
+                    sibling: Some(tree.earlier[depth].len() - 1),
+                };
+                open.retain(|&step| {
+                    if *work > MAX_MATCH_WORK {
+                        return true;
+                    }
+                    *work += 1;
+                    let sibling_step = &self.sibling_steps[step as usize];
+                    if !ancestors.hold(&sibling_step.ancestor_keys) {
+                        return false;
+                    }
+                    let CascadeRule { rule, recorded, .. } =
+                        &self.rules[sibling_step.rule as usize];
+                    let fit = match_prefix_at(
+                        &rule.selector,
+                        recorded,
+                        sibling_step.compound as usize,
+                        &tree,
+                        node,
+                        work,
+                    );
+                    if fit != Tri::No {
+                        fits.push((step, fit));
+                    }
+                    fit != Tri::Yes
+                });
+            }
+            if *work > MAX_MATCH_WORK {
+                return Err(DocumentError::ResourceLimit);
+            }
+            let siblings = &mut earlier[depth];
+            let place = siblings.count - 1;
+            for (step, fit) in fits {
+                siblings.note_step(step, fit, place);
+            }
+            siblings.open_steps.insert(group, open);
         }
+        Ok(())
     }
 
     /// Whether any rule styles a `::before` or `::after` box, which may
@@ -5520,7 +5550,7 @@ pub(super) fn chapter_text(
                     earlier.pop();
                     if let Some(siblings) = earlier.last_mut() {
                         siblings.push(closed);
-                        reader.note_sibling(&elements, &mut earlier, &ancestors, work);
+                        reader.note_sibling(&elements, &mut earlier, &ancestors, work)?;
                     }
                 }
                 if let Some(closed) = open.pop() {
@@ -5947,7 +5977,7 @@ pub(super) fn chapter_text(
                 earlier.pop();
                 if let Some(siblings) = earlier.last_mut() {
                     siblings.push(closed);
-                    reader.note_sibling(&elements, &mut earlier, &ancestors, work);
+                    reader.note_sibling(&elements, &mut earlier, &ancestors, work)?;
                 }
             }
             state.effects.opens_run = false;
@@ -6301,6 +6331,41 @@ mod tests {
         let mut work = 0;
         chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
         assert!(work <= 3000 * 4 * 2 + 10_000, "{work}");
+    }
+
+    #[test]
+    fn sibling_rules_settled_by_one_sibling_cost_nothing_after() {
+        // Thousands of `~` rules any sibling fits, whether their compound
+        // requires a key or none, over a long run of siblings: the first
+        // settles each, and the rest do not try them again.
+        for step in ["*", "i"] {
+            let sheet: String = (0..4000)
+                .map(|rule| format!("{step} ~ b{rule} {{ display: block }}\n"))
+                .collect();
+            let (reader, anydoc) = cascade_for(&[&sheet]);
+            let body = format!("<div>{}</div><p>End.</p>", "<i/>".repeat(20_000));
+            let mut work = 0;
+            chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
+            // Each parent's children settle each step once: a few tries of
+            // 4,000 steps at each depth, not 4,000 for each of 20,000.
+            assert!(work <= 100_000, "{step}: {work}");
+        }
+        // Steps no sibling fits are tried for each one, and the work counts:
+        // past the bound, the chapter is refused as a resource limit, not
+        // judged on what was recorded before.
+        let sheet: String = (0..4000)
+            .map(|rule| format!("[data-k] ~ b{rule} {{ display: block }}\n"))
+            .collect();
+        let (reader, anydoc) = cascade_for(&[&sheet]);
+        let body = format!("<div>{}</div><p>End.</p>", "<i/>".repeat(2000));
+        let mut work = 0;
+        chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
+        assert!(work >= 2000 * 4000, "{work}");
+        let mut work = MAX_MATCH_WORK - 4000 * 50;
+        assert!(matches!(
+            chapter_text(&chapter(&body), &reader, &anydoc, &mut work),
+            Err(DocumentError::ResourceLimit)
+        ));
     }
 
     #[test]
