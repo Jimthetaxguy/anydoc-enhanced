@@ -264,16 +264,17 @@ came back clean. The evidence and dispositions are in
 | 3 | Refuse or disclose what the pinned AnyDoc drops or amplifies, from its open pull requests | Symbol and form checkboxes, hidden text, link-destination schemes, and number-format amplification fixtures |
 | 4 | `rmcp` 3.4.1 with read-only tool annotations | Tool names and schemas unchanged |
 | Review 1–2 | Make every preflight check read what AnyDoc reads: its transcoding, its reference resolution, its exact part names | Five decoy fixtures that converted as complete with no warning now fail closed or disclose |
+| 6 | DOCX inline content: refuse ruby text and imported chunks; report dropped non-breaking hyphens as `partial` with a warning | Three fixtures; the DOCX lane emits `partial` for the first time |
 
 ## Next slices
 
-1. **DOCX inline-content oracle.** AnyDoc 0.2.4 silently drops more run
-   content than the symbols already refused. Reproduced: a non-breaking hyphen
-   (`w:noBreakHyphen`) disappears, so "Form 1040‑SR" converts as "Form 1040SR",
-   and ruby base text disappears with its annotation. Candidates to confirm are
-   `w:altChunk` imported content and `w:subDoc`. Decide per element whether to
-   refuse or to disclose with a warning, add fixtures, and assert the result
-   through the worker.
+1. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
+   chunks, and non-breaking hyphens are handled. Elements AnyDoc 0.2.4's walker
+   also skips, which are candidates to confirm with fixtures: `w:contentPart`
+   ink, and date or page-number fields placed in the body (`w:pgNum`,
+   `w:dayShort` and related elements). Master-document `w:subDoc` links
+   reference files outside the package and are reported as external
+   relationships.
 2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
    non-exhaustive `Format` arms, the four Wingdings codes from #177, and a
    re-check of the ported `to_utf8` and `path::resolve`.

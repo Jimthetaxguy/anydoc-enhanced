@@ -137,9 +137,9 @@ exact tool-name set. When parser dependencies change, also assert that
    oracle, real-parser chapter-order/omission evidence, and Linux worker route;
    hostile-resource, filesystem, and cross-platform gates remain.
 
-5. Close the DOCX inline-content gap: AnyDoc 0.2.4 drops non-breaking hyphens
-   ("Form 1040‑SR" becomes "Form 1040SR") and ruby base text without a
-   diagnostic. Decide refuse-or-disclose per element, with fixtures.
+5. Finish the DOCX inline-content oracle. Ruby text and imported chunks fail
+   closed, and dropped non-breaking hyphens are reported as `partial`; confirm
+   the remaining elements the pinned walker skips (roadmap "Next slices").
 6. Adopt the next AnyDoc release only through the checklist in the
    2026-09-24 audit, re-checking the ported `to_utf8` and `path::resolve`.
 

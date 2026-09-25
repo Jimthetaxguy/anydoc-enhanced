@@ -72,7 +72,7 @@ CI: GitHub Actions badge on README.
 - The worker classifies reviewed AnyDoc omission and malformed-recovery warnings into stable incomplete results without exposing raw log text; structural marker oracles cover known public fixtures, while unobserved silent omissions still require additional cases. Strict ODP now has exact identity, visible presentation, local-asset, hidden/external/active, malformed, encryption, archive-limit, and real-worker evidence; strict EPUB now has exact OCF/OPF/spine identity, navigation, local-resource, hostile-content, archive-limit, and real-worker evidence. Darwin/arm64 and Linux x86-64 release-mode resource observations are recorded in `docs/resource-evidence.md`; hostile-resource, filesystem, and cross-host memory gates remain open
 - Bank-direct 1099-INTs often `Unknown` for form id
 - IRC parsing covers U.S. Code Title 26; Treasury Regulation numbering is not parsed
-- AnyDoc 0.2.4 still drops some DOCX run content without a diagnostic (non-breaking hyphens, ruby base text); refusing or disclosing it is the next slice
+- DOCX non-breaking hyphens are dropped by AnyDoc 0.2.4; the result is reported as `partial` with a `characters_omitted` warning, and the Markdown shows the joined words
 - Sweet tools are demo/synthetic until real packages wired
 
 ## Non-goals

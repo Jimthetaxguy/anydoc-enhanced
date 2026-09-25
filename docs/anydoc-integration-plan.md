@@ -238,6 +238,9 @@ slide, sheet, or source-offset provenance that upstream does not expose.
   preserved image URL.
 - Treat any observable skipped chapter, slide, sheet, relationship, or package
   part as `incomplete_conversion`; never return partial content as success.
+  A character-level omission that leaves the text usable, such as a dropped
+  DOCX non-breaking hyphen, is returned with `completeness: partial` and a
+  named warning, never as `complete`.
 - Do not log paths, document text, embedded URLs, or filenames. Use an opaque
   request identifier.
 - Verify the resolved production graph contains no HTTP client or two

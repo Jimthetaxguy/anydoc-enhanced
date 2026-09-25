@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symbol-font checkboxes and letters (`w:sym`), legacy form checkbox and
   drop-down state. Hidden text is converted and disclosed with a
   `hidden_content_preserved` warning.
+- DOCX conversion also refuses ruby text and imported chunks (`w:altChunk`),
+  whose content the pinned parser drops. A dropped non-breaking hyphen
+  ("Form 1040‑SR" converts as "Form 1040SR") is reported with
+  `completeness: partial` and a `characters_omitted` warning; this is the first
+  lane to emit `partial`.
 - XLSX conversion refuses number-format codes over 4,096 bytes; one 8 MiB code
   had amplified to 855 MiB in the worker.
 - Markdown sanitization decodes each link destination before classifying it.
@@ -68,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `parse_irc_sections` reads the Markdown pdf-inspector renders. It returns
   full provision labels such as `(d)(2)(A)(i)`, flags repealed sections, and
   keeps editorial and statutory notes apart from the operative text.
-- `scripts/build-anydoc-hardening-corpus.py` and ten synthetic fixtures that
+- `scripts/build-anydoc-hardening-corpus.py` and thirteen synthetic fixtures that
   reproduce pinned-AnyDoc behaviors the local contract does not inherit.
 - `docs/upstream-drift-audit-2026-09-24.md`: the upstream refresh audit and the
   disposition of each open AnyDoc pull request.
@@ -93,6 +98,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `identify_tax_form`: bank-direct 1099-INTs that render as numeric tables only return `Unknown` (no header text in markdown)
 - No OCR engine ships. Scanned pages report that they need OCR and why, and
   return no text for those pages.
-- AnyDoc 0.2.4 drops some DOCX run content that is not yet refused or
-  disclosed, including non-breaking hyphens and ruby base text; see the next
-  slices in `docs/iterative-improvement-roadmap.md`.
+- DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
+  restore it; the Markdown shows the joined words.

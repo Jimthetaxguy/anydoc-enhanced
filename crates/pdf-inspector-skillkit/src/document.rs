@@ -325,7 +325,8 @@ pub enum Completeness {
     /// Required package content was present and conversion completed.
     Complete,
     /// Conversion produced output but an audited completeness check found a
-    /// recoverable omission. This state is not currently emitted by AnyDoc.
+    /// recoverable omission, named by a warning. Emitted for DOCX when the
+    /// pinned parser drops non-breaking hyphens (`characters_omitted`).
     Partial,
 }
 
@@ -507,6 +508,9 @@ struct PackagePreflight {
     missing_formula_cache: bool,
     missing_required_content: bool,
     unsupported_content: bool,
+    /// Characters the pinned parser drops while the text around them
+    /// converts, so the result is usable but partial.
+    omitted_characters: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1197,6 +1201,9 @@ struct DocxStoryScan {
     /// A run formatted hidden directly (`w:r/w:rPr/w:vanish`), which the
     /// pinned parser converts as ordinary text.
     hidden_run: bool,
+    /// A non-breaking hyphen (`w:noBreakHyphen`), which the pinned parser
+    /// drops, joining its neighbors: "Form 1040‑SR" converts as "Form 1040SR".
+    omitted_hyphen: bool,
     /// Character, paragraph, and table styles applied to content.
     styles_used: HashSet<String>,
 }
@@ -1275,10 +1282,20 @@ fn scan_docx_element(
     // under a paragraph mark (`w:pPr/w:rPr`) or in revision history
     // (`w:rPrChange/w:rPr`, `w:pPrChange/w:pPr`) formats nothing visible.
     let run_property = xml_path_ends_with(stack, &[b"r", b"rPr"]);
+    // Tracked deletions and the source side of tracked moves are omitted from
+    // the output, so nothing inside them is dropped by the parser.
+    let removed = stack
+        .iter()
+        .any(|name| name == b"del" || name == b"moveFrom");
     match local {
-        // Tracked deletions are omitted from the output, symbols included.
-        b"sym" | b"checkBox" | b"ddList" if !stack.iter().any(|name| name == b"del") => {
+        // Ruby text loses its base text as well as the annotation, and an
+        // imported chunk (`w:altChunk`, HTML or RTF that Word merges on
+        // opening) loses all of its content.
+        b"sym" | b"checkBox" | b"ddList" | b"ruby" | b"altChunk" if !removed => {
             scan.dropped = true;
+        }
+        b"noBreakHyphen" if !removed && xml_path_ends_with(stack, &[b"r"]) => {
+            scan.omitted_hyphen = true;
         }
         b"vanish" if run_property => scan.hidden_run |= !xml_toggle_off(event),
         b"rStyle" if run_property => record_style(event, scan)?,
@@ -2991,6 +3008,7 @@ fn preflight_package(
             defaults_hidden |= defaults;
         }
         result.unsupported_content |= docx_scan.dropped;
+        result.omitted_characters |= docx_scan.omitted_hyphen;
         result.hidden_content |= docx_scan.hidden_run
             || defaults_hidden
             || docx_scan
@@ -3148,6 +3166,15 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
         return Err(DocumentError::OutputTooLarge);
     }
     let mut warnings = Vec::new();
+    let mut completeness = Completeness::Complete;
+    if kind == DocumentKind::Docx && preflight.omitted_characters {
+        completeness = Completeness::Partial;
+        warnings.push(DocumentWarning {
+            code: "characters_omitted".into(),
+            message: "The document uses non-breaking hyphens, which the converter drops; hyphenated terms such as form numbers may appear joined."
+                .into(),
+        });
+    }
     if kind == DocumentKind::Docx && preflight.hidden_content {
         warnings.push(DocumentWarning {
             code: "hidden_content_preserved".into(),
@@ -3174,7 +3201,7 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
         schema_version: PROTOCOL_VERSION,
         provider: provider_for(kind),
         markdown,
-        completeness: Completeness::Complete,
+        completeness,
         warnings,
         input_bytes: bytes.len() as u64,
     })
@@ -4806,6 +4833,42 @@ mod tests {
             r#"<w:p><w:sdt><w:sdtContent><w:r><w:t>&#x2612; Yes</w:t></w:r></w:sdtContent></w:sdt></w:p>"#,
         );
         assert!(!docx_preflight(&[("word/document.xml", &control)]).unsupported_content);
+    }
+
+    #[test]
+    fn docx_inline_content_the_pinned_parser_drops_is_refused_or_disclosed() {
+        let preflight_for = |body: &str| {
+            let document = word_part("document", body);
+            docx_preflight(&[("word/document.xml", &document)])
+        };
+        // Content lost with its markup fails closed.
+        for body in [
+            r#"<w:p><w:r><w:ruby><w:rt><w:r><w:t>Note</w:t></w:r></w:rt><w:rubyBase><w:r><w:t>Base</w:t></w:r></w:rubyBase></w:ruby></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:altChunk r:id="rIdAlt"/>"#,
+        ] {
+            let preflight = preflight_for(body);
+            assert!(preflight.unsupported_content, "{body}");
+            assert!(matches!(
+                preflight_rejection(DocumentKind::Docx, &preflight),
+                Some(DocumentError::IncompleteConversion)
+            ));
+        }
+        // A dropped non-breaking hyphen leaves usable, partial text.
+        let preflight = preflight_for(
+            "<w:p><w:r><w:t>Form 1040</w:t><w:noBreakHyphen/><w:t>SR</w:t></w:r></w:p>",
+        );
+        assert!(preflight.omitted_characters);
+        assert!(!preflight.unsupported_content);
+        assert!(preflight_rejection(DocumentKind::Docx, &preflight).is_none());
+        // Tracked deletions and move sources are omitted whole, so nothing
+        // in them is dropped.
+        for wrapper in ["del", "moveFrom"] {
+            let preflight = preflight_for(&format!(
+                r#"<w:p><w:{wrapper}><w:r><w:sym w:char="F0FE"/><w:noBreakHyphen/><w:ruby/></w:r></w:{wrapper}></w:p>"#
+            ));
+            assert!(!preflight.unsupported_content, "{wrapper}");
+            assert!(!preflight.omitted_characters, "{wrapper}");
+        }
     }
 
     #[test]

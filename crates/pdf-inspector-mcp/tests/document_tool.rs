@@ -1270,6 +1270,8 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
         ("docx/symbol-checkbox.docx", "incomplete_conversion"),
         ("docx/legacy-form-checkbox.docx", "incomplete_conversion"),
         ("docx/utf16-footnote-symbol.docx", "incomplete_conversion"),
+        ("docx/ruby-text.docx", "incomplete_conversion"),
+        ("docx/alt-chunk.docx", "incomplete_conversion"),
         ("pptx/fragment-slide-target.pptx", "incomplete_conversion"),
         (
             "pptx/case-variant-presentation-rels.pptx",
@@ -1334,6 +1336,26 @@ fn docx_hidden_text_is_converted_and_disclosed() {
             "{fixture}"
         );
     }
+}
+
+#[test]
+fn docx_dropped_hyphens_are_reported_as_partial() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/non-breaking-hyphen.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-hyphen-integration-test");
+    assert_eq!(document["completeness"], "partial");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(
+        markdown.contains("HYPHEN-MARKER") && markdown.contains("HARDENING-END"),
+        "{markdown}"
+    );
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "characters_omitted"));
 }
 
 #[test]

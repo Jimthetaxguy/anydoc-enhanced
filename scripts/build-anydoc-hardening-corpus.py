@@ -24,6 +24,13 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
   same text. Expected `incomplete_conversion`.
 - utf16-hidden-style.docx: a hidden character style in a UTF-16 styles part.
   Expected complete conversion with the `hidden_content_preserved` warning.
+- non-breaking-hyphen.docx: "FORM 1040" + `w:noBreakHyphen` + "SR"; the
+  pinned parser drops the hyphen and joins the words. Expected a partial
+  conversion with the `characters_omitted` warning.
+- ruby-text.docx: ruby text, whose base text the pinned parser drops with the
+  annotation. Expected `incomplete_conversion`.
+- alt-chunk.docx: an imported HTML chunk (`w:altChunk`) that Word merges on
+  opening and the pinned parser drops. Expected `incomplete_conversion`.
 - pptx/fragment-slide-target.pptx: a slide target whose fragment hides a `..`
   from AnyDoc's resolver, so AnyDoc converts a hidden slide outside
   `ppt/slides/` while a naive resolver lands on a checked decoy. Expected
@@ -335,6 +342,27 @@ def main():
         ],
     )
     write_encoded_chapter_epub()
+    write_docx(
+        "non-breaking-hyphen.docx",
+        '<w:p><w:r><w:t xml:space="preserve">FORM 1040</w:t><w:noBreakHyphen/>'
+        '<w:t xml:space="preserve">SR HYPHEN-MARKER</w:t></w:r></w:p>',
+    )
+    write_docx(
+        "ruby-text.docx",
+        "<w:p><w:r><w:ruby><w:rubyPr/><w:rt><w:r><w:t>RUBY-ANNOTATION</w:t></w:r></w:rt>"
+        "<w:rubyBase><w:r><w:t>RUBY-BASE</w:t></w:r></w:rubyBase></w:ruby></w:r></w:p>",
+    )
+    write_docx(
+        "alt-chunk.docx",
+        '<w:altChunk r:id="rIdChunk"/>',
+        (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{RELS_NS}">'
+            f'<Relationship Id="rIdChunk" Type="{REL_TYPE}/aFChunk" Target="chunk.html"/>'
+            "</Relationships>"
+        ),
+        [("word/chunk.html", "<html><body><p>IMPORTED-CHUNK-TEXT</p></body></html>")],
+    )
     write_docx(
         "utf16-hidden-style.docx",
         '<w:p><w:r><w:rPr><w:rStyle w:val="Quiet"/></w:rPr>'

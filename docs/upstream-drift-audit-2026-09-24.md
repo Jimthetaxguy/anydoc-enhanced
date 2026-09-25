@@ -116,6 +116,9 @@ assert the local result.
 | A checked legacy FORMCHECKBOX loses its state | `incomplete_conversion` | `docx/legacy-form-checkbox.docx` |
 | Hidden runs (`w:vanish`) convert as ordinary text | converted with the `hidden_content_preserved` warning | `docx/hidden-text.docx` |
 | `mailto:`, `file:`, `data:`, `tel:`, and UNC link targets are written into Markdown | complete, every destination removed | `docx/external-link-schemes.docx` |
+| Ruby text (`w:ruby`) loses its base text with the annotation | `incomplete_conversion` | `docx/ruby-text.docx` |
+| Imported chunks (`w:altChunk`) that Word merges on opening are dropped | `incomplete_conversion` | `docx/alt-chunk.docx` |
+| A non-breaking hyphen (`w:noBreakHyphen`) is dropped, joining "1040‑SR" into "1040SR" | `completeness: partial` with the `characters_omitted` warning | `docx/non-breaking-hyphen.docx` |
 | One long `formatCode` amplifies into hundreds of MiB | `resource_limit` before conversion | `xlsx/oversized-number-format.xlsx` |
 | A UTF-16 part is transcoded before parsing, so a byte-level check misses it | checks read the transcoded text: `incomplete_conversion` | `docx/utf16-footnote-symbol.docx` |
 | Hidden text through a style in a UTF-16 styles part | disclosed with `hidden_content_preserved` | `docx/utf16-hidden-style.docx` |
@@ -169,8 +172,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 169 tests pass (125 skillkit unit, 12
-  skillkit integration, 24 document-tool and 5 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 171 tests pass (126 skillkit unit, 12
+  skillkit integration, 25 document-tool and 5 PDF-tool MCP integration, 3
   MCP unit)
 - `bash scripts/check-public-hygiene.sh`
 - Golden comparison of every tool over the public corpus against the previous

@@ -33,12 +33,12 @@ public handoff):
 |---|---|---|
 | `classify_pdf` | Public-fixture test | Tracked 4-page U.S. Code PDF |
 | `pdf_to_markdown` | Public-fixture test | Asserts expected Title 26 content |
-| `analyze_layout` | Compile-tested only | No live MCP smoke yet |
-| `extract_text_regions` | Compile-tested only | API verified, no live MCP smoke |
+| `analyze_layout` | Public-fixture MCP test | Layout signals through the worker on the tracked Title 26 PDF |
+| `extract_text_regions` | Public-fixture MCP test | Region text through the worker on the tracked Title 26 PDF |
 | `extract_table_regions` | Compile-tested only | API verified, no live MCP smoke |
-| `batch_classify` | Compile-tested only | Loops `classify_pdf` |
+| `batch_classify` | Public-fixture MCP test | Text, scanned, and missing inputs in one call |
 | `identify_tax_form` | Unit-tested | No redistributable positive tax-form fixture yet |
-| `parse_irc_sections` | Partial | Unit coverage exists; richer public corpus remains required |
+| `parse_irc_sections` | Public-fixture test | Sections, full provision labels, and repealed placeholders on the tracked Title 26 PDFs |
 | `split_sec_filing` | Unit-tested | No redistributable live-filing fixture yet |
 | `list_tax_packages` | Synthetic demo | Lists bundled Sweet demo packages across six tax workflows |
 | `review_tax_package` | Synthetic demo | Runs deterministic checks against bundled structured examples |
