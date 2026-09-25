@@ -7,11 +7,13 @@
 //! settings, so it reads every layer as shown, and the Markdown holds text
 //! the page does not show, "Ending balance 1,000.00 superseded" beside the
 //! "Ending balance 2,000.00" a reader sees. The layers are read from the
-//! default configuration: its base state, and the layers it turns on or
-//! off; a membership dictionary shows its content as its policy or
-//! visibility expression says, and a layer meant for design only has no
-//! effect on viewing. Content is hidden where a marked-content span, a
-//! form, or an annotation names a layer so hidden.
+//! default configuration: its base state, the layers it turns on or off,
+//! and the states a viewer sets them to from their usage on opening the
+//! document; a layer is hidden only where the common readers all hide it
+//! (see `Layers::hidden`). A membership dictionary shows its content as its
+//! policy or visibility expression says, and a layer meant for design only
+//! has no effect on viewing. Content is hidden where a marked-content span,
+//! a form, or an annotation names a layer so hidden.
 //!
 //! Each verdict is reached once: a layer's, and that of a membership
 //! dictionary or an expression the document holds, are kept, so a page
@@ -32,6 +34,19 @@ const MAX_EXPRESSION_DEPTH: usize = 32;
 /// kept (see the module's documentation).
 const MAX_TERMS: usize = 1_000_000;
 
+/// The categories of a layer's usage dictionary a viewer sets its state
+/// from on opening the document (ISO 32000-1, 8.11.4.4), each with the entry
+/// giving the state it recommends; the rest recommend a state the reader
+/// decides, by its magnification, its user, or its language.
+const CATEGORIES: [(&[u8], Option<&[u8]>); 6] = [
+    (b"View", Some(b"ViewState")),
+    (b"Print", Some(b"PrintState")),
+    (b"Export", Some(b"ExportState")),
+    (b"Zoom", None),
+    (b"User", None),
+    (b"Language", None),
+];
+
 /// What a verdict is kept by: a layer, by its object id; a membership
 /// dictionary or an expression the document refers to, by its object id;
 /// or a dictionary the document holds in place, by its address, which
@@ -50,6 +65,9 @@ pub(crate) struct Layers {
     base_off: bool,
     on: HashSet<ObjectId>,
     off: HashSet<ObjectId>,
+    /// The categories a viewer sets each layer's state from on opening the
+    /// document (see `automatic`); `None` where they were too many to read.
+    automatic: Option<HashMap<ObjectId, u8>>,
     /// Whether the content each layer, membership dictionary, and
     /// expression judged so far marks shows.
     shows: RefCell<HashMap<Key, bool>>,
@@ -64,17 +82,21 @@ fn resolve<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object>
     }
 }
 
-fn references(document: &Document, object: Option<&Object>) -> HashSet<ObjectId> {
+/// The entries of `object`, where it is an array or refers to one; none
+/// where it is not.
+fn array<'a>(document: &'a Document, object: Option<&'a Object>) -> &'a [Object] {
     object
         .and_then(|object| resolve(document, object))
         .and_then(|object| object.as_array().ok())
-        .map(|array| {
-            array
-                .iter()
-                .filter_map(|entry| entry.as_reference().ok())
-                .collect()
-        })
+        .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+fn references(document: &Document, object: Option<&Object>) -> HashSet<ObjectId> {
+    array(document, object)
+        .iter()
+        .filter_map(|entry| entry.as_reference().ok())
+        .collect()
 }
 
 impl Layers {
@@ -97,7 +119,12 @@ impl Layers {
             .and_then(|default| resolve(document, default))
             .and_then(|default| default.as_dict().ok());
         let Some(default) = default else {
-            return Some(Layers::set(false, HashSet::new(), HashSet::new()));
+            return Some(Layers::set(
+                false,
+                HashSet::new(),
+                HashSet::new(),
+                Some(HashMap::new()),
+            ));
         };
         Some(Layers::set(
             default
@@ -107,16 +134,24 @@ impl Layers {
                 .is_some_and(|state| state == b"OFF"),
             references(document, default.get(b"ON").ok()),
             references(document, default.get(b"OFF").ok()),
+            automatic(document, default.get(b"AS").ok()),
         ))
     }
 
     /// Layers set as `base_off` says, with those `on` turned on and those
-    /// `off` turned off, no verdict reached yet.
-    fn set(base_off: bool, on: HashSet<ObjectId>, off: HashSet<ObjectId>) -> Self {
+    /// `off` turned off, and set on opening from the `automatic` categories
+    /// of their usage, no verdict reached yet.
+    fn set(
+        base_off: bool,
+        on: HashSet<ObjectId>,
+        off: HashSet<ObjectId>,
+        automatic: Option<HashMap<ObjectId, u8>>,
+    ) -> Self {
         Layers {
             base_off,
             on,
             off,
+            automatic,
             shows: RefCell::new(HashMap::new()),
             terms: Cell::new(MAX_TERMS),
         }
@@ -136,15 +171,15 @@ impl Layers {
     }
 
     /// Whether the layer `id` shows, judged once: a layer for design only
-    /// always does. `None` once the bound is spent.
+    /// always does, and any other unless readers hide it (see `hidden`).
+    /// `None` once the bound is spent.
     fn layer_shows(&self, document: &Document, id: ObjectId) -> Option<bool> {
         self.term()?;
         if let Some(shows) = self.kept(Key::Layer(id)) {
             return Some(shows);
         }
-        let design_only = document
-            .get_dictionary(id)
-            .ok()
+        let layer = document.get_dictionary(id).ok();
+        let design_only = layer
             .and_then(|layer| layer.get(b"Intent").ok())
             .is_some_and(|intent| match intent {
                 Object::Name(name) => name != b"View" && name != b"All",
@@ -154,14 +189,41 @@ impl Layers {
                 }),
                 _ => false,
             });
-        let shows = design_only
-            || if self.base_off {
-                self.on.contains(&id)
-            } else {
-                !self.off.contains(&id)
-            };
+        let shows = design_only || !self.hidden(document, id, layer);
         self.shows.borrow_mut().insert(Key::Layer(id), shows);
         Some(shows)
+    }
+
+    /// Whether readers hide the layer `id`, whose dictionary is `layer`, on
+    /// opening the document. The default configuration turns it on or off;
+    /// a viewer following ISO 32000-1 (8.11.4.4) then sets it as its usage
+    /// recommends in the categories the configuration's usage application
+    /// dictionaries for viewing name for it (see `opened`). PDFium and
+    /// pdf.js read no usage application dictionaries: PDFium sets a layer
+    /// as its usage recommends for viewing, where it does, whatever the
+    /// configuration says, and pdf.js hides a layer that either turns off.
+    /// Readers differ where the usage recommends a state for viewing and
+    /// nothing applies it, or recommends showing a layer turned off; the
+    /// layer is taken to be hidden only where all of them hide it.
+    fn hidden(&self, document: &Document, id: ObjectId, layer: Option<&Dictionary>) -> bool {
+        let set_on = if self.base_off {
+            self.on.contains(&id)
+        } else {
+            !self.off.contains(&id)
+        };
+        let usage = layer
+            .and_then(|layer| layer.get(b"Usage").ok())
+            .and_then(|usage| resolve(document, usage))
+            .and_then(|usage| usage.as_dict().ok());
+        let opened = match &self.automatic {
+            Some(automatic) => match automatic.get(&id) {
+                Some(&named) => opened(document, usage, named, set_on),
+                None => Some(set_on),
+            },
+            None => None,
+        };
+        let viewing = recommended(document, usage, b"View", b"ViewState");
+        opened == Some(false) && !viewing.unwrap_or(set_on)
     }
 
     /// Whether a visibility expression shows its content, read `depth`
@@ -370,6 +432,104 @@ impl Layers {
     }
 }
 
+/// The categories, as bits in the order of `CATEGORIES`, a viewer sets each
+/// layer's state from on opening the document, as `applications`, the
+/// default configuration's usage application dictionaries, name them: those
+/// for the View event naming the layer. `None` where they name more layers
+/// and categories than `MAX_TERMS`; a viewer's states are then not known.
+fn automatic(document: &Document, applications: Option<&Object>) -> Option<HashMap<ObjectId, u8>> {
+    let mut automatic = HashMap::new();
+    let mut left = MAX_TERMS;
+    for application in array(document, applications) {
+        let Some(application) =
+            resolve(document, application).and_then(|application| application.as_dict().ok())
+        else {
+            continue;
+        };
+        let viewing = application
+            .get(b"Event")
+            .ok()
+            .and_then(|event| event.as_name().ok())
+            .is_some_and(|event| event == b"View");
+        if !viewing {
+            continue;
+        }
+        let mut named = 0;
+        for category in array(document, application.get(b"Category").ok()) {
+            left = left.checked_sub(1)?;
+            let bit = category
+                .as_name()
+                .ok()
+                .and_then(|category| CATEGORIES.iter().position(|(name, _)| *name == category));
+            named |= bit.map_or(0, |bit| 1 << bit);
+        }
+        if named == 0 {
+            continue;
+        }
+        for layer in array(document, application.get(b"OCGs").ok()) {
+            left = left.checked_sub(1)?;
+            if let Ok(layer) = layer.as_reference() {
+                *automatic.entry(layer).or_insert(0) |= named;
+            }
+        }
+    }
+    Some(automatic)
+}
+
+/// The state a viewer following ISO 32000-1 sets a layer to on opening the
+/// document, where the default configuration turned it on as `set_on` says,
+/// its usage dictionary is `usage`, and usage application dictionaries for
+/// viewing name the `named` categories for it: off where the usage
+/// recommends off in one of them; else not known where it recommends a
+/// state the reader decides; else on where it recommends on; else as the
+/// configuration set it.
+fn opened(
+    document: &Document,
+    usage: Option<&Dictionary>,
+    named: u8,
+    set_on: bool,
+) -> Option<bool> {
+    let mut on = false;
+    let mut undecided = false;
+    for (bit, (category, entry)) in CATEGORIES.iter().enumerate() {
+        if named & (1 << bit) == 0 {
+            continue;
+        }
+        match entry {
+            Some(entry) => match recommended(document, usage, category, entry) {
+                Some(false) => return Some(false),
+                Some(true) => on = true,
+                None => {}
+            },
+            None => undecided |= usage.is_some_and(|usage| usage.has(category)),
+        }
+    }
+    if undecided {
+        None
+    } else {
+        Some(on || set_on)
+    }
+}
+
+/// The state `usage`, a layer's usage dictionary, recommends in `category`
+/// by its `entry`: on unless the entry is `/OFF`; `None` where it has none.
+fn recommended(
+    document: &Document,
+    usage: Option<&Dictionary>,
+    category: &[u8],
+    entry: &[u8],
+) -> Option<bool> {
+    let state = usage?
+        .get(category)
+        .ok()
+        .and_then(|category| resolve(document, category))?
+        .as_dict()
+        .ok()?
+        .get(entry)
+        .ok()?;
+    Some(!matches!(resolve(document, state), Some(Object::Name(name)) if name == b"OFF"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +688,110 @@ mod tests {
         let written = dictionary! { "Type" => "OCMD", "VE" => hidden };
         assert!(layers.hides_written(&document, &written));
         assert!(layers.hides_written(&document, &written));
+    }
+
+    #[test]
+    fn layers_hide_as_readers_set_them_on_opening() {
+        let mut document = Document::with_version("1.7");
+        let viewed = |state: &str| dictionary! { "View" => dictionary! { "ViewState" => state } };
+        let zoomed = dictionary! { "Zoom" => dictionary! { "min" => 2 } };
+        let mut zoomed_off = zoomed.clone();
+        zoomed_off.extend(&viewed("OFF"));
+        let usages = [
+            Some(viewed("OFF")),
+            Some(viewed("OFF")),
+            Some(viewed("ON")),
+            Some(viewed("ON")),
+            Some(zoomed),
+            Some(zoomed_off),
+            Some(viewed("OFF")),
+            None,
+        ];
+        let ids: Vec<ObjectId> = usages
+            .into_iter()
+            .map(|usage| {
+                let mut layer = dictionary! { "Type" => "OCG" };
+                if let Some(usage) = usage {
+                    layer.set("Usage", usage);
+                }
+                document.add_object(layer)
+            })
+            .collect();
+        let [viewed_off, unapplied_off, viewed_on, unapplied_on, zoomed, zoomed_off, printed, off] =
+            ids[..]
+        else {
+            unreachable!("eight layers");
+        };
+        let application = |event: &str, category: &str, layers: &[ObjectId]| -> Object {
+            dictionary! {
+                "Event" => event,
+                "Category" => vec![category.into()],
+                "OCGs" => layers.iter().map(|&id| id.into()).collect::<Vec<Object>>(),
+            }
+            .into()
+        };
+        let catalog = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "OCProperties" => dictionary! {
+                "OCGs" => ids.iter().map(|&id| id.into()).collect::<Vec<Object>>(),
+                "D" => dictionary! {
+                    "OFF" => vec![viewed_on.into(), unapplied_on.into(), zoomed.into(), off.into()],
+                    "AS" => vec![
+                        application("View", "View", &[viewed_off, viewed_on]),
+                        application("View", "Zoom", &[zoomed, zoomed_off]),
+                        application("View", "View", &[zoomed_off]),
+                        application("Print", "View", &[printed]),
+                    ],
+                },
+            },
+        });
+        document.trailer.set("Root", catalog);
+        let layers = Layers::new(&document).expect("layers");
+        let hides = |id: ObjectId| layers.hides(&document, &id.into());
+        // On opening, a viewer sets a layer as its usage recommends for
+        // viewing where the configuration applies that: hidden where it
+        // recommends hiding, as PDFium and pdf.js hide it too; shown where
+        // it recommends showing a layer turned off, as PDFium shows it too.
+        assert!(hides(viewed_off));
+        assert!(!hides(viewed_on));
+        // Where nothing applies its usage for viewing, a viewer sets the
+        // layer as the configuration does: one turned on shows, though
+        // PDFium and pdf.js hide it by its usage; one turned off is hidden,
+        // unless PDFium shows it by its usage.
+        assert!(!hides(unapplied_off));
+        assert!(hides(off));
+        assert!(!hides(unapplied_on));
+        // A recommendation applied on printing is not one for viewing.
+        assert!(!hides(printed));
+        // The magnification a layer wants may be the reader's; where another
+        // category recommends hiding the layer, it is hidden all the same.
+        assert!(!hides(zoomed));
+        assert!(hides(zoomed_off));
+        // Named past the bound, the states a viewer sets are not known, and
+        // a layer turned off shows.
+        for (applications, hides) in [(1, true), (1_001, false)] {
+            let mut crowded = Document::with_version("1.7");
+            let ids: Vec<ObjectId> = (0..1_000)
+                .map(|_| crowded.add_object(dictionary! { "Type" => "OCG" }))
+                .collect();
+            let named =
+                crowded.add_object(ids.iter().map(|&id| id.into()).collect::<Vec<Object>>());
+            let application = crowded.add_object(dictionary! {
+                "Event" => "View", "Category" => vec!["View".into()], "OCGs" => named,
+            });
+            let catalog = crowded.add_object(dictionary! {
+                "Type" => "Catalog",
+                "OCProperties" => dictionary! {
+                    "OCGs" => named,
+                    "D" => dictionary! {
+                        "OFF" => vec![ids[0].into()],
+                        "AS" => vec![Object::from(application); applications],
+                    },
+                },
+            });
+            crowded.trailer.set("Root", catalog);
+            let layers = Layers::new(&crowded).expect("layers");
+            assert_eq!(layers.hides(&crowded, &ids[0].into()), hides);
+        }
     }
 }

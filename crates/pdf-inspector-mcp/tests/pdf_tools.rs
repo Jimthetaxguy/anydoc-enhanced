@@ -1988,6 +1988,50 @@ fn layers_named_in_many_spans_are_judged_once() {
     assert!(started.elapsed() < Duration::from_secs(20));
 }
 
+/// A statement page whose superseded balance sits in a layer the default
+/// configuration leaves on, meant for print: its usage recommends hiding it
+/// when viewed, which the configuration has a viewer apply on opening where
+/// `applied`.
+fn print_layer_pdf(applied: bool) -> Vec<u8> {
+    let automatic = if applied {
+        "/AS [<< /Event /View /Category [/View] /OCGs [6 0 R] >>]"
+    } else {
+        ""
+    };
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /ON [6 0 R] {automatic} >> >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Checking account statement) Tj ET \
+              BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET \
+              /OC /MC0 BDC BT /F1 10 Tf 72 680 Td (Ending balance 1,000.00 superseded) Tj ET EMC",
+        ),
+        b"<< /Type /OCG /Name (Print only) /Usage << /View << /ViewState /OFF >> /Print << /PrintState /ON >> >> >>".to_vec(),
+    ])
+}
+
+#[test]
+fn layers_a_viewer_hides_on_opening_are_reported() {
+    let results = convert_all(&[print_layer_pdf(true), print_layer_pdf(false)]);
+    // Applied on opening, the layer's usage hides it from a reader, and
+    // pdf-inspector reads it all the same. Not applied, a viewer following
+    // the standard shows the layer, as the configuration leaves it on.
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("1,000.00 superseded"), "{markdown}");
+    }
+    assert_eq!(
+        warned_pages(&results, "hidden_layer_text_read"),
+        [Some(serde_json::json!([1])), None]
+    );
+}
+
 /// A statement page showing `content` after its heading and balance, in
 /// Helvetica as `/F1` (object 4), with a layer (object 6) off by default, and
 /// `objects` as objects 7 on. Its resources hold `/F1`, the layer as `/MC0`,
