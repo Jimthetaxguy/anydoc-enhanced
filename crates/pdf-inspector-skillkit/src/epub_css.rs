@@ -3136,7 +3136,17 @@ struct Open {
     contents_hidden: bool,
     /// Children are fallback content a reader replaces.
     fallback: bool,
+    /// Children sit in an SVG image, outside a `foreignObject`.
     in_svg: bool,
+    /// A reader paints nothing inside where it stands (see
+    /// [`svg_unpainted`]).
+    unpainted: bool,
+    /// Inside an SVG `text` element, whose text a reader paints; other SVG
+    /// elements paint none right inside them.
+    svg_text: bool,
+    /// For an SVG `switch`: whether a child it may render has come, which
+    /// leaves the later ones unrendered.
+    switch_taken: Option<bool>,
     /// Children are laid out as flex or grid items.
     items: Tri,
     exempt: Exempt,
@@ -3505,15 +3515,77 @@ struct Facts {
     position: Position,
 }
 
+/// What the pass before the walk finds in a chapter: the facts of each
+/// element in document order, and the ids something refers to where that
+/// makes a reader paint an SVG resource (see [`svg_unpainted`]).
+#[derive(Default)]
+struct ChapterFacts {
+    elements: Vec<Facts>,
+    /// The ids an SVG `use` element draws.
+    used: std::collections::HashSet<String>,
+    /// The ids a fill, stroke, clip path, mask, or marker paints
+    /// (`url(#id)`), in an attribute or a `style` element.
+    painted: std::collections::HashSet<String>,
+}
+
+/// Properties that paint the SVG resource they refer to: a pattern as a
+/// fill or stroke, a clip path, a mask, and markers.
+const PAINTING_PROPERTIES: [&str; 8] = [
+    "fill",
+    "stroke",
+    "clip-path",
+    "mask",
+    "marker",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+];
+
+/// The ids the `url(#id)` references in a value refer to.
+fn url_fragments(value: &str) -> impl Iterator<Item = &str> + '_ {
+    let lower = value.to_ascii_lowercase();
+    let starts: Vec<usize> = lower.match_indices("url(").map(|(at, _)| at + 4).collect();
+    starts.into_iter().filter_map(move |start| {
+        let rest = value[start..].trim_start().trim_start_matches(['"', '\'']);
+        let id = rest.strip_prefix('#')?;
+        let end = id
+            .find(|character: char| {
+                matches!(character, ')' | '"' | '\'') || character.is_whitespace()
+            })
+            .unwrap_or(id.len());
+        Some(&id[..end])
+    })
+}
+
+/// Add the ids that painting declarations in a `style` attribute or
+/// element refer to.
+fn painted_by_style(css: &str, painted: &mut std::collections::HashSet<String>) {
+    for declaration in css.split([';', '{', '}']) {
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if PAINTING_PROPERTIES
+            .iter()
+            .any(|property| name.eq_ignore_ascii_case(property))
+        {
+            painted.extend(url_fragments(value).map(str::to_string));
+        }
+    }
+}
+
 /// An open element in the pass before the walk, or the chapter's top
 /// level: its element children so far, each with the name it carries, and
-/// how many carry each name.
+/// how many carry each name; whether its children sit in an SVG image, and
+/// whether it is a `style` element, whose text is a stylesheet.
 #[derive(Default)]
 struct Family {
     fact: Option<usize>,
     children: Vec<(u32, u32)>,
     names: HashMap<String, u32>,
     counts: Vec<u32>,
+    svg: bool,
+    style: bool,
 }
 
 impl Family {
@@ -3529,13 +3601,15 @@ impl Family {
 }
 
 /// For each element of a chapter in document order: whether a child is one
-/// of AnyDoc's blocks, and where it sits among its siblings.
-fn element_facts(chapter: &[u8]) -> Result<Vec<Facts>, DocumentError> {
+/// of AnyDoc's blocks, and where it sits among its siblings; and the ids
+/// that make a reader paint an SVG resource.
+fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
     let mut xml = quick_xml::Reader::from_reader(std::io::Cursor::new(chapter));
     xml.config_mut().trim_text(false);
     xml.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    let mut facts: Vec<Facts> = Vec::new();
+    let mut found = ChapterFacts::default();
+    let facts = &mut found.elements;
     let mut open: Vec<Family> = vec![Family::default()];
     loop {
         let event = xml
@@ -3546,16 +3620,30 @@ fn element_facts(chapter: &[u8]) -> Result<Vec<Facts>, DocumentError> {
             quick_xml::events::Event::Empty(element) => (element, false),
             quick_xml::events::Event::End(_) => {
                 if open.len() > 1 {
-                    open.pop().expect("an open element").finish(&mut facts);
+                    open.pop().expect("an open element").finish(facts);
                 }
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::Text(text)
+                if open.last().is_some_and(|family| family.style) =>
+            {
+                painted_by_style(&String::from_utf8_lossy(text.as_ref()), &mut found.painted);
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::CData(text)
+                if open.last().is_some_and(|family| family.style) =>
+            {
+                painted_by_style(&String::from_utf8_lossy(text.as_ref()), &mut found.painted);
                 buffer.clear();
                 continue;
             }
             quick_xml::events::Event::Eof => {
                 while let Some(family) = open.pop() {
-                    family.finish(&mut facts);
+                    family.finish(facts);
                 }
-                return Ok(facts);
+                return Ok(found);
             }
             _ => {
                 buffer.clear();
@@ -3565,9 +3653,42 @@ fn element_facts(chapter: &[u8]) -> Result<Vec<Facts>, DocumentError> {
         let name = element.name();
         let local = String::from_utf8_lossy(super::xml_local_name(name.as_ref())).into_owned();
         let family = open.last_mut().expect("the chapter's top level");
+        let svg = family.svg || local == "svg";
+        for attribute in element.attributes().flatten() {
+            let key = attribute.key.as_ref();
+            if key == b"xmlns" || key.starts_with(b"xmlns:") {
+                continue;
+            }
+            let key = super::xml_local_name(key);
+            let used = key == b"href" && svg && local == "use";
+            let styled = key.eq_ignore_ascii_case(b"style");
+            let painting = PAINTING_PROPERTIES
+                .iter()
+                .any(|property| key.eq_ignore_ascii_case(property.as_bytes()));
+            if !(used || styled || painting) {
+                continue;
+            }
+            let value = attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map(|value| value.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned());
+            if used {
+                if let Some(id) = value.trim().strip_prefix('#') {
+                    found.used.insert(id.to_string());
+                }
+            } else if styled {
+                painted_by_style(&value, &mut found.painted);
+            } else {
+                found
+                    .painted
+                    .extend(url_fragments(&value).map(str::to_string));
+            }
+        }
         if let Some(parent) = family.fact {
             facts[parent].has_blocks |= anydoc_block(&local);
         }
+        let style = local == "style";
+        let foreign = local == "foreignObject";
         let next = family.names.len() as u32;
         let name = *family.names.entry(local).or_insert(next);
         if name as usize == family.counts.len() {
@@ -3587,6 +3708,8 @@ fn element_facts(chapter: &[u8]) -> Result<Vec<Facts>, DocumentError> {
         if start {
             open.push(Family {
                 fact: Some(facts.len() - 1),
+                svg: svg && !foreign,
+                style,
                 ..Family::default()
             });
         }
@@ -3627,6 +3750,48 @@ fn walked_reach(element: &Element, anydoc: &AnyDocCascade) -> Reach {
         "ul" | "ol" => Reach::List,
         "table" => Reach::Table,
         _ => Reach::Walk,
+    }
+}
+
+/// SVG elements a reader paints what they hold where they stand: the image,
+/// its groups and links, a `switch`, text and the spans and paths in it,
+/// and a `foreignObject`, whose HTML it lays out. Of these, only text and
+/// the HTML paint the text right inside them.
+fn svg_paints(local: &str) -> bool {
+    matches!(
+        local,
+        "svg" | "g" | "a" | "switch" | "text" | "tspan" | "textPath" | "foreignObject"
+    )
+}
+
+/// Whether a reader paints nothing an element inside an SVG image holds,
+/// where it stands. A resource paints only where something refers to it:
+/// a `symbol`, or an element inside `defs`, where a `use` element draws it,
+/// and a pattern, clip path, mask, or marker where a fill, stroke, clip,
+/// mask, or marker names it. Gradients, filters, and elements SVG does not
+/// define paint nothing.
+fn svg_unpainted(element: &Element, facts: &ChapterFacts, parent_unpainted: bool) -> bool {
+    let local = element.local.as_str();
+    let referenced = element.first("id").is_some_and(|id| match local {
+        "pattern" | "clipPath" | "mask" | "marker" => facts.painted.contains(id),
+        _ => (svg_paints(local) || local == "symbol") && facts.used.contains(id),
+    });
+    !referenced && (parent_unpainted || !svg_paints(local))
+}
+
+/// Whether a reader renders a child of an SVG `switch`, which renders only
+/// the first child whose conditions hold: no extension an EPUB names but
+/// HTML's holds, and a language holds only on a reader set to it.
+fn svg_switch_renders(element: &Element) -> Tri {
+    if element
+        .first("requiredextensions")
+        .is_some_and(|extensions| extensions.trim() != "http://www.w3.org/1999/xhtml")
+    {
+        Tri::No
+    } else if element.first("systemlanguage").is_some() {
+        Tri::Maybe
+    } else {
+        Tri::Yes
     }
 }
 
@@ -4023,8 +4188,12 @@ pub(super) fn chapter_text(
                 .last()
                 .filter(|_| text.chars().any(|character| !character.is_whitespace()));
             if let Some(state) = state {
-                let hidden =
-                    state.undisplayed || state.invisible || state.contents_hidden || state.fallback;
+                let hidden = state.undisplayed
+                    || state.invisible
+                    || state.contents_hidden
+                    || state.fallback
+                    || state.unpainted
+                    || (state.in_svg && !state.svg_text);
                 match state.reach {
                     Reach::Walk | Reach::Whole if hidden => {
                         let shown_anyway = match state.exempt {
@@ -4061,7 +4230,11 @@ pub(super) fn chapter_text(
         if elements.len() >= MAX_CHAPTER_DEPTH {
             return Err(DocumentError::ResourceLimit);
         }
-        let fact = facts.get(element_index).copied().unwrap_or_default();
+        let fact = facts
+            .elements
+            .get(element_index)
+            .copied()
+            .unwrap_or_default();
         let has_blocks = fact.has_blocks;
         element_index += 1;
         let local =
@@ -4197,9 +4370,38 @@ pub(super) fn chapter_text(
             ),
             _ => Effects::default(),
         };
-        let parent = open.last();
         let element = elements.last().expect("the element just pushed");
+        // Whether a reader paints what the element holds where it stands:
+        // inside an SVG image, see [`svg_unpainted`]; of a `switch`'s
+        // children, one it renders at most.
+        let rendered = match open
+            .last_mut()
+            .and_then(|parent| parent.switch_taken.as_mut())
+        {
+            Some(taken) => {
+                let renders = if *taken {
+                    Tri::No
+                } else {
+                    svg_switch_renders(element)
+                };
+                *taken |= renders != Tri::No;
+                renders
+            }
+            None => Tri::Yes,
+        };
+        let parent = open.last();
         let in_svg = parent_in_svg || element.lower == "svg";
+        let parent_unpainted = parent.is_some_and(|parent| parent.unpainted);
+        let unpainted = if parent_in_svg {
+            svg_unpainted(element, &facts, parent_unpainted) || rendered != Tri::Yes
+        } else {
+            parent_unpainted
+        };
+        let svg_text = parent.is_some_and(|parent| parent.svg_text)
+            || (parent_in_svg && element.local == "text");
+        let switch_taken = (in_svg && element.local == "switch").then_some(false);
+        // A `foreignObject` holds HTML, laid out as a reader lays out a page.
+        let children_in_svg = in_svg && element.local != "foreignObject";
         let mut state = match &style {
             // Nothing below converts or shows, so its style does not matter.
             None => Open {
@@ -4209,7 +4411,10 @@ pub(super) fn chapter_text(
                 invisible: false,
                 contents_hidden: false,
                 fallback: false,
-                in_svg,
+                in_svg: children_in_svg,
+                unpainted,
+                svg_text,
+                switch_taken,
                 items: Tri::No,
                 exempt: Exempt::None,
                 effects,
@@ -4239,7 +4444,10 @@ pub(super) fn chapter_text(
                     },
                     contents_hidden: style.content_visibility == Resolved::Hidden,
                     fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
-                    in_svg,
+                    in_svg: children_in_svg,
+                    unpainted,
+                    svg_text,
+                    switch_taken,
                     items: style.items,
                     exempt,
                     effects,
@@ -4250,7 +4458,8 @@ pub(super) fn chapter_text(
         // converts: text, such as a label, and a sign beside digits. AnyDoc
         // writes a list item with a list marker of its own, which stands in
         // for a sign before or after it.
-        let hidden = state.undisplayed || state.invisible || state.contents_hidden;
+        let hidden =
+            state.undisplayed || state.invisible || state.contents_hidden || state.unpainted;
         let generated = style
             .as_ref()
             .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
@@ -4707,6 +4916,92 @@ mod tests {
         assert!(!converts_hidden(
             &["title { visibility: hidden }"],
             "<p>BODY</p>"
+        ));
+    }
+
+    #[test]
+    fn text_an_svg_image_does_not_paint_converts_hidden() {
+        let svg =
+            r#"xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink""#;
+        let html = r#"xmlns="http://www.w3.org/1999/xhtml""#;
+        for body in [
+            // Resources nothing refers to paint nothing.
+            format!(r#"<svg {svg}><defs><text>Confidential 1,250.00</text></defs></svg>"#),
+            format!(r#"<svg {svg}><symbol id="s"><text>SECRET</text></symbol></svg>"#),
+            format!(r#"<svg {svg}><clipPath id="c"><text>SECRET</text></clipPath></svg>"#),
+            format!(r#"<svg {svg}><mask id="m"><text>SECRET</text></mask></svg>"#),
+            format!(r#"<svg {svg}><pattern id="p"><text>SECRET</text></pattern></svg>"#),
+            format!(r#"<svg {svg}><marker id="k"><text>SECRET</text></marker></svg>"#),
+            // A link in the page draws no symbol.
+            format!(
+                r##"<p><a href="#s">See</a></p><svg {svg}><symbol id="s"><text>SECRET</text></symbol></svg>"##
+            ),
+            // Gradients and filters paint no text, even where named.
+            format!(
+                r##"<svg {svg}><linearGradient id="g"><text>SECRET</text></linearGradient><rect fill="url(#g)"/></svg>"##
+            ),
+            // Elements SVG does not define, and text outside a text element.
+            format!(r#"<svg {svg}><foo><text>SECRET</text></foo></svg>"#),
+            format!(r#"<svg {svg}><g>SECRET</g></svg>"#),
+            // A `switch` renders one child: the first whose conditions hold.
+            format!(r#"<svg {svg}><switch><text>Shown</text> <text>SECRET</text></switch></svg>"#),
+            format!(
+                r#"<svg {svg}><switch><text requiredExtensions="http://ns.adobe.com/AdobeIllustrator/10.0/">SECRET</text></switch></svg>"#
+            ),
+            // HTML in a resource nothing refers to.
+            format!(
+                r#"<svg {svg}><defs><foreignObject><p {html}>SECRET</p></foreignObject></defs></svg>"#
+            ),
+        ] {
+            assert!(converts_hidden(&[], &body), "{body}");
+        }
+        for body in [
+            // Resources something refers to paint what they hold.
+            format!(
+                r##"<svg {svg}><symbol id="s"><text>Shown</text></symbol><use href="#s"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><defs><text id="t">Shown</text></defs><use xlink:href="#t"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p"><text>Shown</text></pattern><rect fill="url(#p)"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><clipPath id="c"><text>Shown</text></clipPath><rect clip-path="url('#c')"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><mask id="m"><text>Shown</text></mask><rect style="mask: url(#m)"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><style>.r {{ marker-end: url(#k) }}</style><marker id="k"><text>Shown</text></marker><path class="r"/></svg>"##
+            ),
+            // Text in text elements, links, and paths, and HTML in an SVG image.
+            format!(
+                r##"<svg {svg}><a href="#x"><text>Shown <tspan>more</tspan><textPath href="#p">on a path</textPath></text></a></svg>"##
+            ),
+            format!(
+                r#"<svg {svg}><foreignObject>Shown <p {html}>and more</p></foreignObject></svg>"#
+            ),
+            format!(
+                r#"<svg {svg}><switch><foreignObject requiredExtensions="http://ns.adobe.com/AdobeIllustrator/10.0/"/><g><text>Shown</text></g></switch></svg>"#
+            ),
+            format!(
+                r#"<svg {svg}><switch><foreignObject requiredExtensions="http://www.w3.org/1999/xhtml"><p {html}>Shown</p></foreignObject></switch></svg>"#
+            ),
+        ] {
+            assert!(!converts_hidden(&[], &body), "{body}");
+        }
+        // A `::before` box in an SVG image's HTML shows, as in a page.
+        let label = r#".x::before { content: "Balance due " }"#;
+        assert!(drops_shown(
+            &[label],
+            &format!(
+                r#"<svg {svg}><foreignObject><div {html} class="x">1,250.00</div></foreignObject></svg>"#
+            )
+        ));
+        assert!(!drops_shown(
+            &[r#"text::before { content: "Balance due " }"#],
+            &format!(r#"<svg {svg}><text>1,250.00</text></svg>"#)
         ));
     }
 
