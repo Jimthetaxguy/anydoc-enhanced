@@ -54,6 +54,17 @@ const WORKER_PARSER_THREADS: &str = "4";
 /// Largest operation-parameter block (such as PDF regions) a worker frame
 /// may carry ahead of the document bytes.
 pub(crate) const MAX_WORKER_PARAMS_BYTES: usize = 1024 * 1024;
+/// Worker frame codes for a document the worker classifies itself, from its
+/// bytes and its file name's extension (see [`DocumentFrame`]): to convert
+/// it, or only to classify it. Codes 1 to 8 convert a variant already
+/// known, and PDF operations use 16 and up.
+const WORKER_CONVERT: u8 = 9;
+const WORKER_CLASSIFY: u8 = 10;
+/// The longest file name extension a classifying frame carries: a file
+/// name's own limit on the platforms the worker runs on.
+const MAX_EXTENSION_BYTES: usize = 255;
+/// A classification's response: a kind and a variant, or an error.
+const MAX_CLASSIFY_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Entries a package may hold: AnyDoc 0.2.4 refuses a larger archive
@@ -499,10 +510,107 @@ pub fn capabilities(kind: DocumentKind) -> DocumentCapabilities {
 }
 
 /// Classify a path using content signatures first and its extension second.
-pub fn classify(path: impl AsRef<Path>) -> Result<DocumentClassification, DocumentError> {
+/// The worker reads the package: the server reads the file, under one of
+/// the worker slots, and counts an archive's entries, and no more.
+pub async fn classify(path: impl AsRef<Path>) -> Result<DocumentClassification, DocumentError> {
     let canonical = crate::validate_path(path).map_err(map_path_error)?;
-    let bytes = crate::read_validated(&canonical).map_err(map_path_error)?;
-    Ok(classify_bytes(&bytes, &canonical))
+    let permit = worker_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| DocumentError::WorkerBusy)?;
+    let frame = read_document_frame(&canonical).await?;
+    // An archive past AnyDoc's entry bound is classified by its extension,
+    // unopened.
+    if zip_past_entry_bound(frame.document()) {
+        return Ok(classify_package(frame.document(), &canonical, true));
+    }
+    let size_bytes = frame.document().len() as u64;
+    if !worker_sandbox_available() {
+        // Without the worker the package is read here, as many at a time
+        // as there are worker slots.
+        return tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            classify_bytes(frame.document(), &canonical)
+        })
+        .await
+        .map_err(|_| DocumentError::ConversionFailed);
+    }
+    let job = WorkerJob {
+        code: WORKER_CLASSIFY,
+        payload: frame.payload,
+        timeout: WORKER_TIMEOUT,
+        max_response_bytes: MAX_CLASSIFY_RESPONSE_BYTES,
+    };
+    let response = run_worker_job(job, worker_executable()?, permit).await?;
+    match (response.classified, response.error) {
+        (Some(found), None) => Ok(classification_of(found.kind, found.variant, size_bytes)),
+        (None, Some(error)) => Err(error.into_document_error()),
+        _ => Err(DocumentError::WorkerProtocol),
+    }
+}
+
+/// A document read for the worker to classify: its file name's extension,
+/// as a little-endian `u32` length and its bytes, then the document itself,
+/// held once.
+struct DocumentFrame {
+    payload: Vec<u8>,
+    prefix: usize,
+}
+
+impl DocumentFrame {
+    fn document(&self) -> &[u8] {
+        &self.payload[self.prefix..]
+    }
+}
+
+/// Read a document into a frame for the worker to classify (see
+/// [`DocumentFrame`]), refusing one past [`MAX_DOCUMENT_SIZE`].
+async fn read_document_frame(path: &Path) -> Result<DocumentFrame, DocumentError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| extension.len() <= MAX_EXTENSION_BYTES)
+        .unwrap_or_default()
+        .as_bytes();
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| DocumentError::InputUnavailable)?;
+    let size_hint = file.metadata().await.map_or(0, |metadata| metadata.len());
+    let mut payload =
+        Vec::with_capacity(4 + extension.len() + size_hint.min(MAX_DOCUMENT_SIZE) as usize);
+    payload.extend_from_slice(&(extension.len() as u32).to_le_bytes());
+    payload.extend_from_slice(extension);
+    let prefix = payload.len();
+    (&mut file)
+        .take(MAX_DOCUMENT_SIZE + 1)
+        .read_to_end(&mut payload)
+        .await
+        .map_err(|_| DocumentError::InputUnavailable)?;
+    if (payload.len() - prefix) as u64 > MAX_DOCUMENT_SIZE {
+        return Err(DocumentError::ResourceLimit);
+    }
+    Ok(DocumentFrame { payload, prefix })
+}
+
+/// Split a frame the worker classifies (see [`DocumentFrame`]) into a file
+/// name with the document's extension, which is all the classification
+/// reads of a path, and the document.
+fn classifying_frame(frame: &[u8]) -> Result<(PathBuf, &[u8]), DocumentError> {
+    let (length, rest) = frame
+        .split_first_chunk::<4>()
+        .ok_or(DocumentError::WorkerProtocol)?;
+    let length = u32::from_le_bytes(*length) as usize;
+    if length > MAX_EXTENSION_BYTES || length > rest.len() {
+        return Err(DocumentError::WorkerProtocol);
+    }
+    let (extension, document) = rest.split_at(length);
+    let extension = std::str::from_utf8(extension).map_err(|_| DocumentError::WorkerProtocol)?;
+    let name = if extension.is_empty() {
+        PathBuf::from("document")
+    } else {
+        PathBuf::from(format!("document.{extension}"))
+    };
+    Ok((name, document))
 }
 
 fn map_path_error(error: crate::SkillkitError) -> DocumentError {
@@ -8637,7 +8745,18 @@ fn classify_package(bytes: &[u8], path: &Path, oversized: bool) -> DocumentClass
             DocumentVariant::for_format(format, bytes, path)
         }
     });
-    let capabilities = detected.map(capabilities);
+    classification_of(detected, variant, bytes.len() as u64)
+}
+
+/// The classification of `size_bytes` of input found to be of this kind
+/// and variant: the kind's capabilities, and whether its route converts
+/// the variant.
+fn classification_of(
+    kind: Option<DocumentKind>,
+    variant: Option<DocumentVariant>,
+    size_bytes: u64,
+) -> DocumentClassification {
+    let capabilities = kind.map(capabilities);
     let enabled = capabilities.as_ref().is_some_and(|value| value.enabled)
         && matches!(
             variant,
@@ -8653,34 +8772,20 @@ fn classify_package(bytes: &[u8], path: &Path, oversized: bool) -> DocumentClass
             )
         );
     DocumentClassification {
-        kind: detected,
+        kind,
         variant,
         enabled,
-        size_bytes: bytes.len() as u64,
+        size_bytes,
         capabilities,
     }
 }
 
-/// Convert an enabled document through the supervised worker.
-pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, DocumentError> {
-    let canonical = crate::validate_path(path).map_err(map_path_error)?;
-    let mut bytes = Vec::new();
-    tokio::fs::File::open(&canonical)
-        .await
-        .map_err(|_| DocumentError::InputUnavailable)?
-        .take(MAX_DOCUMENT_SIZE + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| DocumentError::InputUnavailable)?;
-    if bytes.len() as u64 > MAX_DOCUMENT_SIZE {
-        return Err(DocumentError::ResourceLimit);
-    }
-    // An archive with more entries than AnyDoc reads is refused unopened,
-    // as the worker would refuse it after indexing them all.
-    if zip_past_entry_bound(&bytes) {
-        return Err(DocumentError::ResourceLimit);
-    }
-    let classification = classify_package(&bytes, &canonical, false);
+/// The route a classified document takes: its kind and variant where the
+/// route converts it, else the refusal it gives. The worker routes what it
+/// classifies, and the server checks the kind and variant it reports.
+fn document_route(
+    classification: &DocumentClassification,
+) -> Result<(DocumentKind, DocumentVariant), DocumentError> {
     let kind = classification.kind.ok_or(DocumentError::Unrecognized)?;
     let variant = classification.variant.ok_or(DocumentError::Unrecognized)?;
     if kind == DocumentKind::Docx && variant != DocumentVariant::Docx {
@@ -8711,15 +8816,50 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
             },
         );
     }
-    if !classification.enabled {
+    if !classification.enabled || kind_for_variant(variant) != Some(kind) {
         return Err(DocumentError::Unsupported);
     }
-    // The worker runs the package preflight before it converts, under the
-    // conversion's deadline, memory ceiling, and in-flight bound, and
-    // returns what the preflight found with the Markdown. Run here, a
-    // crafted package's checks held a thread and memory that no bound
-    // applied to, past the tool's timeout.
-    let (raw_markdown, preflight) = run_worker_process(&bytes, variant).await?;
+    Ok((kind, variant))
+}
+
+/// Convert an enabled document through the supervised worker.
+pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, DocumentError> {
+    let canonical = crate::validate_path(path).map_err(map_path_error)?;
+    // A worker slot is taken before the file is read, so calls waiting for
+    // one hold no document bytes. The worker classifies the document, runs
+    // the package preflight, and converts it, under the conversion's
+    // deadline, memory ceiling, and in-flight bound, and returns what it
+    // found with the Markdown. Classified here, AnyDoc's detection parsed a
+    // package's relationships, content types, or main part, to 128 MiB
+    // each, in the server: a 9.9 MB package took it to 1.8 GiB.
+    let permit = worker_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| DocumentError::WorkerBusy)?;
+    let frame = read_document_frame(&canonical).await?;
+    // An archive with more entries than AnyDoc reads is refused unopened,
+    // as the worker would refuse it after indexing them all.
+    if zip_past_entry_bound(frame.document()) {
+        return Err(DocumentError::ResourceLimit);
+    }
+    let input_bytes = frame.document().len() as u64;
+    if !worker_sandbox_available() {
+        // No route converts without the worker; the refusal the document's
+        // route gives is found here, under the slot.
+        return tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            document_route(&classify_package(frame.document(), &canonical, false))
+                .and(Err(DocumentError::WorkerUnavailable))
+        })
+        .await
+        .map_err(|_| DocumentError::ConversionFailed)?;
+    }
+    let WorkerConversion {
+        kind,
+        variant,
+        markdown: raw_markdown,
+        preflight,
+    } = run_worker_conversion(frame.payload, worker_executable()?, permit).await?;
     // The worker refuses what the preflight rejects before converting it;
     // the supervisor applies the same rejection to what it returns.
     if let Some(error) = preflight_rejection(kind, &preflight) {
@@ -8783,7 +8923,7 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
         markdown,
         completeness,
         warnings,
-        input_bytes: bytes.len() as u64,
+        input_bytes,
     })
 }
 
@@ -8796,38 +8936,47 @@ pub(crate) struct WorkerJob {
     pub(crate) max_response_bytes: usize,
 }
 
-/// Convert a document in the worker: its Markdown, and what the worker's
-/// package preflight found.
-async fn run_worker_process(
-    bytes: &[u8],
+/// What the worker made of a document it classified: the kind and variant
+/// it found, the Markdown, and what the package preflight found.
+struct WorkerConversion {
+    kind: DocumentKind,
     variant: DocumentVariant,
-) -> Result<(String, PackagePreflight), DocumentError> {
-    if !worker_sandbox_available() {
-        return Err(DocumentError::WorkerUnavailable);
-    }
-    let executable = worker_executable()?;
-    run_worker_process_with_executable(bytes, variant, executable).await
+    markdown: String,
+    preflight: PackagePreflight,
 }
 
-async fn run_worker_process_with_executable(
-    bytes: &[u8],
-    variant: DocumentVariant,
+/// Classify and convert a document in the worker, from a frame read by
+/// [`read_document_frame`], under the worker slot `permit`. The kind and
+/// variant the worker reports must be a route that converts.
+async fn run_worker_conversion(
+    payload: Vec<u8>,
     executable: PathBuf,
-) -> Result<(String, PackagePreflight), DocumentError> {
-    let permit = worker_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| DocumentError::WorkerBusy)?;
+    permit: OwnedSemaphorePermit,
+) -> Result<WorkerConversion, DocumentError> {
     let job = WorkerJob {
-        code: variant.worker_code(),
-        payload: bytes.to_vec(),
+        code: WORKER_CONVERT,
+        payload,
         timeout: WORKER_TIMEOUT,
         max_response_bytes: MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
     };
     let response = run_worker_job(job, executable, permit).await?;
-    match (response.markdown, response.error, response.preflight) {
-        (Some(markdown), None, Some(preflight)) => Ok((markdown, preflight)),
-        (None, Some(error), _) => Err(error.into_document_error()),
+    match (
+        response.markdown,
+        response.error,
+        response.preflight,
+        response.classified,
+    ) {
+        (Some(markdown), None, Some(preflight), Some(found)) => {
+            let (kind, variant) = document_route(&classification_of(found.kind, found.variant, 0))
+                .map_err(|_| DocumentError::WorkerProtocol)?;
+            Ok(WorkerConversion {
+                kind,
+                variant,
+                markdown,
+                preflight,
+            })
+        }
+        (None, Some(error), _, _) => Err(error.into_document_error()),
         _ => Err(DocumentError::WorkerProtocol),
     }
 }
@@ -9304,6 +9453,16 @@ pub(crate) struct WorkerResponse {
     /// What the package preflight found, beside a document's Markdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) preflight: Option<PackagePreflight>,
+    /// What the worker found a document to be, where it classified it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) classified: Option<WorkerClassification>,
+}
+
+/// A document's kind and variant as the worker classified it.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct WorkerClassification {
+    kind: Option<DocumentKind>,
+    variant: Option<DocumentVariant>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9320,6 +9479,7 @@ pub(crate) struct WorkerError {
 impl WorkerError {
     fn into_document_error(self) -> DocumentError {
         match self.code.as_str() {
+            "unrecognized" => DocumentError::Unrecognized,
             "needs_ocr" => DocumentError::OcrRequired { pages: self.pages },
             "encrypted" => DocumentError::Encrypted,
             "resource_limit" => DocumentError::ResourceLimit,
@@ -9419,33 +9579,69 @@ pub fn run_worker() -> Result<(), DocumentError> {
             crate::pdf_worker::MAX_PDF_RESPONSE_BYTES,
         );
     }
-    if bytes.len() as u64 > MAX_DOCUMENT_SIZE {
-        write_worker_response(
-            &mut output,
-            worker_response_for_error(&DocumentError::ResourceLimit),
-            MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
-        )?;
-        return Ok(());
-    }
-    let variant = match code {
-        1 => DocumentVariant::Docx,
-        2 => DocumentVariant::Xlsx,
-        3 => DocumentVariant::Pptx,
-        4 => DocumentVariant::Ods,
-        5 => DocumentVariant::Odt,
-        6 => DocumentVariant::Csv,
-        7 => DocumentVariant::Odp,
-        8 => DocumentVariant::Epub,
-        _ => {
-            write_worker_response(
-                &mut output,
-                worker_response_for_error(&DocumentError::Unsupported),
-                MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
-            )?;
-            return Ok(());
+    let response = document_worker_response(*code, bytes);
+    write_worker_response(&mut output, response, MAX_SERIALIZED_WORKER_RESPONSE_BYTES)
+}
+
+/// Answer a document frame. A frame the worker classifies (codes 9 and 10)
+/// is answered with the kind and variant found, and for code 9, as for the
+/// variants of codes 1 to 8, with the refusal its route gives or the
+/// Markdown and what the package preflight found.
+fn document_worker_response(code: u8, frame: &[u8]) -> WorkerResponse {
+    let (variant, classified, bytes) = if matches!(code, WORKER_CONVERT | WORKER_CLASSIFY) {
+        let (name, document) = match classifying_frame(frame) {
+            Ok(split) => split,
+            Err(error) => return worker_response_for_error(&error),
+        };
+        if document.len() as u64 > MAX_DOCUMENT_SIZE {
+            return worker_response_for_error(&DocumentError::ResourceLimit);
         }
+        let classification = classify_bytes(document, &name);
+        let found = WorkerClassification {
+            kind: classification.kind,
+            variant: classification.variant,
+        };
+        if code == WORKER_CLASSIFY {
+            return WorkerResponse {
+                classified: Some(found),
+                ..Default::default()
+            };
+        }
+        match document_route(&classification) {
+            Ok((_, variant)) => (variant, Some(found), document),
+            Err(error) => return worker_response_for_error(&error),
+        }
+    } else {
+        if frame.len() as u64 > MAX_DOCUMENT_SIZE {
+            return worker_response_for_error(&DocumentError::ResourceLimit);
+        }
+        let Some(variant) = [
+            DocumentVariant::Docx,
+            DocumentVariant::Xlsx,
+            DocumentVariant::Pptx,
+            DocumentVariant::Ods,
+            DocumentVariant::Odt,
+            DocumentVariant::Csv,
+            DocumentVariant::Odp,
+            DocumentVariant::Epub,
+        ]
+        .into_iter()
+        .find(|variant| variant.worker_code() == code) else {
+            return worker_response_for_error(&DocumentError::Unsupported);
+        };
+        (variant, None, frame)
     };
-    let response = if variant == DocumentVariant::Csv {
+    let mut response = convert_in_worker(variant, bytes);
+    if response.error.is_none() {
+        response.classified = classified;
+    }
+    response
+}
+
+/// Convert a document of a known variant in the worker: the refusal the
+/// package preflight gives, or the Markdown and what the preflight found.
+fn convert_in_worker(variant: DocumentVariant, bytes: &[u8]) -> WorkerResponse {
+    if variant == DocumentVariant::Csv {
         match tabular_csv::to_markdown(bytes) {
             Ok(markdown) if markdown.len() <= MAX_MARKDOWN_SIZE => WorkerResponse {
                 markdown: Some(markdown),
@@ -9457,8 +9653,9 @@ pub fn run_worker() -> Result<(), DocumentError> {
             Err(error) => worker_response_for_error(&error),
         }
     } else {
-        let kind = kind_for_variant(variant).ok_or(DocumentError::WorkerProtocol)?;
-        let format = anydoc_format(variant).ok_or(DocumentError::WorkerProtocol)?;
+        let (Some(kind), Some(format)) = (kind_for_variant(variant), anydoc_format(variant)) else {
+            return worker_response_for_error(&DocumentError::WorkerProtocol);
+        };
         match preflight_package(bytes, kind, variant)
             .and_then(|preflight| preflight_rejection(kind, &preflight).map_or(Ok(preflight), Err))
         {
@@ -9490,8 +9687,7 @@ pub fn run_worker() -> Result<(), DocumentError> {
                 },
             },
         }
-    };
-    write_worker_response(&mut output, response, MAX_SERIALIZED_WORKER_RESPONSE_BYTES)
+    }
 }
 
 fn resource_evidence_enabled() -> bool {
@@ -15842,11 +16038,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&worker, permissions).expect("make canceling worker executable");
 
-        let task = tokio::spawn(run_worker_process_with_executable(
-            &[],
-            DocumentVariant::Docx,
-            worker,
-        ));
+        let task = tokio::spawn(convert_with(document_frame("docx", &[]), worker));
         let recorded = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
@@ -15920,32 +16112,172 @@ mod tests {
             list_numbering_differs: true,
             ..PackagePreflight::default()
         };
+        let classified = |kind, variant| {
+            Some(WorkerClassification {
+                kind: Some(kind),
+                variant: Some(variant),
+            })
+        };
         let worker = answering(
             "converted",
             WorkerResponse {
                 markdown: Some("Converted".into()),
                 preflight: Some(found),
+                classified: classified(DocumentKind::Docx, DocumentVariant::Docx),
                 ..Default::default()
             },
         );
-        let (markdown, preflight) =
-            run_worker_process_with_executable(&refused, DocumentVariant::Docx, worker)
-                .await
-                .expect("worker Markdown");
-        assert_eq!(markdown, "Converted");
-        assert!(preflight.list_numbering_differs);
-        // Markdown without what the preflight found cannot be disclosed.
-        let worker = answering(
-            "unchecked",
-            WorkerResponse {
-                markdown: Some("Converted".into()),
-                ..Default::default()
-            },
+        let converted = convert_with(document_frame("docx", &refused), worker)
+            .await
+            .expect("worker Markdown");
+        assert_eq!(converted.markdown, "Converted");
+        assert_eq!(
+            (converted.kind, converted.variant),
+            (DocumentKind::Docx, DocumentVariant::Docx)
         );
+        assert!(converted.preflight.list_numbering_differs);
+        // Markdown without what the preflight found cannot be disclosed, nor
+        // without the kind the worker found, nor for a kind whose route
+        // converts nothing.
+        for (name, response) in [
+            (
+                "unchecked",
+                WorkerResponse {
+                    markdown: Some("Converted".into()),
+                    classified: classified(DocumentKind::Docx, DocumentVariant::Docx),
+                    ..Default::default()
+                },
+            ),
+            (
+                "unclassified",
+                WorkerResponse {
+                    markdown: Some("Converted".into()),
+                    preflight: Some(PackagePreflight::default()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "unrouted",
+                WorkerResponse {
+                    markdown: Some("Converted".into()),
+                    preflight: Some(PackagePreflight::default()),
+                    classified: classified(DocumentKind::Docx, DocumentVariant::Docm),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let worker = answering(name, response);
+            assert!(
+                matches!(
+                    convert_with(document_frame("docx", &refused), worker).await,
+                    Err(DocumentError::WorkerProtocol)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// A frame the worker classifies, as `read_document_frame` reads one.
+    fn document_frame(extension: &str, document: &[u8]) -> Vec<u8> {
+        let mut frame = (extension.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(extension.as_bytes());
+        frame.extend_from_slice(document);
+        frame
+    }
+
+    /// Convert a frame with this worker, under a worker slot.
+    async fn convert_with(
+        frame: Vec<u8>,
+        worker: PathBuf,
+    ) -> Result<WorkerConversion, DocumentError> {
+        let permit = worker_semaphore()
+            .acquire_owned()
+            .await
+            .expect("worker slot");
+        run_worker_conversion(frame, worker, permit).await
+    }
+
+    #[test]
+    fn worker_classifies_and_routes_what_the_server_reads_whole() {
+        // The frame carries the extension, which is all a classification
+        // reads of a path.
+        let frame = document_frame("CSV", b"a,b\n1,2\n");
+        let (name, document) = classifying_frame(&frame).expect("frame");
+        assert_eq!(name, PathBuf::from("document.CSV"));
+        assert_eq!(document, b"a,b\n1,2\n");
+        let (name, _) = classifying_frame(&document_frame("", b"x")).expect("frame");
+        assert_eq!(name, PathBuf::from("document"));
+        for broken in [
+            vec![1, 0],
+            [5u32.to_le_bytes().as_slice(), b"doc"].concat(),
+            [
+                ((MAX_EXTENSION_BYTES + 1) as u32).to_le_bytes().as_slice(),
+                &[b'x'; MAX_EXTENSION_BYTES + 1],
+            ]
+            .concat(),
+            [2u32.to_le_bytes().as_slice(), &[0xff, 0xfe]].concat(),
+        ] {
+            assert!(matches!(
+                classifying_frame(&broken),
+                Err(DocumentError::WorkerProtocol)
+            ));
+        }
+        // The worker classifies by content, then by extension.
+        let docx = zip_entries(&[
+            ("[Content_Types].xml", DOCX_TYPES),
+            ("word/document.xml", DOCX_XML),
+        ]);
+        let classified = |extension: &str, document: &[u8]| {
+            let response =
+                document_worker_response(WORKER_CLASSIFY, &document_frame(extension, document));
+            let found = response.classified.expect("classification");
+            (found.kind, found.variant)
+        };
+        assert_eq!(
+            classified("pdf", &docx),
+            (Some(DocumentKind::Docx), Some(DocumentVariant::Docx))
+        );
+        assert_eq!(
+            classified("csv", b"a,b\n"),
+            (Some(DocumentKind::Csv), Some(DocumentVariant::Csv))
+        );
+        assert_eq!(classified("txt", b"plain"), (None, None));
+        // It routes what it converts as the server routed it: a
+        // macro-enabled package is refused, unrecognized content too, and a
+        // document is converted with the kind and variant it was found to be.
+        let refused = |extension: &str, document: &[u8]| {
+            document_worker_response(WORKER_CONVERT, &document_frame(extension, document))
+                .error
+                .expect("refusal")
+                .code
+        };
+        let macro_enabled = zip_entries(&[
+            ("[Content_Types].xml", br#"<Types><Override PartName="/word/document.xml" ContentType="application/vnd.ms-word.document.macroEnabled.main+xml"/></Types>"#),
+            ("word/document.xml", DOCX_XML),
+        ]);
+        assert_eq!(refused("docm", &macro_enabled), "active_content_disabled");
+        assert_eq!(refused("txt", b"plain"), "unrecognized");
         assert!(matches!(
-            run_worker_process_with_executable(&refused, DocumentVariant::Docx, worker).await,
-            Err(DocumentError::WorkerProtocol)
+            WorkerError {
+                code: "unrecognized".into(),
+                pages: Vec::new()
+            }
+            .into_document_error(),
+            DocumentError::Unrecognized
         ));
+        let converted =
+            document_worker_response(WORKER_CONVERT, &document_frame("csv", b"a,b\n1,2\n"));
+        assert!(converted
+            .markdown
+            .is_some_and(|markdown| markdown.contains('1')));
+        let found = converted.classified.expect("classification");
+        assert_eq!(
+            (found.kind, found.variant),
+            (Some(DocumentKind::Csv), Some(DocumentVariant::Csv))
+        );
+        // A variant's own code still converts, unclassified.
+        let converted = document_worker_response(DocumentVariant::Csv.worker_code(), b"a,b\n1,2\n");
+        assert!(converted.markdown.is_some() && converted.classified.is_none());
     }
 
     #[cfg(unix)]

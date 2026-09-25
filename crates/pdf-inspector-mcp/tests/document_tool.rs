@@ -10,7 +10,19 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 fn run_classify_document(path: String, client_name: &str) -> serde_json::Value {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pdf-inspector-mcp"))
+    run_classify_document_with_worker(path, client_name, None)
+}
+
+fn run_classify_document_with_worker(
+    path: String,
+    client_name: &str,
+    worker_bin: Option<&Path>,
+) -> serde_json::Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pdf-inspector-mcp"));
+    if let Some(worker_bin) = worker_bin {
+        command.env("ANYDOC_WORKER_BIN", worker_bin);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1725,9 +1737,11 @@ fn document_warnings_come_from_the_workers_preflight() {
     };
     // The package preflight runs in the worker, under its deadline and
     // memory ceiling; the server discloses what it found.
+    let docx = serde_json::json!({ "kind": "docx", "variant": "docx" });
     let document = answered(serde_json::json!({
         "markdown": "PREFLIGHT-MARKER",
-        "preflight": { "list_numbering_differs": true, "hidden_content": true }
+        "preflight": { "list_numbering_differs": true, "hidden_content": true },
+        "classified": docx
     }));
     assert_eq!(document["completeness"], "partial", "{document}");
     assert_eq!(document["markdown"], "PREFLIGHT-MARKER");
@@ -1743,9 +1757,79 @@ fn document_warnings_come_from_the_workers_preflight() {
     // the preflight's findings is not returned.
     let document = answered(serde_json::json!({
         "markdown": "PREFLIGHT-MARKER",
-        "preflight": { "unsupported_content": true }
+        "preflight": { "unsupported_content": true },
+        "classified": docx
     }));
     assert_eq!(document["code"], "incomplete_conversion", "{document}");
-    let document = answered(serde_json::json!({ "markdown": "PREFLIGHT-MARKER" }));
+    let document = answered(serde_json::json!({
+        "markdown": "PREFLIGHT-MARKER",
+        "classified": docx
+    }));
     assert_eq!(document["code"], "worker_protocol", "{document}");
+}
+
+#[cfg(unix)]
+#[test]
+fn documents_are_classified_in_the_worker() {
+    let temporary = tempfile::tempdir().expect("temporary worker directory");
+    // Plain text, which no signature or extension names: what kind it is
+    // comes from the worker, the server reading no part of it.
+    let text = temporary.path().join("notes.txt");
+    std::fs::write(&text, "WORKER-CLASSIFIED").expect("write text input");
+    let worker = answering_worker(
+        temporary.path(),
+        &serde_json::json!({ "classified": { "kind": "docx", "variant": "docx" } }),
+    );
+    let classification = run_classify_document_with_worker(
+        text.to_string_lossy().into_owned(),
+        "worker-classification-test",
+        Some(&worker),
+    );
+    assert_eq!(classification["kind"], "docx", "{classification}");
+    assert_eq!(classification["variant"], "docx", "{classification}");
+    assert_eq!(
+        classification["size_bytes"],
+        serde_json::Value::from("WORKER-CLASSIFIED".len())
+    );
+    // Converted, it takes the route the worker found, and a route that
+    // converts nothing is no answer.
+    let converted = temporary.path().join("converted");
+    std::fs::create_dir(&converted).expect("worker directory");
+    let worker = answering_worker(
+        &converted,
+        &serde_json::json!({
+            "markdown": "WORKER-CONVERTED",
+            "preflight": {},
+            "classified": { "kind": "docx", "variant": "docx" }
+        }),
+    );
+    let document = run_document_tool_with_worker(
+        text.to_string_lossy().into_owned(),
+        "worker-classification-test",
+        Some(&worker),
+    );
+    assert_eq!(document["kind"], "docx", "{document}");
+    assert_eq!(document["markdown"], "WORKER-CONVERTED", "{document}");
+    let unrouted = temporary.path().join("unrouted");
+    std::fs::create_dir(&unrouted).expect("worker directory");
+    let worker = answering_worker(
+        &unrouted,
+        &serde_json::json!({
+            "markdown": "WORKER-CONVERTED",
+            "preflight": {},
+            "classified": { "kind": "pdf", "variant": "pdf" }
+        }),
+    );
+    let document = run_document_tool_with_worker(
+        text.to_string_lossy().into_owned(),
+        "worker-classification-test",
+        Some(&worker),
+    );
+    assert_eq!(document["code"], "worker_protocol", "{document}");
+    // Without a worker override, plain text is classified as nothing.
+    let classification =
+        run_classify_document(text.to_string_lossy().into_owned(), "plain-text-test");
+    assert!(classification["kind"].is_null(), "{classification}");
+    let document = run_document_tool(text.to_string_lossy().into_owned(), "plain-text-test");
+    assert_eq!(document["code"], "unrecognized", "{document}");
 }

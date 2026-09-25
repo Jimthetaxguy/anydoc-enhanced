@@ -383,8 +383,8 @@ impl PdfInspectorServer {
     )]
     async fn classify_document(&self, params: Parameters<DocumentPathInput>) -> String {
         let path = params.0.path;
-        dispatch_document_sync("classify_document", move || {
-            pdf_inspector_skillkit::document::classify(&path)
+        dispatch_document("classify_document", move || async move {
+            pdf_inspector_skillkit::document::classify(path).await
         })
         .await
     }
