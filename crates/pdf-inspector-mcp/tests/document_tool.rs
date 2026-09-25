@@ -1329,6 +1329,15 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
         ),
         ("odt/page-anchored-frame.odt", "incomplete_conversion"),
         ("ods/untyped-formula-value.ods", "incomplete_conversion"),
+        // Number formats AnyDoc renders differently, and drawing text it
+        // never reads.
+        ("xlsx/negative-sign-by-colour.xlsx", "incomplete_conversion"),
+        ("xlsx/format-hidden-value.xlsx", "incomplete_conversion"),
+        ("xlsx/locale-date-format.xlsx", "incomplete_conversion"),
+        ("xlsx/drawing-text-box.xlsx", "incomplete_conversion"),
+        ("ods/negative-sign-by-colour.ods", "incomplete_conversion"),
+        ("ods/format-hidden-value.ods", "incomplete_conversion"),
+        ("ods/cell-anchored-text-box.ods", "incomplete_conversion"),
     ] {
         let fixture = format!(
             "{}/../../test-corpus/{relative_path}",
@@ -1399,6 +1408,19 @@ fn pptx_section_lists_are_not_slides() {
     assert!(document["markdown"]
         .as_str()
         .is_some_and(|markdown| markdown.contains("SECTION-SLIDE")));
+}
+
+#[test]
+fn xlsx_parenthesized_negatives_keep_their_sign() {
+    let fixture = format!(
+        "{}/../../test-corpus/xlsx/red-parenthesized-negative.xlsx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "xlsx-negative-integration-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    assert!(document["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("(25,000)")));
 }
 
 #[test]

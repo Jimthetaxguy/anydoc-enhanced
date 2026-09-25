@@ -84,6 +84,26 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
 - epub/kindle-media-pair.epub: the common Kindle stylesheet pair, whose
   second rule inside `@media amzn-mobi` AnyDoc applies everywhere, dropping
   a paragraph readers show. Expected `incomplete_conversion`.
+- xlsx/negative-sign-by-colour.xlsx: a negative amount whose format,
+  `#,##0;[Red]#,##0`, marks it only in red; AnyDoc renders it unsigned.
+  Expected `incomplete_conversion`.
+- xlsx/red-parenthesized-negative.xlsx: the same amount under
+  `#,##0;[Red]\\(#,##0\\)`, which keeps its parentheses. Expected
+  complete conversion.
+- xlsx/format-hidden-value.xlsx: an amount its format (`;;;`) hides.
+  Expected `incomplete_conversion`.
+- xlsx/locale-date-format.xlsx: a date under built-in format 31, which
+  AnyDoc cannot resolve and renders as a serial number. Expected
+  `incomplete_conversion`.
+- xlsx/drawing-text-box.xlsx: a text box over the sheet, which AnyDoc never
+  reads. Expected `incomplete_conversion`.
+- ods/negative-sign-by-colour.ods: a negative value displayed without a
+  sign, which only its colour marked. Expected `incomplete_conversion`.
+- ods/format-hidden-value.ods: a value its format hides, displayed as an
+  empty paragraph, which AnyDoc replaces with the typed value. Expected
+  `incomplete_conversion`.
+- ods/cell-anchored-text-box.ods: a text box anchored to a cell, which
+  AnyDoc never reads. Expected `incomplete_conversion`.
 
 All content is synthetic and contains no personal data.
 """
@@ -424,6 +444,106 @@ def write_unrendered_formula_cache():
     patched_workpaper("unrendered-formula-cache.xlsx", patch)
 
 
+SML_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OFFICE_RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def styled_workpaper(name, number_format_id, code, value, extra=()):
+    """public-workpaper.xlsx with a styles part, and receipts cell B3 holding
+    `value` under format `number_format_id` (defined as `code` when given)."""
+
+    def patch(entries):
+        custom = ""
+        if code is not None:
+            escaped = code.replace("&", "&amp;").replace('"', "&quot;")
+            custom = (
+                f'<numFmts count="1"><numFmt numFmtId="{number_format_id}" '
+                f'formatCode="{escaped}"/></numFmts>'
+            )
+        styles = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<styleSheet xmlns="{SML_MAIN}">{custom}'
+            f'<cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="{number_format_id}" '
+            'applyNumberFormat="1"/></cellXfs></styleSheet>'
+        ).encode()
+        out = []
+        for filename, data in entries:
+            if filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(
+                    b'<c r="B3"><v>25000</v></c>', f'<c r="B3" s="1"><v>{value}</v></c>'.encode()
+                ).replace(b"<v>150000</v>", f"<v>{125000 + value}</v>".encode())
+            elif filename == "xl/_rels/workbook.xml.rels":
+                data = data.replace(
+                    b"</Relationships>",
+                    f'<Relationship Id="rId3" Type="{OFFICE_RELS}/styles" '
+                    'Target="styles.xml"/></Relationships>'.encode(),
+                )
+            elif filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"</Types>",
+                    b'<Override PartName="/xl/styles.xml" ContentType="application/'
+                    b'vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
+                )
+            out.append((filename, data))
+        out.append(("xl/styles.xml", styles))
+        out.extend(extra)
+        return out
+
+    patched_workpaper(name, patch)
+
+
+def write_drawing_text_box():
+    drawing = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff>'
+        "<xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row>"
+        "<xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        '<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="2" name="TextBox 1"/>'
+        '<xdr:cNvSpPr txBox="1"/></xdr:nvSpPr><xdr:spPr/><xdr:txBody><a:bodyPr/>'
+        "<a:p><a:r><a:t>DRAWING-NOTE: receipts restated; see note 4</a:t></a:r></a:p>"
+        "</xdr:txBody></xdr:sp><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"
+    ).encode()
+    sheet_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{OFFICE_RELS}/drawing" '
+        'Target="../drawings/drawing1.xml"/></Relationships>'
+    ).encode()
+
+    def patch(entries):
+        out = []
+        for filename, data in entries:
+            if filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(
+                    b"</sheetData>",
+                    f'</sheetData><drawing xmlns:r="{OFFICE_RELS}" r:id="rId1"/>'.encode(),
+                )
+            elif filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"</Types>",
+                    b'<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/'
+                    b'vnd.openxmlformats-officedocument.drawing+xml"/></Types>',
+                )
+            out.append((filename, data))
+        out.append(("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels))
+        out.append(("xl/drawings/drawing1.xml", drawing))
+        return out
+
+    patched_workpaper("drawing-text-box.xlsx", patch)
+
+
+def ods_sheet(cells):
+    """An ODS body with one row of `cells`."""
+    return (
+        '<office:spreadsheet><table:table table:name="Sheet1"><table:table-row>'
+        '<table:table-cell office:value-type="string"><text:p>Receipts</text:p></table:table-cell>'
+        f"{cells}</table:table-row></table:table></office:spreadsheet>"
+    )
+
+
 ODF_NS = (
     'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
     'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
@@ -709,6 +829,43 @@ def main():
         "  .kf8-only { display: none; }\n}\n",
         '<p>VISIBLE-CHAPTER</p><p class="kf8-only">SHOWN-IN-EPUB-READERS</p>'
         '<p class="mobi-only">Old Kindle fallback.</p>',
+    )
+    styled_workpaper("negative-sign-by-colour.xlsx", 164, "#,##0;[Red]#,##0", -25000)
+    styled_workpaper(
+        "red-parenthesized-negative.xlsx", 164, "#,##0;[Red]\\(#,##0\\)", -25000
+    )
+    styled_workpaper("format-hidden-value.xlsx", 164, ";;;", 25000)
+    styled_workpaper("locale-date-format.xlsx", 31, None, 45762)
+    write_drawing_text_box()
+    ods = "application/vnd.oasis.opendocument.spreadsheet"
+    write_odf(
+        "ods",
+        "negative-sign-by-colour.ods",
+        ods,
+        ods_sheet(
+            '<table:table-cell office:value-type="float" office:value="-1234.1">'
+            "<text:p>1234.10</text:p></table:table-cell>"
+        ),
+    )
+    write_odf(
+        "ods",
+        "format-hidden-value.ods",
+        ods,
+        ods_sheet(
+            '<table:table-cell office:value-type="float" office:value="98765">'
+            "<text:p/></table:table-cell>"
+        ),
+    )
+    write_odf(
+        "ods",
+        "cell-anchored-text-box.ods",
+        ods,
+        ods_sheet(
+            '<table:table-cell office:value-type="float" office:value="12">'
+            '<draw:frame svg:width="4cm" svg:height="1cm"><draw:text-box>'
+            "<text:p>CELL-NOTE: see workpaper 7</text:p></draw:text-box></draw:frame>"
+            "<text:p>12</text:p></table:table-cell>"
+        ),
     )
 
 
