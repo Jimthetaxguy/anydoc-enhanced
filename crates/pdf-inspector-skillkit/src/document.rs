@@ -3312,11 +3312,13 @@ fn docx_numbering_labels(
     }
 }
 
-/// A numbering part's list definitions, as far as the numbers Word and
-/// AnyDoc show differ.
+/// A numbering part's list definitions as Word or AnyDoc reads them, as far
+/// as the numbers they show differ.
 #[derive(Default)]
 struct DocxNumbering {
-    /// Each abstract definition (`w:abstractNum`) by id.
+    /// Each abstract definition (`w:abstractNum`) by id: AnyDoc matches the
+    /// id's text, and Word the integer it reads, so `01` and `+1` name
+    /// definition 1 for Word only.
     definitions: HashMap<String, DocxDefinition>,
     /// Each list instance (`w:num`) by id.
     lists: HashMap<u64, DocxList>,
@@ -3340,7 +3342,7 @@ struct DocxDefinition {
 /// (`w:startOverride`).
 #[derive(Default)]
 struct DocxList {
-    definition: String,
+    definition: Option<String>,
     levels: [Option<DocxLevel>; DOCX_LIST_LEVELS],
     starts: [Option<u64>; DOCX_LIST_LEVELS],
 }
@@ -3594,12 +3596,13 @@ impl DocxMarker {
 
 /// A list instance as one side of the replay counts it: the definition its
 /// levels come from, which Word shares counters through, its levels and
-/// markers, and the styles its levels are bound to, each with the first
-/// level bound to it.
+/// markers, the levels it restarts (`w:startOverride`), and the styles its
+/// levels are bound to, each with the first level bound to it.
 struct DocxInstance {
     definition: String,
     levels: [DocxLevel; DOCX_LIST_LEVELS],
     markers: [DocxMarker; DOCX_LIST_LEVELS],
+    starts: [Option<u64>; DOCX_LIST_LEVELS],
     bound: Vec<(usize, usize)>,
 }
 
@@ -3787,7 +3790,7 @@ impl DocxNumbering {
                 .get(style)
                 .and_then(|style| style.list)
                 .and_then(|list| self.lists.get(&list))
-                .map(|list| list.definition.as_str());
+                .and_then(|list| list.definition.as_deref());
             let next = match through_style {
                 Some(next) => Some(next),
                 None if word => self.style_definitions.get(style).map(String::as_str),
@@ -3827,10 +3830,11 @@ impl DocxNumbering {
         word: bool,
     ) -> Option<DocxInstance> {
         let instance = self.lists.get(&list)?;
-        let definition = self.resolve_definition(&instance.definition, styles, word)?;
+        let definition = self.resolve_definition(instance.definition.as_deref()?, styles, word)?;
         let levels = self.levels_from(instance, definition)?;
         Some(DocxInstance {
             definition: definition.to_string(),
+            starts: instance.starts,
             bound: chains.bound(&levels),
             markers: levels.each_ref().map(|level| {
                 if word {
@@ -3842,7 +3846,15 @@ impl DocxNumbering {
             levels: levels.map(Option::unwrap_or_default),
         })
     }
+}
 
+/// A numbering part as Word and as AnyDoc read it.
+struct DocxNumberings {
+    word: DocxNumbering,
+    anydoc: DocxNumbering,
+}
+
+impl DocxNumberings {
     /// Where a paragraph's numbering resolves, for Word and for AnyDoc: the
     /// list given directly or its style chain's, and the level given
     /// directly or read from the style chain (see
@@ -3876,9 +3888,10 @@ impl DocxNumbering {
             if list == 0 {
                 return None;
             }
+            let numbering = if word { &self.word } else { &self.anydoc };
             let instance = instances
                 .entry(list)
-                .or_insert_with(|| self.instance(list, styles, chains, word))
+                .or_insert_with(|| numbering.instance(list, styles, chains, word))
                 .as_ref()?;
             let level = match (used.level, style) {
                 (Some(level), _) => level,
@@ -3946,7 +3959,7 @@ impl DocxNumbering {
     /// whose mark is deleted, still takes a number in AnyDoc.
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
         // A value only Word can read may number what AnyDoc does not.
-        if scan.padded_numbering || self.padded || styles.padded {
+        if scan.padded_numbering || self.word.padded || styles.padded {
             return !scan.list_paragraphs.is_empty();
         }
         let chains = DocxStyleChains::new(styles);
@@ -3984,19 +3997,14 @@ impl DocxNumbering {
                 .get(paragraph.used as usize)
                 .copied()
                 .unwrap_or_default();
-            let restart = |list: u64, level: usize| {
-                self.lists
-                    .get(&list)
-                    .and_then(|instance| instance.starts[level])
-            };
             let anydoc_label = match resolved.anydoc.filter(|_| paragraph.anydoc) {
                 Some((list, level)) => match anydoc_instances
                     .entry(list)
-                    .or_insert_with(|| self.instance(list, styles, &chains, false))
+                    .or_insert_with(|| self.anydoc.instance(list, styles, &chains, false))
                 {
                     Some(instance) if matches!(instance.markers[level], DocxMarker::Count(_)) => {
                         let start = |level: usize| {
-                            restart(list, level).unwrap_or_else(|| instance.levels[level].start())
+                            instance.starts[level].unwrap_or_else(|| instance.levels[level].start())
                         };
                         let counters = anydoc.entry(list).or_default();
                         let value = counters.next(level, start(level), None, &instance.levels);
@@ -4020,12 +4028,12 @@ impl DocxNumbering {
             let word_label = match resolved.word {
                 Some((list, level)) => match word_instances
                     .entry(list)
-                    .or_insert_with(|| self.instance(list, styles, &chains, true))
+                    .or_insert_with(|| self.word.instance(list, styles, &chains, true))
                 {
                     Some(instance) => {
                         let story = (!paragraph.in_text_box).then_some(paragraph.part);
                         let restart_at =
-                            restart(list, level).filter(|_| restarted.insert((story, list)));
+                            instance.starts[level].filter(|_| restarted.insert((story, list)));
                         let counters = word
                             .entry((story, instance.definition.clone()))
                             .or_default();
@@ -4376,6 +4384,7 @@ fn docx_start_value(value: &str) -> Option<u64> {
 /// and node bounds.
 fn docx_numbering_definitions(
     reader: impl std::io::BufRead,
+    word: bool,
 ) -> Result<DocxNumbering, DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(reader);
     reader.config_mut().trim_text(false);
@@ -4390,6 +4399,15 @@ fn docx_numbering_definitions(
     let mut list: Option<u64> = None;
     let mut override_level: Option<usize> = None;
     let mut open_level: Option<DocxOpenLevel> = None;
+    // A definition id as the side matches it: AnyDoc its text, Word the
+    // XML Schema integer it reads.
+    let definition_id = |id: String| {
+        if word {
+            id.parse::<i64>().ok().map(|id| id.to_string())
+        } else {
+            Some(id)
+        }
+    };
     // AnyDoc reads a missing or unreadable level index as the first and
     // skips an index past the last level.
     let level_of = |event: &quick_xml::events::BytesStart<'_>| {
@@ -4467,7 +4485,7 @@ fn docx_numbering_definitions(
             .any(|value| value.trim() != value);
         match local.as_slice() {
             b"abstractNum" if stack.len() == 1 => {
-                definition = value(b"abstractNumId");
+                definition = value(b"abstractNumId").and_then(definition_id);
                 if let Some(id) = &definition {
                     if id.len() > MAX_STYLE_ID_BYTES
                         || (numbering.definitions.len() >= MAX_DOCX_STYLES
@@ -4490,8 +4508,9 @@ fn docx_numbering_definitions(
                 }
             }
             b"abstractNumId" if list.is_some() && xml_path_ends_with(&stack, &[b"num"]) => {
-                if let (Some(id), Some(definition)) = (list, value(b"val")) {
-                    numbering.lists.entry(id).or_default().definition = definition;
+                if let Some(id) = list {
+                    numbering.lists.entry(id).or_default().definition =
+                        value(b"val").and_then(definition_id);
                 }
             }
             b"numStyleLink" if xml_path_ends_with(&stack, &[b"abstractNum"]) => {
@@ -6959,12 +6978,21 @@ fn preflight_package(
                 docx_numbering_labels(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
             hidden_labels |= hidden;
             label_styles.extend(styles);
-            let Ok(entry) = archive.by_name(part) else {
+            let mut read = |word: bool| -> Result<Option<DocxNumbering>, DocumentError> {
+                let Ok(entry) = archive.by_name(part) else {
+                    return Ok(None);
+                };
+                docx_numbering_definitions(
+                    open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?,
+                    word,
+                )
+                .map(Some)
+            };
+            let (Some(word), Some(anydoc)) = (read(true)?, read(false)?) else {
                 continue;
             };
-            let numbering =
-                docx_numbering_definitions(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
-            result.list_numbering_differs |= numbering.numbers_differ(&docx_scan, &style_numbering);
+            result.list_numbering_differs |=
+                DocxNumberings { word, anydoc }.numbers_differ(&docx_scan, &style_numbering);
         }
         result.hidden_content |= hidden_labels
             || label_styles
@@ -10708,6 +10736,21 @@ mod tests {
         // Without the style, Word still finds the definition declaring it;
         // AnyDoc bullets the list.
         assert!(differs(items.clone(), linked, ""));
+        // Word reads a definition id as an integer, and AnyDoc matches its
+        // text: an instance naming definition "01", or a definition
+        // declared as "+1", numbers only in Word.
+        let named = |declared: &str, referenced: &str| {
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId w:val="{referenced}"/></w:num>"#,
+                definition(0, decimal).replace(
+                    r#"w:abstractNumId="0""#,
+                    &format!(r#"w:abstractNumId="{declared}""#)
+                )
+            )
+        };
+        assert!(differs(item(1, 0, ""), named("1", "01"), ""));
+        assert!(differs(item(1, 0, ""), named("+1", "1"), ""));
+        assert!(!differs(item(1, 0, ""), named("1", "1"), ""));
 
         // Only a start override restarts a level; replacing the level's
         // definition leaves Word counting on.
