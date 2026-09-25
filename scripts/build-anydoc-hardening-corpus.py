@@ -78,6 +78,12 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
   address. Expected complete output with the address sanitized.
 - epub/display-none-omitted.epub: text a linked `display: none` rule hides,
   which AnyDoc omits as a reader does. Expected complete output without it.
+- epub/list-text-outside-items.epub: text and a paragraph placed directly in
+  an ordered list, which a reader shows and AnyDoc's list walker skips.
+  Expected `incomplete_conversion`.
+- epub/kindle-media-pair.epub: the common Kindle stylesheet pair, whose
+  second rule inside `@media amzn-mobi` AnyDoc applies everywhere, dropping
+  a paragraph readers show. Expected `incomplete_conversion`.
 
 All content is synthetic and contains no personal data.
 """
@@ -689,6 +695,20 @@ def main():
         "display-none-omitted.epub",
         ".gone { display: none }\n",
         '<p>VISIBLE-CHAPTER</p><p class="gone">OMITTED-LIKE-A-READER</p>',
+    )
+    write_styled_epub(
+        "list-text-outside-items.epub",
+        "p { margin: 0 }\n",
+        "<p>VISIBLE-CHAPTER</p><ol><li>Line one</li>LOOSE-LIST-TEXT"
+        "<p>PARAGRAPH-IN-LIST</p><li>Line two</li></ol>",
+    )
+    write_styled_epub(
+        "kindle-media-pair.epub",
+        ".mobi-only { display: none; }\n"
+        "@media amzn-mobi {\n  .mobi-only { display: block; }\n"
+        "  .kf8-only { display: none; }\n}\n",
+        '<p>VISIBLE-CHAPTER</p><p class="kf8-only">SHOWN-IN-EPUB-READERS</p>'
+        '<p class="mobi-only">Old Kindle fallback.</p>',
     )
 
 

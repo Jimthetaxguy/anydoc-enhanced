@@ -4258,12 +4258,14 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
                 result.missing_required_content |= chapter_result.missing_required_content;
                 let cascade =
                     stylesheets.chapter_cascade(&mut archive, &target, &styles, &mut result)?;
-                result.hidden_content |= epub_css::converts_hidden_text(
+                let text = epub_css::chapter_text(
                     &chapter,
                     &cascade.reader,
                     &cascade.anydoc,
                     &mut css_work,
                 )?;
+                result.hidden_content |= text.converts_hidden;
+                result.unsupported_content |= text.drops_shown;
             }
             Err(DocumentError::Malformed) => result.missing_required_content = true,
             Err(error) => return Err(error),
@@ -4758,10 +4760,16 @@ fn preflight_rejection(kind: DocumentKind, preflight: &PackagePreflight) -> Opti
                 || preflight.missing_required_content
                 || preflight.unsupported_content
         }
-        DocumentKind::Pptx | DocumentKind::Epub => {
+        DocumentKind::Pptx => {
             preflight.hidden_content
                 || preflight.external_relationships
                 || preflight.missing_required_content
+        }
+        DocumentKind::Epub => {
+            preflight.hidden_content
+                || preflight.external_relationships
+                || preflight.missing_required_content
+                || preflight.unsupported_content
         }
         DocumentKind::Odp => {
             preflight.hidden_content

@@ -574,6 +574,8 @@ fn strict_epub_negative_fixtures_fail_closed() {
         ("encoded-chapter-href.epub", "incomplete_conversion"),
         ("linked-css-hidden.epub", "incomplete_conversion"),
         ("escaped-selector.epub", "incomplete_conversion"),
+        ("list-text-outside-items.epub", "incomplete_conversion"),
+        ("kindle-media-pair.epub", "incomplete_conversion"),
         ("nav-spine-mismatch.epub", "incomplete_conversion"),
         ("missing-local-resource.epub", "incomplete_conversion"),
         ("external-reference.epub", "incomplete_conversion"),

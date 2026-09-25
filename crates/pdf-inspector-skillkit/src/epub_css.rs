@@ -1970,7 +1970,21 @@ impl Cascade {
             || (element.lower == "audio" && !has("controls"))
             || matches!(
                 element.lower.as_str(),
-                "datalist" | "noembed" | "noframes" | "template" | "rp" | "title"
+                "area"
+                    | "base"
+                    | "basefont"
+                    | "datalist"
+                    | "head"
+                    | "link"
+                    | "meta"
+                    | "noembed"
+                    | "noframes"
+                    | "param"
+                    | "rp"
+                    | "script"
+                    | "style"
+                    | "template"
+                    | "title"
             );
         if hidden_by_user_agent {
             add(
@@ -2175,7 +2189,11 @@ enum Reach {
     Row,
     /// `pre` or `math`: all text below converts, whatever its style.
     Whole,
-    /// Nothing below converts.
+    /// Nothing below converts, but a reader may show it: an element AnyDoc
+    /// styles hidden, `noscript`, or content in a position its walker skips,
+    /// such as text or a paragraph directly in a list or table.
+    Omitted,
+    /// Nothing below converts, and a reader shows none of it either.
     Dropped,
 }
 
@@ -2204,28 +2222,59 @@ struct Open {
     exempt: Exempt,
 }
 
+/// Elements whose text no reader renders and AnyDoc never converts: the
+/// elements AnyDoc's walker skips that HTML's rendering rules hide, and the
+/// elements it reads for their attributes alone.
+fn never_rendered(element: &Element) -> bool {
+    matches!(
+        element.local.as_str(),
+        "script" | "style" | "head" | "template" | "hr" | "br" | "img" | "image"
+    )
+}
+
+/// An element in a position AnyDoc's walker skips.
+fn left_out(element: &Element) -> Reach {
+    if never_rendered(element) {
+        Reach::Dropped
+    } else {
+        Reach::Omitted
+    }
+}
+
 fn walked_reach(element: &Element, anydoc: &AnyDocCascade) -> Reach {
-    if anydoc.hides(element) {
+    if never_rendered(element) {
         return Reach::Dropped;
     }
+    if anydoc.hides(element) {
+        return Reach::Omitted;
+    }
     match element.local.as_str() {
-        "script" | "style" | "head" | "template" | "noscript" => Reach::Dropped,
+        // A reader without scripting, as most are, shows it.
+        "noscript" => Reach::Omitted,
         "pre" | "math" => Reach::Whole,
         "ul" | "ol" => Reach::List,
         "table" => Reach::Table,
-        "hr" | "br" | "img" | "image" => Reach::Dropped,
         _ => Reach::Walk,
     }
 }
 
-/// Whether a chapter holds text a reading system hides and AnyDoc converts.
-/// The chapter must already be known to be well formed.
-pub(super) fn converts_hidden_text(
+/// How a chapter's text fares between a reading system and AnyDoc.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ChapterText {
+    /// Text a reader hides converts.
+    pub(super) converts_hidden: bool,
+    /// Text a reader shows does not convert.
+    pub(super) drops_shown: bool,
+}
+
+/// Compare what a reading system shows of a chapter with what AnyDoc
+/// converts. The chapter must already be known to be well formed.
+pub(super) fn chapter_text(
     chapter: &[u8],
     reader: &Cascade,
     anydoc: &AnyDocCascade,
     work: &mut u64,
-) -> Result<bool, DocumentError> {
+) -> Result<ChapterText, DocumentError> {
     let mut xml = quick_xml::Reader::from_reader(std::io::Cursor::new(chapter));
     xml.config_mut().trim_text(false);
     xml.config_mut().check_end_names = false;
@@ -2235,6 +2284,7 @@ pub(super) fn converts_hidden_text(
     let mut top_level = 0usize;
     let mut root_taken = false;
     let mut body_taken = false;
+    let mut found = ChapterText::default();
     loop {
         let event = xml
             .read_event_into(&mut buffer)
@@ -2262,26 +2312,43 @@ pub(super) fn converts_hidden_text(
                     reference.as_ref(),
                 ))),
             ),
-            quick_xml::events::Event::Eof => return Ok(false),
+            quick_xml::events::Event::Eof => return Ok(found),
             _ => {
                 buffer.clear();
                 continue;
             }
         };
         if let Some(text) = text {
-            if let Some(state) = open.last() {
-                let converted = matches!(state.reach, Reach::Walk | Reach::Whole);
+            let state = open
+                .last()
+                .filter(|_| text.chars().any(|character| !character.is_whitespace()));
+            if let Some(state) = state {
                 let hidden =
                     state.undisplayed || state.invisible || state.contents_hidden || state.fallback;
-                if converted && hidden && text.chars().any(|character| !character.is_whitespace()) {
-                    let shown_anyway = match state.exempt {
-                        Exempt::None => false,
-                        Exempt::Description => true,
-                        Exempt::RubyParenthesis => !text.chars().any(char::is_alphanumeric),
-                    };
-                    if !shown_anyway {
-                        return Ok(true);
+                match state.reach {
+                    Reach::Walk | Reach::Whole if hidden => {
+                        let shown_anyway = match state.exempt {
+                            Exempt::None => false,
+                            Exempt::Description => true,
+                            Exempt::RubyParenthesis => !text.chars().any(char::is_alphanumeric),
+                        };
+                        found.converts_hidden |= !shown_anyway;
                     }
+                    Reach::Walk | Reach::Whole | Reach::Dropped => {}
+                    // Text in a list, a table, a row group, a row, or the
+                    // root element outside the body is skipped, like
+                    // everything in an omitted element.
+                    Reach::Root
+                    | Reach::List
+                    | Reach::Table
+                    | Reach::RowGroup
+                    | Reach::Row
+                    | Reach::Omitted => {
+                        found.drops_shown |= !hidden && state.exempt == Exempt::None;
+                    }
+                }
+                if found.converts_hidden && found.drops_shown {
+                    return Ok(found);
                 }
             }
             buffer.clear();
@@ -2323,7 +2390,7 @@ pub(super) fn converts_hidden_text(
                     root_taken = true;
                     Reach::Root
                 } else {
-                    Reach::Dropped
+                    left_out(&element)
                 }
             }
             Some(parent) => match parent.reach {
@@ -2332,7 +2399,7 @@ pub(super) fn converts_hidden_text(
                         body_taken = true;
                         Reach::Walk
                     } else {
-                        Reach::Dropped
+                        left_out(&element)
                     }
                 }
                 Reach::Walk => walked_reach(&element, anydoc),
@@ -2340,7 +2407,7 @@ pub(super) fn converts_hidden_text(
                     if element.local == "li" {
                         Reach::Walk
                     } else {
-                        Reach::Dropped
+                        left_out(&element)
                     }
                 }
                 Reach::Table => match element.local.as_str() {
@@ -2350,23 +2417,24 @@ pub(super) fn converts_hidden_text(
                         parent.caption_seen = true;
                         Reach::Walk
                     }
-                    _ => Reach::Dropped,
+                    _ => left_out(&element),
                 },
                 Reach::RowGroup => {
                     if element.local == "tr" {
                         Reach::Row
                     } else {
-                        Reach::Dropped
+                        left_out(&element)
                     }
                 }
                 Reach::Row => {
                     if matches!(element.local.as_str(), "td" | "th") {
                         Reach::Walk
                     } else {
-                        Reach::Dropped
+                        left_out(&element)
                     }
                 }
                 Reach::Whole => Reach::Whole,
+                Reach::Omitted => left_out(&element),
                 Reach::Dropped => Reach::Dropped,
             },
         };
@@ -2382,7 +2450,7 @@ pub(super) fn converts_hidden_text(
                 .last()
                 .is_some_and(|element| element.lower == "svg");
         let state = if reach == Reach::Dropped {
-            // Nothing below converts, so its style does not matter.
+            // Nothing below converts or shows, so its style does not matter.
             Open {
                 children: 0,
                 reach,
@@ -2513,11 +2581,20 @@ mod tests {
         .into_bytes()
     }
 
-    /// Whether text a reader hides converts, with these stylesheets.
-    fn converts_hidden(sheets: &[&str], body: &str) -> bool {
+    fn walk(sheets: &[&str], body: &str) -> ChapterText {
         let (reader, anydoc) = cascade_for(sheets);
         let mut work = 0;
-        converts_hidden_text(&chapter(body), &reader, &anydoc, &mut work).expect("chapter walk")
+        chapter_text(&chapter(body), &reader, &anydoc, &mut work).expect("chapter walk")
+    }
+
+    /// Whether text a reader hides converts, with these stylesheets.
+    fn converts_hidden(sheets: &[&str], body: &str) -> bool {
+        walk(sheets, body).converts_hidden
+    }
+
+    /// Whether text a reader shows does not convert.
+    fn drops_shown(sheets: &[&str], body: &str) -> bool {
+        walk(sheets, body).drops_shown
     }
 
     #[test]
@@ -2745,6 +2822,51 @@ mod tests {
             &[".x { visibility: hidden }"],
             r#"<ul><p class="x">DROPPED</p></ul>"#
         ));
+        // Script and style text inside `pre` is hidden but converts.
+        assert!(converts_hidden(&[], "<pre>a<script>SECRET</script></pre>"));
+    }
+
+    #[test]
+    fn text_readers_show_and_anydoc_skips_is_found() {
+        // AnyDoc reads only `li` children of a list, and only row groups,
+        // rows, cells, and the first caption of a table.
+        for body in [
+            "<ul>LOOSE TEXT<li>item</li></ul>",
+            "<ol><li>item</li><p>A PARAGRAPH</p></ol>",
+            "<table>LOOSE<tr><td>cell</td></tr></table>",
+            "<table><tr><td>cell</td></tr><div>A BLOCK</div></table>",
+            "<table><tbody><p>X</p><tr><td>cell</td></tr></tbody></table>",
+            "<table><tr><td>cell</td><div>X</div></tr></table>",
+            "<table><caption>First</caption><caption>SECOND</caption></table>",
+            "<noscript>SHOWN WITHOUT SCRIPTS</noscript>",
+        ] {
+            assert!(drops_shown(&[], body), "{body}");
+            assert!(!converts_hidden(&[], body), "{body}");
+        }
+        // Rules AnyDoc applies and readers do not: its split at every `}`
+        // applies the second rule of a media block everywhere.
+        let kindle = "@media amzn-mobi { .kf8 { font-size: 1em } .mobi-hidden { display: none } }";
+        assert!(drops_shown(
+            &[kindle],
+            r#"<p class="mobi-hidden">EPUB TEXT</p>"#
+        ));
+        assert!(!drops_shown(&[kindle], r#"<p class="kf8">EPUB TEXT</p>"#));
+        // Skipped text a reader hides too, whitespace, never-rendered
+        // elements, and descriptions are not lost.
+        for body in [
+            r#"<ul style="display:none">GONE<li>item</li></ul>"#,
+            r#"<ul><p hidden="">GONE</p><li>item</li></ul>"#,
+            "<ul>
+  <li>item</li>
+  <li>item</li>
+</ul>",
+            "<ul><script>code()</script><li>item</li></ul>",
+            "<table><tr><td>cell</td></tr><style>td { color: red }</style></table>",
+            r#"<div style="display:none">GONE</div>"#,
+            ".x { display: none }",
+        ] {
+            assert!(!drops_shown(&[".x { display: none }"], body), "{body}");
+        }
     }
 
     #[test]
@@ -2812,7 +2934,7 @@ mod tests {
         let (reader, anydoc) = cascade_for(&["[data-x] { visibility: hidden }"]);
         let mut work = MAX_MATCH_WORK;
         assert!(matches!(
-            converts_hidden_text(&chapter("<p>TEXT</p>"), &reader, &anydoc, &mut work),
+            chapter_text(&chapter("<p>TEXT</p>"), &reader, &anydoc, &mut work),
             Err(DocumentError::ResourceLimit)
         ));
     }
