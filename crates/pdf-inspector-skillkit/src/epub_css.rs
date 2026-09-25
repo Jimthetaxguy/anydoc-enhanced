@@ -7710,10 +7710,11 @@ struct Open {
     /// The font size an SVG element's attributes or inline style set, on it
     /// or on an element around it inside the image.
     svg_font: Option<f64>,
-    /// For an SVG `text` or `tspan` that sets `dx`, how it moves its
-    /// glyphs, where it or an element around it moves one apart (see
-    /// [`svg_glyph_shifts`]), and how many of them came.
-    glyph_shifts: Vec<Tri>,
+    /// For an SVG `text` or `tspan` that sets `dx`, `dy`, `x`, or `y`
+    /// lists, how each moves its glyphs, where it or an element around it
+    /// moves one apart (see [`svg_glyph_shifts`]), and how many of them
+    /// came.
+    glyph_shifts: [Vec<Tri>; 4],
     shifts_taken: usize,
     /// Children are laid out as flex or grid items, and how they stand so
     /// far.
@@ -7737,9 +7738,11 @@ struct Open {
 }
 
 impl Open {
-    /// Whether its `dx` list reaches glyphs still to come.
+    /// Whether its lists reach glyphs still to come.
     fn shifts_glyphs(&self) -> bool {
-        self.shifts_taken < self.glyph_shifts.len()
+        self.glyph_shifts
+            .iter()
+            .any(|list| self.shifts_taken < list.len())
     }
 }
 
@@ -7971,13 +7974,38 @@ fn svg_number(value: &str) -> Option<f64> {
     value.strip_suffix("px").unwrap_or(value).parse().ok()
 }
 
-/// The numbers of an SVG list of lengths (`dx="0 0 120 0"`); `None` where
-/// one is not a number [`svg_number`] reads.
-fn svg_numbers(value: &str) -> Option<Vec<f64>> {
+/// A length of an SVG list, in pixels: user units and `px`, the font's
+/// `em` and `ex`, and the absolute units, zero in any. `Some(None)` for a
+/// percentage, of a viewport the check does not read; `None` for what is
+/// not a length, which voids the list.
+fn svg_pixels(value: &str, em: f64) -> Option<Option<f64>> {
+    let split = value
+        .find(|character: char| character.is_ascii_alphabetic() || character == '%')
+        .unwrap_or(value.len());
+    let number: f64 = value[..split].parse().ok()?;
+    let scale = match value[split..].to_ascii_lowercase().as_str() {
+        "" | "px" => 1.0,
+        "em" => em,
+        "ex" => em / 2.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "%" => return Some((number == 0.0).then_some(0.0)),
+        _ => return None,
+    };
+    Some(Some(number * scale))
+}
+
+/// The lengths of an SVG list (`dx="0 0 120 0"`), each as [`svg_pixels`]
+/// reads it; `None` where one is not a length.
+fn svg_lengths(value: &str, em: f64) -> Option<Vec<Option<f64>>> {
     value
         .split(|character: char| character.is_ascii_whitespace() || character == ',')
         .filter(|part| !part.is_empty())
-        .map(svg_number)
+        .map(|part| svg_pixels(part, em))
         .collect()
 }
 
@@ -7996,31 +8024,58 @@ fn svg_shift(dx: f64, em: f64) -> Tri {
     }
 }
 
-/// How an SVG `text` or `tspan`'s `dx` moves its glyphs, one value for
-/// each, first to last: the first glyph goes where the element's own place
-/// sets it (see [`svg_text_flow`]), `No` here, and each after it as its
-/// value moves it from where the one before ends (see [`svg_shift`]). A
-/// reader takes the value for each glyph from the innermost element whose
-/// list reaches it (see [`add_positioned`]). Empty where the element sets
-/// no `dx` that reads.
-fn svg_glyph_shifts(element: &Element, em: f64) -> Vec<Tri> {
-    let Some(numbers) = element.first("dx").and_then(svg_numbers) else {
-        return Vec::new();
+/// How an SVG `text` or `tspan`'s `dx`, `dy`, `x`, and `y` lists move its
+/// glyphs, one value for each glyph, first to last: the first glyph goes
+/// where the element's own place sets it (see [`svg_text_flow`]), `No`
+/// here, and each after it from where the one before stands: by `dx` as
+/// [`svg_shift`] tells; by `dy`, or to the next `y`, on its line (`No`),
+/// off it within half an em as a superscript is (`Maybe`), or onto another
+/// (`Yes`); to the next `x` where the one before ends, within half an em of
+/// 0.6 em past it (`No`), or elsewhere (`Yes`). A length the check cannot
+/// size may move it apart (`Maybe`). A reader takes each value from the
+/// innermost element whose list reaches the glyph (see [`add_positioned`]).
+/// Empty where the element sets no such list that reads.
+fn svg_glyph_shifts(element: &Element, em: f64) -> [Vec<Tri>; 4] {
+    let off_line = |moved: f64| {
+        if moved == 0.0 {
+            Tri::No
+        } else if moved.abs() <= em / 2.0 {
+            Tri::Maybe
+        } else {
+            Tri::Yes
+        }
     };
-    let Some((_, after)) = numbers.split_first() else {
-        return Vec::new();
+    let beside = |moved: f64| {
+        if (moved - 0.6 * em).abs() <= em / 2.0 {
+            Tri::No
+        } else {
+            Tri::Yes
+        }
     };
-    std::iter::once(Tri::No)
-        .chain(after.iter().map(|dx| svg_shift(*dx, em)))
-        .collect()
+    ["dx", "dy", "x", "y"].map(|name| {
+        let Some(lengths) = element.first(name).and_then(|value| svg_lengths(value, em)) else {
+            return Vec::new();
+        };
+        let step = |at: usize| match (name, lengths[at - 1], lengths[at]) {
+            ("dx", _, Some(dx)) => svg_shift(dx, em),
+            ("dy", _, Some(dy)) => off_line(dy),
+            ("x", Some(before), Some(x)) => beside(x - before),
+            ("y", Some(before), Some(y)) => off_line(y - before),
+            _ => Tri::Maybe,
+        };
+        (0..lengths.len())
+            .map(|at| if at == 0 { Tri::No } else { step(at) })
+            .collect()
+    })
 }
 
-/// Add text inside an SVG label whose `dx` lists move glyphs one by one
-/// (see [`svg_glyph_shifts`]) to the run, each glyph a list moves apart
-/// from the one before starting a piece of its own; whether it runs into
-/// the text before it. A reader numbers the characters of the label as
-/// they come, white space it collapses left out, and each open element's
-/// list gives the next of its values to each, until it runs out.
+/// Add text inside an SVG label whose lists move glyphs one by one (see
+/// [`svg_glyph_shifts`]) to the run, each glyph a list moves apart from
+/// the one before starting a piece of its own; whether it runs into the
+/// text before it. A reader numbers the characters of the label as they
+/// come, white space it collapses left out, and each open element's lists
+/// give the next of their values to each, until they run out; of each
+/// kind, the innermost that reaches a glyph moves it.
 fn add_positioned(run: &mut Run, text: &str, open: &mut [Open]) -> bool {
     let mut lists: Vec<&mut Open> = open
         .iter_mut()
@@ -8038,15 +8093,17 @@ fn add_positioned(run: &mut Run, text: &str, open: &mut [Open]) -> bool {
             continue;
         }
         space = character.is_whitespace();
-        let mut shift = Tri::No;
-        let mut innermost = true;
+        let mut shifts = [None; 4];
         lists.retain_mut(|state| {
-            if std::mem::take(&mut innermost) {
-                shift = state.glyph_shifts[state.shifts_taken];
+            for (shift, list) in shifts.iter_mut().zip(&state.glyph_shifts) {
+                if shift.is_none() {
+                    *shift = list.get(state.shifts_taken).copied();
+                }
             }
             state.shifts_taken += 1;
             state.shifts_glyphs()
         });
+        let shift = shifts.into_iter().flatten().max().unwrap_or(Tri::No);
         if shift != Tri::No {
             if at > start {
                 fused |= run.add(&text[start..at]);
@@ -8088,11 +8145,15 @@ fn svg_text_flow(
     own: Flow,
 ) -> Flow {
     let (em, sized) = (font.unwrap_or(16.0), font.is_some());
-    let number = |name: &str| element.first(name).map(svg_number);
-    let (x, y, dy) = (number("x"), number("y"), number("dy"));
-    let dx = element
-        .first("dx")
-        .map(|value| svg_numbers(value).and_then(|numbers| numbers.first().copied()));
+    // The first length of each list places the element; a `dy` of none
+    // moves nothing.
+    let first = |name: &str| {
+        element.first(name).map(|value| {
+            svg_lengths(value, em).and_then(|lengths| lengths.first().copied().flatten())
+        })
+    };
+    let (x, y, dx) = (first("x"), first("y"), first("dx"));
+    let dy = first("dy").filter(|dy| *dy != Some(0.0));
     if element.local == "textPath" {
         run.svg_pen = None;
         return Flow::Block;
@@ -9886,19 +9947,19 @@ pub(super) fn chapter_text(
         let svg_text = parent.is_some_and(|parent| parent.svg_text)
             || (parent_in_svg && element.local == "text");
         let switch_taken = (in_svg && element.local == "switch").then_some(false);
-        // A `dx` list is read where it, or one around it, moves a glyph
+        // Lists are read where they, or those around them, move a glyph
         // apart.
         let glyph_shifts = if parent_in_svg && matches!(element.local.as_str(), "text" | "tspan") {
             let shifts = svg_glyph_shifts(element, svg_font.unwrap_or(16.0));
-            let read = shifts.iter().any(|shift| *shift != Tri::No)
+            let read = shifts.iter().flatten().any(|shift| *shift != Tri::No)
                 || open.iter().any(Open::shifts_glyphs);
             if read {
                 shifts
             } else {
-                Vec::new()
+                Default::default()
             }
         } else {
-            Vec::new()
+            Default::default()
         };
         // A `foreignObject` holds HTML, laid out as a reader lays out a page.
         let children_in_svg = in_svg && element.local != "foreignObject";
@@ -11331,6 +11392,44 @@ mod tests {
             r##"<text font-size="16"><textPath href="#p">Units 1250</textPath></text>"##,
         ] {
             assert!(!fuses(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn svg_lists_of_any_kind_and_unit_move_glyphs_apart() {
+        let fuses = |label: &str| {
+            walk(
+                &[],
+                &format!(
+                    r#"<p>Figure 1.</p><svg xmlns="http://www.w3.org/2000/svg" width="500" height="160" viewBox="0 0 500 160">{label}</svg>"#
+                ),
+            )
+            .fuses_blocks
+        };
+        // A glyph a `dx` list moves along the line by a length in any
+        // unit, or a share of the image the check cannot size; one a `dy`
+        // or `y` list moves onto another line; and one an `x` list sets
+        // away from where the one before ends.
+        for label in [
+            r#"<text x="10" y="30" font-size="16" dx="0 0 10em 0">1250</text>"#,
+            r#"<text x="10" y="30" font-size="16" dx="0 0 40mm 0">1250</text>"#,
+            r#"<text x="10" y="30" font-size="16" dx="0 0 30% 0">1250</text>"#,
+            r#"<text x="10" y="30" font-size="16" dy="0 0 60 0">1250</text>"#,
+            r#"<text x="10" y="30" font-size="16">Units <tspan dy="0 60">1250</tspan></text>"#,
+            r#"<text x="10 20 30 300" y="30" font-size="16">1250</text>"#,
+            r#"<text x="10" y="30 30 90 90" font-size="16">1250</text>"#,
+        ] {
+            assert!(fuses(label), "{label}");
+        }
+        // Glyphs a list leaves where they run on, or moves back no more
+        // than a kerning pair does.
+        for label in [
+            r#"<text x="10" y="30" font-size="16" dx="0 0 -0.2em 0">1250</text>"#,
+            r#"<text x="10" y="30" font-size="16" dy="0 0 0 0">1250</text>"#,
+            r#"<text x="10 20 30 40" y="30" font-size="16">1250</text>"#,
+            r#"<text x="10" y="30 30 30 30" font-size="16">1250</text>"#,
+        ] {
+            assert!(!fuses(label), "{label}");
         }
     }
 
