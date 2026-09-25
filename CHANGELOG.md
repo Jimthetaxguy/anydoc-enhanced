@@ -553,6 +553,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     page 2, not as "Plan P2" on page 6.
   - A dynamic XFA form whose notice runs in two languages, 176 words, is
     reported: the notice Adobe's forms show allows four times the words.
+  - PDF layers (loop 24): a page naming one membership dictionary of 1,000
+    layers in 100,000 marked-content spans judged the layers span by span
+    and ran past the worker's 25-second deadline. Each layer, membership
+    dictionary, and visibility expression is now judged once, within a
+    bound per document past which content is taken to show, and the file
+    converts in about a second. Layers are set as viewers set them on
+    opening, from their usage for viewing (ISO 32000-1, 8.11.4.4): a layer
+    is taken to be hidden only where a viewer following the standard,
+    PDFium, and pdf.js all hide it, and one whose state depends on the
+    reader's magnification, user, or language is taken to show.
+  - PDF hidden-layer and invisible text holding a letter past ASCII in a
+    Windows ANSI font ("remplacé", "Don’t"), or read without a font or a
+    map (fonts a page inherits, a font name no resource defines, a form
+    drawing in its invoker's font, a composite font read as code points,
+    a Japanese, Chinese, or Korean font with no map), was passed over. It
+    is now read as pdf-inspector 1.24.0 reads it, and looked for as it
+    writes it: ligatures spelled out, a symbol font's private-use codes
+    read, soft hyphens and zero-width marks left out; the glyph-by-glyph
+    word check, the running-header gate, and the repeat check read such
+    text the same way. A marked-content span's `/ActualText`, which
+    pdf-inspector reads in place of the span's glyphs whatever the render
+    mode, is reported where every glyph it stands for is painted
+    invisibly or in a hidden layer.
+  - PDF form values (loop 21): a value whose widget is in a hidden layer,
+    which pdf-inspector writes as current ("old_balance: 1,000.00
+    superseded"), is reported as `hidden_layer_text_read`; and a field
+    past pdf-inspector's walk bound of 100,000 `/Fields` and `/Kids`
+    entries, now counted as it counts them, references or not, a choice it
+    writes as its export value ("MFJ" for "Married filing jointly"), and a
+    text field whose only value is the text its appearance draws, which
+    Acrobat and PDFium show and pdf-inspector leaves out, unless the form
+    asks for its appearances to be drawn again, are reported as
+    `form_values_misread`.
+  - PDF annotations (loop 22): only text boxes, lines, stamps, and
+    watermarks count against the 10,000-annotation bound, so a text box
+    after a long table of contents of links is read; a stamp is judged the
+    same whichever is read first, as a verdict the depth read, the budget,
+    or a form met again cut short is no longer kept; an inline image's
+    data in an appearance is passed over for its length, or to the `EI`
+    content follows, as pdf.js finds it; and text painted in render mode 3
+    or 7 in a stamp's appearance no longer counts as drawn.
+  Over the 4,412 corpus PDFs these fixes changed no warning; the review's
+  own files change as above, and its stress files convert as fast as
+  before.
 - Review round ten checked loops 20 to 23 and 25:
   - PDF running headers (#483): the check re-read every page of every
     multi-page PDF, 20 to 30% more CPU, under a 4 s budget of its own, so
