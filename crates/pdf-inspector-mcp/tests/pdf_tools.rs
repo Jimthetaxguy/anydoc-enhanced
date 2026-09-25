@@ -2477,6 +2477,39 @@ fn choices_read_as_their_export_values_are_reported() {
     );
 }
 
+/// A one-page form whose one field, a payee, has no value, its appearance
+/// drawing one; `redrawn` has a viewer draw its appearances again.
+fn appearance_form_pdf(redrawn: bool) -> Vec<u8> {
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] /NeedAppearances {redrawn} >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", b"BT /F1 12 Tf 72 740 Td (Payment request) Tj ET"),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (payee) /Rect [300 600 500 620] /P 3 0 R /F 4 /AP << /N 7 0 R >> >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 20] /Resources << /Font << /F1 4 0 R >> >>",
+            b"/Tx BMC BT /F1 10 Tf 2 4 Td (Example Payee LLC) Tj ET EMC",
+        ),
+    ])
+}
+
+#[test]
+fn form_values_only_an_appearance_draws_are_reported() {
+    let results = convert_all(&[appearance_form_pdf(false), appearance_form_pdf(true)]);
+    // pdf-inspector 1.24.0 writes a field's value, and reads no widget's
+    // appearance; when a release reads appearances, this expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(!markdown.contains("Example Payee"), "{markdown}");
+    assert_eq!(
+        warned_pages(&results, "form_values_misread"),
+        [Some(serde_json::json!([1])), None]
+    );
+}
+
 /// A one-page form whose `/Fields` lists `entries` entries that are no
 /// fields before its one field, a payee.
 fn padded_form_pdf(entries: usize) -> Vec<u8> {

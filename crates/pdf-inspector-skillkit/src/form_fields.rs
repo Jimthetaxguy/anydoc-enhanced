@@ -11,7 +11,9 @@
 //! reference, as a text stream, or only as rich text, is not written at
 //! all, though a viewer shows it. A choice it writes as the value chosen,
 //! where a viewer shows the text the field's options give that value, "MFJ"
-//! for "Married filing jointly".
+//! for "Married filing jointly". A text or choice field with no value at
+//! all it writes nothing for, where a viewer shows the text its widget's
+//! appearance draws, unless the form has its appearances drawn again.
 //!
 //! The walk follows pdf-inspector's through the field tree, within its
 //! bounds, which count every entry of the tree's arrays, references or
@@ -49,6 +51,9 @@ const MAX_VALUE_BYTES: usize = 64 << 10;
 /// Options of choice fields read to find the text they give their values,
 /// in all.
 const MAX_OPTIONS: usize = 1_000_000;
+/// Bytes widgets' appearances may decode to, in all, for the text they draw
+/// to be read.
+const MAX_APPEARANCE_BYTES: usize = 16 << 20;
 /// References followed to reach an object.
 const MAX_REFERENCE_HOPS: usize = 8;
 /// Annotation flags that keep a widget from view: hidden, and not viewed.
@@ -138,7 +143,20 @@ struct Walk<'a> {
     past: bool,
     /// Options left to read (see `MAX_OPTIONS`).
     options: usize,
+    /// What is read of widgets' appearances; `None` where the form has a
+    /// viewer draw them again, from the values.
+    appearances: Option<Appearances<'a>>,
     values: Values,
+}
+
+/// What the walk reads of widgets' appearances.
+struct Appearances<'a> {
+    /// The fonts the form gives its appearances by default.
+    fonts: Option<&'a Dictionary>,
+    /// How each font read reads its codes.
+    glyphs: crate::glyph_words::GlyphFonts,
+    /// Decoded bytes left to read (see `MAX_APPEARANCE_BYTES`).
+    left: usize,
 }
 
 impl<'a> Walk<'a> {
@@ -314,6 +332,100 @@ impl<'a> Walk<'a> {
         displayed.then(|| texts.join(", "))
     }
 
+    /// The text the normal appearance of `widget`, of a text or choice
+    /// field, draws, as a viewer shows it for a field with no value: each
+    /// string shown not invisibly, as its font reads it, a space between
+    /// text objects; `None` where it draws none, the form has its
+    /// appearances drawn again, or the bytes left to read are spent.
+    fn appearance(&mut self, kind: &[u8], widget: &'a Dictionary) -> Option<String> {
+        if !matches!(kind, b"Tx" | b"Ch") {
+            return None;
+        }
+        let document = self.document;
+        let appearances = self.appearances.as_mut()?;
+        let normal = resolved(document, widget.get(b"AP").ok()?)?
+            .as_dict()
+            .ok()?
+            .get(b"N")
+            .ok()?;
+        let stream = match resolved(document, normal)? {
+            Object::Stream(stream) => stream,
+            Object::Dictionary(states) => {
+                let state = widget.get(b"AS").ok()?.as_name().ok()?;
+                resolved(document, states.get(state).ok()?)?
+                    .as_stream()
+                    .ok()?
+            }
+            _ => return None,
+        };
+        let limit = appearances.left.min(MAX_VALUE_BYTES);
+        let content = stream.get_plain_content_with_limit(limit);
+        appearances.left -= match &content {
+            Ok(content) => content.len(),
+            Err(_) => limit.min(stream.content.len()),
+        };
+        let operations = lopdf::content::Content::decode(&content.ok()?)
+            .ok()?
+            .operations;
+        let dictionary = |object: &'a Object| resolved(document, object)?.as_dict().ok();
+        let fonts = stream
+            .dict
+            .get(b"Resources")
+            .ok()
+            .and_then(dictionary)
+            .and_then(|resources| resources.get(b"Font").ok())
+            .and_then(dictionary)
+            .or(appearances.fonts);
+        let (mut font, mut invisible) = (None, false);
+        let (mut texts, mut text) = (Vec::new(), String::new());
+        for operation in &operations {
+            match operation.operator.as_str() {
+                "Tf" => {
+                    font = operation
+                        .operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| fonts?.get(name).ok())
+                        .and_then(|font| resolved(document, font)?.as_dict().ok())
+                        .and_then(|font| appearances.glyphs.font(document, font));
+                }
+                // Text painted in mode 3, or used only to clip, shows nothing.
+                "Tr" => {
+                    invisible = operation
+                        .operands
+                        .first()
+                        .and_then(|mode| mode.as_float().ok())
+                        .is_some_and(|mode| matches!(mode as i64, 3 | 7));
+                }
+                "Tj" | "'" | "\"" | "TJ" => {
+                    let shown = if operation.operator == "TJ" {
+                        operation.operands.first()
+                    } else {
+                        operation.operands.last()
+                    };
+                    let strings: Vec<&[u8]> = match shown {
+                        Some(Object::Array(parts)) => {
+                            parts.iter().filter_map(|part| part.as_str().ok()).collect()
+                        }
+                        Some(part) => part.as_str().ok().into_iter().collect(),
+                        None => Vec::new(),
+                    };
+                    for bytes in strings {
+                        let read = font
+                            .filter(|_| !invisible)
+                            .and_then(|font| appearances.glyphs.text_or(font, bytes, ' '));
+                        text.extend(read);
+                    }
+                }
+                "ET" if !text.trim().is_empty() => texts.push(std::mem::take(&mut text)),
+                _ => {}
+            }
+        }
+        texts.push(text);
+        let text = texts.join(" ");
+        (!text.trim().is_empty()).then(|| text.trim().to_string())
+    }
+
     /// The plain text of a text field's rich value, which a viewer shows
     /// where it has no value as plain text.
     fn rich(&self, kind: &[u8], field: &'a Dictionary) -> Option<String> {
@@ -345,6 +457,12 @@ impl<'a> Walk<'a> {
         let Some(shown) = displayed
             .or_else(|| value.and_then(|value| self.shown(kind, value)))
             .or_else(|| self.rich(kind, field))
+            .or_else(|| {
+                value
+                    .is_none()
+                    .then(|| self.appearance(kind, field))
+                    .flatten()
+            })
         else {
             return;
         };
@@ -715,6 +833,7 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
         examined: 0,
         past: false,
         options: MAX_OPTIONS,
+        appearances: None,
         values: Values::default(),
     };
     let fields: &[Object] = {
@@ -740,6 +859,25 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
         else {
             return Values::default();
         };
+        // A form asking for its appearances to be drawn again has a viewer
+        // draw them from the values.
+        let redrawn = form
+            .get(b"NeedAppearances")
+            .ok()
+            .and_then(|redrawn| resolved(document, redrawn))
+            .and_then(|redrawn| redrawn.as_bool().ok())
+            .unwrap_or(false);
+        let fonts = form
+            .get(b"DR")
+            .ok()
+            .and_then(|resources| walk.dictionary(resources))
+            .and_then(|resources| resources.get(b"Font").ok())
+            .and_then(|fonts| walk.dictionary(fonts));
+        walk.appearances = (!redrawn).then(|| Appearances {
+            fonts,
+            glyphs: crate::glyph_words::GlyphFonts::default(),
+            left: MAX_APPEARANCE_BYTES,
+        });
         fields
     };
     if fields.is_empty() {
@@ -1124,6 +1262,74 @@ mod tests {
             texts,
             ["Married filing jointly", "Single, Married filing jointly"]
         );
+    }
+
+    #[test]
+    fn text_fields_with_no_value_are_found_as_their_appearance_draws_them() {
+        let build = |redrawn: bool| {
+            let mut document = form(|document, page| {
+                let helvetica = document.add_object(dictionary! {
+                    "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+                    "Encoding" => "WinAnsiEncoding",
+                });
+                let drawn = |document: &mut Document, content: &[u8]| {
+                    document.add_object(lopdf::Stream::new(
+                        dictionary! {
+                            "Type" => "XObject", "Subtype" => "Form",
+                            "Resources" => dictionary! { "Font" => dictionary! { "F1" => helvetica } },
+                        },
+                        content.to_vec(),
+                    ))
+                };
+                // A text field whose value is gone but for its appearance.
+                let shown = drawn(
+                    document,
+                    b"/Tx BMC BT /F1 10 Tf 2 4 Td (Example Payee LLC) Tj ET EMC",
+                );
+                let payee = document.add_object(dictionary! {
+                    "FT" => "Tx", "T" => Object::string_literal("payee"), "P" => page,
+                    "AP" => dictionary! { "N" => shown },
+                });
+                // One drawn invisibly, and a check box, whose appearance
+                // draws a mark, not text.
+                let unseen = drawn(
+                    document,
+                    b"/Tx BMC BT 3 Tr /F1 10 Tf 2 4 Td (Old Payee LLC) Tj ET EMC",
+                );
+                let old = document.add_object(dictionary! {
+                    "FT" => "Tx", "T" => Object::string_literal("old_payee"), "P" => page,
+                    "AP" => dictionary! { "N" => unseen },
+                });
+                let mark = drawn(document, b"BT /F1 10 Tf 2 2 Td (4) Tj ET");
+                let check = document.add_object(dictionary! {
+                    "FT" => "Btn", "T" => Object::string_literal("dependent"), "P" => page,
+                    "AS" => "Yes", "AP" => dictionary! { "N" => dictionary! { "Yes" => mark } },
+                });
+                (vec![payee, old, check], vec![payee, old, check])
+            });
+            let catalog = document
+                .trailer
+                .get(b"Root")
+                .and_then(Object::as_reference)
+                .expect("a catalog");
+            document
+                .get_dictionary_mut(catalog)
+                .and_then(|catalog| catalog.get_mut(b"AcroForm"))
+                .and_then(Object::as_dict_mut)
+                .expect("a form")
+                .set("NeedAppearances", redrawn);
+            values(&document, None).misread
+        };
+        assert_eq!(
+            build(false),
+            vec![FormValue {
+                text: "Example Payee LLC".to_string(),
+                pages: vec![1]
+            }]
+        );
+        // A form whose appearances a viewer draws again, from the values,
+        // shows none.
+        assert!(build(true).is_empty());
     }
 
     #[test]
