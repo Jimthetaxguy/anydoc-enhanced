@@ -734,6 +734,9 @@ pub(crate) struct Findings {
     /// Form field values pdf-inspector misreads or never writes, when the
     /// pages are read for repeats (see `form_fields`).
     pub(crate) form_values: Vec<crate::form_fields::FormValue>,
+    /// Text annotations show that pdf-inspector never reads, when the pages
+    /// are read for repeats (see `annotations`).
+    pub(crate) annotation_texts: Vec<crate::annotations::AnnotationText>,
 }
 
 /// Words shown glyph by glyph kept across a document.
@@ -765,6 +768,7 @@ pub(crate) fn scan(
     let mut found = Findings::default();
     if twice_skip.is_some() {
         found.form_values = crate::form_fields::misread(&document);
+        found.annotation_texts = crate::annotations::unread(&document, only);
     }
     // Words shown glyph by glyph, by page and font, and the fonts seen
     // painting their spaces on any page.

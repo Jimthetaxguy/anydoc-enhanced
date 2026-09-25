@@ -94,6 +94,8 @@ pub const PDF_WARNING_TABLE_VALUES_DETACHED: &str = "table_values_detached";
 pub const PDF_WARNING_HEADER_FOOTER_DROPPED: &str = "header_footer_dropped";
 /// A form field's value is garbled or missing in the Markdown.
 pub const PDF_WARNING_FORM_VALUES_MISREAD: &str = "form_values_misread";
+/// Text an annotation shows on the page is missing from the Markdown.
+pub const PDF_WARNING_ANNOTATION_TEXT_UNREAD: &str = "annotation_text_unread";
 
 /// Pages read again for lines dropped as running headers and footers, how
 /// many are read at a time and grouped into lines at a time, and the time
@@ -575,35 +577,31 @@ impl PdfInfo {
         }
     }
 
-    /// Report the pages of form field values pdf-inspector garbles or never
-    /// writes (see `form_fields`) that the Markdown does not show.
-    fn check_form_values(
-        &mut self,
-        values: &[form_fields::FormValue],
-        only: Option<&HashSet<u32>>,
-    ) {
+    /// The pages of `texts`, each a text and the pages it belongs to, whose
+    /// text the Markdown does not show, among the pages `only` names.
+    fn unshown(&self, texts: &[(&[u32], &str)], only: Option<&HashSet<u32>>) -> Vec<u32> {
         let Some(markdown) = self.markdown.as_deref() else {
-            return;
+            return Vec::new();
         };
-        let values: Vec<(&[u32], String)> = values
+        let texts: Vec<(&[u32], String)> = texts
             .iter()
-            .map(|value| (value.pages.as_slice(), repeated_lines::bare(&value.text)))
+            .map(|(pages, text)| (*pages, repeated_lines::bare(text)))
             .filter(|(_, text)| !text.is_empty())
             .collect();
-        let mut patterns: Vec<&str> = values.iter().map(|(_, text)| text.as_str()).collect();
+        let mut patterns: Vec<&str> = texts.iter().map(|(_, text)| text.as_str()).collect();
         patterns.sort_unstable();
         patterns.dedup();
         if patterns.is_empty() {
-            return;
+            return Vec::new();
         }
         let Ok(automaton) = aho_corasick::AhoCorasick::new(&patterns) else {
-            return;
+            return Vec::new();
         };
         let shown: HashSet<&str> = automaton
             .find_overlapping_iter(&repeated_lines::bare(markdown))
             .map(|found| patterns[found.pattern().as_usize()])
             .collect();
-        let mut pages: Vec<u32> = values
+        let mut pages: Vec<u32> = texts
             .iter()
             .filter(|(_, text)| !shown.contains(text.as_str()))
             .flat_map(|(pages, _)| pages.iter().copied())
@@ -611,6 +609,40 @@ impl PdfInfo {
             .collect();
         pages.sort_unstable();
         pages.dedup();
+        pages
+    }
+
+    /// Report the pages of text annotations show (see `annotations`) that
+    /// the Markdown does not show.
+    fn check_annotation_texts(&mut self, texts: &[annotations::AnnotationText]) {
+        let pages: Vec<[u32; 1]> = texts.iter().map(|text| [text.page]).collect();
+        let texts: Vec<(&[u32], &str)> = pages
+            .iter()
+            .zip(texts)
+            .map(|(page, text)| (page.as_slice(), text.text.as_str()))
+            .collect();
+        let pages = self.unshown(&texts, None);
+        if !pages.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_ANNOTATION_TEXT_UNREAD,
+                "On these pages text shown in an annotation, such as a text box typed onto the page or a stamp drawn in text, is not in the Markdown: pdf-inspector 1.24.0 reads a page's content, links, and form values only; read these pages another way.",
+                pages,
+            ));
+        }
+    }
+
+    /// Report the pages of form field values pdf-inspector garbles or never
+    /// writes (see `form_fields`) that the Markdown does not show.
+    fn check_form_values(
+        &mut self,
+        values: &[form_fields::FormValue],
+        only: Option<&HashSet<u32>>,
+    ) {
+        let values: Vec<(&[u32], &str)> = values
+            .iter()
+            .map(|value| (value.pages.as_slice(), value.text.as_str()))
+            .collect();
+        let pages = self.unshown(&values, only);
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_FORM_VALUES_MISREAD,
@@ -651,6 +683,8 @@ impl PdfInfo {
         .unwrap_or_default();
         let values = std::mem::take(&mut found.form_values);
         self.check_form_values(&values, only);
+        let annotations = std::mem::take(&mut found.annotation_texts);
+        self.check_annotation_texts(&annotations);
         if found.hidden_layer.is_empty() {
             return found;
         }
@@ -747,6 +781,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
     }
 }
 
+mod annotations;
 pub mod document;
 pub mod domain;
 mod doubled_text;

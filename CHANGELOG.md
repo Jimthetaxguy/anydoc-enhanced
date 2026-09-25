@@ -51,8 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PDF results carry a `warnings` list, absent when empty, naming text the
   Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
   form text it does not read, pages that lose a line it takes for a running
-  header, form values it garbles or leaves out, and tables whose amounts
-  may sit in the wrong row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
+  header, form values it garbles or leaves out, annotation text it never
+  reads, and tables whose amounts may sit in the wrong row or column or
+  after the table (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -193,6 +194,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Text shown in annotations, which pdf-inspector 1.24.0 never reads, is
+  reported. A PDF shows text in annotations besides its page content: a
+  text box a reviewer types onto the page (FreeText), such as "Adjusted
+  basis 12,500.00 per preparer", or a stamp or watermark drawn in text,
+  such as "RECEIVED APR 15 2025". pdf-inspector reads a page's content,
+  links, and form values only, so such text was missing from the Markdown
+  with no sign. Visible text boxes, and stamps and watermarks whose
+  appearance draws text, are now read for their text (`/Contents`, or the
+  plain text of their rich text), and a page whose annotation text the
+  Markdown does not show carries the new `annotation_text_unread` warning;
+  the Markdown is not changed. Notes shown only in a popup, and markup
+  commenting on the page's own text, are not what the page shows and are
+  not read. No PDF among 4,412 corpus, fixture, review, and fuzz files is
+  named (only ten of them hold annotations).
 - Form field values pdf-inspector 1.24.0 garbles or leaves out are reported
   (upstream issue #504). pdf-inspector writes each filled form field into
   the Markdown as its name and value, but reads the value as UTF-8, while a

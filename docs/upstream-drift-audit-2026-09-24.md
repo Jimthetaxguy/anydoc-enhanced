@@ -131,6 +131,7 @@ through the server:
 | Issue | Report | Local disposition |
 |---|---|---|
 | #483 | Page content dropped when three or more pages share near-identical text | Reproduced, and wider than reported: pdf-inspector drops, from every page but the first, a line it finds near the top or bottom of three pages and three in ten at about the same height, comparing lines with the digits at either end left out, and drops the lines beside it with it. A consolidated statement's second and third accounts lose their "Account number" lines; a payroll register's later employees lose their IDs and hour totals. Reported as `header_footer_dropped` (Loop 20) where a dropped line says what no kept line says, other than by a page number, and the Markdown does not show it. Identical copies, such as a W-2's Copy C and Copy 2, keep their lines on the first copy only; that is not reported. |
+| (none filed) | Annotations other than links and form fields are never read | Found locally: pdf-inspector 1.24.0 has no code for FreeText, Stamp, or appearance streams, so a text box typed onto a page, or a stamp drawn in text, is missing from the Markdown. Reported as `annotation_text_unread` (Loop 22) where the Markdown does not show its text. |
 | #504 | Form field names and values are decoded as UTF-8, mangling UTF-16 text strings | Reproduced, and wider than reported: PDFDocEncoding values lose their accented letters ("S�o Paulo"), and pdf-inspector reads a value only from a field that is its own widget, so a radio group's choice or a field shown twice is not written at all. Reported as `form_values_misread` (Loop 21) where the Markdown does not show the value read right. |
 | #588 | A table row continuing onto the next page loses its continuation | Not reproduced as a loss: in a generated statement whose last row wraps onto the next page, the continuation reads there, as a heading of its own, apart from its row. |
 | #587 | Expose a one-parse structured page result | Would let the checks that read pages again (repeats, word gaps, tables, and dropped headers) reuse the conversion's own positioned text instead of reading it a second time. |
@@ -298,8 +299,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 282 tests pass (223 skillkit unit, 13
-  skillkit integration, 29 document-tool and 14 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 284 tests pass (224 skillkit unit, 13
+  skillkit integration, 29 document-tool and 15 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI

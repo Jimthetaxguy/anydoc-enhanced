@@ -980,6 +980,71 @@ fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
     assert_eq!(reported(&results[2]), None, "{}", results[2]);
 }
 
+/// A statement page a reviewer marked up: a text box typed onto it and a
+/// stamp drawn in text, both annotations; `flattened` also sets their text
+/// in the page's own content.
+fn annotated_statement_pdf(flattened: bool) -> Vec<u8> {
+    let mut content = String::from(
+        "BT /F1 12 Tf 72 740 Td (Brokerage statement realized gains) Tj ET \
+         BT /F1 10 Tf 72 700 Td (100 sh XYZ CORP sold 03/02/25 proceeds 5,210.00) Tj ET",
+    );
+    if flattened {
+        content.push_str(
+            " BT /F1 10 Tf 302 666 Td (Adjusted basis 12,500.00 per preparer) Tj ET \
+              BT /F1 12 Tf 404 736 Td (RECEIVED APR 15 2025) Tj ET",
+        );
+    }
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R 7 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", content.as_bytes()),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [300 660 560 680] /F 4 /DA (/Helv 10 Tf 0 g) /Contents (Adjusted basis 12,500.00 per preparer) >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 720 560 760] /F 4 /Contents (RECEIVED APR 15 2025) /AP << /N 8 0 R >> >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 160 40] /Resources << /Font << /F1 4 0 R >> >>",
+            b"BT /F1 12 Tf 4 16 Td (RECEIVED APR 15 2025) Tj ET",
+        ),
+    ])
+}
+
+#[test]
+fn annotation_text_pdf_inspector_never_reads_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for flattened in [false, true] {
+        let path = temporary.path().join(format!("annotated-{flattened}.pdf"));
+        std::fs::write(&path, annotated_statement_pdf(flattened)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "annotation_text_unread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // pdf-inspector 1.24.0 reads no annotation but links and form fields;
+    // when a release reads them, this expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        !markdown.contains("12,500.00") && !markdown.contains("RECEIVED"),
+        "{markdown}"
+    );
+    assert_eq!(
+        reported(&results[0]),
+        Some(serde_json::json!([1])),
+        "{}",
+        results[0]
+    );
+    // Text the page's own content also sets is in the Markdown.
+    assert_eq!(reported(&results[1]), None, "{}", results[1]);
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");
