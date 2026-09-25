@@ -115,6 +115,11 @@ pub const PDF_WARNING_CJK_TEXT_MISREAD: &str = "cjk_text_misread";
 /// Characters a text in such a font needs, bare, to tell whether the
 /// Markdown shows it.
 const MIN_CJK_CHARS: usize = 4;
+/// The running-header check could not read every page again within the
+/// call's time or its page limit, so pages it did not read may lose a line.
+pub const PDF_WARNING_HEADER_FOOTER_UNCHECKED: &str = "header_footer_unchecked";
+/// The notice a viewer without XFA shows, as Adobe's forms word it.
+const XFA_NOTICE: &str = "if this message is not eventually replaced";
 /// Columns of vertical writing side by side read row by row across them, or
 /// out of order (upstream #575).
 pub const PDF_WARNING_VERTICAL_TEXT_MISREAD: &str = "vertical_text_misread";
@@ -584,16 +589,27 @@ impl PdfInfo {
         let mut per_page =
             started.elapsed().as_secs_f64() / f64::from(self.page_count.max(1)) * REPEAT_READ_SHARE;
         let mut pages = Vec::new();
-        // The last page read, when not every page wanted is.
+        // The last page read, when not every page wanted is: past the pages
+        // the rule reads at most, or where the call's time ran out, 0 when
+        // it ran out before any.
         let mut read_to = (!read_all).then(|| wanted[wanted.len() - 1]);
-        'read: for (index, chunk) in wanted.chunks(REPEAT_READ_PAGES).enumerate() {
-            let expected = started.elapsed().as_secs_f64() + per_page * chunk.len() as f64;
-            if expected > MAX_CALL_FOR_REPEATS.as_secs_f64() {
-                read_to = (index * REPEAT_READ_PAGES)
-                    .checked_sub(1)
-                    .map(|last| wanted[last]);
+        let mut next = 0;
+        'read: while next < wanted.len() {
+            // As many pages as the time left reads, in parts of at most
+            // `REPEAT_READ_PAGES`.
+            let left = MAX_CALL_FOR_REPEATS.as_secs_f64() - started.elapsed().as_secs_f64();
+            let fits = if per_page > 0.0 {
+                (left.max(0.0) / per_page) as usize
+            } else {
+                usize::MAX
+            };
+            let take = fits.min(REPEAT_READ_PAGES).min(wanted.len() - next);
+            if take == 0 {
+                read_to = Some(next.checked_sub(1).map_or(0, |last| wanted[last]));
                 break;
             }
+            let chunk = &wanted[next..next + take];
+            next += take;
             let reading = std::time::Instant::now();
             let chunk: HashSet<u32> = chunk.iter().copied().collect();
             let read = std::panic::catch_unwind(|| {
@@ -654,10 +670,8 @@ impl PdfInfo {
                 );
             }
             per_page = reading.elapsed().as_secs_f64() / chunk.len() as f64;
-            if started.elapsed() > MAX_CALL_FOR_REPEATS {
-                read_to = pages
-                    .last()
-                    .map(|page: &repeated_lines::PageLines| page.page);
+            if started.elapsed() > MAX_CALL_FOR_REPEATS && next < wanted.len() {
+                read_to = Some(wanted[next - 1]);
                 break 'read;
             }
         }
@@ -666,8 +680,25 @@ impl PdfInfo {
             Some(last) => wanted.iter().take_while(|page| **page <= last).count() as u32,
             None => self.page_count,
         };
-        let lost = repeated_lines::lost(&pages, counted, markdown);
+        let lost = if counted == 0 {
+            repeated_lines::Lost::default()
+        } else {
+            repeated_lines::lost(&pages, counted, markdown)
+        };
         if lost.pages.is_empty() {
+            // Pages not read again are not known to keep their lines.
+            if let Some(last) = [read_to, lost.read_to].into_iter().flatten().min() {
+                let read = if last == 0 {
+                    "could read no page again within the call's time".to_string()
+                } else {
+                    format!("found none through page {last}, and pages after it were not checked")
+                };
+                self.warnings.push(PdfWarning::new(
+                    PDF_WARNING_HEADER_FOOTER_UNCHECKED,
+                    &format!("pdf-inspector 1.24.0 drops lines it takes for running headers or footers, and may drop with them a line that says what the one it keeps does not, as with a second account's number heading its pages; the check for such lines {read}. Read the top and bottom of the pages not checked with extract_text_regions."),
+                    Vec::new(),
+                ));
+            }
             return;
         }
         let mut message = "On these pages pdf-inspector 1.24.0 drops a line it takes for a running header or footer, though the line says what the one it keeps on an earlier page does not, as with a second account's number or another person's name heading its pages; read the top and bottom of these pages with extract_text_regions.".to_string();
@@ -895,13 +926,22 @@ impl PdfInfo {
     }
 
     /// Whether the Markdown holds no more than a notice a page: at most
-    /// `MAX_NOTICE_WORDS` words a page, on average.
+    /// `MAX_NOTICE_WORDS` words a page, on average, or four times as many
+    /// where it holds the notice Adobe's forms show.
     fn shows_only_a_notice(&self) -> bool {
-        let words = self
-            .markdown
-            .as_deref()
-            .map_or(0, |markdown| markdown.split_whitespace().count());
-        words <= MAX_NOTICE_WORDS * self.page_count.max(1) as usize
+        let markdown = self.markdown.as_deref().unwrap_or_default();
+        let words = markdown.split_whitespace().count();
+        let pages = self.page_count.max(1) as usize;
+        if words <= MAX_NOTICE_WORDS * pages {
+            return true;
+        }
+        // Adobe's notice, beside the same in other languages, runs longer.
+        let spaced = markdown
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        spaced.contains(XFA_NOTICE) && words <= MAX_NOTICE_WORDS * 4 * pages
     }
 
     /// Scan what the pages paint and report what the scan finds but a
@@ -932,8 +972,19 @@ impl PdfInfo {
         }
         // The scan only adds signals: if it fails, the result stands as
         // pdf-inspector gave it.
+        // The Markdown's table rows are set aside from the lines at a page's
+        // edges before the running-header gate's window is taken.
+        let tables = self.markdown.as_deref().map(repeated_lines::table_rows);
+        let tables = tables.as_ref().map(|(rows, cells)| (rows, cells));
         let mut found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            text_paints::scan_document(buffer, &layer_skip, twice_skip.as_ref(), only, whole)
+            text_paints::scan_document(
+                buffer,
+                &layer_skip,
+                twice_skip.as_ref(),
+                only,
+                whole,
+                tables,
+            )
         }))
         .unwrap_or_default();
         let values = std::mem::take(&mut found.form_values);

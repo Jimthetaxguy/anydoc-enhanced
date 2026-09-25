@@ -469,6 +469,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round eleven checked the round-ten fixes and loops 22 to 25:
+  - PDF running headers (#483): the gate that decides whether pages are
+    read again grouped a page's runs by height to the point, where
+    pdf-inspector joins runs under 3 points apart into one line, so a
+    bank's name and an account number set a fraction of a point lower, or
+    a name 2 points above a smaller number, read as two lines, neither
+    changing enough to open it, and accounts 2 and 3 lost their numbers
+    with no warning. The gate now makes lines as pdf-inspector does, reads
+    a header drawn a glyph at a time as one text, sets the Markdown's
+    table rows aside before it counts a page's edge lines, and lets a
+    document with form fields, whose values pdf-inspector reads among the
+    lines and the scan does not, be read again whole. Keys that occur in
+    the same places are weighed once, under a work budget, where 400
+    pages of 1,400 runs at their top edge had timed out; 11.9 s now, 13.1 s
+    before round ten.
+  - The reading again is sized to the time the call has left, a part at a
+    time, where it had skipped a 2,000-page statement entirely, and a
+    check that stops short, or reads nothing, says so as the new
+    `header_footer_unchecked` warning, where it had said nothing unless it
+    found a page to name; an 1,800-page statement now reads through page
+    1,385, from 1,024.
+  - Numbers that count pages: "N of M" and "N/M" count only after a page
+    word or standing alone, so a statement's "Closing date 2/28" and a
+    "Loan 2 of 3" heading their pages are no longer taken for page
+    numbers; a number after a label such as "Check", "Invoice No.", or "#"
+    is an identifier, not a folio, so checks 1002 to 1005 heading their
+    pages are named; and a page word joined to its number counts only
+    where it is the page's own, as a form field named "p2.holder" is on
+    page 2, not as "Plan P2" on page 6.
+  - A dynamic XFA form whose notice runs in two languages, 176 words, is
+    reported: the notice Adobe's forms show allows four times the words.
 - Review round ten checked loops 20 to 23 and 25:
   - PDF running headers (#483): the check re-read every page of every
     multi-page PDF, 20 to 30% more CPU, under a 4 s budget of its own, so
@@ -874,8 +905,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elsewhere, as in a transfer line, counts as shown; a count after a page
   word no higher than the page's number reads as a page number begun
   afresh; and where the page scan cannot read a run's text, or runs out of
-  its budget, every page is read again for the running-header rule, within
-  the call's time. Invisible text is looked for on the pages the repeat
+  its budget, or the document holds form fields, every page is read again
+  for the running-header rule, within the call's time, and pages left
+  unread are disclosed as `header_footer_unchecked`. Invisible text is looked for on the pages the repeat
   check reads, but not on a page listed as needing OCR; a page images cover
   whose text mostly paints nothing is taken for a scan, and invisible text
   on it is not reported, whatever it says; and text pdf-inspector reads

@@ -45,6 +45,44 @@ const PAGE_WORDS: [&str; 12] = [
     "page", "pages", "pg", "p", "pp", "seite", "página", "pagina", "blatt", "sheet", "folio",
     "side",
 ];
+/// Words that set the number after them apart as something's own, such as a
+/// check's or an invoice's, which may run with the pages a set distance
+/// from theirs and still say what page it is not.
+const LABEL_WORDS: [&str; 30] = [
+    "no",
+    "nr",
+    "number",
+    "num",
+    "check",
+    "cheque",
+    "invoice",
+    "inv",
+    "account",
+    "acct",
+    "id",
+    "ref",
+    "reference",
+    "order",
+    "receipt",
+    "claim",
+    "policy",
+    "loan",
+    "case",
+    "ticket",
+    "voucher",
+    "item",
+    "unit",
+    "suite",
+    "form",
+    "document",
+    "file",
+    "batch",
+    "transaction",
+    "confirmation",
+];
+/// Joining a line's parts, the gate's evaluations of the texts of the
+/// bands it reads, at most; past them, it lets the pages be read again.
+const MAX_GATE_WORK: usize = 20_000_000;
 
 /// The lines of one page the rule reads: those among its highest or lowest
 /// distinct heights, or every line of a page with few.
@@ -314,7 +352,47 @@ fn masked(text: &str, page: u32) -> (String, bool) {
             .and_then(|index| pieces.get(index))
             .is_some_and(|(piece, what)| *what == Piece::Other && test(piece))
     };
-    // Numbers that count: "3 of 7", "3/7" but not a date's "3/7/2025".
+    // A page word before the piece at `index`: `Some(false)` where white
+    // space or a mark such as "." or ":" sets it apart, `Some(true)` where
+    // it is joined to the number, as in "p2" (a field named for its page)
+    // or "Plan P2".
+    let page_word_at = |index: usize| {
+        let glued = index
+            .checked_sub(1)
+            .and_then(|before| pieces.get(before))
+            .is_some_and(|(_, what)| *what != Piece::Other);
+        let before = beside(index, false).and_then(|before| {
+            if other_is(Some(before), &|piece| {
+                piece
+                    .trim()
+                    .chars()
+                    .all(|mark| matches!(mark, '.' | ':' | '#'))
+            }) {
+                beside(before, false)
+            } else {
+                Some(before)
+            }
+        });
+        word_is(before, &PAGE_WORDS).then_some(glued)
+    };
+    let paged_at = |index: usize| page_word_at(index) == Some(false);
+    // Pieces that frame a number without saying anything: white space,
+    // dashes, brackets, and bars.
+    let framing = |at: usize| {
+        pieces.get(at).is_some_and(|(piece, what)| {
+            *what == Piece::Other
+                && piece.chars().all(|mark| {
+                    mark.is_whitespace()
+                        || matches!(
+                            mark,
+                            '-' | '\u{2013}' | '\u{2014}' | '(' | ')' | '[' | ']' | '|' | '.'
+                        )
+                })
+        })
+    };
+    // Numbers that count: "3 of 7", "3/7" but not a date's "3/7/2025", after
+    // a page word or standing alone, as "Closing date 1/31" and "Loan 2 of 3"
+    // do not.
     let mut counting: HashSet<usize> = HashSet::new();
     for index in 0..pieces.len() {
         let (Some(first), Some(between)) = (number(index), beside(index, true)) else {
@@ -331,8 +409,10 @@ fn masked(text: &str, page: u32) -> (String, bool) {
             continue;
         };
         let chained = |at: Option<usize>| other_is(at, &|piece| piece.contains('/'));
+        let alone = (0..index).all(framing) && (second_at + 1..pieces.len()).all(framing);
         if first <= second
             && !(slash && (chained(beside(second_at, true)) || chained(index.checked_sub(1))))
+            && (paged_at(index) || alone)
         {
             counting.extend([index, second_at]);
         }
@@ -372,22 +452,27 @@ fn masked(text: &str, page: u32) -> (String, bool) {
             continue;
         }
         let dashes = ['-', '\u{2013}', '\u{2014}'];
-        let paged = word_is(
-            before.and_then(|before| {
-                // A page word, a mark such as "." or ":" after it aside.
-                if other_is(Some(before), &|piece| {
-                    piece
-                        .trim()
-                        .chars()
-                        .all(|mark| matches!(mark, '.' | ':' | '#'))
-                }) {
-                    beside(before, false)
-                } else {
-                    Some(before)
-                }
-            }),
-            &PAGE_WORDS,
-        );
+        let paged = paged_at(index);
+        // Joined to a page word, a number counts the pages only where it is
+        // the page's own: "p2.holder" on page 2, not "Plan P2" on page 6.
+        let own_page = page_word_at(index) == Some(true) && value == Some(i64::from(page));
+        // A label such as "Check", "No.", or "#" before the number.
+        let labelled = other_is(before, &|piece| piece.trim() == "#")
+            || word_is(
+                before.and_then(|before| {
+                    if other_is(Some(before), &|piece| {
+                        piece
+                            .trim()
+                            .chars()
+                            .all(|mark| matches!(mark, '.' | ':' | '#'))
+                    }) {
+                        beside(before, false)
+                    } else {
+                        Some(before)
+                    }
+                }),
+                &LABEL_WORDS,
+            );
         // Dashes framing a number alone, not joining it to other digits as
         // a date's do.
         let dash = |piece: &str| {
@@ -413,6 +498,7 @@ fn masked(text: &str, page: u32) -> (String, bool) {
             || (index + 1 == pieces.len() && apart(index.checked_sub(1)));
         let folio = at_end
             && !dated
+            && !labelled
             && match what {
                 Piece::Roman(value, lower) => *lower && *value <= MAX_ROMAN_FOLIO,
                 _ => true,
@@ -426,7 +512,7 @@ fn masked(text: &str, page: u32) -> (String, bool) {
         let restarted =
             (paged || framed) && value.is_some_and(|value| (0..=i64::from(page)).contains(&value));
         match offset.filter(|_| paged || framed || folio) {
-            _ if restarted => masked.push('#'),
+            _ if restarted || own_page => masked.push('#'),
             Some(offset) => masked.push_str(&format!("#{offset}#")),
             None => {
                 counts_only = false;
@@ -549,25 +635,84 @@ pub(crate) struct EdgeRun {
 }
 
 /// The height, to the point, the gate sets a run at.
-fn height(run: &EdgeRun) -> i64 {
-    run.y.round() as i64
+/// The lines pdf-inspector makes of a page's runs, top to bottom, as the
+/// indexes of their runs: taken from the top, and from the left along a
+/// height, a run goes on the line above when it sits less than 3 points
+/// from that line's first run, unless, set more than half a point apart
+/// from it, it starts where that run starts, as a line below it at the
+/// margin does, or well left of the line's last run.
+fn lines_of(runs: &[EdgeRun]) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by(|&one, &other| {
+        runs[other]
+            .y
+            .total_cmp(&runs[one].y)
+            .then(runs[one].x.total_cmp(&runs[other].x))
+    });
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    for index in order {
+        let run = &runs[index];
+        let joins = lines.last().is_some_and(|line| {
+            let (first, last) = (&runs[line[0]], &runs[line[line.len() - 1]]);
+            let apart = (first.y - run.y).abs();
+            apart < 3.0
+                && !(apart > 0.5 && ((run.x - first.x).abs() < 5.0 || run.x < last.x - 10.0))
+        });
+        match lines.last_mut().filter(|_| joins) {
+            Some(line) => line.push(index),
+            None => lines.push(vec![index]),
+        }
+    }
+    lines
 }
 
-/// The runs of a page at its `SCAN_EDGE_HEIGHTS` highest and lowest
-/// heights, or all of them on a page of few.
-pub(crate) fn edge_runs(mut runs: Vec<EdgeRun>) -> Vec<EdgeRun> {
-    let mut heights: Vec<i64> = runs.iter().map(height).collect();
-    heights.sort_unstable();
-    heights.dedup();
-    if heights.len() > SCAN_EDGE_HEIGHTS * 2 {
-        let low = heights[SCAN_EDGE_HEIGHTS - 1];
-        let high = heights[heights.len() - SCAN_EDGE_HEIGHTS];
-        runs.retain(|run| {
-            let height = height(run);
-            height <= low || height >= high
-        });
+/// Whether the Markdown shows a line of `runs` as a table row: whole, or
+/// each part as a cell of one. A run whose text the scan could not read
+/// leaves it undecided, not a row.
+fn is_table_row(runs: &[&EdgeRun], rows: &HashSet<String>, cells: &HashSet<String>) -> bool {
+    if runs.iter().any(|run| run.text.is_none()) {
+        return false;
     }
-    runs
+    let parts: Vec<String> = runs
+        .iter()
+        .map(|run| bare(run.text.as_deref().unwrap_or_default().trim()))
+        .collect();
+    rows.contains(&parts.concat())
+        || parts
+            .iter()
+            .all(|part| part.is_empty() || cells.contains(part))
+}
+
+/// The rows and the cells of the Markdown's tables (see `table_rows`).
+pub(crate) type Tables<'a> = (&'a HashSet<String>, &'a HashSet<String>);
+
+/// The runs of a page on its `SCAN_EDGE_HEIGHTS` highest and lowest lines,
+/// as pdf-inspector makes them (see `lines_of`), lines the Markdown shows
+/// as table rows (`tables`) aside; or all of them on a page of few.
+pub(crate) fn edge_runs(runs: Vec<EdgeRun>, tables: Option<Tables<'_>>) -> Vec<EdgeRun> {
+    let lines: Vec<Vec<usize>> = lines_of(&runs)
+        .into_iter()
+        .filter(|line| {
+            tables.is_none_or(|(rows, cells)| {
+                let line: Vec<&EdgeRun> = line.iter().map(|&index| &runs[index]).collect();
+                !is_table_row(&line, rows, cells)
+            })
+        })
+        .collect();
+    if lines.len() <= SCAN_EDGE_HEIGHTS * 2 {
+        return runs;
+    }
+    let kept: HashSet<usize> = lines[..SCAN_EDGE_HEIGHTS]
+        .iter()
+        .chain(&lines[lines.len() - SCAN_EDGE_HEIGHTS..])
+        .flatten()
+        .copied()
+        .collect();
+    runs.into_iter()
+        .enumerate()
+        .filter(|(index, _)| kept.contains(index))
+        .map(|(_, run)| run)
+        .collect()
 }
 
 /// A run's text as the gate reads it: as it is, masked (see `masked`), and
@@ -599,24 +744,18 @@ pub(crate) fn may_drop(
     let mut bands: Vec<(u32, Vec<RunText>)> = Vec::new();
     let mut keyed: HashMap<String, Vec<usize>> = HashMap::new();
     for (page, runs) in pages {
-        let mut by_height: std::collections::BTreeMap<i64, Vec<&EdgeRun>> =
-            std::collections::BTreeMap::new();
-        for run in runs {
-            if run.text.is_none() {
-                return true;
-            }
-            by_height.entry(height(run)).or_default().push(run);
+        if runs.iter().any(|run| run.text.is_none()) {
+            return true;
         }
         let text = |run: &EdgeRun| run.text.as_deref().unwrap_or_default().trim().to_string();
-        let on_page: Vec<Vec<&EdgeRun>> = by_height
-            .into_values()
-            .filter(|band| {
-                let parts: Vec<String> = band.iter().map(|run| bare(&text(run))).collect();
-                !(rows.contains(&parts.concat())
-                    || parts
-                        .iter()
-                        .all(|part| part.is_empty() || cells.contains(part)))
+        let on_page: Vec<Vec<&EdgeRun>> = lines_of(runs)
+            .into_iter()
+            .map(|line| {
+                line.into_iter()
+                    .map(|index| &runs[index])
+                    .collect::<Vec<_>>()
             })
+            .filter(|band| !is_table_row(band, rows, cells))
             .collect();
         let count = on_page.len();
         for (rank, mut band) in on_page.into_iter().enumerate() {
@@ -649,16 +788,31 @@ pub(crate) fn may_drop(
                 }
             }
             texts.extend(band.iter().map(|run| text(run)));
+            // A band shown a glyph or a few at a time is read whole as well,
+            // its runs joined without spaces, as pdf-inspector joins glyphs
+            // set close.
+            let glyphs = band
+                .iter()
+                .map(|run| text(run).chars().count())
+                .sum::<usize>()
+                <= 3 * band.len();
+            let tight: String = band.iter().map(|run| text(run)).collect();
+            if glyphs && band.len() > 1 {
+                texts.push(tight.clone());
+            }
             let index = bands.len();
-            bands.push((
-                *page,
-                band.iter()
-                    .map(|run| {
-                        let (masked, counts_only) = masked(&text(run), *page);
-                        (text(run), masked, counts_only)
-                    })
-                    .collect(),
-            ));
+            let mut read: Vec<RunText> = band
+                .iter()
+                .map(|run| {
+                    let (masked, counts_only) = masked(&text(run), *page);
+                    (text(run), masked, counts_only)
+                })
+                .collect();
+            if glyphs && band.len() > 1 {
+                let (masked, counts_only) = masked(&tight, *page);
+                read.push((tight, masked, counts_only));
+            }
+            bands.push((*page, read));
             let mut keys: HashSet<String> = HashSet::new();
             for text in texts {
                 let key = compared(&text);
@@ -671,7 +825,21 @@ pub(crate) fn may_drop(
             }
         }
     }
+    // Keys found in the same bands say the same of them: each list of bands
+    // is weighed once, and past the work allowed the gate opens.
+    let mut weighed: HashSet<&[usize]> = HashSet::new();
+    let mut work = 0usize;
     keyed.values().any(|occurrences| {
+        if !weighed.insert(occurrences.as_slice()) {
+            return false;
+        }
+        work += occurrences
+            .iter()
+            .map(|&band| bands[band].1.len() + 1)
+            .sum::<usize>();
+        if work > MAX_GATE_WORK {
+            return true;
+        }
         let pages: HashSet<u32> = occurrences.iter().map(|&band| bands[band].0).collect();
         if pages.len() < threshold {
             return false;
@@ -1138,6 +1306,19 @@ mod tests {
         ));
         assert!(same(("Statement page 5", 5), ("Statement page 1", 1)));
         assert!(same(("Statement page 0", 1), ("Statement page 1", 2)));
+        // Counts after a page word, or standing alone, count the pages; a
+        // date or an index after another word does not.
+        assert!(same(("3/7", 3), ("4/7", 4)));
+        assert!(same(("- 3 of 7 -", 3), ("- 4 of 7 -", 4)));
+        assert!(!same(("Closing date 1/31", 1), ("Closing date 2/28", 3)));
+        assert!(!same(("Loan 1 of 3", 1), ("Loan 2 of 3", 3)));
+        // A labelled number running with the pages is an identifier.
+        assert!(!same(("Check 1001", 1), ("Check 1002", 2)));
+        assert!(!same(("Invoice No. 1001", 1), ("Invoice No. 1002", 2)));
+        assert!(!same(("Check #101", 1), ("Check #102", 2)));
+        // Joined to a page word, a number is the page's only where it is.
+        assert!(same(("p1.holder: Jane", 1), ("p2.holder: Jane", 2)));
+        assert!(!same(("Plan P1", 1), ("Plan P2", 6)));
         assert!(same(("Report - 0 -", 1), ("Report - 7 -", 8)));
         assert!(same(("Disclosures, page 2", 7), ("Disclosures, page 1", 1)));
         assert!(same(("Excerpt page 102", 2), ("Excerpt page 101", 1)));
@@ -1279,7 +1460,61 @@ mod tests {
             .map(|row| bare(&format!("03/{row:02} Card purchase")))
             .collect();
         assert!(may_drop(&tables, 3, &none, &cells));
-        assert_eq!(edge_runs(tables[0].1.clone()).len(), 24);
+        assert_eq!(edge_runs(tables[0].1.clone(), None).len(), 24);
+        // Set aside first, the rows leave every other line within the edges.
+        assert_eq!(
+            edge_runs(tables[0].1.clone(), Some((&none, &cells))).len(),
+            40
+        );
+        // A header drawn a glyph at a time is read whole.
+        let glyphs = |page: u32, number: &str| {
+            let text = format!("Account number {number}");
+            let runs = text
+                .chars()
+                .enumerate()
+                .filter(|(_, glyph)| *glyph != ' ')
+                .map(|(index, glyph)| EdgeRun {
+                    y: 740.0,
+                    x: 72.0 + 6.0 * index as f32,
+                    size: 10.0,
+                    text: Some(glyph.to_string()),
+                })
+                .collect();
+            (page, runs)
+        };
+        let changing = [
+            glyphs(1, "12345678"),
+            glyphs(2, "87654321"),
+            glyphs(3, "87654321"),
+        ];
+        assert!(may_drop(&changing, 3, &none, &none));
+        let same = [
+            glyphs(1, "12345678"),
+            glyphs(2, "12345678"),
+            glyphs(3, "12345678"),
+        ];
+        assert!(!may_drop(&same, 3, &none, &none));
+    }
+
+    #[test]
+    fn runs_join_into_lines_as_pdf_inspector_joins_them() {
+        let run = |x: f32, y: f32| EdgeRun {
+            y,
+            x,
+            size: 10.0,
+            text: Some(String::new()),
+        };
+        // A number set a fraction of a point below the name beside it, and a
+        // run less than 3 points below a line's first that does not start at
+        // its margin, are on its line; one starting at the margin is not.
+        let runs = [
+            run(72.0, 750.6),
+            run(300.0, 750.4),
+            run(72.0, 740.0),
+            run(300.0, 738.2),
+            run(72.0, 737.5),
+        ];
+        assert_eq!(lines_of(&runs), [vec![0, 1], vec![2, 3], vec![4]]);
     }
 
     #[test]

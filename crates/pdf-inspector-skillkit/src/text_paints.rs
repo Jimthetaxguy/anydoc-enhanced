@@ -1260,7 +1260,36 @@ pub(crate) fn scan(
     twice_skip: Option<&HashSet<u32>>,
     only: Option<&HashSet<u32>>,
 ) -> Findings {
-    scan_document(buffer, layer_skip, twice_skip, only, twice_skip.is_some())
+    scan_document(
+        buffer,
+        layer_skip,
+        twice_skip,
+        only,
+        twice_skip.is_some(),
+        None,
+    )
+}
+
+/// Whether the document holds form fields. pdf-inspector reads their values
+/// among a page's lines, where the page scan does not see them, so the
+/// running-header gate cannot tell what it would drop with them.
+fn has_form_fields(document: &Document) -> bool {
+    fn resolved<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
+        document.dereference(object).ok().map(|(_, object)| object)
+    }
+    document
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|root| resolved(document, root))
+        .and_then(|root| root.as_dict().ok())
+        .and_then(|root| root.get(b"AcroForm").ok())
+        .and_then(|form| resolved(document, form))
+        .and_then(|form| form.as_dict().ok())
+        .and_then(|form| form.get(b"Fields").ok())
+        .and_then(|fields| resolved(document, fields))
+        .and_then(|fields| fields.as_array().ok())
+        .is_some_and(|fields| !fields.is_empty())
 }
 
 /// As `scan`, and, when `whole` is set, reading what the document holds
@@ -1272,6 +1301,7 @@ pub(crate) fn scan_document(
     twice_skip: Option<&HashSet<u32>>,
     only: Option<&HashSet<u32>>,
     whole: bool,
+    tables: Option<crate::repeated_lines::Tables<'_>>,
 ) -> Findings {
     let options = lopdf::LoadOptions {
         max_decompressed_size: Some(MAX_OBJECT_STREAM_BYTES),
@@ -1302,7 +1332,7 @@ pub(crate) fn scan_document(
     // not read for repeats, as one needing OCR is not, leaves the gate
     // nothing to go by.
     let mut edges = twice_skip
-        .filter(|skip| skip.is_empty())
+        .filter(|skip| skip.is_empty() && !has_form_fields(&document))
         .map(|_| Vec::new());
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
@@ -1328,6 +1358,7 @@ pub(crate) fn scan_document(
             layer: check_layer,
             twice: check_twice,
             forms: check_forms,
+            tables,
         };
         match scan_page(&document, page_id, checks, budgets, layers.as_ref()) {
             Ok(page) => {
@@ -1409,10 +1440,13 @@ struct Budgets<'a> {
 /// What a page is read for: an invisible layer, text painted twice (with
 /// word gaps and words shown glyph by glyph), and forms without resources.
 #[derive(Clone, Copy)]
-struct Checks {
+struct Checks<'a> {
     layer: bool,
     twice: bool,
     forms: bool,
+    /// The Markdown's table rows, set aside from the lines at a page's
+    /// edges the running-header gate reads.
+    tables: Option<crate::repeated_lines::Tables<'a>>,
 }
 
 /// What the scan found on one page.
@@ -1449,7 +1483,7 @@ struct PageFindings {
 fn scan_page(
     document: &Document,
     page_id: ObjectId,
-    checks: Checks,
+    checks: Checks<'_>,
     budgets: Budgets<'_>,
     layers: Option<&std::rc::Rc<Layers>>,
 ) -> Result<PageFindings, Exhausted> {
@@ -1556,6 +1590,7 @@ fn scan_page(
                 ..run
             })
             .collect(),
+        checks.tables,
     );
     Ok(PageFindings {
         edges,
