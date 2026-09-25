@@ -130,6 +130,9 @@ pub const PDF_WARNING_VERTICAL_TEXT_MISREAD: &str = "vertical_text_misread";
 /// them to be read in order, right before left, as a passage's columns are,
 /// where a form's labels standing in cells side by side read across.
 const MIN_VERTICAL_PASSAGE_CHARS: usize = 6;
+/// Characters a column of vertical writing holds at most to be taken for a
+/// table's label where the Markdown shows it as a cell.
+const MAX_VERTICAL_LABEL_CHARS: usize = 8;
 /// Characters a text in a hidden layer needs, bare, for the Markdown's
 /// showing it to count.
 pub(crate) const MIN_HIDDEN_CHARS: usize = 6;
@@ -913,6 +916,23 @@ impl PdfInfo {
     ) {
         let numbers: Vec<[u32; 1]> = readings.iter().map(|(page, _)| [*page]).collect();
         let long = |text: &str, least: usize| text.chars().count() >= least;
+        // Short labels the Markdown shows as cells of a table, as a table's
+        // header labels set vertically are read: its row reads left to
+        // right, as a passage's columns do not.
+        let paired = readings.iter().any(|(_, readings)| {
+            readings
+                .iter()
+                .any(|reading| matches!(reading, vertical_text::Reading::Pair(Some(_), true)))
+        });
+        let cells = self
+            .markdown
+            .as_deref()
+            .filter(|_| paired)
+            .map(|markdown| repeated_lines::table_rows(markdown).1)
+            .unwrap_or_default();
+        let label = |text: &str| {
+            !long(text, MAX_VERTICAL_LABEL_CHARS + 1) && cells.contains(&repeated_lines::bare(text))
+        };
         let read: Vec<(&[u32], String)> = numbers
             .iter()
             .zip(readings)
@@ -926,7 +946,9 @@ impl PdfInfo {
                         }
                         vertical_text::Reading::Pair(Some((right, left)), passage) => {
                             let both = format!("{right}{left}");
-                            let order = *passage && long(&both, MIN_VERTICAL_PASSAGE_CHARS);
+                            let order = *passage
+                                && long(&both, MIN_VERTICAL_PASSAGE_CHARS)
+                                && !(label(right) && label(left));
                             [right.clone(), left.clone()]
                                 .into_iter()
                                 .chain(order.then_some(both))
@@ -1570,6 +1592,15 @@ mod tests {
         let mut info = read("住民税は別に通知 源泉徴収票の支払金額\n");
         info.check_vertical_text(&passage, None);
         let vertical = PDF_WARNING_VERTICAL_TEXT_MISREAD.to_owned();
+        assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
+        // Short labels the Markdown shows as cells of a table's row read left
+        // to right, as a table's header does; set as a line, they do not.
+        let labels = [(1, vec![pair("源泉徴収", "支払金額", true)])];
+        let mut info = read("|支払金額|源泉徴収|\n|---|---|\n|5,200|162|\n");
+        info.check_vertical_text(&labels, None);
+        assert!(info.warnings.is_empty());
+        let mut info = read("支払金額 源泉徴収\n");
+        info.check_vertical_text(&labels, None);
         assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
         // A passage's short last column, read before the long one.
         let short = [(

@@ -42,9 +42,10 @@ pub(crate) enum Reading {
 /// The least share of one column's size another's must be to stand beside
 /// it in one passage: ruby, set beside its base at half its size, does not.
 const SIMILAR_SIZE: f64 = 0.75;
-/// How far apart, in their size, two columns of a passage stand at most;
-/// labels in the cells of a table stand further apart.
-const PASSAGE_PITCH: f64 = 2.5;
+/// How far apart, in their size, two columns of a passage stand at most,
+/// its leading wide; labels in the cells of a table may stand nearer (see
+/// `check_vertical_text`).
+const PASSAGE_PITCH: f64 = 4.0;
 /// Columns of another size passed over to find a column's neighbour.
 const MAX_PASSED_COLUMNS: usize = 3;
 
@@ -231,6 +232,15 @@ mod tests {
                 Reading::Alone("源泉徴収票の支払金額".to_owned()),
             ]
         );
+        // Columns of a passage with wide leading, three sizes apart.
+        let wide = [
+            run(500.0, 720.0, "源泉徴収票の支払金額", 0),
+            run(464.0, 720.0, "源泉徴収税額は十六万", 0),
+        ];
+        assert!(matches!(
+            readings(&wide)[..],
+            [Reading::Pair(Some(_), true)]
+        ));
         // Labels in cells five sizes apart pair, but not as a passage.
         let labels = [
             run(390.0, 630.0, "源泉徴収税額", 0),
