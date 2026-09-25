@@ -711,6 +711,95 @@ fn text_drawn_through_forms_pdf_inspector_misses_is_reported() {
     );
 }
 
+/// A W-2 summary page drawing `/Fm1`, a form with `form_entries` showing
+/// `lines`, from resources that bind `font` as `/F1`, on the page or, with
+/// `inherited`, only on its page tree node.
+fn w2_form_pdf(inherited: bool, font: &str, form_entries: &str, lines: &[&str]) -> Vec<u8> {
+    let resources = "/Resources << /Font << /F1 4 0 R >> /XObject << /Fm1 6 0 R >> >>";
+    let (pages, page) = if inherited {
+        (resources, "")
+    } else {
+        ("", resources)
+    };
+    let shown: String = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("BT /F1 10 Tf 72 {} Td ({line}) Tj ET\n", 700 - 18 * index))
+        .collect();
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {pages} >>").into_bytes(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] {page} /Contents 5 0 R >>")
+            .into_bytes(),
+        font.as_bytes().to_vec(),
+        stream(
+            "",
+            b"BT /F1 14 Tf 72 740 Td (Employer payroll summary for 2025) Tj ET q /Fm1 Do Q",
+        ),
+        stream(
+            &format!("/Type /XObject /Subtype /Form /BBox [0 0 612 792] {form_entries}"),
+            shown.as_bytes(),
+        ),
+    ])
+}
+
+#[test]
+fn form_text_pdf_inspector_reads_otherwise_than_the_page_is_reported() {
+    let helvetica =
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+    let own = "/Resources << /Font << /F1 4 0 R >> >>";
+    let boxes = [
+        "Box 1 Wages, tips, other compensation 85,000.00",
+        "Box 2 Federal income tax withheld 12,400.00",
+    ];
+    // Word's export names the Windows-1252 glyphs it uses in /Differences.
+    let named = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type \
+                 /Encoding /BaseEncoding /WinAnsiEncoding /Differences [146 /quoteright \
+                 150 /endash 233 /eacute] >> >>";
+    let accented = [
+        "Soci\\351t\\351 G\\351n\\351rale 85,000.00",
+        "Account holder\\222s wages 2024\\2262025",
+    ];
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for (name, pdf) in [
+        ("inherited.pdf", w2_form_pdf(true, helvetica, own, &boxes)),
+        ("own.pdf", w2_form_pdf(false, helvetica, own, &boxes)),
+        ("accented.pdf", w2_form_pdf(false, named, "", &accented)),
+    ] {
+        let path = temporary.path().join(name);
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| {
+        result["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "form_text_unread")
+        })
+    };
+    let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
+    // pdf-inspector 1.24.0 finds a page's forms in the page's own resources
+    // alone, so a form the page inherits is not read; when a release reads
+    // inherited resources, this expectation goes.
+    assert!(!markdown(0).contains("85,000.00"), "{}", results[0]);
+    assert!(reported(&results[0]), "{}", results[0]);
+    assert!(markdown(1).contains("85,000.00"), "{}", results[1]);
+    assert!(!reported(&results[1]), "{}", results[1]);
+    // A form without a font of its own shows its text in the page's, which
+    // pdf-inspector reads byte by byte, as Windows-1252 has the bytes: the
+    // font's glyph names read the same, so nothing is reported.
+    assert!(
+        markdown(2).contains("Soci\u{e9}t\u{e9} G\u{e9}n\u{e9}rale")
+            && markdown(2).contains("holder\u{2019}s wages 2024\u{2013}2025"),
+        "{}",
+        results[2]
+    );
+    assert!(!reported(&results[2]), "{}", results[2]);
+}
+
 /// A one-page PDF showing each of `runs`, a string in 9-point Helvetica
 /// placed at its left end and baseline.
 fn helvetica_runs_pdf(runs: &[(f64, u32, &str)]) -> Vec<u8> {

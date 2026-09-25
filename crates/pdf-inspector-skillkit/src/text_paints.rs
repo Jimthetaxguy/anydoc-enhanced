@@ -36,11 +36,14 @@
 //! **Text drawn through a form.** A form XObject without `/Resources` of
 //! its own draws with its invoker's, as renderers read the specification,
 //! but pdf-inspector gives it none (open upstream #312): a form it draws is
-//! never read. pdf-inspector also starts every form with no font, so text a
-//! form shows before setting a font of its own, in the font it was drawn
-//! with, is read byte by byte. A page is reported when it shows text in a
-//! form pdf-inspector does not reach, or text read byte by byte that its
-//! font reads otherwise.
+//! never read. pdf-inspector finds a page's forms among the page's own
+//! resources alone, not those it inherits, and a form's fonts and forms
+//! among the form's own alone, where pdfium looks a category they lack up
+//! in the page's. It also starts every form with no font, so text a form
+//! shows before setting a font of its own, in the font it was drawn with,
+//! is read byte by byte, as Windows-1252, UTF-16, or UTF-8 has it. A page
+//! is reported when it shows text in a form pdf-inspector does not reach,
+//! or text read byte by byte that its font reads otherwise.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -151,14 +154,13 @@ struct State {
     read_mode: i64,
     /// Whether `Tf` has set a font; text shown before shows nothing.
     font: bool,
-    /// Whether `Tf` finds fonts pdf-inspector reads text by: not in a form
-    /// without resources of its own, where it finds none.
-    fonts: bool,
     /// Whether pdf-inspector reads the text here at all: not in a form it
-    /// reaches only through a form without resources of its own.
+    /// does not find where the page or form drawing it names it (see
+    /// [`Resources`]).
     reached: bool,
     /// Whether pdf-inspector reads the text here byte by byte, with no
-    /// font: in a form, until the form sets a font among its own resources.
+    /// font: in a form, until the form sets a font it finds among the
+    /// form's own resources.
     raw: bool,
     /// How the font in force reads its codes, when the page is read for
     /// forms.
@@ -184,7 +186,6 @@ impl State {
         render_mode: 0,
         read_mode: 0,
         font: false,
-        fonts: true,
         reached: true,
         raw: false,
         decoded: None,
@@ -202,10 +203,11 @@ impl State {
 /// How a font reads its codes.
 #[derive(Clone, Copy, Debug)]
 enum Decoded {
-    /// Two bytes a code, which read byte by byte make two characters.
+    /// Through the font's own maps (see `GlyphFonts`), two bytes a code or
+    /// one.
+    Glyphs { font: usize, two_bytes: bool },
+    /// Two bytes a code, in maps the scan does not read.
     TwoBytes,
-    /// Through the font's own maps (see `GlyphFonts`).
-    Glyphs(usize),
 }
 
 /// Where the visible runs of one page start, by a hash of their bytes and
@@ -475,6 +477,121 @@ fn shown_bytes(text: Option<&Object>) -> Vec<u8> {
     }
 }
 
+/// The strings a text-showing operand holds: a string, or an array's.
+fn strings(text: Option<&Object>) -> impl Iterator<Item = &[u8]> {
+    let (one, many) = match text {
+        Some(Object::String(bytes, _)) => (Some(bytes.as_slice()), &[][..]),
+        Some(Object::Array(parts)) => (None, parts.as_slice()),
+        _ => (None, &[][..]),
+    };
+    one.into_iter()
+        .chain(many.iter().filter_map(|part| match part {
+            Object::String(bytes, _) => Some(bytes.as_slice()),
+            _ => None,
+        }))
+}
+
+/// A string as pdf-inspector reads it without a font: UTF-16 after a
+/// byte-order mark, or where nulls make over a quarter of an even string of
+/// four bytes or more and the UTF-16 reads as text; UTF-8 where the bytes
+/// past ASCII form it; otherwise byte by byte, as Windows-1252 has them.
+fn read_without_font(bytes: &[u8]) -> String {
+    let utf16 = |bytes: &[u8]| {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    if let [0xFE, 0xFF, rest @ ..] = bytes {
+        return utf16(rest);
+    }
+    let nulls = bytes.iter().filter(|&&byte| byte == 0).count();
+    if bytes.len() >= 4 && bytes.len().is_multiple_of(2) && 4 * nulls > bytes.len() {
+        let text = utf16(bytes);
+        if reads_as_text(&text) {
+            return text;
+        }
+    }
+    if bytes.iter().any(|&byte| byte > 0x7F) {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return text.to_string();
+        }
+    }
+    bytes.iter().map(|&byte| windows_1252(byte)).collect()
+}
+
+/// A byte as Windows-1252 reads it; the five codes it leaves undefined, and
+/// the others outside 0x80 to 0x9F, as Latin-1 does.
+fn windows_1252(byte: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{81}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{8D}',
+        '\u{017D}', '\u{8F}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}',
+        '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}',
+        '\u{9D}', '\u{017E}', '\u{0178}',
+    ];
+    match byte {
+        0x80..=0x9F => HIGH[usize::from(byte - 0x80)],
+        _ => char::from(byte),
+    }
+}
+
+/// Whether text read as UTF-16 reads as text, by pdf-inspector's score of
+/// it: ten for each common English word, one for each letter (with CJK
+/// ideographs and kana), digit, and two for each space, less two for each
+/// other character and six for a control or replacement character, less
+/// fifteen more for over fifteen letters without a common word.
+fn reads_as_text(text: &str) -> bool {
+    const COMMON: [&str; 22] = [
+        "the", "and", "of", "to", "in", "a", "is", "that", "for", "with", "on", "as", "by", "from",
+        "this", "be", "are", "at", "or", "not", "it", "our",
+    ];
+    let (mut score, mut letters, mut common) = (0i64, 0i64, 0i64);
+    let mut word = String::new();
+    for character in text.chars().chain([' ']) {
+        if character.is_ascii_alphabetic() {
+            letters += 1;
+            score += 1;
+            word.push(character.to_ascii_lowercase());
+            continue;
+        }
+        if COMMON.contains(&word.as_str()) {
+            common += 1;
+            score += 10;
+        }
+        word.clear();
+        score += match character {
+            ' ' => 2,
+            '0'..='9' => 1,
+            '\u{4E00}'..='\u{9FFF}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}' => {
+                letters += 1;
+                1
+            }
+            '\u{FFFD}' => -6,
+            character if character.is_control() => -6,
+            _ => -2,
+        };
+    }
+    // The space closing the text scores nothing.
+    score -= 2;
+    if letters > 15 && common == 0 {
+        score -= 15;
+    }
+    score > 0
+}
+
+/// Text without the control characters pdf-inspector drops from what it
+/// reads, all below the space but tab and line ends.
+fn without_controls(text: &str) -> String {
+    text.chars()
+        .filter(|&character| character >= ' ' || matches!(character, '\t' | '\n' | '\r'))
+        .collect()
+}
+
 /// What one page's content shows.
 #[derive(Default)]
 struct PageText {
@@ -557,9 +674,13 @@ impl PageText {
         self.restore_to(0);
     }
 
-    /// Note visible text for the check of forms: text pdf-inspector does
-    /// not reach, or reads byte by byte otherwise than its font does.
-    fn note_form_text(&mut self, state: State, bytes: &[u8]) {
+    /// Note visible text a form shows, for the check of forms: text
+    /// pdf-inspector does not reach, or reads byte by byte (see
+    /// [`read_without_font`]) otherwise than its font does, the control
+    /// characters it drops aside. Where the font does not say what a string
+    /// reads as, codes of two bytes read byte by byte differ from it; codes
+    /// of one may not.
+    fn note_form_text(&mut self, state: State, text: Option<&Object>, bytes: &[u8]) {
         if !self.forms
             || self.form_text_unread
             || !state.font
@@ -575,17 +696,24 @@ impl PageText {
         } else {
             match state.decoded {
                 Some(Decoded::TwoBytes) => true,
-                Some(Decoded::Glyphs(font)) => {
-                    self.glyph_fonts.text(font, bytes).is_some_and(|text| {
-                        let raw: String = bytes
-                            .iter()
-                            .map(|&byte| match byte {
-                                0x20..=0x7E => char::from(byte),
-                                _ => '\u{FFFD}',
-                            })
-                            .collect();
-                        text != raw
-                    })
+                Some(Decoded::Glyphs { font, two_bytes }) => {
+                    let (mut read, mut raw) = (String::new(), String::new());
+                    let mut known = true;
+                    for string in strings(text) {
+                        match self.glyph_fonts.text(font, string) {
+                            Some(text) => read.push_str(&text),
+                            None => {
+                                known = false;
+                                break;
+                            }
+                        }
+                        raw.push_str(&read_without_font(string));
+                    }
+                    if known {
+                        without_controls(&read) != without_controls(&raw)
+                    } else {
+                        two_bytes
+                    }
                 }
                 None => false,
             }
@@ -624,8 +752,8 @@ impl PageText {
         }
     }
 
-    /// Note a visible run whose start the text matrix says, and the string
-    /// it strikes over itself, if any.
+    /// Note a visible run pdf-inspector reads whose start the text matrix
+    /// says, and the string it strikes over itself, if any.
     fn note_run(
         &mut self,
         state: State,
@@ -636,6 +764,7 @@ impl PageText {
     ) {
         if self.runs.is_none()
             || !state.font
+            || !state.reached
             || matches!(state.read_mode, 3 | 7)
             || !bytes.iter().any(|&byte| byte != b' ')
         {
@@ -905,20 +1034,20 @@ fn scan_page(
     let Some(page_box) = page_box(document, page_id) else {
         return Ok(PageFindings::default());
     };
-    let resources = page_resources(document, page_id);
+    let scopes = page_resources(document, page_id);
     let check_twice = checks.twice;
     // A scan is an image XObject; for the layer check, a page that binds
     // none, directly or through its forms, is not read. Nor is a page that
     // binds no form read for forms.
     let mut seen = HashSet::new();
     let check_layer = checks.layer
-        && resources
+        && scopes
             .iter()
-            .any(|dictionary| binds_image(document, dictionary, 0, &mut seen));
+            .any(|scope| binds_image(document, scope.dictionary, 0, &mut seen));
     let check_forms = checks.forms
-        && resources
+        && scopes
             .iter()
-            .any(|dictionary| binds_form(document, dictionary));
+            .any(|scope| binds_form(document, scope.dictionary));
     if !check_layer && !check_twice && !check_forms {
         return Ok(PageFindings::default());
     }
@@ -953,10 +1082,15 @@ fn scan_page(
     };
     page.save();
     let mut forms = Vec::new();
+    let resources = Resources {
+        form: None,
+        own: true,
+        page: &scopes,
+    };
     let executed = execute(
         document,
         &content,
-        &resources,
+        resources,
         State::START,
         page_box,
         &mut page,
@@ -1008,7 +1142,7 @@ fn scan_page(
 fn execute<'a>(
     document: &'a Document,
     content: &[u8],
-    resources: &[&'a Dictionary],
+    resources: Resources<'a, '_>,
     start: State,
     page_box: [f64; 4],
     page: &mut PageText,
@@ -1107,31 +1241,33 @@ fn execute<'a>(
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
                     state.font = name.as_name().is_ok();
-                    let resolved = name
+                    let found = name
                         .as_name()
                         .ok()
-                        .and_then(|name| font(document, resources, name));
+                        .and_then(|name| resources.find(document, b"Font", name))
+                        .and_then(|(font, read)| Some((dictionary(document, font)?, read)));
+                    let resolved = found.map(|(font, _)| font);
+                    // pdf-inspector reads text by the fonts it finds (see
+                    // `Resources`), and byte by byte where it finds none.
+                    let read = found.is_some_and(|(_, read)| read);
                     // Word gaps are checked with the repeats, on the pages
-                    // read for them.
+                    // read for them, in text pdf-inspector reads.
+                    let judged = read && state.reached;
                     state.gaps = resolved
-                        .filter(|_| page.runs.is_some() && state.fonts)
+                        .filter(|_| page.runs.is_some() && judged)
                         .and_then(|font| page.gap_fonts.font(document, font));
                     state.glyph_font = resolved
-                        .filter(|_| page.glyph_words.is_some() && state.fonts)
+                        .filter(|_| page.glyph_words.is_some() && judged)
                         .and_then(|font| page.glyph_fonts.font(document, font));
-                    // pdf-inspector finds a font only among the resources
-                    // of the page or form drawing it, and none for a form
-                    // without its own.
-                    state.raw = !state.fonts || resolved.is_none();
+                    state.raw = !read;
                     state.decoded = resolved.filter(|_| page.forms).and_then(|font| {
                         let two_bytes = font
                             .get(b"Subtype")
                             .and_then(Object::as_name)
                             .is_ok_and(|subtype| subtype == b"Type0");
-                        if two_bytes {
-                            Some(Decoded::TwoBytes)
-                        } else {
-                            page.glyph_fonts.font(document, font).map(Decoded::Glyphs)
+                        match page.glyph_fonts.font(document, font) {
+                            Some(font) => Some(Decoded::Glyphs { font, two_bytes }),
+                            None => two_bytes.then_some(Decoded::TwoBytes),
                         }
                     });
                     if let Some(size) = number(document, size) {
@@ -1217,8 +1353,8 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
-                if in_text {
-                    page.note_form_text(state, &bytes);
+                if in_text && !forms.is_empty() {
+                    page.note_form_text(state, text, &bytes);
                 }
                 // Inside a span giving the text its glyphs stand for,
                 // pdf-inspector reads that text and not the glyphs.
@@ -1285,7 +1421,7 @@ fn execute<'a>(
                 let Some(name) = operands.first().and_then(|name| name.as_name().ok()) else {
                     continue;
                 };
-                let Some((id, stream)) = xobject(document, resources, name) else {
+                let Some((id, stream, read)) = xobject(document, resources, name) else {
                     continue;
                 };
                 match stream.dict.get(b"Subtype").and_then(Object::as_name) {
@@ -1306,26 +1442,33 @@ fn execute<'a>(
                             .and_then(|matrix| array(document, matrix))
                             .and_then(|values| matrix(document, values))
                             .unwrap_or(IDENTITY);
-                        // A form without resources uses its invoker's.
-                        let form_resources: Vec<&Dictionary> = match stream
+                        // A form without resources of its own, where
+                        // `/Resources` is missing or no dictionary, draws
+                        // with its invoker's, which pdf-inspector does not
+                        // read.
+                        let form_resources = match stream
                             .dict
                             .get(b"Resources")
                             .ok()
                             .and_then(|resources| dictionary(document, resources))
                         {
-                            Some(own) => vec![own],
-                            None => resources.to_vec(),
+                            Some(own) => Resources {
+                                form: Some(own),
+                                own: true,
+                                page: resources.page,
+                            },
+                            None => Resources {
+                                own: false,
+                                ..resources
+                            },
                         };
                         // pdf-inspector reads a form's text from no font and
-                        // no spacing, with the fonts of its own resources.
+                        // no spacing, with the fonts of its own resources,
+                        // and reads it at all only where it finds the form.
                         let inner = State {
                             ctm: multiply(form_matrix, state.ctm),
-                            // pdf-inspector finds a form drawn by a form only
-                            // among that form's own resources, and starts it
-                            // with no font.
-                            reached: state.reached && state.fonts,
+                            reached: state.reached && read,
                             raw: true,
-                            fonts: stream.dict.has(b"Resources"),
                             gaps: None,
                             glyph_font: None,
                             char_spacing: 0.0,
@@ -1340,7 +1483,7 @@ fn execute<'a>(
                         let result = execute(
                             document,
                             &bytes,
-                            &form_resources,
+                            form_resources,
                             inner,
                             page_box,
                             page,
@@ -1487,68 +1630,129 @@ fn dictionary<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Dict
     document.dereference(object).ok()?.1.as_dict().ok()
 }
 
-/// The page's resource dictionaries in lookup order: its own, then those it
-/// inherits.
-fn page_resources(document: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
-    let Ok((own, inherited)) = document.get_page_resources(page_id) else {
-        return Vec::new();
-    };
-    own.into_iter()
-        .chain(
-            inherited
-                .into_iter()
-                .filter_map(|id| document.get_dictionary(id).ok()),
-        )
-        .collect()
+/// One of a page's resource dictionaries, and what pdf-inspector reads of
+/// it.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    dictionary: &'a Dictionary,
+    /// Whether pdf-inspector finds the fonts it binds: the page's own, and
+    /// those it inherits by reference, as lopdf collects a page's fonts.
+    fonts: bool,
+    /// Whether pdf-inspector finds the XObjects it binds: the page's own
+    /// alone.
+    xobjects: bool,
 }
 
-/// The named font from the first resource dictionary that binds it.
-fn font<'a>(
-    document: &'a Document,
-    resources: &[&'a Dictionary],
-    name: &[u8],
-) -> Option<&'a Dictionary> {
-    for resources in resources {
-        let Some(fonts) = resources
-            .get(b"Font")
-            .ok()
-            .and_then(|fonts| dictionary(document, fonts))
-        else {
-            continue;
+/// Where a content stream finds what it names, as renderers look it up,
+/// and whether pdf-inspector finds it there too. A form's own resources
+/// hold its names, and pdfium looks a category they lack, such as `/Font`,
+/// up in the page's; pdf-inspector reads a form's own resources alone, and
+/// none for a form without them, which draws with its invoker's.
+#[derive(Clone, Copy)]
+struct Resources<'a, 'p> {
+    /// The resources of the form being read: its own, or, for a form
+    /// without, those of the form drawing it; none for the page's content
+    /// and a form it draws that has none.
+    form: Option<&'a Dictionary>,
+    /// Whether pdf-inspector reads the names the stream looks up: the
+    /// page's content, and a form with resources of its own.
+    own: bool,
+    /// The page's resource dictionaries, its own first, then those it
+    /// inherits, nearest first.
+    page: &'p [Scope<'a>],
+}
+
+impl<'a> Resources<'a, '_> {
+    /// The resource of `category` named `name`, as a renderer finds it, and
+    /// whether pdf-inspector finds it there too.
+    fn find(
+        &self,
+        document: &'a Document,
+        category: &[u8],
+        name: &[u8],
+    ) -> Option<(&'a Object, bool)> {
+        let held = |resources: &'a Dictionary| {
+            resources
+                .get(category)
+                .ok()
+                .and_then(|held| dictionary(document, held))
         };
-        let Ok(entry) = fonts.get(name) else {
-            continue;
-        };
-        return dictionary(document, entry);
+        if let Some(held) = self.form.and_then(held) {
+            return held.get(name).ok().map(|entry| (entry, self.own));
+        }
+        let read = self.own && self.form.is_none();
+        self.page.iter().find_map(|scope| {
+            let entry = held(scope.dictionary)?.get(name).ok()?;
+            let found = if category == b"Font" {
+                scope.fonts
+            } else {
+                scope.xobjects
+            };
+            Some((entry, read && found))
+        })
     }
-    None
 }
 
-/// The named XObject from the first resource dictionary that binds it, with
-/// its object id.
+/// The page's resource dictionaries, as renderers inherit them: its own,
+/// then each ancestor's, nearest first, each with what pdf-inspector reads
+/// of it.
+fn page_resources(document: &Document, page_id: ObjectId) -> Vec<Scope<'_>> {
+    // lopdf, which pdf-inspector finds a page's fonts with, takes the
+    // page's own resources and those it inherits by reference.
+    let lopdf: Vec<&Dictionary> = match document.get_page_resources(page_id) {
+        Ok((own, inherited)) => own
+            .into_iter()
+            .chain(
+                inherited
+                    .into_iter()
+                    .filter_map(|id| document.get_dictionary(id).ok()),
+            )
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let mut scopes: Vec<Scope> = Vec::new();
+    let mut node = document.get_dictionary(page_id).ok();
+    for depth in 0..MAX_PAGE_TREE_DEPTH {
+        let Some(current) = node else {
+            break;
+        };
+        if let Some(resources) = current
+            .get(b"Resources")
+            .ok()
+            .and_then(|resources| dictionary(document, resources))
+        {
+            if !scopes
+                .iter()
+                .any(|scope| std::ptr::eq(scope.dictionary, resources))
+            {
+                scopes.push(Scope {
+                    dictionary: resources,
+                    fonts: lopdf.iter().any(|known| std::ptr::eq(*known, resources)),
+                    xobjects: depth == 0,
+                });
+            }
+        }
+        node = current
+            .get(b"Parent")
+            .and_then(Object::as_reference)
+            .ok()
+            .and_then(|parent| document.get_dictionary(parent).ok());
+    }
+    scopes
+}
+
+/// The XObject named `name`, as a renderer finds it, with its object id and
+/// whether pdf-inspector finds it there too.
 fn xobject<'a>(
     document: &'a Document,
-    resources: &[&'a Dictionary],
+    resources: Resources<'a, '_>,
     name: &[u8],
-) -> Option<(ObjectId, &'a Stream)> {
-    for resources in resources {
-        let Some(xobjects) = resources
-            .get(b"XObject")
-            .ok()
-            .and_then(|xobjects| dictionary(document, xobjects))
-        else {
-            continue;
-        };
-        let Ok(Object::Reference(id)) = xobjects.get(name) else {
-            continue;
-        };
-        return document
-            .get_object(*id)
-            .and_then(Object::as_stream)
-            .ok()
-            .map(|stream| (*id, stream));
-    }
-    None
+) -> Option<(ObjectId, &'a Stream, bool)> {
+    let (Object::Reference(id), read) = resources.find(document, b"XObject", name)? else {
+        return None;
+    };
+    let stream = document.get_object(*id).and_then(Object::as_stream).ok()?;
+    Some((*id, stream, read))
 }
 
 /// Whether a resource dictionary binds a form XObject.
@@ -1691,8 +1895,19 @@ pub(crate) mod tests {
     /// A one-page document whose `/F1` is the given font, and whose form
     /// has the given entries.
     fn scan_pdf_with(page: &str, form: &str, font: &str, form_entries: &str) -> Vec<u8> {
+        scan_pdf_objects(page, form, font, form_entries, &[])
+    }
+
+    /// `scan_pdf_with`, with `extra` as objects 8, 9, and on.
+    fn scan_pdf_objects(
+        page: &str,
+        form: &str,
+        font: &str,
+        form_entries: &str,
+        extra: &[Vec<u8>],
+    ) -> Vec<u8> {
         let pixels = vec![200u8; 64 * 64];
-        let objects: Vec<Vec<u8>> = vec![
+        let mut objects: Vec<Vec<u8>> = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
@@ -1711,6 +1926,13 @@ pub(crate) mod tests {
                 form.as_bytes(),
             ),
         ];
+        objects.extend_from_slice(extra);
+        pdf_of(&objects)
+    }
+
+    /// A PDF file holding `objects` as objects 1, 2, …, with object 1 as
+    /// the catalog.
+    fn pdf_of(objects: &[Vec<u8>]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -1950,6 +2172,17 @@ pub(crate) mod tests {
         assert!(found(page, &form, "").gaps_misread.is_empty());
         let own_font = format!("BT /F1 10 Tf 60 700 Td {kerned} ET");
         assert_eq!(found(page, &own_font, own).gaps_misread, vec![1]);
+        // Nor is text in a form pdf-inspector does not reach, which it
+        // leaves out, read for its gaps.
+        let nested = |outer: &str| {
+            let pdf = nested_form_pdf_in(outer, subset, &own_font);
+            scan(&pdf, &HashSet::new(), Some(&HashSet::new()), None).gaps_misread
+        };
+        assert!(nested("").is_empty());
+        assert_eq!(
+            nested("/Resources << /XObject << /Inner 7 0 R >> >>"),
+            vec![1]
+        );
     }
 
     #[test]
@@ -2038,60 +2271,95 @@ pub(crate) mod tests {
     /// drawing `/Inner`, bound on the page with Helvetica, which shows the
     /// page's one line of text.
     fn nested_form_pdf(outer_entries: &str) -> Vec<u8> {
+        nested_form_pdf_in(
+            outer_entries,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            "BT /F1 10 Tf 72 700 Td (Box 1 Wages 85,000.00) Tj ET",
+        )
+    }
+
+    /// `nested_form_pdf`, with `/F1` the given font, and `/Inner` showing
+    /// `inner`.
+    fn nested_form_pdf_in(outer_entries: &str, font: &str, inner: &str) -> Vec<u8> {
         let form = "/Type /XObject /Subtype /Form /BBox [0 0 612 792]";
-        let objects: Vec<Vec<u8>> =
-            vec![
+        let objects: Vec<Vec<u8>> = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
               /Resources << /Font << /F1 4 0 R >> /XObject << /Outer 6 0 R /Inner 7 0 R >> >> \
               /Contents 5 0 R >>"
                 .to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
-                .to_vec(),
-            stream("", b"BT /F1 12 Tf 72 740 Td (Payroll summary) Tj ET q /Outer Do Q"),
+            font.as_bytes().to_vec(),
+            stream(
+                "",
+                b"BT /F1 12 Tf 72 740 Td (Payroll summary) Tj ET q /Outer Do Q",
+            ),
             stream(&format!("{form} {outer_entries}"), b"q /Inner Do Q"),
             stream(
                 &format!("{form} /Resources << /Font << /F1 4 0 R >> >>"),
-                b"BT /F1 10 Tf 72 700 Td (Box 1 Wages 85,000.00) Tj ET",
+                inner.as_bytes(),
             ),
         ];
-        let mut pdf = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(pdf.len());
-            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
-            pdf.extend_from_slice(object);
-            pdf.extend_from_slice(b"\nendobj\n");
-        }
-        let xref = pdf.len();
-        pdf.extend_from_slice(
-            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
-        );
-        for offset in offsets {
-            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        pdf.extend_from_slice(
+        pdf_of(&objects)
+    }
+
+    /// A one-page document drawing `/Fm1`, a form with Helvetica of its own
+    /// showing a line of the page, from resources (object 7) the page or
+    /// its page tree node binds with the given entries.
+    fn inherited_form_pdf(pages_entries: &str, page_entries: &str) -> Vec<u8> {
+        pdf_of(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {pages_entries} >>").into_bytes(),
             format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-                objects.len() + 1
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] {page_entries} \
+                 /Contents 5 0 R >>"
             )
-            .as_bytes(),
-        );
-        pdf
+            .into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_vec(),
+            stream(
+                "",
+                b"BT /F1 12 Tf 72 740 Td (Payroll summary) Tj ET q /Fm1 Do Q",
+            ),
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+                 /Resources << /Font << /F1 4 0 R >> >>",
+                b"BT /F1 10 Tf 72 700 Td (Box 1 Wages 85,000.00) Tj ET",
+            ),
+            b"<< /Font << /F1 4 0 R >> /XObject << /Fm1 6 0 R >> >>".to_vec(),
+        ])
     }
 
     #[test]
     fn text_drawn_through_forms_pdf_inspector_misses_is_found() {
         let unread =
             |pdf: &[u8]| scan(pdf, &HashSet::new(), Some(&HashSet::new()), None).forms_unread;
-        // A form drawn by a form without resources of its own is not read;
-        // bound in the drawing form's own resources, it is.
-        assert_eq!(unread(&nested_form_pdf("")), vec![1]);
+        // A form drawn by a form without resources of its own is not read,
+        // nor by one whose `/Resources` is no dictionary, or lacks the
+        // `/XObject` category pdfium then takes from the page; bound in the
+        // drawing form's own resources, it is.
+        for outer in [
+            "",
+            "/Resources null",
+            "/Resources 99 0 R",
+            "/Resources << /ProcSet [/PDF] >>",
+        ] {
+            assert_eq!(unread(&nested_form_pdf(outer)), vec![1], "{outer}");
+        }
         assert!(unread(&nested_form_pdf(
             "/Resources << /XObject << /Inner 7 0 R >> >>"
         ))
         .is_empty());
+        // pdf-inspector finds the page's forms in its own resources alone:
+        // a form the page inherits, directly or by reference, is not read.
+        let own = inherited_form_pdf("", "/Resources 7 0 R");
+        assert!(unread(&own).is_empty());
+        for pages in [
+            "/Resources 7 0 R",
+            "/Resources << /Font << /F1 4 0 R >> /XObject << /Fm1 6 0 R >> >>",
+        ] {
+            assert_eq!(unread(&inherited_form_pdf(pages, "")), vec![1], "{pages}");
+        }
         // Only a full run with Markdown reads forms.
         let pdf = nested_form_pdf("");
         assert!(scan(&pdf, &HashSet::new(), None, None)
@@ -2116,9 +2384,81 @@ pub(crate) mod tests {
         assert!(found(page, plain, helvetica, "").is_empty());
         assert_eq!(found(page, coded, subset, ""), vec![1]);
         assert_eq!(found(page, coded, subset, "/Resources << >>"), vec![1]);
-        // A form setting the font from its own resources is read with it.
+        // A form setting the font from its own resources is read with it;
+        // from resources without `/Font`, where pdfium takes the page's
+        // font, it is read byte by byte.
         let own = "BT /F1 10 Tf 72 700 Td (Total deposits\\03285,000.00) Tj ET";
         assert!(found(page, own, subset, "/Resources << /Font << /F1 4 0 R >> >>").is_empty());
+        assert_eq!(
+            found(page, own, subset, "/Resources << /ProcSet [/PDF] >>"),
+            vec![1]
+        );
+        // Bytes past ASCII read byte by byte as Windows-1252 has them, as the
+        // font reads them too, are read right; a font that names another
+        // glyph at such a code is not.
+        let winansi = |differences: &str| {
+            format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type \
+                 /Encoding /BaseEncoding /WinAnsiEncoding /Differences [{differences}] >> >>"
+            )
+        };
+        let accented = "BT 72 700 Td (Soci\\351t\\351 holder\\222s 2024\\2262025) Tj ET";
+        let names = winansi("146 /quoteright 150 /endash 233 /eacute");
+        assert!(found(page, accented, &names, "").is_empty());
+        let name = "BT 72 700 Td (Soci\\351t\\351 G\\351n\\351rale) Tj ET";
+        assert_eq!(found(page, name, &winansi("233 /egrave"), ""), vec![1]);
+    }
+
+    #[test]
+    fn two_byte_text_read_byte_by_byte_is_compared_with_its_font() {
+        // A composite font whose codes are the text's code points, as UTF-16
+        // writes them: pdf-inspector reads the bytes as UTF-16, as the font
+        // does. Codes offset from the code points read otherwise.
+        let font = "<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+UnicodeSans \
+                    /Encoding /Identity-H /ToUnicode 8 0 R >>";
+        // The codes from `first` read as the code points from U+0020.
+        let found = |form: &str, first: &str| {
+            let cmap = stream(
+                "",
+                format!(
+                    "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                     /CMapName /Custom def /CMapType 2 def 1 begincodespacerange <0000> <FFFF> \
+                     endcodespacerange 1 beginbfrange <{first}> <00FF> <0020> endbfrange \
+                     endcmap CMapName currentdict /CMap defineresource pop end end"
+                )
+                .as_bytes(),
+            );
+            let pdf = scan_pdf_objects("BT /F1 10 Tf ET /Fm1 Do", form, font, "", &[cmap]);
+            scan(&pdf, &HashSet::new(), Some(&HashSet::new()), None).forms_unread
+        };
+        let unicode =
+            "BT 72 700 Td <0054006F00740061006C00200031002C003200350030002E00300030> Tj ET";
+        assert!(found(unicode, "0020").is_empty());
+        // "Total" at codes 29 below its code points.
+        let offset = "BT 72 700 Td <0037005200570044004F> Tj ET";
+        assert_eq!(found(offset, "0003"), vec![1]);
+    }
+
+    #[test]
+    fn strings_read_without_a_font_read_as_pdf_inspector_reads_them() {
+        for (bytes, text) in [
+            (&b"Total 1,250.00"[..], "Total 1,250.00"),
+            (
+                b"\x92\x96\x93\x97\xe9\xa7",
+                "\u{2019}\u{2013}\u{201c}\u{2014}\u{e9}\u{a7}",
+            ),
+            (b"A\x81\x8dB", "A\u{81}\u{8d}B"),
+            (b"\xc3\xa9t\xc3\xa9", "\u{e9}t\u{e9}"),
+            (b"\xfe\xff\x00A\x00B", "AB"),
+            (b"\x00T\x00o\x00t\x00a\x00l", "Total"),
+            // Too short for UTF-16: the null is a control byte, dropped.
+            (b"\x00-", "\u{0}-"),
+            // UTF-16 that does not read as text is read byte by byte.
+            (b"\x00\x13\x00\x14", "\u{0}\u{13}\u{0}\u{14}"),
+        ] {
+            assert_eq!(read_without_font(bytes), text, "{bytes:?}");
+        }
+        assert_eq!(without_controls("\u{0}-\u{1}\tA"), "-\tA");
     }
 
     #[test]
