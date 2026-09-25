@@ -1911,10 +1911,20 @@ fn execute<'a>(
     forms: &mut Vec<ObjectId>,
     budget: &mut Budget,
 ) -> Result<(), Exhausted> {
+    // pdf-inspector reads nothing of a stream of more operators than it
+    // reads; the rest are charged before they are decoded, as decoding
+    // holds them all at once.
+    let operators = crate::content_ops::operators(
+        content,
+        crate::content_ops::MAX_READ_OPERATORS.saturating_add(1),
+    );
+    if operators > crate::content_ops::MAX_READ_OPERATORS {
+        return Ok(());
+    }
+    budget.take_operations(operators)?;
     let Ok(content) = Content::decode(content) else {
         return Ok(());
     };
-    budget.take_operations(content.operations.len())?;
     let mut state = start;
     let mut saved: Vec<State> = Vec::new();
     // Saves past the cap, so their restores are matched too.

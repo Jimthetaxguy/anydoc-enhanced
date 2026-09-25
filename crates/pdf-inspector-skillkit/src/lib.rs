@@ -1248,6 +1248,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 
 mod annotations;
 mod cjk_fonts;
+mod content_ops;
 pub mod document;
 pub mod domain;
 mod doubled_text;
