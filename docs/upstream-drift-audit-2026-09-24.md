@@ -311,8 +311,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 321 tests pass (252 skillkit unit, 13
-  skillkit integration, 29 document-tool and 24 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 329 tests pass (259 skillkit unit, 13
+  skillkit integration, 30 document-tool and 24 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI

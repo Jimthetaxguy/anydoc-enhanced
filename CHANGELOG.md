@@ -493,7 +493,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     document declares another form of its pages, is not counted.
   Over 4,412 corpus, fixture, review, and fuzz PDFs, no warning of these
   loops changed but on their reproducers, and none timed out.
-- Review round nine checked loops 17 to 19 and the round-eight fixes:
+- Review round nine checked loops 17 to 19, the round-eight fixes, and the
+  document worker:
   - PDF words split in glyph-by-glyph text (#531): Chrome's Skia keeps a
     glyph in its open string when its hinted advance equals its declared
     width, so a word going on in a string of several glyphs was dropped;
@@ -515,6 +516,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pdfium takes from the page; a form's text is compared with the reading
     pdf-inspector makes without a font. A run painted twice by a `TJ`
     rewind is found on any page of a long statement.
+  - Documents: the package checks run in the worker, under its 15-second
+    deadline, 1 GiB memory ceiling, and two-worker bound, and come back
+    with the Markdown; the server reads no package part. It had run them
+    itself first, with no bound, past the tool's timeout and ahead of the
+    worker bound: a 15 KB DOCX whose list carries 1 MB of level text took
+    the server to 827 MiB with 50 list instances, 3.2 GiB with 200, and
+    down with 500; 10,000 tiny numbering parts held it 48 s; an EPUB's
+    style scan took it to 5.7 GiB and down. The DOCX reproducers now answer
+    in about a second with the server under 20 MiB, and the EPUB ones stop
+    at the worker's bounds with `resource_limit` or `worker_timeout`. A
+    package holding more entries than AnyDoc reads (100,000) is refused
+    with `resource_limit` before it is opened, where indexing a 43 MB
+    package of empty entries cost the server 340 MiB.
+  - DOCX: lists are replayed once, from the numbering and styles parts each
+    side reads (AnyDoc the relationship with the lowest id, else the
+    conventional part; Word, as LibreOffice shows it, the first
+    relationship, and no part without one), rather than once per numbering
+    part: 1,000 numbering parts beside 600,000 paragraphs took 10.2 s and
+    now 0.3 s, and 10,000 no longer time out. A list instance shares its
+    definition's levels instead of copying them, and a level's number text
+    past 1,024 bytes is disclosed rather than kept. Two numbering or styles
+    parts, or one no relationship names, that number a list otherwise on
+    each side are disclosed as `list_numbering_differs`.
+  - DOCX: list numbers are read as each side reads them. A number or id is
+    taken from the attribute AnyDoc reads (`w:val`, else an unprefixed
+    `val`), so a padded `w:val=" 1"` beside an ignorable `x:val="1"`, which
+    Word reads and AnyDoc cannot, no longer passes; a definition or list
+    instance defined twice is kept first by Word and last by AnyDoc; a
+    paragraph is numbered through the style Word finds for it (its exact
+    id, else its name; a character, table, or numbering style's own list;
+    else the default paragraph style); and a paragraph's repeated marks,
+    or a mark inside alternate content, are read as LibreOffice reads them
+    (the last `w:numId`, `w:numPr`, and `w:pPr`, merged) and as AnyDoc
+    does (the first, and only the paragraph's own). A level the list does
+    not define, or past the ninth, which Word shows uncertainly, is
+    disclosed. Twenty-four review fixtures that converted complete now
+    report `list_numbering_differs`.
+  - DOCX: text Word shows in alternate content is compared with the text
+    AnyDoc converts from it. A formula in a choice AnyDoc does not read,
+    such as one requiring `w14` or the math namespace itself, and a
+    fallback holding other text than the choice Word shows ("Pay 900 USD"
+    for "Pay 100 USD"), are refused as `incomplete_conversion`.
+  - XLSX: a section naming General beside date letters, such as
+    `General;[Red]General s`, renders as General in AnyDoc, which ignores
+    the letters, so a negative marked by its colour alone lost its sign
+    and is now refused; `General d`, `General yyyy`, and `[h]General` keep
+    their value and no longer are. A fraction scaled by thousands
+    (`# ?/?,`), which AnyDoc shows a thousandth of and LibreOffice
+    unscaled, is refused.
+  - None of 303 public, 119 review, 58 round-seven, 62 round-eight, and
+    750 randomized documents, nor 181 and 216 regression workbooks,
+    changed; the 210 randomized list documents still agree with
+    LibreOffice.
 - Review round eight checked loops 14 to 17 and the round-seven fixes:
   - PDF: a statement whose rows repeat a cell of two amounts, such as
     "0.00 0.00" quarter- and year-to-date, made the merged-cell check time
@@ -814,6 +868,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   garbled-text reason.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
+- DOCX list checks follow ECMA-376 where Word and LibreOffice part: a
+  choice requiring the `w` namespace with no fallback is disclosed though
+  LibreOffice shows no numbers there. A later `w:numId` that is not a
+  number, or a `w:pPr` after the paragraph's runs, converts complete where
+  LibreOffice shows none; and a choice requiring VML that holds text, beside
+  a fallback without it, would be refused. An XLSX format code rejected for
+  other reasons whose only date letter is `s` or `A/P` converts complete
+  where LibreOffice shows a time, and `# ?/?,` over a tiny positive value is
+  refused, as a positive cell does not carry its magnitude.
 - Visual concealment (text color, size, opacity, clipping, or off-screen
   positioning) is not detected in any lane. EPUB text in a closed `<details>`
   and SVG `<title>` and `<desc>`, which read like image alt text, are not
