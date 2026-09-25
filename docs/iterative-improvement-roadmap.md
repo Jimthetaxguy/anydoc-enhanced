@@ -272,36 +272,32 @@ came back clean. The evidence and dispositions are in
 | 9 | Scanned PDF pages whose invisible OCR layer pdf-inspector drops (open upstream #479, #501) | A stamped scan read as text at confidence 1.0 with only its Bates number is now reported for OCR with `invisible_text_layer`; 1–5 ms per call |
 | 10 | Spreadsheet number formats and drawings, from AnyDoc's #72 and #151 | Negatives marked only in red (−25,000 read as 25,000), values a format hides, unresolved locale dates, and text boxes are refused; no producer-shaped workbook changed |
 | 11 | DOCX list numbers AnyDoc renders differently from Word (#129) | Shared definitions, deleted numbered paragraphs, and ordinal or word formats convert as `partial` with `list_numbering_differs`; AnyDoc's own upstream fixture shows 1 where Word shows 5 |
+| 12 | EPUB blocks AnyDoc runs together, from its older pull request (#4) | Minified `div`s ("Balance due1,250.00") and an image's alt text running into its caption are refused; indented markup converts as before, and only the three reproductions among 303 public documents changed |
 | Sanitizer | Keep what the Markdown sanitizer removed wrongly | Cell line breaks (`<br>`) kept, which had fused "52,000" and "1,250" into "52,0001,250" in six lanes; escaped `\<Client name>` placeholders and code kept |
 
 ## Next slices
 
-1. **EPUB inline containers that fuse text.** AnyDoc 0.2.4 walks a `div`,
-   `section`, `figure`, or `figcaption` without block children inline, so
-   minified markup such as `<div>Balance due</div><div>1,250.00</div>` reads
-   "Balance due1,250.00" (upstream #4). A check needs the walker model to know
-   whether a container has block children before it closes.
-2. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
+1. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
    chunks, and non-breaking hyphens are handled. Elements AnyDoc 0.2.4's walker
    also skips, which are candidates to confirm with fixtures: `w:contentPart`
    ink, and date or page-number fields placed in the body (`w:pgNum`,
    `w:dayShort` and related elements). Master-document `w:subDoc` links
    reference files outside the package and are reported as external
    relationships.
-3. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
+2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
    non-exhaustive `Format` arms, the four Wingdings codes from #177, a
    re-check of the ported `to_utf8` and `path::resolve`, and the walker,
    numbering, and format models, which mirror 0.2.4's behavior.
-4. **Next pdf-inspector release.** If #479 or #501 lands, compare its
+3. **Next pdf-inspector release.** If #479 or #501 lands, compare its
    invisible-layer handling with the local scan before removing either; if
    #578 lands, PDF Markdown gains link destinations and must pass through the
    sanitizer.
-5. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
+4. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
    external relationship, including an ordinary hyperlink, while DOCX converts
    and removes the destination with a warning. Hyperlink relationships could
    follow the DOCX policy, since the sanitizer already removes their
    destinations. This is a policy change for the owners to decide.
-6. **Non-Linux containment.** PDF and document parsing still lack a memory
+5. **Non-Linux containment.** PDF and document parsing still lack a memory
    ceiling on macOS and fall back to in-process parsing where no sandbox
    exists; filesystem isolation remains open on every platform.
 
@@ -322,6 +318,10 @@ Each of these is a policy choice the checks make one way today:
   do not. It converts without notice.
 - **Comments and notes.** DOCX comments, XLSX notes, and ODS annotations are
   not converted and are not disclosed.
+- **Headers and footers.** AnyDoc converts the DOCX body, footnotes, and
+  endnotes, not headers or footers, so a "DRAFT" marking or client name placed
+  only in a header is missing without notice. A warning for headers and
+  footers holding text other than a page number would disclose it.
 - **ODP speaker notes in shapes.** LibreOffice writes notes converted from
   PowerPoint as shapes, which AnyDoc does not read, so such decks are refused;
   they could convert as `partial` instead.

@@ -42,11 +42,12 @@ content. The overlapping `active-content.epub`, `hidden-content.epub`, and
 `encrypted.epub` names now refer to the generator-backed qualification
 fixtures, so their earlier hashes are not listed as separate artifacts.
 
-The directory therefore contains twenty-one packages: ten generated
+The directory therefore contains twenty-three packages: ten generated
 qualification fixtures, four retained low-level fixtures, and
 `encoded-chapter-href.epub`, `linked-css-hidden.epub`, `escaped-selector.epub`,
 `list-text-outside-items.epub`, `kindle-media-pair.epub`,
-`display-none-omitted.epub`, and `web-address-in-text.epub` from
+`minified-blocks.epub`, `indented-blocks.epub`, `display-none-omitted.epub`,
+and `web-address-in-text.epub` from
 `scripts/build-anydoc-hardening-corpus.py`. The first's spine href
 percent-decodes, as AnyDoc resolves it, to a chapter with hidden text beside a
 clean decoy stored under the encoded name. The second and third hide a
@@ -54,10 +55,13 @@ paragraph through a linked stylesheet, with `visibility: hidden` and through
 an escaped class selector; readers hide the text and AnyDoc converts it. The
 fourth and fifth are the reverse: readers show text that AnyDoc drops, placed
 directly in a list, or hidden by the Kindle stylesheet pair, whose second rule
-inside `@media amzn-mobi` AnyDoc applies everywhere. All five must return
-`incomplete_conversion`. The last two must convert completely: a
-`display: none` rule that AnyDoc applies as a reader does, and a web address
-written in the text, which the sanitizer removes. Their hashes are recorded in
+inside `@media amzn-mobi` AnyDoc applies everywhere. The sixth puts a label
+and its amount in adjacent `div` elements with no white space between them;
+AnyDoc walks them inline and writes "Balance due1,250.00". All six must return
+`incomplete_conversion`. The last three must convert completely: the same
+`div` elements indented, which AnyDoc joins with a space; a `display: none`
+rule that AnyDoc applies as a reader does; and a web address written in the
+text, which the sanitizer removes. Their hashes are recorded in
 the corpus index.
 
 | Legacy fixture | SHA-256 |

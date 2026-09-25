@@ -141,7 +141,7 @@ this audit named some by their latest commit, and listed #160, closed on
 | #39, #90 | Skip hidden worksheets; omit hidden rows and columns | Superseded: 0.2.4 omits both. The local preflight refuses them. |
 | #16 | Preserve merged-cell spans past the used range | Superseded: 0.2.4 widens the grid. A merge over a whole row pads to 16,384 columns and returns `resource_limit`. |
 | #17 | Unwrap single-cell tables that wrap a nested table | 0.2.4 flattens the nested table into `<br>`-joined lines. The local sanitizer removed those `<br>` tags, fusing "52,000" and "1,250" into "52,0001,250" in six lanes; it now keeps them. |
-| #4 | EPUB metadata and figure captions | A container without block children is walked inline, so minified markup fuses words ("Balance due1,250.00"). Documented as a known limitation and a next slice. |
+| #4 | EPUB metadata and figure captions | A container without block children is walked inline, so minified markup fused words ("Balance due1,250.00") and an image's alt text ran into its caption. Chapters where text a reader shows in separate blocks runs together are now refused; indented markup, joined with a space, converts. |
 | #46 | Keep delimiters from pairing across runs | Superseded: 0.2.4 looks ahead across the paragraph. |
 | #54 | Fix invalid EPUB spine references | 0.2.4 drops such entries; the local preflight refuses them. |
 | #44 | Parse each package part once, and bound the total | Parts re-parsed per reference: 20,000 chart references are refused by the part cap, and 9,000 return `resource_limit` from the worker in 3.5 s. |

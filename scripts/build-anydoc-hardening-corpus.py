@@ -84,6 +84,12 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
 - epub/kindle-media-pair.epub: the common Kindle stylesheet pair, whose
   second rule inside `@media amzn-mobi` AnyDoc applies everywhere, dropping
   a paragraph readers show. Expected `incomplete_conversion`.
+- epub/minified-blocks.epub: a label and its amount in adjacent `div`
+  elements with no white space between them, which a reader shows on two
+  lines and AnyDoc runs together as "Balance due1,250.00". Expected
+  `incomplete_conversion`.
+- epub/indented-blocks.epub: the same markup indented, which AnyDoc joins
+  with a space. Expected complete conversion.
 - xlsx/negative-sign-by-colour.xlsx: a negative amount whose format,
   `#,##0;[Red]#,##0`, marks it only in red; AnyDoc renders it unsigned.
   Expected `incomplete_conversion`.
@@ -833,6 +839,16 @@ def main():
         "  .kf8-only { display: none; }\n}\n",
         '<p>VISIBLE-CHAPTER</p><p class="kf8-only">SHOWN-IN-EPUB-READERS</p>'
         '<p class="mobi-only">Old Kindle fallback.</p>',
+    )
+    write_styled_epub(
+        "minified-blocks.epub",
+        "div { margin: 0 }\n",
+        "<p>VISIBLE-CHAPTER</p><div><div>Balance due</div><div>1,250.00</div></div>",
+    )
+    write_styled_epub(
+        "indented-blocks.epub",
+        "div { margin: 0 }\n",
+        "<p>VISIBLE-CHAPTER</p><div>\n  <div>Balance due</div>\n  <div>1,250.00</div>\n</div>",
     )
     styled_workpaper("negative-sign-by-colour.xlsx", 164, "#,##0;[Red]#,##0", -25000)
     styled_workpaper(

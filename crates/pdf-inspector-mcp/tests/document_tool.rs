@@ -576,6 +576,7 @@ fn strict_epub_negative_fixtures_fail_closed() {
         ("escaped-selector.epub", "incomplete_conversion"),
         ("list-text-outside-items.epub", "incomplete_conversion"),
         ("kindle-media-pair.epub", "incomplete_conversion"),
+        ("minified-blocks.epub", "incomplete_conversion"),
         ("nav-spine-mismatch.epub", "incomplete_conversion"),
         ("missing-local-resource.epub", "incomplete_conversion"),
         ("external-reference.epub", "incomplete_conversion"),
@@ -613,6 +614,12 @@ fn epub_text_readers_hide_and_anydoc_omits_converts() {
     let markdown = document["markdown"].as_str().expect("markdown");
     assert!(markdown.contains("VISIBLE-CHAPTER"));
     assert!(!markdown.contains("OMITTED-LIKE-A-READER"));
+    // Indented blocks AnyDoc walks inline are joined with a space, so no
+    // words run together.
+    let document = run_document_tool(fixture("indented-blocks.epub"), "epub-indented-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("Balance due 1,250.00"), "{markdown}");
     // A web address written in the text loads nothing; it is sanitized.
     let document = run_document_tool(fixture("web-address-in-text.epub"), "epub-address-test");
     assert_eq!(document["completeness"], "complete", "{document}");

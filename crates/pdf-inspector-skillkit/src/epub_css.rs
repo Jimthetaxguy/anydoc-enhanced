@@ -2220,6 +2220,161 @@ struct Open {
     fallback: bool,
     in_svg: bool,
     exempt: Exempt,
+    /// How AnyDoc's inline run treats the element (see [`Run`]).
+    opens_run: bool,
+    flush_after: bool,
+    boundary_after: bool,
+}
+
+/// One inline run of AnyDoc's walker (a `Builder`): the text it last
+/// added, and whether a reader starts a new block since then without AnyDoc
+/// starting a new paragraph. Text added across such a boundary with no white
+/// space between runs together in the Markdown, as "Balance due1,250.00".
+#[derive(Default)]
+struct Run {
+    last: Option<char>,
+    boundary: bool,
+}
+
+impl Run {
+    fn flush(&mut self) {
+        *self = Run::default();
+    }
+
+    /// Add text to the run; whether it runs into the text before it.
+    fn add(&mut self, text: &str) -> bool {
+        let kept = || text.chars().filter(|character| anydoc_keeps(*character));
+        let (Some(first), Some(last)) = (kept().next(), kept().next_back()) else {
+            return false;
+        };
+        if kept().all(char::is_whitespace) {
+            if self.last.is_some() {
+                self.last = Some(' ');
+            }
+            return false;
+        }
+        let fused = self.boundary
+            && self.last.is_some_and(|previous| !previous.is_whitespace())
+            && !first.is_whitespace();
+        self.last = Some(last);
+        self.boundary = false;
+        fused
+    }
+}
+
+/// Whether AnyDoc keeps a character of text: `clean_text` drops soft hyphens,
+/// zero-width spaces, byte order marks, and control characters other than
+/// tabs and line ends.
+fn anydoc_keeps(character: char) -> bool {
+    !matches!(character, '\u{ad}' | '\u{200b}' | '\u{feff}')
+        && (!character.is_control() || matches!(character, '\t' | '\n' | '\r'))
+}
+
+/// Whether an image source is an absolute URI (`is_absolute_uri`): a scheme,
+/// and not a Windows drive path.
+fn anydoc_absolute_uri(source: &str) -> bool {
+    let Some((scheme, _)) = source.split_once(':') else {
+        return false;
+    };
+    let mut characters = scheme.chars();
+    let scheme = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        });
+    let bytes = source.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    scheme && !drive
+}
+
+/// AnyDoc's container elements (`is_container_tag`): walked through, with a
+/// new paragraph only when they hold a block element.
+fn anydoc_container(local: &str) -> bool {
+    matches!(
+        local,
+        "div"
+            | "section"
+            | "article"
+            | "aside"
+            | "main"
+            | "nav"
+            | "header"
+            | "footer"
+            | "figure"
+            | "figcaption"
+            | "center"
+            | "details"
+            | "summary"
+            | "li"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "body"
+    )
+}
+
+/// AnyDoc's block elements (`is_block_tag`).
+fn anydoc_block(local: &str) -> bool {
+    anydoc_container(local)
+        || matches!(
+            local,
+            "p" | "ul"
+                | "ol"
+                | "table"
+                | "blockquote"
+                | "pre"
+                | "hr"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+        )
+}
+
+/// For each element of a chapter in document order, whether a child element
+/// is one of AnyDoc's blocks (`has_block_children`).
+fn block_children(chapter: &[u8]) -> Result<Vec<bool>, DocumentError> {
+    let mut xml = quick_xml::Reader::from_reader(std::io::Cursor::new(chapter));
+    xml.config_mut().trim_text(false);
+    xml.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut flags: Vec<bool> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    loop {
+        let event = xml
+            .read_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        let (element, start) = match event {
+            quick_xml::events::Event::Start(element) => (element, true),
+            quick_xml::events::Event::Empty(element) => (element, false),
+            quick_xml::events::Event::End(_) => {
+                open.pop();
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::Eof => return Ok(flags),
+            _ => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let name = element.name();
+        let local = String::from_utf8_lossy(super::xml_local_name(name.as_ref()));
+        if let Some(&parent) = open.last() {
+            flags[parent] |= anydoc_block(&local);
+        }
+        if start {
+            open.push(flags.len());
+        }
+        flags.push(false);
+        buffer.clear();
+    }
 }
 
 /// Elements whose text no reader renders and AnyDoc never converts: the
@@ -2265,6 +2420,9 @@ pub(super) struct ChapterText {
     pub(super) converts_hidden: bool,
     /// Text a reader shows does not convert.
     pub(super) drops_shown: bool,
+    /// Text a reader shows in separate blocks runs together, with no space
+    /// between, in AnyDoc's Markdown.
+    pub(super) fuses_blocks: bool,
 }
 
 /// Compare what a reading system shows of a chapter with what AnyDoc
@@ -2285,6 +2443,9 @@ pub(super) fn chapter_text(
     let mut root_taken = false;
     let mut body_taken = false;
     let mut found = ChapterText::default();
+    let blocks = block_children(chapter)?;
+    let mut element_index = 0usize;
+    let mut runs: Vec<Run> = Vec::new();
     loop {
         let event = xml
             .read_event_into(&mut buffer)
@@ -2294,7 +2455,17 @@ pub(super) fn chapter_text(
             quick_xml::events::Event::Empty(start) => (Some((start, false)), None),
             quick_xml::events::Event::End(_) => {
                 elements.pop();
-                open.pop();
+                if let Some(closed) = open.pop() {
+                    if closed.opens_run {
+                        runs.pop();
+                    }
+                    if let Some(run) = runs.last_mut() {
+                        if closed.flush_after {
+                            run.flush();
+                        }
+                        run.boundary |= closed.boundary_after;
+                    }
+                }
                 buffer.clear();
                 continue;
             }
@@ -2319,6 +2490,11 @@ pub(super) fn chapter_text(
             }
         };
         if let Some(text) = text {
+            if open.last().is_some_and(|state| state.reach == Reach::Walk) {
+                if let Some(run) = runs.last_mut() {
+                    found.fuses_blocks |= run.add(&text);
+                }
+            }
             let state = open
                 .last()
                 .filter(|_| text.chars().any(|character| !character.is_whitespace()));
@@ -2347,7 +2523,7 @@ pub(super) fn chapter_text(
                         found.drops_shown |= !hidden && state.exempt == Exempt::None;
                     }
                 }
-                if found.converts_hidden && found.drops_shown {
+                if found.converts_hidden && found.drops_shown && found.fuses_blocks {
                     return Ok(found);
                 }
             }
@@ -2361,6 +2537,8 @@ pub(super) fn chapter_text(
         if elements.len() >= MAX_CHAPTER_DEPTH {
             return Err(DocumentError::ResourceLimit);
         }
+        let has_blocks = blocks.get(element_index).copied().unwrap_or(false);
+        element_index += 1;
         let local =
             String::from_utf8_lossy(super::xml_local_name(start.name().as_ref())).into_owned();
         let attributes = super::xml_attributes(&start)
@@ -2438,10 +2616,89 @@ pub(super) fn chapter_text(
                 Reach::Dropped => Reach::Dropped,
             },
         };
+        // How the element meets AnyDoc's inline run. Paragraphs, headings,
+        // quotes, list items, cells, captions, and the body get runs of
+        // their own; lists, tables, `pre`, rules, and containers holding
+        // blocks end the current paragraph; any other container is walked
+        // inline although a reader starts a new block.
+        let parent_reach = open.last().map(|parent| parent.reach);
+        let local = element.local.as_str();
+        let (mut opens_run, mut flush_after, mut boundary_after) = (false, false, false);
+        match (parent_reach, reach) {
+            (Some(Reach::Root), Reach::Walk)
+            | (Some(Reach::List | Reach::Table | Reach::Row), Reach::Walk) => opens_run = true,
+            (Some(Reach::Walk), _) => {
+                let run = runs.last_mut();
+                match (local, reach) {
+                    ("p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote", Reach::Walk) => {
+                        if let Some(run) = run {
+                            run.flush();
+                        }
+                        opens_run = true;
+                        flush_after = true;
+                    }
+                    (_, Reach::List | Reach::Table | Reach::Whole) | ("hr", _) => {
+                        if let Some(run) = run {
+                            run.flush();
+                        }
+                        flush_after = true;
+                    }
+                    ("br", Reach::Dropped) => {
+                        if let Some(run) = run.filter(|run| run.last.is_some()) {
+                            run.last = Some('\n');
+                        }
+                    }
+                    // AnyDoc writes a packaged image as its alt text, inline,
+                    // and an image from outside the package as Markdown image
+                    // markup, which keeps the text on either side apart.
+                    ("img" | "image", Reach::Dropped) if !anydoc.hides(&element) => {
+                        let source = element
+                            .first("src")
+                            .or_else(|| element.first("href"))
+                            .unwrap_or("");
+                        if let Some(run) = run {
+                            if anydoc_absolute_uri(source) {
+                                if run.last.is_some() {
+                                    run.last = Some(' ');
+                                }
+                            } else {
+                                let alt = element.first("alt").unwrap_or("").trim();
+                                found.fuses_blocks |= run.add(alt);
+                            }
+                        }
+                    }
+                    (container, Reach::Walk) if anydoc_container(container) => {
+                        if let Some(run) = run {
+                            if has_blocks {
+                                run.flush();
+                            } else {
+                                run.boundary = true;
+                            }
+                        }
+                        if has_blocks {
+                            flush_after = true;
+                        } else {
+                            boundary_after = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
         // An empty element holds no text to check.
         if !has_children {
+            if let Some(run) = runs.last_mut() {
+                if flush_after {
+                    run.flush();
+                }
+                run.boundary |= boundary_after;
+            }
             buffer.clear();
             continue;
+        }
+        if opens_run {
+            runs.push(Run::default());
         }
         elements.push(element);
         let parent = open.last();
@@ -2461,6 +2718,9 @@ pub(super) fn chapter_text(
                 fallback: false,
                 in_svg,
                 exempt: Exempt::None,
+                opens_run,
+                flush_after,
+                boundary_after,
             }
         } else {
             let style = reader.evaluate(&elements, work)?;
@@ -2490,6 +2750,9 @@ pub(super) fn chapter_text(
                 fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
                 in_svg,
                 exempt,
+                opens_run,
+                flush_after,
+                boundary_after,
             }
         };
         open.push(state);
@@ -2824,6 +3087,50 @@ mod tests {
         ));
         // Script and style text inside `pre` is hidden but converts.
         assert!(converts_hidden(&[], "<pre>a<script>SECRET</script></pre>"));
+    }
+
+    #[test]
+    fn blocks_anydoc_runs_together_are_found() {
+        let fuses = |body: &str| walk(&[], body).fuses_blocks;
+        // A container without block children is walked inline, so adjacent
+        // blocks with no white space between them run together.
+        for body in [
+            "<div>Balance due</div><div>1,250.00</div>",
+            "<dl><dt>Tax year</dt><dd>2023</dd></dl>",
+            "<p><span>Paid</span><div>300.00</div></p>",
+            "Intro<div>More</div>",
+            "<section>One</section>Two",
+            "A<div/>B",
+            "<ul><li><div>Item</div><div>Note</div></li></ul>",
+            // A packaged image converts as its alt text.
+            r#"<figure><img src="chart.png" alt="chart"/><figcaption>Figure 2</figcaption></figure>"#,
+            r#"<div><img src="total.png" alt="Total"/></div><div>1,250.00</div>"#,
+        ] {
+            assert!(fuses(body), "{body}");
+        }
+        // White space, paragraphs, blocks inside the containers, list items,
+        // cells, and inline elements keep text apart as a reader does.
+        for body in [
+            "<div>Balance due</div>\n<div>1,250.00</div>",
+            "<p>A</p><p>B</p>",
+            "<div><p>A</p></div><div><p>B</p></div>",
+            "<span>A</span><span>B</span>",
+            "<ul><li>A</li><li>B</li></ul>",
+            "<table><tr><td>A</td><td>B</td></tr></table>",
+            "<div>A<br/>B</div>",
+            "<div>A</div><p>B</p>",
+            "<div>A </div><div>B</div>",
+            "<h1>Title</h1><div>Body</div>",
+            // An image from outside the package is Markdown image markup; an
+            // image without alt text converts as nothing; AnyDoc drops
+            // zero-width spaces.
+            r#"<figure><img src="https://example.com/chart.png" alt="chart"/><figcaption>Figure 2</figcaption></figure>"#,
+            r#"<figure><img src="chart.png" alt=" "/><figcaption>Figure 2</figcaption></figure>"#,
+            r#"<figure><img src="chart.png"/><figcaption>Figure 2</figcaption></figure>"#,
+            "<div>A</div><div>\u{200b}</div>",
+        ] {
+            assert!(!fuses(body), "{body}");
+        }
     }
 
     #[test]

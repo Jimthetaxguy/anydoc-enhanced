@@ -182,6 +182,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- EPUB chapters whose blocks AnyDoc runs together are refused, found from its
+  older EPUB pull request (#4). AnyDoc walks a `div`, `section`, `figure`,
+  `figcaption`, `dd`, or other container without block children inline, so
+  minified markup such as `<div>Balance due</div><div>1,250.00</div>`, which a
+  reader shows on two lines, converted as "Balance due1,250.00", and an
+  image's alt text ran into its caption. Markup with white space between the
+  blocks converts as before. Of 303 public documents, only the three built to
+  reproduce it changed.
 - Converted Markdown keeps line breaks inside table cells. The sanitizer
   removed AnyDoc's `<br>`, so a cell reading "52,000" over "1,250" came out as
   "52,0001,250", one wrong number, in DOCX, PPTX, ODT, ODS, ODP, and EPUB
@@ -256,10 +264,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are not. A value in a cell a merge covers is omitted, as Excel and
   LibreOffice hide it. Neither is flagged.
 - Comments and notes (DOCX comments, XLSX notes, ODS annotations) are not
-  converted and are not flagged.
-- EPUB block containers without block children, such as minified `div`s or a
-  `figure` and its caption, are walked inline by AnyDoc, so adjacent text can
-  run together ("Balance due1,250.00"). This is not flagged.
+  converted and are not flagged, nor are DOCX headers and footers, so a
+  "DRAFT" marking or client name placed only in a header is missing.
+- EPUB block containers without block children, such as indented `div`s or a
+  `figure` and its caption, are walked inline by AnyDoc and convert as one
+  paragraph, their text joined with spaces. This is not flagged; text that
+  would run together is refused.
 - ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
   converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
 - EPUB `noscript` content is treated as shown, as readers without scripting

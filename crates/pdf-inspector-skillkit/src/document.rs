@@ -5025,7 +5025,7 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
                     &mut css_work,
                 )?;
                 result.hidden_content |= text.converts_hidden;
-                result.unsupported_content |= text.drops_shown;
+                result.unsupported_content |= text.drops_shown || text.fuses_blocks;
             }
             Err(DocumentError::Malformed) => result.missing_required_content = true,
             Err(error) => return Err(error),
