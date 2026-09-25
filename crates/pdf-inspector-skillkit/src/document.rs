@@ -2414,9 +2414,6 @@ struct DocxStoryScan {
     list_paragraphs: Vec<DocxListParagraph>,
     /// The story part being scanned.
     part: DocxPart,
-    /// A paragraph's list instance or level written with white space
-    /// around it, which Word reads and AnyDoc cannot parse.
-    padded_numbering: bool,
     /// The notes of the note parts in the order they are stored, the note
     /// being read, and where the body first references each.
     notes_stored: Vec<(bool, String)>,
@@ -2457,11 +2454,14 @@ struct DocxListParagraph {
 }
 
 /// The numbering a paragraph asks for: a list instance and a level given
-/// directly, and its paragraph style, which supplies what is not.
+/// directly, as Word and as AnyDoc read them, and its paragraph style,
+/// which supplies what is not.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct DocxListUse {
     list: Option<u64>,
     level: Option<usize>,
+    anydoc_list: Option<u64>,
+    anydoc_level: Option<usize>,
     style: Option<String>,
 }
 
@@ -2507,10 +2507,13 @@ struct DocxParagraphMark {
     style_separator: bool,
     styles: Vec<String>,
     /// The list instance (`w:numId`) and level (`w:ilvl`) numbering it
-    /// directly; a `w:numId` of 0 removes a style's numbering.
+    /// directly, as Word reads them, collapsing white space around the
+    /// number, and as AnyDoc parses the text as it stands; a list instance
+    /// of 0 removes a style's numbering.
     list: Option<u64>,
-    direct_list: bool,
     level: Option<usize>,
+    anydoc_list: Option<u64>,
+    anydoc_level: Option<usize>,
     /// The paragraph style, which may number the paragraph.
     style: Option<String>,
     /// The mark is a tracked deletion or move source.
@@ -2954,17 +2957,16 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                         paragraph.marked = true;
                     }
                     let mark = std::mem::take(&mut scan.mark);
-                    // A `w:numId` of 0 given directly removes a style's
-                    // numbering; any other paragraph may be numbered through
-                    // its style, or through Word's default one.
-                    if mark.list.is_some() || !mark.direct_list {
-                        let used = DocxListUse {
-                            list: mark.list,
-                            level: mark.level,
-                            style: mark.style.clone(),
-                        };
-                        record_list_paragraph(scan, &stack, used, mark.deleted)?;
-                    }
+                    // Any paragraph may be numbered, directly, through its
+                    // style, or through Word's default one.
+                    let used = DocxListUse {
+                        list: mark.list,
+                        level: mark.level,
+                        anydoc_list: mark.anydoc_list,
+                        anydoc_level: mark.anydoc_level,
+                        style: mark.style.clone(),
+                    };
+                    record_list_paragraph(scan, &stack, used, mark.deleted)?;
                     if mark.numbered && !mark.style_separator {
                         scan.hidden_run |= mark.hidden;
                         for style in mark.styles {
@@ -3155,25 +3157,23 @@ fn scan_docx_element(
         }
         b"numId" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
             let values = xml_attribute_values(event, b"val");
-            scan.padded_numbering |= values.iter().any(|value| value.trim() != value);
             scan.mark.numbered |= values.iter().any(|value| value.trim() != "0");
-            scan.mark.direct_list = true;
-            if let Some(list) = values
-                .iter()
-                .find_map(|value| value.trim().parse::<u64>().ok())
-                .filter(|&list| list != 0)
-            {
+            let list = |value: &str| value.parse::<u64>().ok();
+            if let Some(list) = values.iter().find_map(|value| list(value.trim())) {
                 scan.mark.list = Some(list);
+            }
+            if let Some(list) = values.iter().find_map(|value| list(value)) {
+                scan.mark.anydoc_list = Some(list);
             }
         }
         b"ilvl" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
             let values = xml_attribute_values(event, b"val");
-            scan.padded_numbering |= values.iter().any(|value| value.trim() != value);
-            if let Some(level) = values
-                .iter()
-                .find_map(|value| value.trim().parse::<usize>().ok())
-            {
-                scan.mark.level = Some(level.min(DOCX_LIST_LEVELS - 1));
+            let level = |value: &str| value.parse::<usize>().ok();
+            if let Some(level) = values.iter().find_map(|value| level(value.trim())) {
+                scan.mark.level = Some(level);
+            }
+            if let Some(level) = values.iter().find_map(|value| level(value)) {
+                scan.mark.anydoc_level = Some(level);
             }
         }
         b"del" | b"moveFrom" if word_path_ends_with(stack, &[b"p", b"pPr", b"rPr"]) => {
@@ -3324,9 +3324,6 @@ struct DocxNumbering {
     lists: HashMap<u64, DocxList>,
     /// The first definition declaring each list style (`w:styleLink`).
     style_definitions: HashMap<String, String>,
-    /// A numbering value written with white space around it, which Word
-    /// reads as an XML Schema number and AnyDoc cannot parse.
-    padded: bool,
 }
 
 #[derive(Default)]
@@ -3909,7 +3906,12 @@ impl<'a> DocxReading<'a> {
     /// given directly or read from the style chain (see
     /// [`DocxStyleChains::level`]). A list instance of 0 removes numbering.
     fn resolve(&mut self, used: &DocxListUse, style: Option<&str>) -> Option<(u64, usize)> {
-        let list = match used.list {
+        let (list, level) = if self.word {
+            (used.list, used.level)
+        } else {
+            (used.anydoc_list, used.anydoc_level)
+        };
+        let list = match list {
             Some(list) => list,
             None => self.chains.list(style?)?,
         };
@@ -3917,7 +3919,7 @@ impl<'a> DocxReading<'a> {
             return None;
         }
         let bound = self.instance(list)?.bound.clone();
-        let level = match (used.level, style) {
+        let level = match (level, style) {
             (Some(level), _) => level,
             (None, Some(style)) => self.chains.level(style, &bound, self.word),
             (None, None) => 0,
@@ -3985,10 +3987,6 @@ impl DocxNumberings {
     /// level names no start. A paragraph Word does not show, such as one
     /// whose mark is deleted, still takes a number in AnyDoc.
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
-        // A value only Word can read may number what AnyDoc does not.
-        if scan.padded_numbering || self.word.padded || styles.padded {
-            return !scan.list_paragraphs.is_empty();
-        }
         let mut word = DocxReading::new(true, &self.word, &styles.styles);
         let mut anydoc = DocxReading::new(false, &self.anydoc, &styles.anydoc_styles);
         // Word numbers a paragraph that names no style, or one the parts do
@@ -4111,8 +4109,6 @@ struct DocxStyleNumbering {
     /// a paragraph naming no style or one the parts do not define. AnyDoc
     /// reads no default.
     default_paragraph: Option<String>,
-    /// A style's list instance written with white space around it.
-    padded: bool,
 }
 
 #[derive(Default)]
@@ -4365,8 +4361,6 @@ fn docx_style_numbering(
         let local = xml_local_name(event.name().as_ref()).to_vec();
         let raw = xml_attribute_values(&event, b"val").into_iter().next();
         let value = || raw.as_ref().map(|value| value.trim().to_string());
-        numbering.padded |=
-            local == b"numId" && raw.as_ref().is_some_and(|value| value.trim() != value);
         // AnyDoc reads the first `w:basedOn` of a style, and the list of the
         // first `w:numId` of the first `w:numPr` of its first `w:pPr`.
         if let Some(kept) = kept.as_mut() {
@@ -4390,7 +4384,7 @@ fn docx_style_numbering(
                 {
                     kept.lists += 1;
                     if kept.lists == 1 {
-                        kept.style.list = value().and_then(|list| list.parse().ok());
+                        kept.style.list = raw.as_ref().and_then(|list| list.parse().ok());
                     }
                 }
                 _ => {}
@@ -4502,8 +4496,18 @@ fn docx_numbering_definitions(
     let mut list: Option<u64> = None;
     let mut override_level: Option<usize> = None;
     let mut open_level: Option<DocxOpenLevel> = None;
+    // A number as the side reads it: Word reads an XML Schema integer,
+    // collapsing white space around it, and AnyDoc parses the text as it
+    // stands, so a number written with white space is only Word's.
+    let number = |text: String| {
+        if word {
+            text.trim().to_string()
+        } else {
+            text
+        }
+    };
     // A definition id as the side matches it: AnyDoc its text, Word the
-    // XML Schema integer it reads.
+    // integer it reads.
     let definition_id = |id: String| {
         if word {
             id.parse::<i64>().ok().map(|id| id.to_string())
@@ -4511,13 +4515,13 @@ fn docx_numbering_definitions(
             Some(id)
         }
     };
-    // AnyDoc reads a missing or unreadable level index as the first and
-    // skips an index past the last level.
+    // A missing or unreadable level index reads as the first, and an index
+    // past the last level is skipped.
     let level_of = |event: &quick_xml::events::BytesStart<'_>| {
         let level = xml_attribute_values(event, b"ilvl")
             .into_iter()
             .next()
-            .and_then(|value| value.trim().parse::<usize>().ok())
+            .and_then(|value| number(value).parse::<usize>().ok())
             .unwrap_or(0);
         (level < DOCX_LIST_LEVELS).then_some(level)
     };
@@ -4574,21 +4578,10 @@ fn docx_numbering_definitions(
         let local = xml_local_name(event.name().as_ref()).to_vec();
         let raw = |name: &[u8]| xml_attribute_values(&event, name).into_iter().next();
         let value = |name: &[u8]| raw(name).map(|value| value.trim().to_string());
-        // Numbers are XML Schema integers, whose white space Word collapses;
-        // formats and style ids are strings, which keep it, and LibreOffice
-        // reads them as AnyDoc does.
-        let number = matches!(
-            local.as_slice(),
-            b"abstractNumId" | b"start" | b"startOverride" | b"lvlRestart"
-        );
-        numbering.padded |= [b"abstractNumId".as_slice(), b"numId", b"ilvl", b"val"]
-            .iter()
-            .filter(|name| **name != b"val" || number)
-            .filter_map(|name| raw(name))
-            .any(|value| value.trim() != value);
+        let numeric = |name: &[u8]| raw(name).map(number);
         match local.as_slice() {
             b"abstractNum" if stack.len() == 1 => {
-                definition = value(b"abstractNumId").and_then(definition_id);
+                definition = numeric(b"abstractNumId").and_then(definition_id);
                 if let Some(id) = &definition {
                     if id.len() > MAX_STYLE_ID_BYTES
                         || (numbering.definitions.len() >= MAX_DOCX_STYLES
@@ -4600,7 +4593,7 @@ fn docx_numbering_definitions(
                 }
             }
             b"num" if stack.len() == 1 => {
-                list = value(b"numId").and_then(|id| id.parse().ok());
+                list = numeric(b"numId").and_then(|id| id.parse().ok());
                 if let Some(id) = list {
                     if numbering.lists.len() >= MAX_DOCX_STYLES
                         && !numbering.lists.contains_key(&id)
@@ -4613,7 +4606,7 @@ fn docx_numbering_definitions(
             b"abstractNumId" if list.is_some() && xml_path_ends_with(&stack, &[b"num"]) => {
                 if let Some(id) = list {
                     numbering.lists.entry(id).or_default().definition =
-                        value(b"val").and_then(definition_id);
+                        numeric(b"val").and_then(definition_id);
                 }
             }
             b"numStyleLink" if xml_path_ends_with(&stack, &[b"abstractNum"]) => {
@@ -4645,7 +4638,7 @@ fn docx_numbering_definitions(
                 if let (Some(id), Some(level), Some(start)) = (
                     list,
                     override_level,
-                    value(b"val").and_then(|start| docx_start_value(&start)),
+                    numeric(b"val").and_then(|start| docx_start_value(&start)),
                 ) {
                     numbering.lists.entry(id).or_default().starts[level] = Some(start);
                 }
@@ -4690,13 +4683,14 @@ fn docx_numbering_definitions(
             {
                 if let (Some(open), Some(found)) = (open_level.as_mut(), value(b"val")) {
                     let level = &mut open.level;
+                    let found_number = numeric(b"val").unwrap_or_default();
                     match local.as_slice() {
                         b"numFmt" if level.format.is_none() => level.format = Some(found),
                         b"start" if level.start.is_none() => {
-                            level.start = docx_start_value(&found);
+                            level.start = docx_start_value(&found_number);
                         }
                         b"lvlRestart" if level.restart.is_none() => {
-                            level.restart = found.parse().ok();
+                            level.restart = found_number.parse().ok();
                         }
                         b"pStyle" if level.style.is_none() => level.style = Some(found),
                         _ => {}
@@ -10731,6 +10725,49 @@ mod tests {
         // reads and AnyDoc cannot.
         let padded = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val=" 1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#;
         assert!(differs(padded.to_string(), &level(0, Some("%1.")), ""));
+        // Such a number matters only where a numbered paragraph's labels
+        // read it: a start AnyDoc takes as 1 where Word reads 3, but not a
+        // start of 1 either way, a definition no instance names, or a style
+        // no paragraph uses.
+        let started = |start: &str| {
+            format!(
+                r#"<w:lvl w:ilvl="0"><w:start w:val="{start}"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>"#
+            )
+        };
+        assert!(differs(items.clone(), &started(" 3"), ""));
+        assert!(!differs(items.clone(), &started("1 "), ""));
+        let listed = |numbering: &str, styles: &str| {
+            let document = word_part("document", &items);
+            let numbering = format!("<w:numbering {WORD_NS}>{numbering}</w:numbering>");
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let definition = |id: &str, start: &str| {
+            format!(
+                r#"<w:abstractNum w:abstractNumId="{id}">{}</w:abstractNum>"#,
+                started(start)
+            )
+        };
+        let unused = format!(
+            r#"{}{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+            definition("0", "1"),
+            definition("1", " 1")
+        );
+        assert!(!listed(&unused, ""));
+        let unused_style = r#"<w:style w:type="paragraph" w:styleId="Unused"><w:pPr><w:numPr><w:numId w:val=" 1"/></w:numPr></w:pPr></w:style>"#;
+        assert!(!listed(&unused, unused_style));
+        // A definition id written with white space names the definition for
+        // Word only.
+        let spaced = format!(
+            r#"{}<w:num w:numId="1"><w:abstractNumId w:val=" 0"/></w:num>"#,
+            definition("0", "1")
+        );
+        assert!(listed(&spaced, ""));
     }
 
     #[test]
