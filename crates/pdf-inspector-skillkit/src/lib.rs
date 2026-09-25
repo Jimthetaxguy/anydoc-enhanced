@@ -118,6 +118,9 @@ const MIN_CJK_CHARS: usize = 4;
 /// The running-header check could not read every page again within the
 /// call's time or its page limit, so pages it did not read may lose a line.
 pub const PDF_WARNING_HEADER_FOOTER_UNCHECKED: &str = "header_footer_unchecked";
+/// The checks of what each page paints stopped for the document's size, so
+/// the pages past where they stopped went unchecked.
+pub const PDF_WARNING_PAGES_UNCHECKED: &str = "pages_unchecked";
 /// The notice a viewer without XFA shows, as Adobe's forms word it.
 const XFA_NOTICE: &str = "if this message is not eventually replaced";
 /// Columns of vertical writing side by side read row by row across them, or
@@ -129,7 +132,7 @@ pub const PDF_WARNING_VERTICAL_TEXT_MISREAD: &str = "vertical_text_misread";
 const MIN_VERTICAL_PASSAGE_CHARS: usize = 6;
 /// Characters a text in a hidden layer needs, bare, for the Markdown's
 /// showing it to count.
-const MIN_HIDDEN_CHARS: usize = 6;
+pub(crate) const MIN_HIDDEN_CHARS: usize = 6;
 
 /// Pages the running-header check reads again at a time, and groups into
 /// lines at a time; and how long the call may run, reading them, before
@@ -752,26 +755,46 @@ impl PdfInfo {
     }
 
     /// The pages of `texts`, each a page and texts on it, whose texts of
-    /// `MIN_HIDDEN_CHARS` or more the Markdown shows, among the pages `only`
-    /// names.
-    fn shown_pages(&self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) -> Vec<u32> {
+    /// `MIN_HIDDEN_CHARS` or more the Markdown shows, or whose texts were
+    /// left out for want of room to keep them, among the pages `only` names.
+    fn shown_pages(
+        &self,
+        texts: &[(u32, text_paints::PageTexts)],
+        only: Option<&HashSet<u32>>,
+    ) -> Vec<u32> {
         let pages: Vec<[u32; 1]> = texts.iter().map(|(page, _)| [*page]).collect();
-        let texts: Vec<(&[u32], &str)> = pages
+        let looked_for: Vec<(&[u32], &str)> = pages
             .iter()
             .zip(texts)
             .flat_map(|(page, (_, texts))| {
                 texts
+                    .texts
                     .iter()
                     .filter(|text| repeated_lines::bare(text).chars().count() >= MIN_HIDDEN_CHARS)
                     .map(move |text| (page.as_slice(), text.as_str()))
             })
             .collect();
-        self.showing(&texts, only, true)
+        let mut shown = self.showing(&looked_for, only, true);
+        shown.extend(
+            texts
+                .iter()
+                .filter(|(page, texts)| {
+                    texts.overflowed && only.is_none_or(|only| only.contains(page))
+                })
+                .map(|(page, _)| *page),
+        );
+        shown.sort_unstable();
+        shown.dedup();
+        shown
     }
 
     /// Report the pages whose text painted invisibly, which pdf-inspector
     /// reads as shown (upstream #572), the Markdown shows.
-    fn check_invisible_text(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
+    fn check_invisible_text(
+        &mut self,
+        texts: &[(u32, text_paints::PageTexts)],
+        only: Option<&HashSet<u32>>,
+    ) {
         let pages = self.shown_pages(texts, only);
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
@@ -782,17 +805,21 @@ impl PdfInfo {
         }
     }
 
-    /// Report the pages whose text in a font pdf-inspector reads without its
-    /// collection's map (see `cjk_fonts`) reads otherwise with no sign, and
-    /// mark the document's encoding. Where the fonts' letters and digits are
-    /// long enough to look for, the Markdown must miss some: had it shown
-    /// them all, pdf-inspector read the fonts after all.
+    /// Report the pages whose text in a font pdf-inspector finds no map for
+    /// (see `cjk_fonts`) reads otherwise with no sign, and mark the
+    /// document's encoding. A page stands only where the Markdown shows none
+    /// of that text as pdf-inspector reads it, long enough to look for, and
+    /// shows all of it that can be told as it says it: then pdf-inspector
+    /// read the font after all.
     fn check_cjk_text(
         &mut self,
         pages: &[u32],
-        texts: &[(u32, Vec<String>)],
+        texts: &[(u32, text_paints::CjkTexts)],
         only: Option<&HashSet<u32>>,
     ) {
+        let Some(markdown) = self.markdown.as_deref() else {
+            return;
+        };
         let pages: Vec<u32> = pages
             .iter()
             .copied()
@@ -801,50 +828,83 @@ impl PdfInfo {
         if pages.is_empty() {
             return;
         }
-        let numbers: Vec<[u32; 1]> = texts.iter().map(|(page, _)| [*page]).collect();
-        let readings: Vec<(&[u32], &str)> = numbers
+        let looked_for = |texts: &[String]| -> Vec<String> {
+            texts
+                .iter()
+                .map(|text| repeated_lines::bare(text))
+                .filter(|text| text.chars().count() >= MIN_CJK_CHARS)
+                .collect()
+        };
+        let by_page: HashMap<u32, (Vec<String>, Vec<String>)> = texts
             .iter()
-            .zip(texts)
-            .flat_map(|(page, (_, texts))| {
-                texts
-                    .iter()
-                    .filter(|text| repeated_lines::bare(text).chars().count() >= MIN_CJK_CHARS)
-                    .map(move |text| (page.as_slice(), text.as_str()))
+            .filter(|(page, _)| pages.contains(page))
+            .map(|(page, texts)| (*page, (looked_for(&texts.read_as), looked_for(&texts.says))))
+            .collect();
+        let mut patterns: Vec<&str> = by_page
+            .values()
+            .flat_map(|(read_as, says)| read_as.iter().chain(says))
+            .map(String::as_str)
+            .collect();
+        patterns.sort_unstable();
+        patterns.dedup();
+        let found = repeated_lines::found_in(&patterns, markdown);
+        let reported: Vec<u32> = pages
+            .into_iter()
+            .filter(|page| {
+                // A page whose text was left out cannot be told read right.
+                let Some((read_as, says)) = by_page.get(page) else {
+                    return true;
+                };
+                read_as.iter().any(|text| found.contains(text.as_str()))
+                    || (read_as.is_empty() && says.is_empty())
+                    || !says.iter().all(|text| found.contains(text.as_str()))
             })
             .collect();
-        if !readings.is_empty() && self.unshown(&readings, only).is_empty() {
+        if reported.is_empty() {
             return;
         }
         self.has_encoding_issues = true;
         self.warnings.push(PdfWarning::new(
             PDF_WARNING_CJK_TEXT_MISREAD,
-            "On these pages text set in a Japanese or Chinese font that carries no map of its characters reads as other letters, and its digits and punctuation drop out, with no sign: pdf-inspector 1.24.0 cannot parse the Adobe Japan1, GB1, and CNS1 maps such a font is read through (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
-            pages,
+            "On these pages text set in a Japanese, Chinese, or Korean font that carries no map of its characters reads as other characters, and its digits and punctuation may drop out, with no sign: pdf-inspector 1.24.0 finds no map for such a font where it cannot parse the Adobe Japan1, GB1, or CNS1 map or looks for none (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
+            reported,
         ));
     }
 
-    /// Report the pages whose neighbouring columns of vertical writing (see
-    /// `vertical_text`) the Markdown does not show each whole and, where both
-    /// hold a passage's lines, in order, the right column's text and then the
-    /// left one's; or whose text cannot be read to tell.
+    /// Report the pages whose columns of vertical writing (see
+    /// `vertical_text`) the Markdown does not show as they read: each whole,
+    /// and, for neighbouring columns standing as a passage's do, the right
+    /// column's text and then the left one's; or whose text cannot be read to
+    /// tell.
     fn check_vertical_text(
         &mut self,
-        pairs: &[(u32, Vec<vertical_text::ColumnPair>)],
+        readings: &[(u32, Vec<vertical_text::Reading>)],
         only: Option<&HashSet<u32>>,
     ) {
-        let numbers: Vec<[u32; 1]> = pairs.iter().map(|(page, _)| [*page]).collect();
+        let numbers: Vec<[u32; 1]> = readings.iter().map(|(page, _)| [*page]).collect();
+        let long = |text: &str, least: usize| text.chars().count() >= least;
         let read: Vec<(&[u32], String)> = numbers
             .iter()
-            .zip(pairs)
-            .flat_map(|(page, (_, pairs))| {
-                pairs.iter().flatten().flat_map(move |(right, left)| {
-                    let passage = [right, left]
-                        .iter()
-                        .all(|column| column.chars().count() >= MIN_VERTICAL_PASSAGE_CHARS);
-                    [right.clone(), left.clone()]
-                        .into_iter()
-                        .chain(passage.then(|| format!("{right}{left}")))
-                        .map(move |text| (page.as_slice(), text))
+            .zip(readings)
+            .flat_map(|(page, (_, readings))| {
+                readings.iter().flat_map(move |reading| {
+                    let texts = match reading {
+                        vertical_text::Reading::Alone(text) => {
+                            { long(text, MIN_CJK_CHARS).then(|| text.clone()) }
+                                .into_iter()
+                                .collect()
+                        }
+                        vertical_text::Reading::Pair(Some((right, left)), passage) => {
+                            let both = format!("{right}{left}");
+                            let order = *passage && long(&both, MIN_VERTICAL_PASSAGE_CHARS);
+                            [right.clone(), left.clone()]
+                                .into_iter()
+                                .chain(order.then_some(both))
+                                .collect()
+                        }
+                        vertical_text::Reading::Pair(None, _) => Vec::new(),
+                    };
+                    texts.into_iter().map(move |text| (page.as_slice(), text))
                 })
             })
             .collect();
@@ -854,10 +914,13 @@ impl PdfInfo {
             .collect();
         let mut pages = self.unshown(&texts, only);
         pages.extend(
-            pairs
+            readings
                 .iter()
-                .filter(|(page, pairs)| {
-                    pairs.iter().any(Option::is_none) && only.is_none_or(|only| only.contains(page))
+                .filter(|(page, readings)| {
+                    readings
+                        .iter()
+                        .any(|reading| matches!(reading, vertical_text::Reading::Pair(None, _)))
+                        && only.is_none_or(|only| only.contains(page))
                 })
                 .map(|(page, _)| *page),
         );
@@ -866,7 +929,7 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_VERTICAL_TEXT_MISREAD,
-                "On these pages text set in vertical writing, in columns side by side, reads row by row across the columns or with the columns out of order: pdf-inspector 1.24.0 lays vertical text out as if it were horizontal (upstream #575), so a Japanese or Chinese passage set in columns reads scrambled; read these pages another way, such as by OCR.",
+                "On these pages text set in vertical writing reads row by row across its columns, with its columns out of order, or run through by the lines of horizontal text beside it: pdf-inspector 1.24.0 lays vertical text out as if it were horizontal (upstream #575), so a Japanese or Chinese passage set in columns reads scrambled; read these pages another way, such as by OCR.",
                 pages,
             ));
         }
@@ -874,7 +937,11 @@ impl PdfInfo {
 
     /// Report the pages whose text in layers a reader hides (see
     /// `optional_content`) the Markdown shows: pdf-inspector read it.
-    fn check_hidden_layers(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
+    fn check_hidden_layers(
+        &mut self,
+        texts: &[(u32, text_paints::PageTexts)],
+        only: Option<&HashSet<u32>>,
+    ) {
         let pages = self.shown_pages(texts, only);
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
@@ -997,8 +1064,21 @@ impl PdfInfo {
         self.check_invisible_text(&invisible, only);
         let cjk = std::mem::take(&mut found.cjk_texts);
         self.check_cjk_text(&found.cjk_pages, &cjk, only);
-        let vertical = std::mem::take(&mut found.vertical_pairs);
+        let vertical = std::mem::take(&mut found.vertical_readings);
         self.check_vertical_text(&vertical, only);
+        if let Some(from) = found.unchecked_from {
+            let ocr: HashSet<u32> = self.pages_needing_ocr.iter().copied().collect();
+            let pages: Vec<u32> = (from..=self.page_count)
+                .filter(|page| only.is_none_or(|only| only.contains(page)) && !ocr.contains(page))
+                .collect();
+            if !pages.is_empty() {
+                self.warnings.push(PdfWarning::new(
+                    PDF_WARNING_PAGES_UNCHECKED,
+                    "The checks of what a page paints stopped before these pages, as the document's content ran past the bounds they read within: text painted twice or invisibly, word gaps, and Japanese or Chinese text pdf-inspector 1.24.0 misreads are not reported on them; read them another way where they matter.",
+                    pages,
+                ));
+            }
+        }
         if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
@@ -1447,12 +1527,12 @@ mod tests {
         // A passage's vertical columns the Markdown shows in order, the right
         // one first, stand; shown left to right, or where their text cannot
         // be read, they are reported.
+        let pair = |right: &str, left: &str, passage: bool| {
+            vertical_text::Reading::Pair(Some((right.to_owned(), left.to_owned())), passage)
+        };
         let passage = [(
             1,
-            vec![Some((
-                "源泉徴収票の支払金額".to_owned(),
-                "住民税は別に通知".to_owned(),
-            ))],
+            vec![pair("源泉徴収票の支払金額", "住民税は別に通知", true)],
         )];
         let mut info = read("源泉徴収票の支払金額\n\n住民税は別に通知\n");
         info.check_vertical_text(&passage, None);
@@ -1461,9 +1541,17 @@ mod tests {
         info.check_vertical_text(&passage, None);
         let vertical = PDF_WARNING_VERTICAL_TEXT_MISREAD.to_owned();
         assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
-        // A form's labels standing in cells side by side read across, left
-        // to right; read row by row across them, they are reported.
-        let labels = [(1, vec![Some(("種別".to_owned(), "金額".to_owned()))])];
+        // A passage's short last column, read before the long one.
+        let short = [(
+            1,
+            vec![pair("源泉徴収票の支払金額は五百万円", "です", true)],
+        )];
+        let mut info = read("です源泉徴収票の支払金額は五百万円\n");
+        info.check_vertical_text(&short, None);
+        assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
+        // A form's labels standing in cells apart read across, left to
+        // right; read row by row across them, they are reported.
+        let labels = [(1, vec![pair("種別", "金額", false)])];
         let mut info = read("| 金額 | 種別 |\n");
         info.check_vertical_text(&labels, None);
         assert!(info.warnings.is_empty());
@@ -1471,21 +1559,51 @@ mod tests {
         info.check_vertical_text(&labels, None);
         assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
         let mut info = read("源泉徴収票の支払金額\n\n住民税は別に通知\n");
-        info.check_vertical_text(&[(2, vec![None])], None);
-        assert_eq!(reported(&info), [(vertical, vec![2])]);
-        // Text in a font read without its collection's map that the
-        // Markdown shows as the font says it was read after all.
-        let texts = [(1, vec!["Total wages 52,000.00".to_owned()])];
+        info.check_vertical_text(&[(2, vec![vertical_text::Reading::Pair(None, true)])], None);
+        assert_eq!(reported(&info), [(vertical.clone(), vec![2])]);
+        // A column alone, read whole, stands; run through by the lines
+        // beside it, it is reported.
+        let alone = [(
+            1,
+            vec![vertical_text::Reading::Alone(
+                "源泉徴収票の支払金額".to_owned(),
+            )],
+        )];
+        let mut info = read("源泉徴収票の支払金額\n\nInstruction 0\n");
+        info.check_vertical_text(&alone, None);
+        assert!(info.warnings.is_empty());
+        let mut info = read("源 Instruction 0\n泉 Instruction 1\n徴収票の支払金額\n");
+        info.check_vertical_text(&alone, None);
+        assert_eq!(reported(&info), [(vertical, vec![1])]);
+        // Text in a font pdf-inspector finds no map for, which the Markdown
+        // shows as it says it and not as pdf-inspector reads it: read after
+        // all.
+        let texts = [(
+            1,
+            text_paints::CjkTexts {
+                says: vec!["Total wages 52,000.00".to_owned()],
+                read_as: vec!["5PUBMXBHFT".to_owned()],
+            },
+        )];
+        let cjk = || [(PDF_WARNING_CJK_TEXT_MISREAD.to_owned(), vec![1])];
         let mut info = read("Total wages 52,000.00\n");
         info.check_cjk_text(&[1], &texts, None);
         assert!(info.warnings.is_empty() && !info.has_encoding_issues);
-        let mut info = read("5PUBMXBHFT\n");
-        info.check_cjk_text(&[1], &texts, None);
-        assert_eq!(
-            reported(&info),
-            [(PDF_WARNING_CJK_TEXT_MISREAD.to_owned(), vec![1])]
-        );
-        assert!(info.has_encoding_issues);
+        // Shown as pdf-inspector reads it, though the same words stand
+        // elsewhere, it is reported.
+        for markdown in ["5PUBMXBHFT\n", "Total wages 52,000.00\n\n5PUBMXBHFT\n"] {
+            let mut info = read(markdown);
+            info.check_cjk_text(&[1], &texts, None);
+            assert_eq!(reported(&info), cjk(), "{markdown}");
+            assert!(info.has_encoding_issues);
+        }
+        // With nothing to tell by, or its text left out, it is reported.
+        let mut info = read("Total wages\n");
+        info.check_cjk_text(&[1], &[(1, text_paints::CjkTexts::default())], None);
+        assert_eq!(reported(&info), cjk());
+        let mut info = read("Total wages\n");
+        info.check_cjk_text(&[1], &[], None);
+        assert_eq!(reported(&info), cjk());
     }
 
     #[test]

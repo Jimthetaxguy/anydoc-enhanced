@@ -1,24 +1,79 @@
-//! Composite fonts whose text pdf-inspector 1.24.0 reads without their
-//! character collection's map (upstream issue #573).
+//! Composite fonts of Adobe's Japanese, Chinese, and Korean collections
+//! whose text pdf-inspector 1.24.0 reads with no map (upstream issue #573).
 //!
-//! A font keyed by CID in one of Adobe's character collections, shown under
-//! `Identity-H` or `Identity-V` with no `/ToUnicode` map and no embedded
-//! program to read a map from, is read through its collection's map.
-//! pdf-inspector bundles those maps, but cannot parse the Japanese and
-//! Chinese ones (the Korean one it keeps as a table of its own), and then
-//! reads the codes as the bytes they are made of. A string with a byte past
-//! 0x7F reads as U+FFFD, which marks the page garbled; any other reads as
-//! other letters, "Total" as "5PUBM", with its digits and punctuation
-//! dropped as control codes, and nothing marks it.
+//! A composite font with no `/ToUnicode` map, under `Identity-H` or
+//! `Identity-V`, is read by the map of its embedded TrueType or OpenType
+//! program, else by its collection's map. pdf-inspector bundles those maps
+//! but cannot parse the Japanese and Chinese ones (it keeps the Korean one
+//! as a table of its own), and never looks for one where the font names a
+//! `/ToUnicode` that is no map, gives its encoding other than as a name in
+//! place, or sets its descendant in place with no program. With no map, it
+//! reads a string with a byte past 0x7F as U+FFFD, which marks the page
+//! garbled, and any other as its bytes: "Total" as "5PUBM", with its digits
+//! and punctuation dropped as control codes, and nothing marks it. Where
+//! the font's widths are given mostly past code 0x41, it takes the codes
+//! for Unicode, as Chromium's fonts' are, and reads every one as the
+//! character of its value: "一壱溢" as "ҰұҲ". A font under a predefined
+//! `Uni*-UCS2` CMap with no `/ToUnicode` map is read the same way, but
+//! Chinese under `UniGB-UCS2-H`, which lopdf reads as UTF-16.
 
-use lopdf::{Dictionary, Document, Object};
+use std::collections::{HashMap, HashSet};
 
-/// The collections whose maps pdf-inspector 1.24.0 cannot parse.
-const UNREAD_COLLECTIONS: [&[u8]; 3] = [b"Japan1", b"GB1", b"CNS1"];
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use pdf_inspector::tounicode::{build_cmap_from_truetype, ToUnicodeCMap};
+
+/// Adobe's collections for Japanese, Simplified and Traditional Chinese,
+/// and Korean.
+const COLLECTIONS: [&[u8]; 4] = [b"Japan1", b"GB1", b"CNS1", b"Korea1"];
+/// The one pdf-inspector keeps a table of its own for.
+const TABLED_COLLECTION: &[u8] = b"Korea1";
 
 /// The CIDs every Adobe collection gives the printable ASCII characters:
 /// CID 1 is the space, and each CID after it the next character.
 const ASCII_CIDS: std::ops::RangeInclusive<u16> = 1..=95;
+
+/// Bytes of maps and font programs read per document to tell whether
+/// pdf-inspector finds a map; past them, a font is taken to have one.
+const MAX_READ_BYTES: usize = 64 << 20;
+/// Bytes one map or program may decode to; one larger is taken to hold a
+/// map.
+const MAX_STREAM_BYTES: usize = 16 << 20;
+/// Distinct CIDs of a font's widths pdf-inspector reads, at most.
+const MAX_WIDTH_CIDS: usize = 65_536;
+
+/// A font pdf-inspector 1.24.0 reads with no map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unmapped {
+    /// Whether it takes the codes for Unicode, and reads each one as the
+    /// character of its value; else a string with a byte past 0x7F reads
+    /// as U+FFFD, and any other as its bytes.
+    pub(crate) passthrough: bool,
+    /// Whether the codes are UCS-2, under a predefined `Uni*-UCS2` CMap,
+    /// not the collection's CIDs.
+    pub(crate) ucs2: bool,
+}
+
+/// Fonts judged so far, by the address of their dictionary, and the bytes
+/// read to judge them.
+#[derive(Default)]
+pub(crate) struct CjkFonts {
+    known: HashMap<usize, Option<Unmapped>>,
+    read: usize,
+}
+
+impl CjkFonts {
+    /// How pdf-inspector reads `font`, when it is a font of Adobe's
+    /// Japanese, Chinese, or Korean collections it finds no map for.
+    pub(crate) fn font(&mut self, document: &Document, font: &Dictionary) -> Option<Unmapped> {
+        let key = std::ptr::from_ref(font) as usize;
+        if let Some(known) = self.known.get(&key) {
+            return *known;
+        }
+        let found = unmapped(document, font, &mut self.read);
+        self.known.insert(key, found);
+        found
+    }
+}
 
 fn resolved<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
     match object {
@@ -31,77 +86,332 @@ fn dictionary<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Dict
     resolved(document, object)?.as_dict().ok()
 }
 
-/// Whether pdf-inspector 1.24.0 reads `font`'s codes without its
-/// collection's map: a composite font under `Identity-H` or `Identity-V`
-/// with no `/ToUnicode` map, whose descendant is in a collection whose map
-/// it cannot parse, and which embeds no TrueType or OpenType program, whose
-/// own map pdf-inspector would read instead.
-pub(crate) fn unmapped(document: &Document, font: &Dictionary) -> bool {
-    let named = |key: &[u8], names: &[&[u8]]| {
-        font.get(key)
-            .and_then(Object::as_name)
-            .is_ok_and(|name| names.contains(&name))
-    };
-    if !named(b"Subtype", &[b"Type0"])
-        || font.has(b"ToUnicode")
-        || !named(b"Encoding", &[b"Identity-H", b"Identity-V"])
-    {
-        return false;
+/// A stream's content as pdf-inspector reads it, decoded where it can be,
+/// counted against `read`; None past `MAX_READ_BYTES` in all, or where it
+/// decodes past `MAX_STREAM_BYTES`.
+fn content(stream: &Stream, read: &mut usize) -> Option<Vec<u8>> {
+    if *read >= MAX_READ_BYTES {
+        return None;
     }
-    let Some(descendant) = font
+    let data = match stream.decompressed_content_with_limit(MAX_STREAM_BYTES) {
+        Ok(data) if !data.is_empty() => data,
+        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => {
+            return None;
+        }
+        _ => stream.content.clone(),
+    };
+    *read += data.len();
+    Some(data)
+}
+
+/// Whether a map holds any entry.
+fn holds(cmap: &ToUnicodeCMap) -> bool {
+    !cmap.char_map.is_empty() || !cmap.ranges.is_empty()
+}
+
+/// Whether the program `file` gives pdf-inspector a map, as a TrueType or
+/// OpenType program with a `cmap` table does; None where it was not read.
+fn program_maps(document: &Document, file: ObjectId, read: &mut usize) -> Option<bool> {
+    let Some(stream) = document
+        .get_object(file)
+        .ok()
+        .and_then(|file| file.as_stream().ok())
+    else {
+        return Some(false);
+    };
+    let data = content(stream, read)?;
+    Some(build_cmap_from_truetype(&data).is_some_and(|cmap| holds(&cmap)))
+}
+
+/// The program a descendant font embeds, as pdf-inspector finds it: the
+/// first of `/FontFile2` and `/FontFile3` given by reference.
+fn program(document: &Document, descendant: &Dictionary) -> Option<ObjectId> {
+    let descriptor = dictionary(document, descendant.get(b"FontDescriptor").ok()?)?;
+    [&b"FontFile2"[..], b"FontFile3"]
+        .into_iter()
+        .find_map(|key| {
+            descriptor
+                .get(key)
+                .ok()
+                .and_then(|file| file.as_reference().ok())
+        })
+}
+
+/// Whether the widths a descendant font gives, in place, are for codes
+/// whose median is 0x41 or past it, which pdf-inspector takes for Unicode.
+fn widths_look_like_unicode(descendant: &Dictionary) -> bool {
+    let Ok(Object::Array(entries)) = descendant.get(b"W") else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    let mut index = 0;
+    while index < entries.len() && seen.len() < MAX_WIDTH_CIDS {
+        let Ok(first) = entries[index].as_i64() else {
+            index += 1;
+            continue;
+        };
+        let start = first as u16;
+        match entries.get(index + 1) {
+            Some(Object::Array(widths)) => {
+                for offset in 0..widths.len() {
+                    if seen.len() >= MAX_WIDTH_CIDS {
+                        break;
+                    }
+                    seen.insert(start.wrapping_add(offset as u16));
+                }
+                index += 2;
+            }
+            Some(last) if index + 2 < entries.len() => {
+                if let Ok(last) = last.as_i64() {
+                    let last = last as u16;
+                    if start <= last {
+                        for cid in start..=last {
+                            if seen.len() >= MAX_WIDTH_CIDS {
+                                break;
+                            }
+                            seen.insert(cid);
+                        }
+                    }
+                }
+                index += 3;
+            }
+            Some(_) => index += 1,
+            None => {
+                seen.insert(start);
+                index += 1;
+            }
+        }
+    }
+    let mut cids: Vec<u16> = seen.into_iter().collect();
+    cids.sort_unstable();
+    cids.get(cids.len() / 2)
+        .is_some_and(|median| *median >= 0x41)
+}
+
+/// Whether `encoding` names one of Adobe's predefined CMaps whose codes are
+/// UCS-2, two bytes each, such as `UniJIS-UCS2-H` or `UniGB-UCS2-V`.
+pub(crate) fn ucs2_cmap(encoding: &[u8]) -> bool {
+    encoding.starts_with(b"Uni")
+        && encoding.windows(6).any(|part| part == b"-UCS2-")
+        && (encoding.ends_with(b"-H") || encoding.ends_with(b"-V"))
+}
+
+/// How pdf-inspector 1.24.0 reads `font`, when it is a composite font of
+/// Adobe's Japanese, Chinese, or Korean collections that it finds no map
+/// for, as it looks for one: a `/ToUnicode` stream it parses; one it cannot
+/// parse, under an Identity CMap, the descendant's program or the Korean
+/// table; with no `/ToUnicode` at all, under an Identity CMap named in
+/// place, the same, keyed by the program or by a descendant given by
+/// reference, and last its widths, taken for Unicode.
+fn unmapped(document: &Document, font: &Dictionary, read: &mut usize) -> Option<Unmapped> {
+    fn name(object: &Object) -> Option<&[u8]> {
+        object.as_name().ok()
+    }
+    if font.get(b"Subtype").ok().and_then(name) != Some(b"Type0".as_slice()) {
+        return None;
+    }
+    let first = font
         .get(b"DescendantFonts")
         .ok()
         .and_then(|fonts| resolved(document, fonts))
         .and_then(|fonts| fonts.as_array().ok())
-        .and_then(|fonts| fonts.first())
-        .and_then(|first| dictionary(document, first))
-    else {
-        return false;
-    };
-    let unread = descendant
+        .and_then(|fonts| fonts.first())?;
+    let by_reference = matches!(first, Object::Reference(_));
+    let descendant = dictionary(document, first)?;
+    let ordering = descendant
         .get(b"CIDSystemInfo")
         .ok()
         .and_then(|info| dictionary(document, info))
-        .and_then(|info| info.get(b"Ordering").ok())
-        .is_some_and(|ordering| match ordering {
-            Object::String(ordering, _) => UNREAD_COLLECTIONS.contains(&ordering.as_slice()),
-            _ => false,
-        });
-    let program = descendant
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|descriptor| dictionary(document, descriptor))
-        .is_some_and(|descriptor| {
-            descriptor.has(b"FontFile2")
-                || descriptor
-                    .get(b"FontFile3")
-                    .ok()
-                    .and_then(|file| resolved(document, file))
-                    .and_then(|file| file.as_stream().ok())
-                    .is_some_and(|file| {
-                        file.dict
-                            .get(b"Subtype")
-                            .and_then(Object::as_name)
-                            .is_ok_and(|subtype| subtype == b"OpenType")
-                    })
-        });
-    unread && !program
+        .and_then(|info| info.get(b"Ordering").ok())?;
+    // pdf-inspector reads its collection from an ordering given in place.
+    let (ordering, in_place) = match ordering {
+        Object::String(ordering, _) => (ordering.as_slice(), true),
+        Object::Reference(id) => match document.get_object(*id) {
+            Ok(Object::String(ordering, _)) => (ordering.as_slice(), false),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !COLLECTIONS.contains(&ordering) {
+        return None;
+    }
+    let tabled = in_place && ordering == TABLED_COLLECTION;
+    let encoding = font.get(b"Encoding").ok();
+    let named = encoding.and_then(name);
+    let ucs2 = named.is_some_and(ucs2_cmap);
+    // lopdf reads Chinese under this one as UTF-16.
+    if matches!(named, Some(b"UniGB-UCS2-H")) {
+        return None;
+    }
+    let bytes = Some(Unmapped {
+        passthrough: false,
+        ucs2,
+    });
+    let identity = |encoding: Option<&Object>| {
+        matches!(encoding.and_then(name), Some(b"Identity-H" | b"Identity-V"))
+    };
+    match font.get(b"ToUnicode") {
+        Ok(Object::Reference(id)) => {
+            let Some(stream) = document
+                .get_object(*id)
+                .ok()
+                .and_then(|map| map.as_stream().ok())
+            else {
+                return bytes;
+            };
+            if ToUnicodeCMap::parse(&content(stream, read)?).is_some_and(|cmap| holds(&cmap)) {
+                return None;
+            }
+            // A map it cannot parse, or that is empty, leaves it the
+            // program's or the table, under an Identity CMap named in place
+            // or by reference.
+            if !identity(encoding.and_then(|encoding| resolved(document, encoding))) {
+                return bytes;
+            }
+            if let Some(file) = program(document, descendant) {
+                if program_maps(document, file, read)? {
+                    return None;
+                }
+            }
+            return if tabled { None } else { bytes };
+        }
+        // A `/ToUnicode` that is no stream gives no map, and keeps it from
+        // looking for one.
+        Ok(_) => return bytes,
+        Err(_) => {}
+    }
+    match encoding {
+        Some(Object::Name(_)) if identity(encoding) => {}
+        Some(Object::Name(_)) if ucs2 => return bytes,
+        // Another predefined CMap.
+        Some(Object::Name(_)) => return None,
+        // An encoding given by reference or as a stream of its own.
+        _ => return bytes,
+    }
+    let file = program(document, descendant);
+    if file.is_none() && !by_reference {
+        return bytes;
+    }
+    if let Some(file) = file {
+        if program_maps(document, file, read)? {
+            return None;
+        }
+    }
+    if tabled {
+        return None;
+    }
+    Some(Unmapped {
+        passthrough: widths_look_like_unicode(descendant),
+        ucs2,
+    })
 }
 
-/// What a string shown in such a font says where pdf-inspector reads it
-/// with no sign, none of its bytes past 0x7F: its codes the collection
-/// gives letters, digits, or the marks amounts and dates are written with,
-/// and a space for any other code. None for a string with a byte past 0x7F
-/// or an odd byte.
-pub(crate) fn silent_reading(bytes: &[u8]) -> Option<String> {
-    if !bytes.len().is_multiple_of(2) || bytes.iter().any(|&byte| byte > 0x7F) {
+/// The codes of a string, two bytes each; None for an odd byte.
+fn codes(bytes: &[u8]) -> Option<Vec<u16>> {
+    bytes.len().is_multiple_of(2).then(|| {
+        bytes
+            .chunks_exact(2)
+            .map(|code| u16::from_be_bytes([code[0], code[1]]))
+            .collect()
+    })
+}
+
+/// The characters of `codes` taken for UTF-16, but for control codes.
+fn as_utf16(codes: &[u16]) -> String {
+    char::decode_utf16(codes.iter().copied())
+        .filter_map(Result::ok)
+        .filter(|character| !character.is_control())
+        .collect()
+}
+
+/// How pdf-inspector scores a reading of a string, to keep the UTF-16 one.
+fn score(text: &str) -> i32 {
+    const COMMON_WORDS: [&str; 22] = [
+        "the", "and", "of", "to", "in", "a", "is", "that", "for", "with", "on", "as", "by", "from",
+        "this", "be", "are", "at", "or", "not", "it", "our",
+    ];
+    let (mut letters, mut spaces, mut digits, mut other, mut words) = (0, 0, 0, 0, 0);
+    let mut word = String::new();
+    let end_word = |word: &mut String, words: &mut i32| {
+        if !word.is_empty() && COMMON_WORDS.contains(&word.as_str()) {
+            *words += 1;
+        }
+        word.clear();
+    };
+    for character in text.chars() {
+        if character.is_ascii_alphabetic() {
+            letters += 1;
+            word.push(character.to_ascii_lowercase());
+            continue;
+        }
+        end_word(&mut word, &mut words);
+        if character == ' ' {
+            spaces += 1;
+        } else if character.is_ascii_digit() {
+            digits += 1;
+        } else if character.is_control() || character == '\u{FFFD}' {
+            other += 3;
+        } else if matches!(character, '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
+        {
+            letters += 1;
+        } else {
+            other += 1;
+        }
+    }
+    end_word(&mut word, &mut words);
+    let mut score = words * 10 + letters + spaces * 2 + digits - other * 2;
+    if letters > 15 && words == 0 {
+        score -= 15;
+    }
+    score
+}
+
+/// What pdf-inspector reads a string shown in `font` as, but for the
+/// control codes it drops, where it reads it with no sign: none for a string
+/// with an odd byte, or, in a font whose codes it does not take for
+/// Unicode, one with a byte past 0x7F, which it marks with U+FFFD. A string
+/// of null-heavy codes it reads as UTF-16 where that scores as text; any
+/// other byte by byte, under the standard encoding, or, for UCS-2, as
+/// Latin-1.
+pub(crate) fn read_as(font: Unmapped, bytes: &[u8]) -> Option<String> {
+    let codes = codes(bytes)?;
+    if font.passthrough {
+        return Some(as_utf16(&codes));
+    }
+    if bytes.iter().any(|&byte| byte > 0x7F) {
         return None;
+    }
+    let utf16 = as_utf16(&codes);
+    let nulls = bytes.iter().filter(|&&byte| byte == 0).count();
+    if bytes.len() >= 4 && nulls * 4 > bytes.len() && score(&utf16) > 0 {
+        return Some(utf16);
     }
     Some(
         bytes
-            .chunks_exact(2)
-            .map(|code| {
-                let cid = u16::from_be_bytes([code[0], code[1]]);
+            .iter()
+            .filter(|&&byte| byte >= 0x20)
+            .map(|&byte| match byte {
+                0x27 if !font.ucs2 => '\u{2019}',
+                0x60 if !font.ucs2 => '\u{2018}',
+                byte => char::from(byte),
+            })
+            .collect(),
+    )
+}
+
+/// What a string shown in `font` says, as far as can be told: under a
+/// UCS-2 CMap, its codes as UTF-16; in a collection, its codes the
+/// collection gives letters, digits, or the marks amounts and dates are
+/// written with, and a space for any other code. None for an odd byte.
+pub(crate) fn says(font: Unmapped, bytes: &[u8]) -> Option<String> {
+    let codes = codes(bytes)?;
+    if font.ucs2 {
+        return Some(as_utf16(&codes));
+    }
+    Some(
+        codes
+            .iter()
+            .map(|&cid| {
                 ASCII_CIDS
                     .contains(&cid)
                     .then(|| char::from(cid as u8 + 0x1F))
@@ -114,30 +424,45 @@ pub(crate) fn silent_reading(bytes: &[u8]) -> Option<String> {
     )
 }
 
+/// Whether pdf-inspector reads a string shown in `font` otherwise than it
+/// says with no sign: taking its codes for Unicode, a code past the space;
+/// else a string with no byte past 0x7F, which in a collection it reads
+/// otherwise wherever a code is past the space, and under UCS-2 wherever
+/// it does not read it as UTF-16.
+pub(crate) fn misread(font: Unmapped, bytes: &[u8]) -> bool {
+    let Some(codes) = codes(bytes) else {
+        return false;
+    };
+    if font.passthrough {
+        return codes.iter().any(|&code| code > 1);
+    }
+    if bytes.iter().any(|&byte| byte > 0x7F) {
+        return false;
+    }
+    if font.ucs2 {
+        return read_as(font, bytes) != Some(as_utf16(&codes));
+    }
+    codes.iter().any(|&code| code > 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lopdf::{dictionary, Stream};
 
-    fn document_with(font: impl FnOnce(&mut Document) -> Dictionary) -> (Document, Dictionary) {
-        let mut document = Document::with_version("1.7");
-        let font = font(&mut document);
-        (document, font)
-    }
-
-    /// A descendant font in `ordering`, embedding `program` under its key,
-    /// if any.
+    /// A descendant font in `ordering`, given by reference, embedding
+    /// `program` under its key, if any.
     fn cid_font(
         document: &mut Document,
         ordering: &str,
-        program: Option<(&str, Dictionary)>,
+        program: Option<(&str, Vec<u8>)>,
     ) -> Object {
         let mut descriptor = dictionary! {
             "Type" => "FontDescriptor",
             "FontName" => "KozMinPr6N-Regular",
         };
-        if let Some((key, dictionary)) = program {
-            let program = document.add_object(Stream::new(dictionary, Vec::new()));
+        if let Some((key, content)) = program {
+            let program = document.add_object(Stream::new(dictionary! {}, content));
             descriptor.set(key, program);
         }
         let descriptor = document.add_object(descriptor);
@@ -155,82 +480,210 @@ mod tests {
         Object::Array(vec![Object::Reference(descendant)])
     }
 
-    fn type0(descendants: Object, encoding: &str) -> Dictionary {
+    fn type0(descendants: Object, encoding: Object) -> Dictionary {
         dictionary! {
             "Type" => "Font",
             "Subtype" => "Type0",
             "BaseFont" => "KozMinPr6N-Regular",
-            "Encoding" => Object::Name(encoding.as_bytes().to_vec()),
+            "Encoding" => encoding,
             "DescendantFonts" => descendants,
         }
     }
 
+    fn judged(build: impl FnOnce(&mut Document) -> Dictionary) -> Option<Unmapped> {
+        let mut document = Document::with_version("1.7");
+        let font = build(&mut document);
+        CjkFonts::default().font(&document, &font)
+    }
+
+    const BYTES: Option<Unmapped> = Some(Unmapped {
+        passthrough: false,
+        ucs2: false,
+    });
+
     #[test]
-    fn fonts_of_the_japanese_and_chinese_collections_without_a_map_are_unmapped() {
+    fn fonts_pdf_inspector_finds_no_map_for_are_unmapped() {
         for ordering in ["Japan1", "GB1", "CNS1"] {
             for encoding in ["Identity-H", "Identity-V"] {
-                let (document, font) =
-                    document_with(|document| type0(cid_font(document, ordering, None), encoding));
-                assert!(unmapped(&document, &font), "{ordering} {encoding}");
+                let font = judged(|document| {
+                    type0(
+                        cid_font(document, ordering, None),
+                        Object::Name(encoding.into()),
+                    )
+                });
+                assert_eq!(font, BYTES, "{ordering} {encoding}");
             }
         }
-        // A bare CFF program has no map of its own.
-        let (document, font) = document_with(|document| {
-            let program = ("FontFile3", dictionary! { "Subtype" => "CIDFontType0C" });
-            type0(cid_font(document, "Japan1", Some(program)), "Identity-H")
+        // A bare CFF program, or junk, has no map of its own.
+        let font = judged(|document| {
+            let program = ("FontFile3", b"\x01\x00\x04\x02 not an sfnt".to_vec());
+            type0(
+                cid_font(document, "Japan1", Some(program)),
+                "Identity-H".into(),
+            )
         });
-        assert!(unmapped(&document, &font));
+        assert_eq!(font, BYTES);
+        // An encoding given by reference, and a ToUnicode that is no map.
+        let font = judged(|document| {
+            let encoding = document.add_object(Object::Name(b"Identity-H".to_vec()));
+            type0(cid_font(document, "Japan1", None), encoding.into())
+        });
+        assert_eq!(font, BYTES);
+        for map in [Object::Name(b"Identity-H".to_vec()), Object::Null] {
+            let font = judged(|document| {
+                let mut font = type0(cid_font(document, "Korea1", None), "Identity-H".into());
+                font.set("ToUnicode", map);
+                font
+            });
+            assert_eq!(font, BYTES);
+        }
+        // An empty ToUnicode stream.
+        let font = judged(|document| {
+            let map = document.add_object(Stream::new(dictionary! {}, Vec::new()));
+            let mut font = type0(cid_font(document, "GB1", None), "Identity-H".into());
+            font.set("ToUnicode", map);
+            font
+        });
+        assert_eq!(font, BYTES);
+        // UCS-2 codes with no map.
+        let font =
+            judged(|document| type0(cid_font(document, "Japan1", None), "UniJIS-UCS2-H".into()));
+        assert_eq!(
+            font,
+            Some(Unmapped {
+                passthrough: false,
+                ucs2: true
+            })
+        );
+        // Widths given mostly past 0x41 take the codes for Unicode.
+        let font = judged(|document| {
+            let descendants = cid_font(document, "Japan1", None);
+            let Object::Array(descendants) = &descendants else {
+                unreachable!()
+            };
+            let id = descendants[0].as_reference().unwrap();
+            let descendant = document.get_object_mut(id).unwrap().as_dict_mut().unwrap();
+            descendant.set(
+                "W",
+                vec![
+                    1.into(),
+                    95.into(),
+                    500.into(),
+                    231.into(),
+                    632.into(),
+                    500.into(),
+                ],
+            );
+            type0(Object::Array(descendants.clone()), "Identity-H".into())
+        });
+        assert_eq!(
+            font,
+            Some(Unmapped {
+                passthrough: true,
+                ucs2: false
+            })
+        );
     }
 
     #[test]
     fn fonts_read_through_a_map_are_not_unmapped() {
         // Korean, which pdf-inspector keeps a table for.
-        let (document, font) =
-            document_with(|document| type0(cid_font(document, "Korea1", None), "Identity-H"));
-        assert!(!unmapped(&document, &font));
-        // A ToUnicode map.
-        let (document, mut font) =
-            document_with(|document| type0(cid_font(document, "Japan1", None), "Identity-H"));
-        font.set("ToUnicode", Object::Reference((99, 0)));
-        assert!(!unmapped(&document, &font));
-        // A predefined CMap whose codes are Unicode.
-        let (document, font) =
-            document_with(|document| type0(cid_font(document, "Japan1", None), "UniJIS-UCS2-H"));
-        assert!(!unmapped(&document, &font));
-        // An embedded TrueType or OpenType program, read for its own map.
-        let (document, font) = document_with(|document| {
-            let program = ("FontFile2", dictionary! {});
-            type0(cid_font(document, "GB1", Some(program)), "Identity-H")
+        let font =
+            judged(|document| type0(cid_font(document, "Korea1", None), "Identity-H".into()));
+        assert_eq!(font, None);
+        // A ToUnicode map it parses.
+        let font = judged(|document| {
+            let map = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                1 begincodespacerange <0000> <FFFF> endcodespacerange \
+                1 beginbfchar <0035> <0054> endbfchar endcmap CMapName currentdict \
+                /CMap defineresource pop end end";
+            let map = document.add_object(Stream::new(dictionary! {}, map.to_vec()));
+            let mut font = type0(cid_font(document, "Japan1", None), "Identity-H".into());
+            font.set("ToUnicode", map);
+            font
         });
-        assert!(!unmapped(&document, &font));
-        let (document, font) = document_with(|document| {
-            let program = ("FontFile3", dictionary! { "Subtype" => "OpenType" });
-            type0(cid_font(document, "CNS1", Some(program)), "Identity-H")
-        });
-        assert!(!unmapped(&document, &font));
-        // A simple font.
-        let (document, font) = document_with(|_| {
-            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" }
-        });
-        assert!(!unmapped(&document, &font));
+        assert_eq!(font, None);
+        // Another predefined CMap, and Chinese under the one lopdf reads.
+        for encoding in ["90ms-RKSJ-H", "UniGB-UCS2-H"] {
+            let font = judged(|document| {
+                type0(
+                    cid_font(document, "Japan1", None),
+                    Object::Name(encoding.into()),
+                )
+            });
+            assert_eq!(font, None, "{encoding}");
+        }
+        // A simple font, and one outside the collections.
+        assert_eq!(
+            judged(
+                |_| dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" }
+            ),
+            None
+        );
+        let font =
+            judged(|document| type0(cid_font(document, "Identity", None), "Identity-H".into()));
+        assert_eq!(font, None);
     }
 
     #[test]
-    fn strings_read_with_no_sign_say_their_ascii_codes() {
+    fn strings_read_with_no_sign_are_told_as_read_and_as_said() {
         // "Total 52,000.00" in CIDs 1-95.
         let cids: Vec<u8> = "Total 52,000.00"
             .bytes()
             .flat_map(|character| u16::from(character - 0x1F).to_be_bytes())
             .collect();
-        assert_eq!(silent_reading(&cids).as_deref(), Some("Total 52,000.00"));
+        let font = BYTES.unwrap();
+        assert_eq!(says(font, &cids).as_deref(), Some("Total 52,000.00"));
+        assert_eq!(read_as(font, &cids).as_deref(), Some("5PUBM"));
+        assert!(misread(font, &cids));
         // HIRAGANA LETTER A in Adobe-Japan1, beside a dollar sign whose glyph
-        // differs among the collections.
-        assert_eq!(
-            silent_reading(&[0x03, 0x4B, 0x00, 0x05, 0x00, 0x16]).as_deref(),
-            Some("  5")
-        );
+        // differs among the collections, read byte by byte.
+        let kana = [0x03, 0x4B, 0x00, 0x05, 0x00, 0x16];
+        assert_eq!(says(font, &kana).as_deref(), Some("  5"));
+        assert_eq!(read_as(font, &kana).as_deref(), Some("K"));
         // A byte past 0x7F reads as U+FFFD, which pdf-inspector marks.
-        assert_eq!(silent_reading(&[0x04, 0x9F, 0x00, 0x16]), None);
-        assert_eq!(silent_reading(&[0x00]), None);
+        assert_eq!(read_as(font, &[0x04, 0x9F, 0x00, 0x16]), None);
+        assert!(!misread(font, &[0x04, 0x9F, 0x00, 0x16]));
+        assert_eq!(says(font, &[0x00]), None);
+        // Codes taken for Unicode read as the characters of their values.
+        let passthrough = Unmapped {
+            passthrough: true,
+            ucs2: false,
+        };
+        assert_eq!(
+            read_as(passthrough, &[0x04, 0xB0, 0x04, 0xB1]).as_deref(),
+            Some("Ұұ")
+        );
+        assert!(misread(passthrough, &[0x04, 0xB0]));
+        // UCS-2 ASCII reads right as UTF-16; kanji byte by byte.
+        let ucs2 = Unmapped {
+            passthrough: false,
+            ucs2: true,
+        };
+        assert!(!misread(ucs2, &[0x00, 0x41, 0x00, 0x42]));
+        assert_eq!(
+            says(ucs2, &[0x4F, 0x4F, 0x6C, 0x11]).as_deref(),
+            Some("住民")
+        );
+        assert_eq!(
+            read_as(ucs2, &[0x4F, 0x4F, 0x6C, 0x11]).as_deref(),
+            Some("OOl")
+        );
+        assert!(misread(ucs2, &[0x4F, 0x4F, 0x6C, 0x11]));
+    }
+
+    #[test]
+    fn ucs2_cmaps_are_told_by_name() {
+        for name in [
+            "UniJIS-UCS2-H",
+            "UniJIS-UCS2-HW-V",
+            "UniGB-UCS2-V",
+            "UniKS-UCS2-H",
+        ] {
+            assert!(ucs2_cmap(name.as_bytes()), "{name}");
+        }
+        for name in ["Identity-H", "UniJIS-UTF16-H", "90ms-RKSJ-V", "UniJIS-UCS2"] {
+            assert!(!ucs2_cmap(name.as_bytes()), "{name}");
+        }
     }
 }

@@ -8,7 +8,8 @@
 //! side read row by row across them where each glyph is placed on its own
 //! ("住源源 民泉泉 税徴徴" for three columns), and out of order, left to
 //! right, where each column is one string. A column standing alone reads
-//! right.
+//! whole, but where lines of horizontal text at its glyphs' heights run
+//! through it.
 
 use lopdf::{Dictionary, Object};
 
@@ -25,9 +26,32 @@ pub(crate) struct VerticalRun {
     pub(crate) show: u64,
 }
 
-/// Two neighbouring columns, right and left, as what each reads as, where
-/// their fonts can be read.
-pub(crate) type ColumnPair = Option<(String, String)>;
+/// What the Markdown must show of a page's columns of vertical writing for
+/// them to read right.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Reading {
+    /// A column with no neighbour of its size beside it, as it reads: whole.
+    Alone(String),
+    /// Two neighbouring columns of one size whose heights overlap, right and
+    /// left, as each reads where their fonts can be read: each whole, and,
+    /// where they stand as near as a passage's columns do, the right one's
+    /// text and then the left one's.
+    Pair(Option<(String, String)>, bool),
+}
+
+/// The least share of one column's size another's must be to stand beside
+/// it in one passage: ruby, set beside its base at half its size, does not.
+const SIMILAR_SIZE: f64 = 0.75;
+/// How far apart, in their size, two columns of a passage stand at most;
+/// labels in the cells of a table stand further apart.
+const PASSAGE_PITCH: f64 = 2.5;
+/// Columns of another size passed over to find a column's neighbour.
+const MAX_PASSED_COLUMNS: usize = 3;
+
+/// Whether two sizes are near enough for their text to be one passage.
+fn similar(one: f64, other: f64) -> bool {
+    one.min(other) >= SIMILAR_SIZE * one.max(other)
+}
 
 /// Whether `font` writes vertically: a composite font under a CMap named
 /// for vertical writing.
@@ -65,19 +89,21 @@ impl Column<'_> {
     }
 }
 
-/// The neighbouring columns of a page's vertical runs whose heights
-/// overlap, right to left: each pair as what the right column and the left
-/// one read as, where their fonts can be read. Runs stand in one column
-/// where they start within half their size of it across the page.
-pub(crate) fn neighbours(runs: &[VerticalRun]) -> Vec<ColumnPair> {
+/// What the Markdown must show of a page's vertical runs (see `Reading`),
+/// right to left. Runs of one size stand in one column where they start
+/// within half their size of it across the page; a column's neighbour is
+/// the nearest to its left of its size, past up to `MAX_PASSED_COLUMNS` of
+/// another, such as ruby.
+pub(crate) fn readings(runs: &[VerticalRun]) -> Vec<Reading> {
     let mut order: Vec<&VerticalRun> = runs.iter().collect();
     order.sort_by(|one, other| other.x.total_cmp(&one.x));
     let mut columns: Vec<Column> = Vec::new();
     for run in order {
-        match columns
-            .last_mut()
-            .filter(|column| (column.x - run.x).abs() <= 0.5 * column.size.max(run.size))
-        {
+        let near = |column: &&mut Column| {
+            (column.x - run.x).abs() <= 0.5 * column.size.max(run.size)
+                && similar(column.size, run.size)
+        };
+        match columns.last_mut().filter(near) {
             Some(column) => column.runs.push(run),
             None => columns.push(Column {
                 x: run.x,
@@ -86,11 +112,32 @@ pub(crate) fn neighbours(runs: &[VerticalRun]) -> Vec<ColumnPair> {
             }),
         }
     }
-    columns
-        .windows(2)
-        .filter(|pair| pair[0].top().min(pair[1].top()) > pair[0].bottom().max(pair[1].bottom()))
-        .map(|pair| pair[0].text().zip(pair[1].text()))
-        .collect()
+    let mut paired = vec![false; columns.len()];
+    let mut readings = Vec::new();
+    for (right, column) in columns.iter().enumerate() {
+        let Some(left) = (right + 1..columns.len())
+            .take(MAX_PASSED_COLUMNS + 1)
+            .find(|&left| similar(column.size, columns[left].size))
+        else {
+            continue;
+        };
+        let neighbour = &columns[left];
+        if column.top().min(neighbour.top()) <= column.bottom().max(neighbour.bottom()) {
+            continue;
+        }
+        paired[right] = true;
+        paired[left] = true;
+        let passage = column.x - neighbour.x <= PASSAGE_PITCH * column.size.max(neighbour.size);
+        readings.push(Reading::Pair(column.text().zip(neighbour.text()), passage));
+    }
+    readings.extend(
+        columns
+            .iter()
+            .zip(paired)
+            .filter(|(_, paired)| !paired)
+            .filter_map(|(column, _)| column.text().map(Reading::Alone)),
+    );
+    readings
 }
 
 #[cfg(test)]
@@ -151,13 +198,50 @@ mod tests {
         }
         runs.push(run(464.0, 300.0, "別紙", 0));
         assert_eq!(
-            neighbours(&runs),
-            [Some(("源泉徴収".to_owned(), "住民税".to_owned()))]
+            readings(&runs),
+            [
+                Reading::Pair(Some(("源泉徴収".to_owned(), "住民税".to_owned())), true),
+                Reading::Alone("別紙".to_owned()),
+            ]
         );
-        // A column standing alone has no neighbour, and a column whose font
-        // cannot be read pairs as unread.
-        assert!(neighbours(&runs[..4]).is_empty());
+        // A column standing alone reads whole; a column whose font cannot
+        // be read pairs as unread, and alone is not read at all.
+        assert_eq!(
+            readings(&runs[..4]),
+            [Reading::Alone("源泉徴収".to_owned())]
+        );
         runs[5].text = None;
-        assert_eq!(neighbours(&runs), [None]);
+        assert_eq!(
+            readings(&runs),
+            [Reading::Pair(None, true), Reading::Alone("別紙".to_owned())]
+        );
+    }
+
+    #[test]
+    fn ruby_and_labels_apart_do_not_read_as_a_passage() {
+        // Ruby at half size beside its base: each stands alone.
+        let mut ruby = run(409.0, 700.0, "げんせんちょうしゅうひょう", 0);
+        ruby.size = 6.0;
+        ruby.bottom = 700.0 - 6.0 * 13.0;
+        let base = run(400.0, 700.0, "源泉徴収票の支払金額", 0);
+        assert_eq!(
+            readings(&[ruby, base]),
+            [
+                Reading::Alone("げんせんちょうしゅうひょう".to_owned()),
+                Reading::Alone("源泉徴収票の支払金額".to_owned()),
+            ]
+        );
+        // Labels in cells five sizes apart pair, but not as a passage.
+        let labels = [
+            run(390.0, 630.0, "源泉徴収税額", 0),
+            run(330.0, 630.0, "支払者の住所", 0),
+        ];
+        assert_eq!(
+            readings(&labels),
+            [Reading::Pair(
+                Some(("源泉徴収税額".to_owned(), "支払者の住所".to_owned())),
+                false
+            )]
+        );
     }
 }

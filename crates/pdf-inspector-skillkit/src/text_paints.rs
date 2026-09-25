@@ -54,6 +54,7 @@ use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
 use crate::glyph_words::{Glyph, GlyphFonts, GlyphWords, KeptWords, ShownWord};
 use crate::optional_content::Layers;
 use crate::repeated_lines::EdgeRun;
+use crate::vertical_text::Reading;
 use crate::word_gaps::{leading_travel, shows_glyphs, Candidate, GapFont, GapFonts, Shown};
 
 /// Bytes any one content stream may decode to.
@@ -85,6 +86,10 @@ const MAX_RUNS_PER_PAGE: usize = 100_000;
 /// Bytes of text a reader does not see, or sees otherwise, noted a page for
 /// each check, at most.
 const MAX_HIDDEN_TEXT: usize = 64 << 10;
+/// Bytes of such text kept across a document, to look for in the Markdown.
+/// A page whose text does not fit, like one whose text overran its own
+/// limit, is reported without it.
+const MAX_NOTED_TEXT: usize = 4 << 20;
 /// Repeated runs recorded per page.
 const MAX_REPEATS_PER_PAGE: usize = 16;
 /// Placed run starts kept per document, for the table check.
@@ -186,9 +191,12 @@ struct State {
     /// Whether a layer a reader hides holds what is drawn here, as a form
     /// in such a layer does.
     hidden: bool,
-    /// Whether pdf-inspector reads the font in force without its
-    /// collection's map (see `cjk_fonts`), when the page is read for it.
-    unmapped: bool,
+    /// How pdf-inspector reads the font in force, where it finds no map for
+    /// it (see `cjk_fonts`), when the page is read for it.
+    cjk: Option<crate::cjk_fonts::Unmapped>,
+    /// Whether the fill is white, as pdf-inspector judges it: in a form,
+    /// it skips text filled white.
+    white: bool,
     /// Whether the font in force writes vertically (see `vertical_text`),
     /// when the page is read for it.
     vertical: bool,
@@ -212,7 +220,8 @@ impl State {
         leading: 0.0,
         rise: 0.0,
         hidden: false,
-        unmapped: false,
+        cjk: None,
+        white: false,
         vertical: false,
     };
 }
@@ -647,33 +656,49 @@ struct PageText {
     layers: Option<std::rc::Rc<Layers>>,
     hidden_text: Option<Noted>,
     /// Text a viewer never paints, in render mode 3, that pdf-inspector
-    /// reads as shown, when the page is read for repeats.
+    /// reads as shown, when the page is read for repeats. Each string noted
+    /// here, and in `hidden_text`, carries the edge run it is read in.
     invisible_text: Option<Noted>,
     /// Text shown in a font pdf-inspector reads without its collection's
     /// map, as the font says it (see `cjk_fonts`), and whether any of it
     /// reads otherwise with no sign, when the page is read for repeats.
     cjk_text: Option<Noted>,
+    cjk_read: Option<Noted>,
     cjk_misread: bool,
+    cjk_fonts: crate::cjk_fonts::CjkFonts,
     /// Strings shown in fonts that write vertically, when the page is read
-    /// for repeats.
+    /// for repeats, and the bytes of their text kept.
     vertical: Option<Vec<crate::vertical_text::VerticalRun>>,
+    vertical_bytes: usize,
 }
 
-/// Texts noted on a page, run by run, and the bytes they hold.
+/// Texts noted on a page, run by run, the bytes they hold, and whether a
+/// text was left out for want of room.
 #[derive(Default)]
 struct Noted {
-    texts: Vec<String>,
+    notes: Vec<Note>,
     bytes: usize,
     last: Option<Last>,
+    overflowed: bool,
 }
 
-/// The last string noted: where its run starts on an upright line, the
-/// characters shown from there, and its place among the page's strings.
+/// A run of noted text, the first and last of the page's edge runs (see
+/// `PageText::note_edge`) it is read in, where the scan kept them, and
+/// whether it starts on the page. pdf-inspector leaves out text set well
+/// off the page where it reads as whole paragraphs, a neighbouring page's
+/// on an imposed sheet, and keeps it otherwise.
+struct Note {
+    text: String,
+    edges: Option<(usize, usize)>,
+    on_page: bool,
+}
+
+/// Where the run noted last starts on an upright line, and the characters
+/// shown from there.
 #[derive(Clone, Copy)]
 struct Last {
     start: Option<Start>,
     shown: usize,
-    show: u64,
 }
 
 /// Where an upright string starts on the page, and its size.
@@ -703,18 +728,72 @@ impl Start {
     }
 }
 
-impl Noted {
-    /// Whether there is room for more: `MAX_HIDDEN_TEXT` bytes a page.
-    fn has_room(&self) -> bool {
-        self.bytes < MAX_HIDDEN_TEXT
+/// Text in fonts pdf-inspector finds no map for on a page: as it says it,
+/// as far as can be told, and as pdf-inspector reads it with no sign.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct CjkTexts {
+    pub(crate) says: Vec<String>,
+    pub(crate) read_as: Vec<String>,
+}
+
+impl CjkTexts {
+    fn bytes(&self) -> usize {
+        self.says.iter().chain(&self.read_as).map(String::len).sum()
+    }
+}
+
+/// The texts noted on a page as they are looked for in the Markdown, and
+/// whether text starting on the page was left out for want of room: such a
+/// page is reported without being looked for.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct PageTexts {
+    pub(crate) texts: Vec<String>,
+    pub(crate) overflowed: bool,
+    /// Whether any of the texts starts on the page.
+    on_page: bool,
+}
+
+impl PageTexts {
+    fn is_empty(&self) -> bool {
+        self.texts.is_empty() && !self.overflowed
     }
 
-    /// Note `text`, the page's `show`th string: more of the run before
-    /// when no other string was shown since and the text matrix was not
-    /// just set, or was set on the run's line no further than a glyph past
-    /// its characters, as text set glyph by glyph is; else a run of its
-    /// own.
-    fn note(&mut self, text: &str, placed: bool, start: Option<Start>, show: u64) {
+    fn bytes(&self) -> usize {
+        self.texts.iter().map(String::len).sum()
+    }
+
+    /// Leave the texts out, the room to keep them spent.
+    fn leave_out(&mut self) {
+        self.overflowed |= self.on_page;
+        self.texts = Vec::new();
+    }
+}
+
+impl Noted {
+    /// Note `text`, read in the page's edge run `edge`, without the control
+    /// characters pdf-inspector drops: more of the run noted last when the
+    /// text matrix was not just set, or was set on the run's line no
+    /// further than a glyph past its characters, as text set glyph by glyph
+    /// is; else a run of its own. Past `MAX_HIDDEN_TEXT` bytes a page, text
+    /// is left out, and the page marked where it starts `on_page` with more
+    /// than white space in it.
+    fn note(
+        &mut self,
+        text: &str,
+        placed: bool,
+        start: Option<Start>,
+        edge: Option<usize>,
+        on_page: bool,
+    ) {
+        if self.overflowed {
+            return;
+        }
+        let text = without_controls(text);
+        if self.bytes + text.len() > MAX_HIDDEN_TEXT {
+            self.overflowed = on_page && text.chars().any(|character| !character.is_whitespace());
+            self.last = None;
+            return;
+        }
         self.bytes += text.len();
         let characters = text.chars().count();
         let goes_on = |from: Start, shown: usize, start: Start| {
@@ -724,29 +803,84 @@ impl Noted {
                 && start.x - from.x <= from.size * (shown as f64 + 1.0)
         };
         let joined = self.last.is_some_and(|last| {
-            last.show + 1 == show
-                && (!placed
-                    || last
-                        .start
-                        .zip(start)
-                        .is_some_and(|(from, start)| goes_on(from, last.shown, start)))
+            !placed
+                || last
+                    .start
+                    .zip(start)
+                    .is_some_and(|(from, start)| goes_on(from, last.shown, start))
         });
-        match self.texts.last_mut().filter(|_| joined) {
-            Some(last) => last.push_str(text),
-            None => self.texts.push(text.to_owned()),
+        match self.notes.last_mut().filter(|_| joined) {
+            Some(note) => {
+                note.text.push_str(&text);
+                note.edges = note.edges.zip(edge).map(|((first, _), last)| (first, last));
+                note.on_page |= on_page;
+            }
+            None => self.notes.push(Note {
+                text,
+                edges: edge.map(|edge| (edge, edge)),
+                on_page,
+            }),
         }
         self.last = Some(match self.last.filter(|_| joined && !placed) {
             Some(last) => Last {
                 shown: last.shown + characters,
-                show,
                 ..last
             },
             None => Last {
                 start,
                 shown: characters,
-                show,
             },
         });
+    }
+
+    /// Text pdf-inspector reads that is not of the kind noted was shown:
+    /// the run noted last goes on no further.
+    fn interrupt(&mut self) {
+        self.last = None;
+    }
+
+    /// The texts noted, as they are looked for in the Markdown: a run of
+    /// `MIN_HIDDEN_CHARS` characters or more as it is, and as its line
+    /// reads from its first character to its last, as glyphs shown out of
+    /// order are read; and a shorter one, such as a "not" or a digit
+    /// slipped into a line, with the text beside it on its line (see
+    /// `line_contexts`), where the scan read the line.
+    fn looked_for(self, edges: &[EdgeRun]) -> PageTexts {
+        let characters = |note: &Note| crate::repeated_lines::bare(&note.text).chars().count();
+        let short = |note: &Note| characters(note) < crate::MIN_HIDDEN_CHARS;
+        let notes: Vec<Note> = self
+            .notes
+            .into_iter()
+            .filter(|note| characters(note) > 0)
+            .collect();
+        let spans: Vec<(usize, usize, bool)> = notes
+            .iter()
+            .filter_map(|note| note.edges.map(|(first, last)| (first, last, short(note))))
+            .collect();
+        let mut read = crate::repeated_lines::line_contexts(edges, &spans).into_iter();
+        let mut on_page = false;
+        let mut texts = Vec::new();
+        for note in notes {
+            let line = note.edges.and_then(|_| read.next().flatten());
+            let found = texts.len();
+            if !short(&note) {
+                if line
+                    .as_ref()
+                    .is_some_and(|line| *line != crate::repeated_lines::bare(&note.text))
+                {
+                    texts.extend(line);
+                }
+                texts.push(note.text);
+            } else {
+                texts.extend(line);
+            }
+            on_page |= texts.len() > found && note.on_page;
+        }
+        PageTexts {
+            texts,
+            overflowed: self.overflowed,
+            on_page,
+        }
     }
 }
 
@@ -956,23 +1090,31 @@ impl PageText {
 
     /// Note text pdf-inspector reads that a reader does not see, in a layer
     /// it hides or, when `invisible`, painted in render mode 3, run by run
-    /// (see `Noted::note`); its text where its font can be read, to
-    /// `MAX_HIDDEN_TEXT` bytes a page.
+    /// (see `Noted::note`), with the edge run `edge` it is read in: its text
+    /// where its font can be read. Text pdf-inspector reads that a reader
+    /// sees, when `unseen` is not set, ends the run noted last.
+    #[allow(clippy::too_many_arguments)]
     fn note_unseen(
         &mut self,
         state: State,
         text_matrix: [f64; 6],
         bytes: &[u8],
         placed: bool,
+        edge: Option<usize>,
+        unseen: bool,
         invisible: bool,
+        page_box: [f64; 4],
     ) {
         let noted = if invisible {
-            &self.invisible_text
+            self.invisible_text.as_mut()
         } else {
-            &self.hidden_text
+            self.hidden_text.as_mut()
         };
-        let room = noted.as_ref().is_some_and(Noted::has_room);
-        if !(room && state.font && state.reached && state.read_mode != 3) {
+        let Some(noted) = noted.filter(|noted| !noted.overflowed) else {
+            return;
+        };
+        if !unseen {
+            noted.interrupt();
             return;
         }
         let Some(text) = state
@@ -981,47 +1123,63 @@ impl PageText {
         else {
             return;
         };
-        let show = self.shows;
-        let noted = if invisible {
-            self.invisible_text.as_mut()
-        } else {
-            self.hidden_text.as_mut()
-        };
-        if let Some(noted) = noted {
-            noted.note(&text, placed, Start::of(state, text_matrix), show);
-        }
+        let on_page = starts_on_page(state, text_matrix, page_box);
+        noted.note(&text, placed, Start::of(state, text_matrix), edge, on_page);
     }
 
-    /// Note a string shown in a font pdf-inspector reads without its
-    /// collection's map: what it says where pdf-inspector reads it with no
-    /// sign, none of its bytes past 0x7F, and a gap where it marks the
-    /// string with U+FFFD. Such a string reads otherwise, or not at all,
-    /// unless it shows only spaces.
-    fn note_unmapped(&mut self, bytes: &[u8], placed: bool) {
-        let show = self.shows;
-        let Some(noted) = self.cjk_text.as_mut().filter(|noted| noted.has_room()) else {
+    /// Note a string pdf-inspector reads, in a font it finds no map for,
+    /// when `cjk` says how it reads it (see `cjk_fonts`): what the string
+    /// says, as far as can be told, and what pdf-inspector reads it as,
+    /// where it reads it with no sign; and whether it reads it otherwise so.
+    /// A string in another font ends the runs noted last.
+    fn note_unmapped(
+        &mut self,
+        bytes: &[u8],
+        placed: bool,
+        cjk: Option<crate::cjk_fonts::Unmapped>,
+    ) {
+        let (Some(says), Some(read)) = (self.cjk_text.as_mut(), self.cjk_read.as_mut()) else {
             return;
         };
-        match crate::cjk_fonts::silent_reading(bytes) {
-            Some(reading) => {
-                self.cjk_misread |= bytes
-                    .chunks_exact(2)
-                    .any(|code| u16::from_be_bytes([code[0], code[1]]) > 1);
-                noted.note(&reading, placed, None, show);
-            }
-            None => noted.note(" ", placed, None, show),
+        let Some(font) = cjk else {
+            says.interrupt();
+            read.interrupt();
+            return;
+        };
+        self.cjk_misread |= crate::cjk_fonts::misread(font, bytes);
+        says.note(
+            &crate::cjk_fonts::says(font, bytes).unwrap_or_default(),
+            placed,
+            None,
+            None,
+            true,
+        );
+        match crate::cjk_fonts::read_as(font, bytes) {
+            Some(text) => read.note(&text, placed, None, None, true),
+            None => read.interrupt(),
         }
     }
 
     /// Note a string shown in a font that writes vertically: more of the
     /// run before when it was the page's last string and the text matrix
     /// was not set since, as its glyphs go on down its column; else a run
-    /// of its own where its line is upright.
-    fn note_vertical(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], placed: bool) {
+    /// of its own where its line is upright and it starts on the page, as
+    /// no column set off the page is seen. Its text is kept to
+    /// `MAX_HIDDEN_TEXT` bytes a page, and past them is not read.
+    fn note_vertical(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        bytes: &[u8],
+        placed: bool,
+        page_box: [f64; 4],
+    ) {
         let show = self.shows;
+        let room = MAX_HIDDEN_TEXT.saturating_sub(self.vertical_bytes);
         let text = state
             .glyph_font
-            .and_then(|font| self.glyph_fonts.text(font, bytes));
+            .and_then(|font| self.glyph_fonts.text(font, bytes))
+            .filter(|text| text.len() <= room);
         let Some(runs) = self
             .vertical
             .as_mut()
@@ -1036,48 +1194,62 @@ impl PageText {
         {
             last.bottom -= glyphs * last.size;
             last.text = last.text.take().zip(text).map(|(mut before, text)| {
+                self.vertical_bytes += text.len();
                 before.push_str(&text);
                 before
             });
             last.show = show;
             return;
         }
-        if let Some(start) = Start::of(state, text_matrix) {
-            runs.push(crate::vertical_text::VerticalRun {
-                x: start.x,
-                top: start.y,
-                bottom: start.y - glyphs * start.size,
-                size: start.size,
-                text,
-                show,
-            });
+        let Some(start) = Start::of(state, text_matrix).filter(|start| {
+            (page_box[0]..=page_box[2]).contains(&start.x)
+                && (page_box[1]..=page_box[3]).contains(&start.y)
+        }) else {
+            return;
+        };
+        if let Some(text) = &text {
+            self.vertical_bytes += text.len();
         }
+        runs.push(crate::vertical_text::VerticalRun {
+            x: start.x,
+            top: start.y,
+            bottom: start.y - glyphs * start.size,
+            size: start.size,
+            text,
+            show,
+        });
     }
 
-    /// Note a run pdf-inspector reads for the running-header check's gate:
-    /// where it starts, when the text matrix was just set, else as more of
-    /// the run before; with its text, where its font can be read.
-    fn note_edge(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], placed: bool) {
+    /// Note a run pdf-inspector reads, for the running-header check's gate
+    /// and to read unseen text beside what it stands with: where it starts,
+    /// when the text matrix was just set, else as more of the run before;
+    /// with its text, where its font can be read. The run the string is
+    /// noted in, where it is.
+    fn note_edge(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        bytes: &[u8],
+        placed: bool,
+    ) -> Option<usize> {
         let room = self
             .edges
             .as_ref()
             .is_some_and(|edges| edges.len() < MAX_RUNS_PER_PAGE);
         if !(room && state.font && state.reached && state.read_mode != 3) {
-            return;
+            return None;
         }
         let text = state
             .glyph_font
             .and_then(|font| self.glyph_fonts.text(font, bytes));
-        let Some(edges) = self.edges.as_mut() else {
-            return;
-        };
+        let edges = self.edges.as_mut()?;
         if !placed {
             if let Some(last) = edges.last_mut() {
                 last.text = last.text.take().zip(text).map(|(mut before, text)| {
                     before.push_str(&text);
                     before
                 });
-                return;
+                return Some(edges.len() - 1);
             }
         }
         let matrix = multiply(text_matrix, state.ctm);
@@ -1086,14 +1258,16 @@ impl PageText {
             matrix[3] * state.rise + matrix[5],
         ];
         let size = state.size.abs() * matrix[2].hypot(matrix[3]);
-        if at.iter().all(|value| value.is_finite()) && size.is_finite() {
-            edges.push(EdgeRun {
-                y: at[1] as f32,
-                x: at[0] as f32,
-                size: size as f32,
-                text,
-            });
+        if !(at.iter().all(|value| value.is_finite()) && size.is_finite()) {
+            return None;
         }
+        edges.push(EdgeRun {
+            y: at[1] as f32,
+            x: at[0] as f32,
+            size: size as f32,
+            text,
+        });
+        Some(edges.len() - 1)
     }
 
     /// Note a visible run pdf-inspector reads whose start the text matrix
@@ -1171,16 +1345,10 @@ impl PageText {
         self.painted();
     }
 
-    /// Whether the page is a scan with a text layer: images cover it, and
-    /// most of its text paints nothing. The layer describes what the scan
-    /// shows; a page drawn over a background image shows its text.
-    fn scanned(&self, page_box: [f64; 4]) -> bool {
-        let page_area = (page_box[2] - page_box[0]) * (page_box[3] - page_box[1]);
-        page_area > 0.0
-            && self.image_area >= COVERED_SHARE * page_area
-            && self.hidden_bytes > self.visible_bytes
-    }
-
+    /// Whether the page is a scan with a text layer: images, drawn or set
+    /// inline, cover it, and most of its text paints nothing. The layer
+    /// describes what the scan shows; a page drawn over a background image
+    /// shows its text.
     fn is_hidden_layer(&self, page_box: [f64; 4]) -> bool {
         let page_area = (page_box[2] - page_box[0]) * (page_box[3] - page_box[1]);
         page_area > 0.0
@@ -1231,21 +1399,24 @@ pub(crate) struct Findings {
     pub(crate) edges: Option<Vec<(u32, Vec<EdgeRun>)>>,
     /// Text pdf-inspector reads in layers a reader hides (see
     /// `optional_content`), by page, on the pages read for repeats.
-    pub(crate) hidden_layer_texts: Vec<(u32, Vec<String>)>,
+    pub(crate) hidden_layer_texts: Vec<(u32, PageTexts)>,
     /// Text a viewer never paints, in render mode 3, that pdf-inspector
     /// reads as shown (upstream issue #572), by page, on the pages read for
     /// repeats but a scan's with its text layer.
-    pub(crate) invisible_texts: Vec<(u32, Vec<String>)>,
+    pub(crate) invisible_texts: Vec<(u32, PageTexts)>,
     /// The pages, among those read for repeats, whose text in a font
-    /// pdf-inspector reads without its collection's map (upstream issue
-    /// #573) reads otherwise with no sign; and that text as the font says
+    /// pdf-inspector finds no map for (upstream issue #573) reads otherwise
+    /// with no sign; and that text as it says it and as pdf-inspector reads
     /// it, by page.
     pub(crate) cjk_pages: Vec<u32>,
-    pub(crate) cjk_texts: Vec<(u32, Vec<String>)>,
-    /// The neighbouring columns of text in vertical writing (upstream issue
-    /// #575), right to left, as what each pair reads as where its fonts can
-    /// be read, by page, on the pages read for repeats.
-    pub(crate) vertical_pairs: Vec<(u32, Vec<crate::vertical_text::ColumnPair>)>,
+    pub(crate) cjk_texts: Vec<(u32, CjkTexts)>,
+    /// What the Markdown must show of the columns of text in vertical
+    /// writing (upstream issue #575), right to left, by page, on the pages
+    /// read for repeats (see `vertical_text::readings`).
+    pub(crate) vertical_readings: Vec<(u32, Vec<crate::vertical_text::Reading>)>,
+    /// The page from which the checks of what pages paint stopped, their
+    /// limits spent, where they did.
+    pub(crate) unchecked_from: Option<u32>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -1315,6 +1486,7 @@ pub(crate) fn scan_document(
     let mut repeats = twice_skip.is_some();
     let mut gap_fonts = GapFonts::default();
     let mut glyph_fonts = GlyphFonts::default();
+    let mut cjk_fonts = crate::cjk_fonts::CjkFonts::default();
     let mut found = Findings::default();
     let layers = Layers::new(&document).map(std::rc::Rc::new);
     if twice_skip.is_some() {
@@ -1334,6 +1506,16 @@ pub(crate) fn scan_document(
     let mut edges = twice_skip
         .filter(|skip| skip.is_empty() && !has_form_fields(&document))
         .map(|_| Vec::new());
+    // Room left for the text kept to look for in the Markdown: a page's
+    // text that does not fit is left out, and the page reported.
+    let mut noted_room = MAX_NOTED_TEXT;
+    let mut fits = |bytes: usize| match noted_room.checked_sub(bytes) {
+        Some(room) => {
+            noted_room = room;
+            true
+        }
+        None => false,
+    };
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
             continue;
@@ -1353,6 +1535,7 @@ pub(crate) fn scan_document(
             repeat: &mut repeat_budget,
             gap_fonts: &mut gap_fonts,
             glyph_fonts: &mut glyph_fonts,
+            cjk_fonts: &mut cjk_fonts,
         };
         let checks = Checks {
             layer: check_layer,
@@ -1372,20 +1555,49 @@ pub(crate) fn scan_document(
                     found.gaps_misread.push(number);
                 }
                 glyph_words.page(number, page.glyph_words, page.glyph_spaces);
-                if !page.hidden_text.is_empty() {
-                    found.hidden_layer_texts.push((number, page.hidden_text));
+                let mut hidden = page.hidden_text;
+                if !fits(hidden.bytes()) {
+                    hidden.leave_out();
                 }
-                if !page.invisible_text.is_empty() {
-                    found.invisible_texts.push((number, page.invisible_text));
+                if !hidden.is_empty() {
+                    found.hidden_layer_texts.push((number, hidden));
+                }
+                let mut invisible = page.invisible_text;
+                if !fits(invisible.bytes()) {
+                    invisible.leave_out();
+                }
+                if !invisible.is_empty() {
+                    found.invisible_texts.push((number, invisible));
                 }
                 if page.cjk_misread {
                     found.cjk_pages.push(number);
                 }
-                if !page.cjk_text.is_empty() {
+                // Text left out cannot tell the page read right.
+                if page.cjk_misread && fits(page.cjk_text.bytes()) {
                     found.cjk_texts.push((number, page.cjk_text));
                 }
-                if !page.vertical_pairs.is_empty() {
-                    found.vertical_pairs.push((number, page.vertical_pairs));
+                let mut readings = page.vertical_readings;
+                let read: usize = readings
+                    .iter()
+                    .map(|reading| match reading {
+                        Reading::Alone(text) => text.len(),
+                        Reading::Pair(texts, _) => texts
+                            .as_ref()
+                            .map_or(0, |(right, left)| right.len() + left.len()),
+                    })
+                    .sum();
+                // Columns side by side whose text is left out cannot be told
+                // read right; one alone is taken to.
+                if !fits(read) {
+                    readings.retain(|reading| matches!(reading, Reading::Pair(..)));
+                    for reading in &mut readings {
+                        if let Reading::Pair(texts, _) = reading {
+                            *texts = None;
+                        }
+                    }
+                }
+                if !readings.is_empty() {
+                    found.vertical_readings.push((number, readings));
                 }
                 if let Some(edges) = edges
                     .as_mut()
@@ -1416,9 +1628,11 @@ pub(crate) fn scan_document(
             Err(Exhausted) if repeat_budget.spent() => {
                 repeats = false;
                 edges = None;
+                found.unchecked_from.get_or_insert(number);
             }
             Err(Exhausted) => {
                 edges = None;
+                found.unchecked_from.get_or_insert(number);
                 break;
             }
         }
@@ -1435,6 +1649,7 @@ struct Budgets<'a> {
     repeat: &'a mut Budget,
     gap_fonts: &'a mut GapFonts,
     glyph_fonts: &'a mut GlyphFonts,
+    cjk_fonts: &'a mut crate::cjk_fonts::CjkFonts,
 }
 
 /// What a page is read for: an invisible layer, text painted twice (with
@@ -1468,16 +1683,17 @@ struct PageFindings {
     /// it is read for repeats.
     edges: Vec<EdgeRun>,
     /// Text pdf-inspector reads in layers a reader hides.
-    hidden_text: Vec<String>,
+    hidden_text: PageTexts,
     /// Text a viewer never paints that pdf-inspector reads, on a page that
     /// is not a scan with its text layer.
-    invisible_text: Vec<String>,
-    /// Text in fonts pdf-inspector reads without their collection's map, as
-    /// the fonts say it, and whether any reads otherwise with no sign.
-    cjk_text: Vec<String>,
+    invisible_text: PageTexts,
+    /// Text in fonts pdf-inspector finds no map for, and whether any reads
+    /// otherwise with no sign.
+    cjk_text: CjkTexts,
     cjk_misread: bool,
-    /// The neighbouring columns of text in vertical writing, right to left.
-    vertical_pairs: Vec<crate::vertical_text::ColumnPair>,
+    /// What the Markdown must show of the columns of text in vertical
+    /// writing, right to left.
+    vertical_readings: Vec<crate::vertical_text::Reading>,
 }
 
 fn scan_page(
@@ -1512,6 +1728,7 @@ fn scan_page(
         repeat,
         gap_fonts,
         glyph_fonts,
+        cjk_fonts,
     } = budgets;
     let budget = if check_layer { layer } else { repeat };
     let mut content = Vec::new();
@@ -1535,7 +1752,9 @@ fn scan_page(
         hidden_text: (check_twice && layers.is_some()).then(Noted::default),
         invisible_text: check_twice.then(Noted::default),
         cjk_text: check_twice.then(Noted::default),
+        cjk_read: check_twice.then(Noted::default),
         cjk_misread: false,
+        cjk_fonts: std::mem::take(cjk_fonts),
         vertical: check_twice.then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
@@ -1562,6 +1781,7 @@ fn scan_page(
     );
     *gap_fonts = std::mem::take(&mut page.gap_fonts);
     *glyph_fonts = std::mem::take(&mut page.glyph_fonts);
+    *cjk_fonts = std::mem::take(&mut page.cjk_fonts);
     executed?;
     page.ended();
     let placed = page
@@ -1579,11 +1799,23 @@ fn scan_page(
         .take()
         .map(GlyphWords::finish)
         .unwrap_or_default();
+    let runs = page.edges.take().unwrap_or_default();
+    let hidden_text = page
+        .hidden_text
+        .take()
+        .map(|noted| noted.looked_for(&runs))
+        .unwrap_or_default();
+    // A scan with its text layer is reported for OCR, which reads what the
+    // scan shows: the layer's invisible text is not looked for.
+    let hidden_layer = checks.layer && page.is_hidden_layer(page_box);
+    let invisible_text = page
+        .invisible_text
+        .take()
+        .filter(|_| !hidden_layer)
+        .map(|noted| noted.looked_for(&runs))
+        .unwrap_or_default();
     let edges = crate::repeated_lines::edge_runs(
-        page.edges
-            .take()
-            .unwrap_or_default()
-            .into_iter()
+        runs.into_iter()
             .map(|run| EdgeRun {
                 x: run.x - page_box[0] as f32,
                 y: run.y - page_box[1] as f32,
@@ -1594,29 +1826,27 @@ fn scan_page(
     );
     Ok(PageFindings {
         edges,
-        hidden_text: page
-            .hidden_text
-            .take()
-            .map(|noted| noted.texts)
-            .unwrap_or_default(),
-        invisible_text: page
-            .invisible_text
-            .take()
-            .filter(|_| !page.scanned(page_box))
-            .map(|noted| noted.texts)
-            .unwrap_or_default(),
-        cjk_text: page
-            .cjk_text
-            .take()
-            .map(|noted| noted.texts)
-            .unwrap_or_default(),
+        hidden_text,
+        invisible_text,
+        cjk_text: CjkTexts {
+            says: page
+                .cjk_text
+                .take()
+                .map(|noted| noted.notes.into_iter().map(|note| note.text).collect())
+                .unwrap_or_default(),
+            read_as: page
+                .cjk_read
+                .take()
+                .map(|noted| noted.notes.into_iter().map(|note| note.text).collect())
+                .unwrap_or_default(),
+        },
         cjk_misread: page.cjk_misread,
-        vertical_pairs: page
+        vertical_readings: page
             .vertical
             .take()
-            .map(|runs| crate::vertical_text::neighbours(&runs))
+            .map(|runs| crate::vertical_text::readings(&runs))
             .unwrap_or_default(),
-        hidden_layer: check_layer && page.is_hidden_layer(page_box),
+        hidden_layer,
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
         placed,
@@ -1720,10 +1950,48 @@ fn execute<'a>(
                     state.ctm = multiply(matrix, state.ctm);
                 }
             }
+            // The fill colour, as pdf-inspector reads it: white past 0.95 in
+            // gray and RGB, and under 0.05 in CMYK.
+            "g" => {
+                if let Some(gray) = operands.first().and_then(|gray| number(document, gray)) {
+                    state.white = gray > 0.95;
+                }
+            }
+            "rg" if operands.len() >= 3 => {
+                state.white = operands[..3]
+                    .iter()
+                    .all(|value| number(document, value).unwrap_or(0.0) > 0.95);
+            }
+            "k" if operands.len() >= 4 => {
+                state.white = operands[..4]
+                    .iter()
+                    .all(|value| number(document, value).unwrap_or(1.0) < 0.05);
+            }
+            "sc" | "scn" => {
+                let values: Vec<f64> = operands
+                    .iter()
+                    .filter_map(|value| number(document, value))
+                    .collect();
+                state.white = match values.as_slice() {
+                    [_, _, _] => values.iter().all(|value| *value > 0.95),
+                    [_, _, _, _] => values.iter().all(|value| *value < 0.05),
+                    _ => false,
+                };
+            }
             "Tr" => {
-                if let Some(mode) = operands.first().and_then(|mode| integer(document, mode)) {
+                // pdf-inspector takes the first operand, cut to a whole
+                // number, and skips mode 3 alone; a viewer takes the last,
+                // cut the same way, and only as one of the eight modes.
+                if let Some(mode) = operands.first().and_then(|mode| number(document, mode)) {
+                    state.read_mode = mode as i64;
+                }
+                if let Some(mode) = operands
+                    .last()
+                    .and_then(|mode| number(document, mode))
+                    .map(|mode| mode as i64)
+                    .filter(|mode| (0..=7).contains(mode))
+                {
                     state.render_mode = mode;
-                    state.read_mode = mode;
                 }
             }
             "BMC" => {
@@ -1788,9 +2056,9 @@ fn execute<'a>(
                         .filter(|_| page.glyph_words.is_some() && judged)
                         .and_then(|font| page.glyph_fonts.font(document, font));
                     state.raw = !read;
-                    state.unmapped = judged
-                        && page.cjk_text.is_some()
-                        && resolved.is_some_and(|font| crate::cjk_fonts::unmapped(document, font));
+                    state.cjk = resolved
+                        .filter(|_| judged && page.cjk_text.is_some())
+                        .and_then(|font| page.cjk_fonts.font(document, font));
                     state.vertical = judged
                         && page.vertical.is_some()
                         && resolved.is_some_and(crate::vertical_text::writes_vertically);
@@ -1899,21 +2167,40 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
-                if in_text {
-                    page.note_edge(state, text_matrix, &bytes, placed);
-                    if state.hidden || layered.contains(&true) {
-                        page.note_unseen(state, text_matrix, &bytes, placed, false);
-                    }
+                // What pdf-inspector reads: text it reaches, in a font, in a
+                // text object, but in mode 3 as it takes the mode, and, in a
+                // form, text filled white.
+                let white =
+                    !forms.is_empty() && state.white && matches!(state.read_mode, 0 | 4 | 7);
+                if in_text && state.font && state.reached && state.read_mode != 3 && !white {
+                    let edge = page.note_edge(state, text_matrix, &bytes, placed);
+                    let hidden = state.hidden || layered.contains(&true);
+                    page.note_unseen(
+                        state,
+                        text_matrix,
+                        &bytes,
+                        placed,
+                        edge,
+                        hidden,
+                        false,
+                        page_box,
+                    );
                     // Mode 3 paints nothing; pdf-inspector reads it where it
                     // takes the text object to start in mode 0 (#572).
-                    if state.render_mode == 3 {
-                        page.note_unseen(state, text_matrix, &bytes, placed, true);
-                    }
-                    if state.unmapped && state.font && state.reached && state.read_mode != 3 {
-                        page.note_unmapped(&bytes, placed);
-                    }
-                    if state.vertical && state.font && state.reached && state.read_mode != 3 {
-                        page.note_vertical(state, text_matrix, &bytes, placed);
+                    let invisible = state.render_mode == 3;
+                    page.note_unseen(
+                        state,
+                        text_matrix,
+                        &bytes,
+                        placed,
+                        edge,
+                        invisible,
+                        true,
+                        page_box,
+                    );
+                    page.note_unmapped(&bytes, placed, state.cjk);
+                    if state.vertical {
+                        page.note_vertical(state, text_matrix, &bytes, placed, page_box);
                     }
                 }
                 if in_text && !forms.is_empty() {
@@ -2158,6 +2445,24 @@ fn multiply(first: [f64; 6], then: [f64; 6]) -> [f64; 6] {
     ]
 }
 
+/// Points past the page box that text pdf-inspector takes for the page's
+/// may start.
+const PAGE_BOX_TOLERANCE: f64 = 6.0;
+
+/// Whether a string shown under `text_matrix` starts on the page, within
+/// `PAGE_BOX_TOLERANCE` of its box. One whose start is unknown is taken to.
+fn starts_on_page(state: State, text_matrix: [f64; 6], page_box: [f64; 4]) -> bool {
+    let matrix = multiply(text_matrix, state.ctm);
+    let at = [
+        matrix[2] * state.rise + matrix[4],
+        matrix[3] * state.rise + matrix[5],
+    ];
+    !at.iter().all(|value| value.is_finite())
+        || ((page_box[0] - PAGE_BOX_TOLERANCE..=page_box[2] + PAGE_BOX_TOLERANCE).contains(&at[0])
+            && (page_box[1] - PAGE_BOX_TOLERANCE..=page_box[3] + PAGE_BOX_TOLERANCE)
+                .contains(&at[1]))
+}
+
 fn number(document: &Document, object: &Object) -> Option<f64> {
     let (_, object) = document.dereference(object).ok()?;
     let value = match object {
@@ -2166,13 +2471,6 @@ fn number(document: &Document, object: &Object) -> Option<f64> {
         _ => return None,
     };
     value.is_finite().then_some(value)
-}
-
-fn integer(document: &Document, object: &Object) -> Option<i64> {
-    match document.dereference(object).ok()?.1 {
-        Object::Integer(value) => Some(*value),
-        _ => None,
-    }
 }
 
 fn matrix(document: &Document, values: &[Object]) -> Option<[f64; 6]> {
@@ -2581,34 +2879,105 @@ pub(crate) mod tests {
         // Glyphs placed one by one along a line, spaces left as gaps.
         for (index, glyph) in "Ignore".chars().enumerate() {
             let at = start(72.0 + 7.0 * index as f64, 700.0);
-            noted.note(&glyph.to_string(), true, at, index as u64 + 1);
+            noted.note(&glyph.to_string(), true, at, Some(index), true);
         }
-        noted.note("the", true, start(72.0 + 7.0 * 6.0 + 3.0, 700.0), 7);
-        // More of that run, then a new line, a run far along the same line,
-        // one whose line is not upright, and runs after another string was
-        // shown between.
-        noted.note(" balance", false, None, 8);
-        noted.note("above", true, start(72.0, 686.0), 9);
-        noted.note("Total", true, start(400.0, 686.0), 10);
-        noted.note("rotated", true, None, 11);
-        noted.note("text", true, start(110.0, 686.0), 12);
-        noted.note("after", true, start(140.0, 686.0), 14);
-        noted.note(" more", false, None, 16);
+        noted.note(
+            "the",
+            true,
+            start(72.0 + 7.0 * 6.0 + 3.0, 700.0),
+            Some(6),
+            true,
+        );
+        // More of that run, past a string of control codes pdf-inspector
+        // drops; then a new line, a run far along the same line, one whose
+        // line is not upright, and runs after text a reader sees was read.
+        noted.note("\u{1}", false, None, Some(6), true);
+        noted.note(" balance", false, None, Some(6), true);
+        noted.note("above", true, start(72.0, 686.0), Some(7), true);
+        noted.note("Total", true, start(400.0, 686.0), Some(8), true);
+        noted.note("rotated", true, None, None, true);
+        noted.note("text", true, start(110.0, 686.0), Some(9), true);
+        noted.interrupt();
+        noted.note("after", true, start(140.0, 686.0), Some(11), true);
+        noted.interrupt();
+        noted.note(" more", false, None, Some(11), true);
+        let notes: Vec<(&str, Option<(usize, usize)>)> = noted
+            .notes
+            .iter()
+            .map(|note| (note.text.as_str(), note.edges))
+            .collect();
         assert_eq!(
-            noted.texts,
+            notes,
             [
-                "Ignorethe balance",
-                "above",
-                "Total",
-                "rotated",
-                "text",
-                "after",
-                " more"
+                ("Ignorethe balance", Some((0, 6))),
+                ("above", Some((7, 7))),
+                ("Total", Some((8, 8))),
+                ("rotated", None),
+                ("text", Some((9, 9))),
+                ("after", Some((11, 11))),
+                (" more", Some((11, 11))),
             ]
         );
         assert_eq!(
             noted.bytes,
             "Ignorethe balanceaboveTotalrotatedtextafter more".len()
+        );
+        assert!(!noted.overflowed);
+    }
+
+    #[test]
+    fn text_past_the_room_to_note_it_marks_the_page() {
+        // White space filling the room leaves out only more of it; text
+        // after it marks the page.
+        let mut noted = Noted::default();
+        noted.note(&" ".repeat(MAX_HIDDEN_TEXT), true, None, None, true);
+        noted.note(" ", true, None, None, true);
+        // Nor does text set off the page, which pdf-inspector may leave out.
+        noted.note("Ignore the balance above", true, None, None, false);
+        assert!(!noted.overflowed);
+        noted.note("Ignore the balance above", true, None, None, true);
+        assert!(noted.overflowed);
+        let texts = noted.looked_for(&[]);
+        assert!(texts.overflowed && texts.texts.is_empty());
+    }
+
+    #[test]
+    fn short_unseen_runs_are_looked_for_with_their_line() {
+        let run = |x: f32, y: f32, text: &str| EdgeRun {
+            x,
+            y,
+            size: 12.0,
+            text: Some(text.to_owned()),
+        };
+        // A digit slipped in before an amount, a word into a sentence, a
+        // mark standing alone on its line, and a run long enough alone.
+        let edges = [
+            run(72.0, 700.0, "Amount due "),
+            run(140.04, 700.0, "1,250.00"),
+            run(139.84, 700.0, "9"),
+            run(72.0, 680.0, "The fee is "),
+            run(128.0, 680.0, "not "),
+            run(128.0, 680.0, "refundable."),
+            run(300.0, 500.0, "x"),
+            run(72.0, 400.0, "Ignore the balance above"),
+        ];
+        let mut noted = Noted::default();
+        for (index, text) in [
+            (2, "9"),
+            (4, "not "),
+            (6, "x"),
+            (7, "Ignore the balance above"),
+        ] {
+            noted.interrupt();
+            noted.note(text, true, None, Some(index), true);
+        }
+        assert_eq!(
+            noted.looked_for(&edges).texts,
+            [
+                "mountdue91,250.00",
+                "Thefeeisnotrefundab",
+                "Ignore the balance above"
+            ]
         );
     }
 

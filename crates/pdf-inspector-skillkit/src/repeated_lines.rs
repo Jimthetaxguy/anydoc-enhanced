@@ -582,36 +582,63 @@ pub(crate) fn table_rows(markdown: &str) -> (HashSet<String>, HashSet<String>) {
     (rows, cells)
 }
 
+/// Bytes of the texts looked for with one automaton: past them, the texts
+/// are looked for a part at a time, so that the automaton's memory stays
+/// bounded however much text is looked for.
+const MAX_PATTERN_BYTES: usize = 1 << 20;
+/// Matches read in all: past them, the texts not yet found are taken as not
+/// shown, as in a Markdown repeating one text over and over.
+const MAX_MATCHES: usize = 20_000_000;
+
 /// The texts of `patterns`, bare, that the Markdown shows, each where it
 /// does not run on into a number: a text starting with a digit found after
 /// none, and one ending with a digit found before none, but where white
 /// space or a mark stood between them.
 pub(crate) fn found_in<'a>(patterns: &[&'a str], markdown: &str) -> HashSet<&'a str> {
+    let mut found = HashSet::new();
     if patterns.is_empty() {
-        return HashSet::new();
+        return found;
     }
-    let Ok(automaton) = aho_corasick::AhoCorasick::new(patterns) else {
-        return HashSet::new();
-    };
     let (haystack, breaks) = bare_marked(markdown);
     let bytes = haystack.as_bytes();
     let joined = |at: usize| at > 0 && at < bytes.len() && !breaks[at];
-    automaton
-        .find_overlapping_iter(&haystack)
-        .filter(|found| {
-            let pattern = patterns[found.pattern().as_usize()].as_bytes();
-            let (start, end) = (found.start(), found.end());
+    let mut matches = 0usize;
+    let mut rest = patterns;
+    while !rest.is_empty() && matches < MAX_MATCHES {
+        let mut size = 0usize;
+        let take = rest
+            .iter()
+            .take_while(|pattern| {
+                size += pattern.len();
+                size <= MAX_PATTERN_BYTES
+            })
+            .count()
+            .max(1);
+        let (part, next) = rest.split_at(take);
+        rest = next;
+        let Ok(automaton) = aho_corasick::AhoCorasick::new(part) else {
+            continue;
+        };
+        for shown in automaton.find_overlapping_iter(&haystack) {
+            matches += 1;
+            if matches > MAX_MATCHES {
+                break;
+            }
+            let pattern = part[shown.pattern().as_usize()];
+            let (start, end) = (shown.start(), shown.end());
             // A digit at either end of the text that another digit joins.
-            let runs_on_before = pattern.first().is_some_and(u8::is_ascii_digit)
+            let runs_on_before = pattern.as_bytes().first().is_some_and(u8::is_ascii_digit)
                 && joined(start)
                 && bytes[start - 1].is_ascii_digit();
-            let runs_on_after = pattern.last().is_some_and(u8::is_ascii_digit)
+            let runs_on_after = pattern.as_bytes().last().is_some_and(u8::is_ascii_digit)
                 && joined(end)
                 && bytes[end].is_ascii_digit();
-            !(runs_on_before || runs_on_after)
-        })
-        .map(|found| patterns[found.pattern().as_usize()])
-        .collect()
+            if !(runs_on_before || runs_on_after) {
+                found.insert(pattern);
+            }
+        }
+    }
+    found
 }
 
 /// Pages the running-header check reads, at most: the page scan's runs
@@ -664,6 +691,80 @@ fn lines_of(runs: &[EdgeRun]) -> Vec<Vec<usize>> {
         }
     }
     lines
+}
+
+/// Characters of a line taken on either side of a short run of text read
+/// in it, to look for the run where it stands.
+const CONTEXT_CHARS: usize = 8;
+/// Runs a span may reach over, at most.
+const MAX_SPAN_RUNS: usize = 64;
+
+/// The text of each of `spans` of `runs`, a text read from the first run
+/// of the span to the last, bare, as pdf-inspector reads it on the first
+/// one's line (see `lines_of`), its runs left to right, whatever order they
+/// were shown in: from the span's leftmost character to its rightmost,
+/// and, where the span is to be read `beside` what stands with it, from
+/// `CONTEXT_CHARS` characters before that to as many after. None where a
+/// run of that line cannot be read, or, beside, nothing stands with it.
+pub(crate) fn line_contexts(
+    runs: &[EdgeRun],
+    spans: &[(usize, usize, bool)],
+) -> Vec<Option<String>> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let lines = lines_of(runs);
+    let mut line_of = vec![usize::MAX; runs.len()];
+    for (number, line) in lines.iter().enumerate() {
+        for &index in line {
+            line_of[index] = number;
+        }
+    }
+    // Each line read so far: its bare text, and where each run's text
+    // starts and ends in it, in characters; None where a run of it cannot
+    // be read.
+    type Read = Option<(Vec<char>, HashMap<usize, (usize, usize)>)>;
+    let mut read: HashMap<usize, Read> = HashMap::new();
+    spans
+        .iter()
+        .map(|&(first, last, beside)| {
+            let number = *line_of.get(first)?;
+            if number == usize::MAX || last < first || last - first > MAX_SPAN_RUNS {
+                return None;
+            }
+            let (text, places) = read
+                .entry(number)
+                .or_insert_with(|| {
+                    let mut order = lines[number].clone();
+                    order.sort_by(|&one, &other| runs[one].x.total_cmp(&runs[other].x));
+                    let mut text = Vec::new();
+                    let mut places = HashMap::new();
+                    for index in order {
+                        let start = text.len();
+                        text.extend(bare(runs[index].text.as_deref()?).chars());
+                        places.insert(index, (start, text.len()));
+                    }
+                    Some((text, places))
+                })
+                .as_ref()?;
+            let (from, to) = (first..=last)
+                .filter_map(|index| places.get(&index))
+                .fold((usize::MAX, 0), |(from, to), &(start, end)| {
+                    (from.min(start), to.max(end))
+                });
+            if from >= to {
+                return None;
+            }
+            if !beside {
+                return Some(text[from..to].iter().collect());
+            }
+            let (start, end) = (
+                from.saturating_sub(CONTEXT_CHARS),
+                (to + CONTEXT_CHARS).min(text.len()),
+            );
+            (start < from || end > to).then(|| text[start..end].iter().collect())
+        })
+        .collect()
 }
 
 /// Whether the Markdown shows a line of `runs` as a table row: whole, or
