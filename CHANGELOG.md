@@ -363,6 +363,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round eight checked loops 14 to 17 and the round-seven fixes:
+  - PDF: a statement whose rows repeat a cell of two amounts, such as
+    "0.00 0.00" quarter- and year-to-date, made the merged-cell check time
+    out with no Markdown returned. The page's positioned text is now
+    indexed once and each distinct cell placed once, so the reproducers
+    convert in about a second. Two runs side by side count as merged
+    columns only under a heading over the second, as a 1099-B's "Wash sale"
+    heads its column: an amount set beside its percentage, "1,234.56
+    (9.02%)", is one cell, and a fee of "0.00" on every row no longer joins
+    two rows. On a page whose text reads rotated, the scan's runs are
+    turned as pdf-inspector turns its text, so a rotated 1099-B's merged
+    cells are reported. A first row of three amounts or more repeated at
+    the end of the text before its table is reported whatever precedes it,
+    as upstream #531's equity statement shows. Doubled text holding a lone
+    "-", ":", or "+" ("09/01/2025 - 09/30/2025") is confirmed; a year
+    "2020" or a box "11" confirms only a repeat whose text is that number
+    alone, or one paint of it. The repeat scan also finds a second paint in
+    another subset font, a shadow a fifth of the size off, a second paint
+    split in two strings, a `TJ` array stepping back to show a string
+    again, and text doubled with no space between its copies; past the 64
+    pages read again, a page is named for its own repeated text rather than
+    in order. The word-gap check reads a page as pdf-inspector does: comments
+    between operands stripped, each text object in render mode 0, forms
+    starting with no font or spacing, glyphs in an ActualText span left to
+    its text, and the pen followed over runs whose widths it knows. A
+    sub-run split between digits, or on a vertical baseline, sets two items
+    apart, which a space inside one item does not, as a 1099-B row read
+    under a wide code 32 shows. Against pdf-inspector patched with its fix,
+    over 2,900 randomized files, it names 685 of the 718 changed pages (654
+    before) and 13 unchanged ones (42 before).
+  - DOCX: list numbers are compared by the label each side shows, at the
+    level each reads, as Word and LibreOffice show them. A level bound to a
+    style, a composite label over a shallower level in a format it cannot
+    render (unless the level is legal-style, `isLgl`), words in a level
+    without a number, and paragraphs Word numbers through its default
+    paragraph style, which AnyDoc does not read, are disclosed as
+    `list_numbering_differs`. List ids and numbers are read as each side
+    reads them (Word trims them as schema integers, AnyDoc parses them as
+    written), which replaces loop 14's document-wide padding rule; a style
+    defined twice is read as each side keeps it; and AnyDoc's branch of
+    alternate content stands for Word's only when both number alike. Text
+    Word shows in alternate content where AnyDoc takes no branch is refused.
+    Style chains are read once per style, so a document of many styles that
+    took 12.8 s converts in 0.7 s; the chain budget and its disclosure are
+    gone. None of 303 public, 119 review, and 239 other regression documents
+    changed; among 750 randomized ones, only a bypass the review found did.
+  - XLSX: a slash is a fraction bar only right after an integer
+    placeholder, as AnyDoc parses it; a fixed denominator counts by its
+    value, a fraction's percent signs scale it, and a fraction AnyDoc
+    rejects renders as General. Eight fraction formats that show an unsigned
+    non-zero value for a negative are now refused, and 26 that show zero now
+    convert; all 204 format and value pairs checked agree with LibreOffice.
 - Review round seven checked the round-six fixes again:
   - EPUB: a reader sets more boxes apart than the chapter walk knew, and
     AnyDoc ran their text together with no warning. Each flex or grid
