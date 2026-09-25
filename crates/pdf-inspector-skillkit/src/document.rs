@@ -2406,8 +2406,9 @@ struct DocxStoryScan {
     /// and those the converted text references.
     notes_defined: HashSet<(bool, String)>,
     notes_referenced: HashSet<(bool, String)>,
-    /// The distinct numbering paragraphs ask for, directly or through their
-    /// style, and each paragraph that asks, in each part's document order.
+    /// The distinct numbering paragraphs ask for, directly, through their
+    /// style, or through Word's default paragraph style, and each
+    /// paragraph, in each part's document order.
     list_uses: Vec<DocxListUse>,
     list_use_ids: HashMap<DocxListUse, u32>,
     list_paragraphs: Vec<DocxListParagraph>,
@@ -2457,15 +2458,15 @@ struct DocxListParagraph {
 
 /// The numbering a paragraph asks for: a list instance and a level given
 /// directly, and its paragraph style, which supplies what is not.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct DocxListUse {
     list: Option<u64>,
     level: Option<usize>,
     style: Option<String>,
 }
 
-/// Paragraphs with numbering or a style a document may have, past what
-/// AnyDoc's node bound allows in its three story parts.
+/// Paragraphs a document may have, past what AnyDoc's node bound allows in
+/// its three story parts.
 const MAX_DOCX_LIST_PARAGRAPHS: usize = 1 << 22;
 
 /// Notes a document may define or reference. Real documents have a few
@@ -2589,7 +2590,7 @@ struct WordNode {
     local: Vec<u8>,
     vocabulary: WordVocabulary,
     /// For an `mc:Choice` or `mc:Fallback`: AnyDoc, or Word, does not take
-    /// the branch.
+    /// the branch. Neither shows a separator note as text.
     anydoc_skips: bool,
     word_skips: bool,
     /// For `mc:AlternateContent`: AnyDoc, or Word, has taken a branch.
@@ -2606,6 +2607,8 @@ struct WordNode {
     anydoc_first: bool,
     /// The numbered paragraphs read before the element opened.
     paragraphs_before: usize,
+    /// For a `w:p`: its mark (`w:pPr`) was read.
+    marked: bool,
 }
 
 impl WordNode {
@@ -2622,6 +2625,7 @@ impl WordNode {
             anydoc_paragraphs: None,
             anydoc_first: false,
             paragraphs_before,
+            marked: false,
         }
     }
 
@@ -2894,6 +2898,10 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     };
                 }
                 take_word_branch(&reader, &event, &mut node, &mut stack);
+                if docx_note(&event, &node, &stack) == Some(true) {
+                    node.anydoc_skips = true;
+                    node.word_skips = true;
+                }
                 scan.hidden_run |= drawing_choice_word_skips(&reader, &event, &node, &stack);
                 scan_docx_element(&event, &node, &stack, scan)?;
                 stack.push(node);
@@ -2907,6 +2915,10 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                 take_word_branch(&reader, &event, &mut node, &mut stack);
                 scan.hidden_run |= drawing_choice_word_skips(&reader, &event, &node, &stack);
                 scan_docx_element(&event, &node, &stack, scan)?;
+                // An empty paragraph Word numbers through its default style.
+                if node.is(WordVocabulary::Word, b"p") {
+                    record_list_paragraph(scan, &stack, DocxListUse::default(), false)?;
+                }
             }
             quick_xml::events::Event::End(_) => {
                 let closed = stack.pop();
@@ -2929,57 +2941,29 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                         stand_in_for_word_branch(&mut scan.list_paragraphs, closed);
                     }
                 }
-                if closed.is_some_and(|node| node.is(WordVocabulary::Word, b"pPr"))
+                if closed
+                    .as_ref()
+                    .is_some_and(|node| node.is(WordVocabulary::Word, b"pPr"))
                     && word_path_ends_with(&stack, &[b"p"])
                 {
+                    if let Some(paragraph) = stack
+                        .iter_mut()
+                        .rev()
+                        .find(|node| !node.is_compatibility_wrapper())
+                    {
+                        paragraph.marked = true;
+                    }
                     let mark = std::mem::take(&mut scan.mark);
                     // A `w:numId` of 0 given directly removes a style's
-                    // numbering.
-                    if mark.list.is_some() || (!mark.direct_list && mark.style.is_some()) {
+                    // numbering; any other paragraph may be numbered through
+                    // its style, or through Word's default one.
+                    if mark.list.is_some() || !mark.direct_list {
                         let used = DocxListUse {
                             list: mark.list,
                             level: mark.level,
                             style: mark.style.clone(),
                         };
-                        let id = match scan.list_use_ids.get(&used) {
-                            Some(&id) => id,
-                            None => {
-                                if scan.list_uses.len() >= MAX_DOCX_STYLES {
-                                    return Err(DocumentError::ResourceLimit);
-                                }
-                                let id = scan.list_uses.len() as u32;
-                                scan.list_uses.push(used.clone());
-                                scan.list_use_ids.insert(used, id);
-                                id
-                            }
-                        };
-                        if scan.list_paragraphs.len() >= MAX_DOCX_LIST_PARAGRAPHS {
-                            return Err(DocumentError::ResourceLimit);
-                        }
-                        let anydoc = !stack.iter().any(|node| node.anydoc_skips)
-                            && !word_content_omitted(&stack);
-                        let deleted = mark.deleted
-                            || stack.iter().any(|node| {
-                                node.vocabulary == WordVocabulary::Word
-                                    && matches!(node.local.as_slice(), b"del" | b"moveFrom")
-                            });
-                        // Word shows what the branches it takes hold, until
-                        // the end of their alternate content lets AnyDoc's
-                        // branch stand for its own.
-                        let word = !deleted && !stack.iter().any(|node| node.word_skips);
-                        if anydoc || word {
-                            scan.list_paragraphs.push(DocxListParagraph {
-                                used: id,
-                                part: scan.part,
-                                note: scan.note.filter(|_| scan.part != DocxPart::Body),
-                                in_text_box: stack
-                                    .iter()
-                                    .any(|node| node.is(WordVocabulary::Word, b"txbxContent")),
-                                anydoc,
-                                word,
-                                deleted,
-                            });
-                        }
+                        record_list_paragraph(scan, &stack, used, mark.deleted)?;
                     }
                     if mark.numbered && !mark.style_separator {
                         scan.hidden_run |= mark.hidden;
@@ -2993,12 +2977,90 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                         }
                     }
                 }
+                // A paragraph without a mark is numbered only through Word's
+                // default paragraph style.
+                if closed
+                    .as_ref()
+                    .is_some_and(|node| node.is(WordVocabulary::Word, b"p") && !node.marked)
+                {
+                    record_list_paragraph(scan, &stack, DocxListUse::default(), false)?;
+                }
             }
             quick_xml::events::Event::Eof => return Ok(()),
             _ => {}
         }
         buffer.clear();
     }
+}
+
+/// Record a paragraph's numbering, with the sides that show it.
+fn record_list_paragraph(
+    scan: &mut DocxStoryScan,
+    stack: &[WordNode],
+    used: DocxListUse,
+    mark_deleted: bool,
+) -> Result<(), DocumentError> {
+    let id = match scan.list_use_ids.get(&used) {
+        Some(&id) => id,
+        None => {
+            if scan.list_uses.len() >= MAX_DOCX_STYLES {
+                return Err(DocumentError::ResourceLimit);
+            }
+            let id = scan.list_uses.len() as u32;
+            scan.list_uses.push(used.clone());
+            scan.list_use_ids.insert(used, id);
+            id
+        }
+    };
+    if scan.list_paragraphs.len() >= MAX_DOCX_LIST_PARAGRAPHS {
+        return Err(DocumentError::ResourceLimit);
+    }
+    let anydoc = !stack.iter().any(|node| node.anydoc_skips) && !word_content_omitted(stack);
+    let deleted = mark_deleted
+        || stack.iter().any(|node| {
+            node.vocabulary == WordVocabulary::Word
+                && matches!(node.local.as_slice(), b"del" | b"moveFrom")
+        });
+    // Word shows what the branches it takes hold, until the end of their
+    // alternate content lets AnyDoc's branch stand for its own.
+    let word = !deleted && !stack.iter().any(|node| node.word_skips);
+    if anydoc || word {
+        scan.list_paragraphs.push(DocxListParagraph {
+            used: id,
+            part: scan.part,
+            note: scan.note.filter(|_| scan.part != DocxPart::Body),
+            in_text_box: stack
+                .iter()
+                .any(|node| node.is(WordVocabulary::Word, b"txbxContent")),
+            anydoc,
+            word,
+            deleted,
+        });
+    }
+    Ok(())
+}
+
+/// For a note of a notes part (`w:footnote` or `w:endnote`), whether it is
+/// a separator, which AnyDoc skips and Word draws as a rule.
+fn docx_note(
+    event: &quick_xml::events::BytesStart<'_>,
+    node: &WordNode,
+    stack: &[WordNode],
+) -> Option<bool> {
+    let note = node.vocabulary == WordVocabulary::Word
+        && matches!(node.local.as_slice(), b"footnote" | b"endnote")
+        && stack.last().is_some_and(|parent| {
+            parent.is(WordVocabulary::Word, b"footnotes")
+                || parent.is(WordVocabulary::Word, b"endnotes")
+        });
+    note.then(|| {
+        xml_attribute_values(event, b"type").iter().any(|kind| {
+            matches!(
+                kind.trim(),
+                "separator" | "continuationSeparator" | "continuationNotice"
+            )
+        })
+    })
 }
 
 fn scan_docx_element(
@@ -3068,19 +3130,7 @@ fn scan_docx_element(
                 scan.note_references.entry(note).or_insert(order);
             }
         }
-        b"footnote" | b"endnote"
-            if node.vocabulary == WordVocabulary::Word
-                && stack.last().is_some_and(|parent| {
-                    parent.is(WordVocabulary::Word, b"footnotes")
-                        || parent.is(WordVocabulary::Word, b"endnotes")
-                })
-                && !xml_attribute_values(event, b"type").iter().any(|kind| {
-                    matches!(
-                        kind.trim(),
-                        "separator" | "continuationSeparator" | "continuationNotice"
-                    )
-                }) =>
-        {
+        b"footnote" | b"endnote" if docx_note(event, node, stack) == Some(false) => {
             let endnote = node.local == b"endnote";
             let ids = xml_attribute_values(event, b"id");
             for id in &ids {
@@ -3795,13 +3845,11 @@ impl DocxNumbering {
 
     /// Where a paragraph's numbering resolves, for Word and for AnyDoc: the
     /// list given directly or its style chain's, and the level given
-    /// directly or read from the style chain. AnyDoc takes the level bound
-    /// to the first style along the chain that a level names
-    /// (`w:lvl/w:pStyle`), else the first, reading no style's own level, as
-    /// ECMA-376 says. Word, as LibreOffice shows it, takes the nearest style
-    /// along the chain that is bound or names its own level
-    /// (`w:numPr/w:ilvl`); a style that does both is numbered at the level
-    /// bound to it. A list instance of 0 removes numbering.
+    /// directly or read from the style chain (see
+    /// [`DocxStyleChains::level`]). Word numbers a paragraph that names no
+    /// style, or one the parts do not define, through the default
+    /// paragraph style; AnyDoc through none. A list instance of 0 removes
+    /// numbering.
     fn resolve_use(
         &self,
         used: &DocxListUse,
@@ -3810,23 +3858,29 @@ impl DocxNumbering {
         word_instances: &mut DocxInstances,
         anydoc_instances: &mut DocxInstances,
     ) -> DocxResolved {
-        let list = match (used.list, used.style.as_deref()) {
-            (Some(list), _) => list,
-            (None, Some(style)) => match chains.list(style) {
-                Some(list) => list,
-                None => return DocxResolved::default(),
-            },
-            (None, None) => return DocxResolved::default(),
-        };
-        if list == 0 {
-            return DocxResolved::default();
-        }
+        let word_style = used
+            .style
+            .as_deref()
+            .filter(|&style| chains.defined(style))
+            .or(styles.default_paragraph.as_deref());
         let side = |word: bool, instances: &mut DocxInstances| {
+            let style = if word {
+                word_style
+            } else {
+                used.style.as_deref()
+            };
+            let list = match used.list {
+                Some(list) => list,
+                None => chains.list(style?)?,
+            };
+            if list == 0 {
+                return None;
+            }
             let instance = instances
                 .entry(list)
                 .or_insert_with(|| self.instance(list, styles, chains, word))
                 .as_ref()?;
-            let level = match (used.level, used.style.as_deref()) {
+            let level = match (used.level, style) {
                 (Some(level), _) => level,
                 (None, Some(style)) => chains.level(style, &instance.bound, word),
                 (None, None) => 0,
@@ -4015,6 +4069,10 @@ impl DocxNumbering {
 #[derive(Default)]
 struct DocxStyleNumbering {
     styles: HashMap<String, DocxStyleList>,
+    /// The default paragraph style (`w:default="1"`), which Word applies to
+    /// a paragraph naming no style or one the parts do not define. AnyDoc
+    /// reads no default.
+    default_paragraph: Option<String>,
     /// A style's list instance written with white space around it.
     padded: bool,
 }
@@ -4132,6 +4190,11 @@ impl<'a> DocxStyleChains<'a> {
         chains
     }
 
+    /// Whether the styles parts define a style.
+    fn defined(&self, style: &str) -> bool {
+        self.index.contains_key(style)
+    }
+
     /// The list instance a paragraph style numbers with.
     fn list(&self, style: &str) -> Option<u64> {
         self.index.get(style).and_then(|&style| self.list[style])
@@ -4236,19 +4299,33 @@ fn docx_style_numbering(
         numbering.padded |=
             local == b"numId" && raw.as_ref().is_some_and(|value| value.trim() != value);
         match local.as_slice() {
-            b"style" if start => {
-                open = xml_attribute_values(&event, b"styleId")
+            b"style" => {
+                let id = xml_attribute_values(&event, b"styleId")
                     .into_iter()
                     .next()
                     .map(|id| id.trim().to_string())
                     .filter(|id| id.len() <= MAX_STYLE_ID_BYTES);
-                if let Some(id) = &open {
+                if let Some(id) = &id {
                     if numbering.styles.len() >= MAX_DOCX_STYLES
                         && !numbering.styles.contains_key(id)
                     {
                         return Err(DocumentError::ResourceLimit);
                     }
                     numbering.styles.entry(id.clone()).or_default();
+                    // The last paragraph style marked the default one.
+                    let paragraph = xml_attribute_values(&event, b"type")
+                        .iter()
+                        .all(|kind| kind.trim() == "paragraph");
+                    if paragraph
+                        && xml_attribute_values(&event, b"default")
+                            .iter()
+                            .any(|value| xml_true(value))
+                    {
+                        numbering.default_paragraph = Some(id.clone());
+                    }
+                }
+                if start {
+                    open = id;
                 }
             }
             b"basedOn" if xml_path_ends_with(&stack, &[b"style"]) => {
@@ -10820,6 +10897,76 @@ mod tests {
             assert!(!composite(parent, "<w:isLgl/>"), "{parent}");
         }
         assert!(!composite("upperRoman", ""));
+    }
+
+    #[test]
+    fn docx_unstyled_paragraphs_take_words_default_paragraph_style() {
+        let differs = |body: &str, styles: &str, notes: Option<&str>| {
+            let document = word_part("document", body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            let notes = notes.map(|notes| format!("<w:footnotes {WORD_NS}>{notes}</w:footnotes>"));
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ];
+            if let Some(notes) = &notes {
+                entries.push(("word/footnotes.xml", notes.as_bytes()));
+            }
+            docx_preflight(&entries).list_numbering_differs
+        };
+        let default = |id: &str, numbered: bool| {
+            let numbering = if numbered {
+                r#"<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>"#
+            } else {
+                ""
+            };
+            format!(
+                r#"<w:style w:type="paragraph" w:default="1" w:styleId="{id}">{numbering}</w:style>"#
+            )
+        };
+        let plain = "<w:p><w:r><w:t>Clause</w:t></w:r></w:p>";
+        let styled = |style: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>Clause</w:t></w:r></w:p>"#
+            )
+        };
+        let spaced =
+            r#"<w:p><w:pPr><w:spacing w:after="0"/></w:pPr><w:r><w:t>Clause</w:t></w:r></w:p>"#;
+        // Word numbers a paragraph naming no style, or one the styles do
+        // not define, through the default paragraph style; AnyDoc does not.
+        let numbered = default("Normal", true);
+        assert!(differs(&plain.repeat(3), &numbered, None));
+        assert!(differs(&spaced.repeat(3), &numbered, None));
+        assert!(differs(&styled("Missing").repeat(2), &numbered, None));
+        assert!(differs(
+            &[plain, &styled("Normal"), plain, &styled("Normal")].concat(),
+            &numbered,
+            None
+        ));
+        let custom = format!(
+            r#"{}<w:style w:type="paragraph" w:styleId="Normal"/>"#,
+            default("LegalBody", true)
+        );
+        assert!(differs(&plain.repeat(2), &custom, None));
+        // An unnumbered default style numbers nothing, and a separator note,
+        // which neither side shows as text, is not counted.
+        let item = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#;
+        assert!(!differs(
+            &[item, plain, item].concat(),
+            &default("Normal", false),
+            None
+        ));
+        let quiet = format!(r#"{numbered}<w:style w:type="paragraph" w:styleId="Quiet"/>"#);
+        let reference = r#"<w:p><w:pPr><w:pStyle w:val="Quiet"/></w:pPr><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+        let notes = format!(
+            r#"<w:footnote w:type="separator" w:id="-1">{plain}</w:footnote><w:footnote w:id="1">{}</w:footnote>"#,
+            styled("Quiet")
+        );
+        assert!(!differs(reference, &quiet, Some(&notes)));
     }
 
     #[test]
