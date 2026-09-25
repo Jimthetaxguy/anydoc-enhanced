@@ -599,6 +599,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     document declares another form of its pages, is not counted.
   Over 4,412 corpus, fixture, review, and fuzz PDFs, no warning of these
   loops changed but on their reproducers, and none timed out.
+- Review round ten also checked round nine's DOCX, XLSX, and document-worker
+  fixes:
+  - Documents: round nine's "the server reads no package part" held for the
+    package checks only. The server still classified each document itself,
+    on the async executor and ahead of the two-worker bound, and AnyDoc's
+    detection parses the package relationships, the content types, and at
+    times the main part, to 128 MiB and 2 million nodes each: a 44 KB DOCX
+    took the server to 590 MiB, a 7.8 MB one to 1.3 GiB, and a 9.9 MB one to
+    1.8 GiB, and four at once to 4.9 GiB or, capped at 6 GiB of address
+    space, down. `classify_document` did the same. The server now takes a
+    worker slot, reads the file into the worker's frame once, beside its
+    extension, and counts an archive's entries; the worker classifies the
+    document, refuses what its route refuses, runs the package preflight,
+    and converts it, and `classify_document` asks the worker too. The three
+    packages peak at 8 to 19 MiB in the server, and 9 to 31 MiB four at
+    once, with the same `resource_limit`; a normal document costs the
+    server what it did. For the two largest, whose detection passes the
+    worker's 1 GiB ceiling, `classify_document` answers `resource_limit`
+    where it answered `docx`. Without the worker sandbox, a document is
+    still classified in the server, for its refusal, one slot at a time.
+  - DOCX notes: where the main part names two footnotes or endnotes
+    relationships, Word, as LibreOffice shows it, reads the first and
+    AnyDoc the lowest id, so a note could convert with another part's text
+    ("pay 900 USD" for "pay 100 USD") as complete; a notes part no
+    relationship names is read by AnyDoc alone, and LibreOffice does not
+    open such a document where its text references a note. Where the two
+    sides read different parts, each note the text references is compared:
+    other text, or a note only one part holds, is refused as
+    `incomplete_conversion`, and the same text numbered otherwise is
+    disclosed as `list_numbering_differs`; a note no text references, which
+    Word does not show, stays disclosed as hidden. Workbooks need no such
+    check: LibreOffice, like AnyDoc, reads the shared strings and styles of
+    the relationship with the lowest id.
+  - DOCX list levels: a level repeating `w:start`, `w:numFmt`, `w:lvlText`,
+    `w:lvlRestart`, or `w:pStyle` was read first-wins on Word's side, as
+    AnyDoc reads it, while LibreOffice numbers the list from the last: 7, 8,
+    9 where AnyDoc writes 1, 2, 3. Word's side now reads every element, the
+    last winning: numbers as LibreOffice reads integers (`7x` is 7; no
+    value, other text, or a value past `i32` is 0), a format, number text,
+    or style only from an element that gives one, and a format only one
+    ECMA-376 defines. Number text past 1,024 bytes is judged by the value
+    Word reads. LibreOffice applies no `w:lvlRestart`; Word's is read as its
+    other numbers are.
+  - DOCX list levels are found as LibreOffice finds them: by the
+    namespaced `w:ilvl`, read as an integer (`1x` is level 1), an element
+    naming none going into the level named last in its definition or list
+    instance, and dropped where none was; an override's level at its own
+    `w:ilvl` (an override of level 0 holding a level 1 restyles level 1),
+    laid over the definition's level; a start override for the level
+    current when it is read. A paragraph style bound to one list level
+    that names another, or none, is numbered at the binding by AnyDoc and
+    ECMA-376 and at its own level by LibreOffice ("1.1." against "2."); it
+    is disclosed. Lists these readings number otherwise report
+    `list_numbering_differs`.
+  - Of 303 public, 119 review, 58 round-seven, 181 workbook, 320 randomized,
+    and 1,324 round-nine documents, two changed: round-eight fixtures built
+    for a bound style's level (`b2-02`, `b3-04`), which LibreOffice numbers
+    otherwise than AnyDoc and now report `list_numbering_differs`.
+    `classify_document` answers as before on all of them, and round nine's
+    performance reproducers keep their verdicts and costs.
 - Review round nine checked loops 17 to 19, the round-eight fixes, and the
   document worker:
   - PDF words split in glyph-by-glyph text (#531): Chrome's Skia keeps a
@@ -624,7 +684,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rewind is found on any page of a long statement.
   - Documents: the package checks run in the worker, under its 15-second
     deadline, 1 GiB memory ceiling, and two-worker bound, and come back
-    with the Markdown; the server reads no package part. It had run them
+    with the Markdown, and the server reads no package part for them,
+    though it still classified each document itself until round ten (see
+    there). It had run them
     itself first, with no bound, past the tool's timeout and ahead of the
     worker bound: a 15 KB DOCX whose list carries 1 MB of level text took
     the server to 827 MiB with 50 list instances, 3.2 GiB with 200, and
