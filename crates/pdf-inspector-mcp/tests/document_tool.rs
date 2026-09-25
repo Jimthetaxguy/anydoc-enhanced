@@ -554,13 +554,38 @@ fn epub_is_recognized_and_platform_memory_gated() {
             previous = offset;
         }
         assert!(!document.to_string().contains("https://"));
-        assert!(!document.to_string().contains("</"));
+        // AnyDoc's anchors for link targets are the only markup kept.
+        assert!(!without_anchors(markdown).contains("</"), "{markdown}");
         assert!(!document.to_string().contains(&["/", "Users", "/"].concat()));
     } else {
         let error = run_document_tool(fixture, "epub-disabled-route-test");
         assert_eq!(error["code"], "unsupported");
         assert_eq!(error["error"], "document format is not enabled");
     }
+}
+
+/// Markdown without the anchors AnyDoc writes for link targets,
+/// `<a id="…"></a>` with an id of `[a-z0-9_-]`.
+fn without_anchors(markdown: &str) -> String {
+    let mut output = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(start) = rest.find("<a id=\"") {
+        let after = &rest[start + "<a id=\"".len()..];
+        let id_length = after
+            .bytes()
+            .take_while(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+            .count();
+        let tail = &after[id_length..];
+        output.push_str(&rest[..start]);
+        if id_length > 0 && tail.starts_with("\"></a>") {
+            rest = &tail["\"></a>".len()..];
+        } else {
+            output.push_str("<a id=\"");
+            rest = after;
+        }
+    }
+    output.push_str(rest);
+    output
 }
 
 #[cfg(target_os = "linux")]

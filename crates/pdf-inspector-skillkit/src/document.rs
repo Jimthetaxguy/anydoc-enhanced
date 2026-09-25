@@ -7024,6 +7024,9 @@ fn sanitize_markdown(markdown: &str) -> (String, bool) {
 /// written, so nothing in them is a tag. AnyDoc's own `<br>` separates the
 /// lines of a table cell; without it, "52,000" over "1,250" would read as
 /// one number.
+/// The longest anchor id the sanitizer keeps.
+const MAX_ANCHOR_ID_BYTES: usize = 64;
+
 fn strip_html_tags(text: &str, html: &Regex) -> String {
     let code = markdown_code_ranges(text);
     let in_code = |position: usize| {
@@ -7053,6 +7056,24 @@ fn strip_html_tags(text: &str, html: &Regex) -> String {
         }
         position = tag.end();
         if tag.as_str() == "<br>" {
+            continue;
+        }
+        // The anchor AnyDoc writes for a link target, `<a id="…"></a>` with
+        // an id of its own characters (`sanitize_id`), shows nothing and is
+        // what the document's own links point at.
+        if tag
+            .as_str()
+            .strip_prefix("<a id=\"")
+            .and_then(|rest| rest.strip_suffix("\">"))
+            .is_some_and(|id| {
+                (1..=MAX_ANCHOR_ID_BYTES).contains(&id.len())
+                    && id
+                        .bytes()
+                        .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+            })
+            && text[tag.end()..].starts_with("</a>")
+        {
+            position = tag.end() + "</a>".len();
             continue;
         }
         output.push_str(&text[copied..tag.start()]);
@@ -7160,21 +7181,21 @@ fn redact_destinations_and_paths(markdown: &str) -> String {
     // Bare URLs with an authority, and the schemes that act without one.
     let url = URL.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(?:[a-z][a-z0-9+.\-]*://|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>]+",
+            r#"(?i)\b(?:[a-z][a-z0-9+.\-]*://|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>`"<]+"#,
         )
         .expect("URL regex")
     });
     // `www.` hosts where GFM links them on its own: at a line start or after
     // whitespace, `*`, `_`, `~`, or `(`. Inside `Text/www.index.xhtml` it is
     // part of a relative path.
-    let www =
-        WWW.get_or_init(|| Regex::new(r"(?im)(^|[\s*_~(])www\.[^\s<)\]>]*").expect("www regex"));
+    let www = WWW
+        .get_or_init(|| Regex::new(r#"(?im)(^|[\s*_~(])www\.[^\s<)\]>`"]*"#).expect("www regex"));
     // Home directories, temporary and private roots, Windows profiles, and
     // UNC shares, unless a path or word character precedes them:
     // `Text/home/ch1.xhtml` is a relative link, not a home directory.
     let path = PATH.get_or_init(|| {
         Regex::new(
-            r"(^|[^A-Za-z0-9._/\\\-])((?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|[A-Za-z]:\\(?i:users)\\)[^\s)\]>]*)",
+            r#"(^|[^A-Za-z0-9._/\\\-])((?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|[A-Za-z]:\\(?i:users)\\)[^\s)\]>`"]*)"#,
         )
         .expect("path regex")
     });
@@ -7517,13 +7538,19 @@ mod tests {
     #[test]
     fn sanitizer_rechecks_links_joined_by_tag_removal() {
         for input in [
-            "Claim[^1]<a id=\"bm\"></a>(//attacker.example.invalid/p)",
+            "Claim[^1]<span></span>(//attacker.example.invalid/p)",
+            "Claim[^1]<a id=\"bm\" name=\"x\"></a>(//attacker.example.invalid/p)",
             "[x](<b>//attacker.example.invalid/p)",
         ] {
             let (output, changed) = sanitize_markdown(input);
             assert!(changed, "{input}");
             assert!(!output.contains("attacker"), "{input} -> {output}");
         }
+        // AnyDoc's own anchor is kept, so it keeps the bracket and the
+        // parenthesis apart and no link forms.
+        let kept = "Claim[^1]<a id=\"bm\"></a>(//attacker.example.invalid/p)";
+        let (output, _) = sanitize_markdown(kept);
+        assert!(!output.contains("](//"), "{output}");
     }
 
     #[test]
@@ -7562,7 +7589,7 @@ mod tests {
             sanitize_markdown("a<br onclick=\"x()\">b<BR>c"),
             ("abc".to_string(), true)
         );
-        // Code shows what is written; the anchor AnyDoc emits still goes.
+        // Code shows what is written.
         for input in [
             "Use `<Client Name>` in the salutation.",
             "```\nDear <Client Name>,\nDue if AGI<threshold and credit>0\n```\n",
@@ -7575,10 +7602,46 @@ mod tests {
                 "{input}"
             );
         }
-        assert_eq!(
-            sanitize_markdown("<a id=\"m\"></a>Target `<x>`"),
-            ("Target `<x>`".to_string(), true)
-        );
+        // The anchor AnyDoc writes for a link target stays; any other
+        // anchor goes.
+        let anchored = "<a id=\"_toc12-2\"></a>Target `<x>` and [back](#_toc12-2)";
+        assert_eq!(sanitize_markdown(anchored), (anchored.to_string(), false));
+        for (input, output) in [
+            ("<a id=\"Upper\"></a>x", "x"),
+            ("<a id=\"m\" onclick=\"y()\"></a>x", "x"),
+            ("<a id=\"m\">shown</a>x", "shownx"),
+            ("<a id=\"\"></a>x", "x"),
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (output.to_string(), true),
+                "{input}"
+            );
+        }
+        let long = format!("<a id=\"{}\"></a>x", "a".repeat(MAX_ANCHOR_ID_BYTES + 1));
+        assert_eq!(sanitize_markdown(&long), ("x".to_string(), true));
+        // A web address or a path in a code span is removed without its
+        // closing backtick.
+        for (input, output) in [
+            (
+                "Portal: `https://portal.example.com/upload` today",
+                "Portal: `[external URL removed]` today",
+            ),
+            (
+                &["Share `", "\\\\", "fileserver\\clients\\2025` today"].concat() as &str,
+                "Share `[local path removed]` today",
+            ),
+            (
+                &["Old `C:", "\\", "Users\\preparer\\returns` path"].concat() as &str,
+                "Old `[local path removed]` path",
+            ),
+            (
+                "<a href=\"javascript:alert(2)\">x</a> and \"https://a.example/x\"",
+                "x and \"[external URL removed]\"",
+            ),
+        ] {
+            assert_eq!(sanitize_markdown(input).0, output, "{input}");
+        }
         // An escaped or unmatched backtick opens no span.
         assert_eq!(
             sanitize_markdown("\\`<b>x</b>`"),

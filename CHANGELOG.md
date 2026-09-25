@@ -187,6 +187,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- The Markdown sanitizer keeps the anchors AnyDoc writes for link targets
+  (`<a id="…"></a>`, with ids of its own characters), so a document's own
+  links still land and a bookmark no longer raises `sanitized_output`. A web
+  address or path redacted inside a code span keeps the span's closing
+  backtick; the redaction had swallowed it, turning the text after it into
+  code.
 - Text pdf-inspector 1.24.0 repeats or merges is reported, from its open pull
   requests (#317, #377, #406, #424, #443, #531). A run painted twice over
   itself, for emphasis, as an overprint, or as a replayed row, came out twice
