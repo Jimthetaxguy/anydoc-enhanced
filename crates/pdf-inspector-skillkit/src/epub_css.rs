@@ -4814,37 +4814,69 @@ const PAINTING_PROPERTIES: [&str; 8] = [
     "marker-end",
 ];
 
-/// The ids the `url(#id)` references in a value refer to.
-fn url_fragments(value: &str) -> impl Iterator<Item = &str> + '_ {
-    let lower = value.to_ascii_lowercase();
-    let starts: Vec<usize> = lower.match_indices("url(").map(|(at, _)| at + 4).collect();
-    starts.into_iter().filter_map(move |start| {
-        let rest = value[start..].trim_start().trim_start_matches(['"', '\'']);
-        let id = rest.strip_prefix('#')?;
-        let end = id
-            .find(|character: char| {
-                matches!(character, ')' | '"' | '\'') || character.is_whitespace()
-            })
-            .unwrap_or(id.len());
-        Some(&id[..end])
-    })
+/// Where [`add_painted`] stands in the tokens it reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaintedScan {
+    /// Before a declaration's name.
+    Start,
+    /// After a name, and whether it names a painting property.
+    Name(bool),
+    /// In a declaration's value, and whether the property paints.
+    Value(bool),
 }
 
-/// Add the ids that painting declarations in a `style` attribute or
-/// element refer to.
-fn painted_by_style(css: &str, painted: &mut std::collections::HashSet<String>) {
-    for declaration in css.split([';', '{', '}']) {
-        let Some((name, value)) = declaration.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        if PAINTING_PROPERTIES
-            .iter()
-            .any(|property| name.eq_ignore_ascii_case(property))
-        {
-            painted.extend(url_fragments(value).map(str::to_string));
+/// Add to `ids` the ids that painting declarations name through `url(#id)`
+/// references: in a `style` element's rules or a `style` attribute's
+/// declarations, or, with `value`, in a presentation attribute's value. A
+/// declaration is a name and a colon, then the tokens up to the next `;`,
+/// `{`, or `}`. A reference is a `url` token, or a `url()` function holding
+/// a string, as a reader tokenizes them: a URL a reader rejects, such as
+/// one that meets an opening parenthesis, names nothing. The tokens are
+/// read one by one, not held, so text costs time and memory in proportion
+/// to its length, however many references it opens.
+fn add_painted(css: &str, value: bool, ids: &mut std::collections::HashSet<String>) {
+    let mut tokenizer = Tokenizer::new(css);
+    let mut scan = if value {
+        PaintedScan::Value(true)
+    } else {
+        PaintedScan::Start
+    };
+    // A `url(` function waits for the string it holds.
+    let mut url_function = false;
+    while let Some(token) = tokenizer.next_token() {
+        match (scan, token) {
+            (_, Token::Whitespace) => {}
+            (_, Token::Semicolon | Token::OpenCurly | Token::CloseCurly) if !value => {
+                scan = PaintedScan::Start;
+                url_function = false;
+            }
+            (PaintedScan::Start, Token::Ident(name)) => {
+                let painting = PAINTING_PROPERTIES
+                    .iter()
+                    .any(|property| name.eq_ignore_ascii_case(property));
+                scan = PaintedScan::Name(painting);
+            }
+            (PaintedScan::Name(painting), Token::Colon) => scan = PaintedScan::Value(painting),
+            (PaintedScan::Value(true), Token::Url(target)) => {
+                ids.extend(fragment(&target).map(str::to_string));
+            }
+            (PaintedScan::Value(true), Token::Function(function)) => {
+                url_function = function.eq_ignore_ascii_case("url");
+            }
+            (PaintedScan::Value(true), Token::Str(target)) if url_function => {
+                ids.extend(fragment(&target).map(str::to_string));
+                url_function = false;
+            }
+            (PaintedScan::Value(_), _) => url_function = false,
+            // A selector, or anything else before a declaration.
+            _ => scan = PaintedScan::Start,
         }
     }
+}
+
+/// The id a URL names in the same document (`#id`), if it names one.
+fn fragment(target: &str) -> Option<&str> {
+    target.strip_prefix('#').filter(|id| !id.is_empty())
 }
 
 /// An open element in the pass before the walk, or the chapter's top
@@ -4901,14 +4933,22 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
             quick_xml::events::Event::Text(text)
                 if open.last().is_some_and(|family| family.style) =>
             {
-                painted_by_style(&String::from_utf8_lossy(text.as_ref()), &mut found.painted);
+                add_painted(
+                    &String::from_utf8_lossy(text.as_ref()),
+                    false,
+                    &mut found.painted,
+                );
                 buffer.clear();
                 continue;
             }
             quick_xml::events::Event::CData(text)
                 if open.last().is_some_and(|family| family.style) =>
             {
-                painted_by_style(&String::from_utf8_lossy(text.as_ref()), &mut found.painted);
+                add_painted(
+                    &String::from_utf8_lossy(text.as_ref()),
+                    false,
+                    &mut found.painted,
+                );
                 buffer.clear();
                 continue;
             }
@@ -4953,12 +4993,8 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
                     if let Some(id) = value.trim().strip_prefix('#') {
                         found.used.insert(id.to_string());
                     }
-                } else if styled {
-                    painted_by_style(&value, &mut found.painted);
                 } else {
-                    found
-                        .painted
-                        .extend(url_fragments(&value).map(str::to_string));
+                    add_painted(&value, !styled, &mut found.painted);
                 }
             }
         }
@@ -6458,6 +6494,39 @@ mod tests {
             &[r#"text::before { content: "Balance due " }"#],
             &format!(r#"<svg {svg}><text>1,250.00</text></svg>"#)
         ));
+    }
+
+    #[test]
+    fn painting_references_are_read_once_through() {
+        // `url(` opened again and again, never closed: each is a URL a
+        // reader rejects at the next parenthesis, and names nothing.
+        let bomb = "url(#".repeat(80_000);
+        let mut ids = std::collections::HashSet::new();
+        add_painted(&bomb, true, &mut ids);
+        add_painted(&format!(".a {{ fill: {bomb} }}"), false, &mut ids);
+        add_painted(&format!("fill: {bomb}"), false, &mut ids);
+        assert!(ids.is_empty(), "{ids:?}");
+        // Closed references name their ids, each kept once; references in
+        // properties that paint nothing, and URLs elsewhere, name none.
+        add_painted(&"url(#p) ".repeat(80_000), true, &mut ids);
+        add_painted(
+            r##"rect { fill: url( "#q" ) } .m { MASK: url('#m') } .x { color: url(#c) } a:hover { background: url(#b) }"##,
+            false,
+            &mut ids,
+        );
+        add_painted("marker-end: url(#k); stroke: url(x.svg#s)", false, &mut ids);
+        let mut found: Vec<&str> = ids.iter().map(String::as_str).collect();
+        found.sort_unstable();
+        assert_eq!(found, ["k", "m", "p", "q"]);
+        // A chapter holding such values is read as any other: its text is
+        // painted, and nothing is flagged.
+        let svg = r#"xmlns="http://www.w3.org/2000/svg""#;
+        let body = format!(
+            r#"<p>Figure 1.</p><svg {svg}><style>.a {{ fill: {bomb} }}</style><rect fill="{bomb}" style="clip-path: {bomb}"/><text>Chart</text></svg>"#
+        );
+        assert_eq!(walk(&[], &body), ChapterText::default());
+        let facts = element_facts(&chapter(&body)).expect("chapter facts");
+        assert!(facts.painted.is_empty() && facts.used.is_empty());
     }
 
     #[test]
