@@ -2447,9 +2447,12 @@ struct DocxListParagraph {
     in_text_box: bool,
     /// AnyDoc converts it, and so numbers it.
     anydoc: bool,
-    /// Word shows it: it is in the `mc:AlternateContent` branch Word
-    /// takes, and its mark is not a tracked deletion or move source.
+    /// Word shows it: it is in the `mc:AlternateContent` branches Word
+    /// takes, or in AnyDoc's branch standing for Word's, and it is not
+    /// deleted.
     word: bool,
+    /// Its mark is a tracked deletion or move source, or it sits in one.
+    deleted: bool,
 }
 
 /// The numbering a paragraph asks for: a list instance and a level given
@@ -2593,18 +2596,43 @@ struct WordNode {
     anydoc_took: bool,
     word_took: bool,
     /// For `mc:AlternateContent`: the branches AnyDoc has taken, and the
-    /// numbered paragraphs of Word's branch, which Word shows only if AnyDoc
-    /// takes no branch.
+    /// numbered paragraphs of Word's branch and of the first branch AnyDoc
+    /// takes, as ranges of `DocxStoryScan::list_paragraphs`.
     anydoc_branches: u32,
-    pending: Vec<usize>,
+    word_paragraphs: Option<std::ops::Range<usize>>,
+    anydoc_paragraphs: Option<std::ops::Range<usize>>,
     /// For an `mc:Choice` or `mc:Fallback`: the first branch of its
-    /// alternate content that AnyDoc takes, which stands for Word's.
+    /// alternate content that AnyDoc takes.
     anydoc_first: bool,
+    /// The numbered paragraphs read before the element opened.
+    paragraphs_before: usize,
 }
 
 impl WordNode {
+    fn new(local: &[u8], vocabulary: WordVocabulary, paragraphs_before: usize) -> Self {
+        WordNode {
+            local: local.to_vec(),
+            vocabulary,
+            anydoc_skips: false,
+            word_skips: false,
+            anydoc_took: false,
+            word_took: false,
+            anydoc_branches: 0,
+            word_paragraphs: None,
+            anydoc_paragraphs: None,
+            anydoc_first: false,
+            paragraphs_before,
+        }
+    }
+
     fn is(&self, vocabulary: WordVocabulary, local: &[u8]) -> bool {
         self.vocabulary == vocabulary && self.local == local
+    }
+
+    /// An `mc:Choice` or `mc:Fallback`.
+    fn is_branch(&self) -> bool {
+        self.vocabulary == WordVocabulary::MarkupCompatibility
+            && matches!(self.local.as_slice(), b"Choice" | b"Fallback")
     }
 
     /// `mc:AlternateContent` and its branches, which wrap content without
@@ -2797,34 +2825,40 @@ fn take_word_branch<R>(
     node.word_skips = !word_takes;
 }
 
-/// Whether Word shows a numbered paragraph as far as the branches of
-/// `mc:AlternateContent` around it decide, where the two take different
-/// branches: those hold the same content in two vocabularies, so the first
-/// branch AnyDoc takes stands for Word's, and Word's own branch counts only
-/// if AnyDoc takes none, which the end of its alternate content decides.
-/// `Some(index)` is the stack index of that alternate content.
-fn word_branch_shows(stack: &[WordNode]) -> Result<bool, usize> {
-    let mut pending = None;
-    for (index, node) in stack.iter().enumerate() {
-        let branch = node.vocabulary == WordVocabulary::MarkupCompatibility
-            && matches!(node.local.as_slice(), b"Choice" | b"Fallback");
-        if !branch {
-            continue;
-        }
-        if !node.anydoc_skips {
-            if !node.anydoc_first {
-                return Ok(false);
-            }
-        } else if node.word_skips || pending.is_some() {
-            return Ok(false);
-        } else {
-            match index.checked_sub(1).map(|parent| &stack[parent]) {
-                Some(alternate) if alternate.anydoc_branches == 0 => pending = Some(index - 1),
-                _ => return Ok(false),
-            }
-        }
+/// Where Word and AnyDoc take different branches of `mc:AlternateContent`,
+/// decide when it ends which paragraphs Word's numbers are compared with.
+/// When the paragraphs Word shows in its branch and those AnyDoc converts
+/// in the first branch it takes ask for the same numbering, in the same
+/// order and stories, the branches hold one list in two vocabularies:
+/// AnyDoc's stands for Word's, and the replay compares Word's numbers with
+/// the paragraphs AnyDoc converts. Branches that number differently count
+/// each for its own side.
+fn stand_in_for_word_branch(paragraphs: &mut [DocxListParagraph], alternate: &WordNode) {
+    let (Some(word), Some(anydoc)) = (
+        alternate.word_paragraphs.clone(),
+        alternate.anydoc_paragraphs.clone(),
+    ) else {
+        return;
+    };
+    if word == anydoc || word.end > paragraphs.len() || anydoc.end > paragraphs.len() {
+        return;
     }
-    pending.map_or(Ok(true), Err)
+    let shown = |range: std::ops::Range<usize>, shows: fn(&DocxListParagraph) -> bool| {
+        paragraphs[range]
+            .iter()
+            .filter(move |paragraph| shows(paragraph))
+            .map(|paragraph| (paragraph.used, paragraph.in_text_box))
+    };
+    let converted = |paragraph: &DocxListParagraph| paragraph.anydoc && !paragraph.deleted;
+    if !shown(word.clone(), |paragraph| paragraph.word).eq(shown(anydoc.clone(), converted)) {
+        return;
+    }
+    for paragraph in &mut paragraphs[anydoc] {
+        paragraph.word = converted(paragraph);
+    }
+    for paragraph in &mut paragraphs[word] {
+        paragraph.word = false;
+    }
 }
 
 /// Scan one Word story part into `scan`. Parse errors fail closed as
@@ -2846,17 +2880,11 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                 if stack.len() >= MAX_XML_DEPTH {
                     return Err(DocumentError::ResourceLimit);
                 }
-                let mut node = WordNode {
-                    local: xml_local_name(event.name().as_ref()).to_vec(),
+                let mut node = WordNode::new(
+                    xml_local_name(event.name().as_ref()),
                     vocabulary,
-                    anydoc_skips: false,
-                    word_skips: false,
-                    anydoc_took: false,
-                    word_took: false,
-                    anydoc_branches: 0,
-                    pending: Vec::new(),
-                    anydoc_first: false,
-                };
+                    scan.list_paragraphs.len(),
+                );
                 if stack.is_empty() {
                     scan.note = None;
                     scan.part = match node.local.as_slice() {
@@ -2871,33 +2899,34 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                 stack.push(node);
             }
             quick_xml::events::Event::Empty(event) => {
-                let mut node = WordNode {
-                    local: xml_local_name(event.name().as_ref()).to_vec(),
+                let mut node = WordNode::new(
+                    xml_local_name(event.name().as_ref()),
                     vocabulary,
-                    anydoc_skips: false,
-                    word_skips: false,
-                    anydoc_took: false,
-                    word_took: false,
-                    anydoc_branches: 0,
-                    pending: Vec::new(),
-                    anydoc_first: false,
-                };
+                    scan.list_paragraphs.len(),
+                );
                 take_word_branch(&reader, &event, &mut node, &mut stack);
                 scan.hidden_run |= drawing_choice_word_skips(&reader, &event, &node, &stack);
                 scan_docx_element(&event, &node, &stack, scan)?;
             }
             quick_xml::events::Event::End(_) => {
                 let closed = stack.pop();
-                // Word's branch of alternate content AnyDoc took no branch
-                // of is what Word shows.
-                if let Some(alternate) = closed
-                    .as_ref()
-                    .filter(|node| node.anydoc_branches == 0 && !node.pending.is_empty())
-                {
-                    for &index in &alternate.pending {
-                        if let Some(paragraph) = scan.list_paragraphs.get_mut(index) {
-                            paragraph.word = true;
+                if let Some(closed) = &closed {
+                    // A branch's numbered paragraphs, where Word takes it or
+                    // it is the first AnyDoc takes.
+                    if let Some(alternate) = stack.last_mut().filter(|parent| {
+                        closed.is_branch()
+                            && parent.is(WordVocabulary::MarkupCompatibility, b"AlternateContent")
+                    }) {
+                        let read = closed.paragraphs_before..scan.list_paragraphs.len();
+                        if !closed.word_skips {
+                            alternate.word_paragraphs = Some(read.clone());
                         }
+                        if closed.anydoc_first {
+                            alternate.anydoc_paragraphs = Some(read);
+                        }
+                    }
+                    if closed.is(WordVocabulary::MarkupCompatibility, b"AlternateContent") {
+                        stand_in_for_word_branch(&mut scan.list_paragraphs, closed);
                     }
                 }
                 if closed.is_some_and(|node| node.is(WordVocabulary::Word, b"pPr"))
@@ -2934,16 +2963,11 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                                 node.vocabulary == WordVocabulary::Word
                                     && matches!(node.local.as_slice(), b"del" | b"moveFrom")
                             });
-                        let branch = if deleted {
-                            Ok(false)
-                        } else {
-                            word_branch_shows(&stack)
-                        };
-                        let word = branch == Ok(true);
-                        if let Err(alternate) = branch {
-                            stack[alternate].pending.push(scan.list_paragraphs.len());
-                        }
-                        if anydoc || word || branch.is_err() {
+                        // Word shows what the branches it takes hold, until
+                        // the end of their alternate content lets AnyDoc's
+                        // branch stand for its own.
+                        let word = !deleted && !stack.iter().any(|node| node.word_skips);
+                        if anydoc || word {
                             scan.list_paragraphs.push(DocxListParagraph {
                                 used: id,
                                 part: scan.part,
@@ -2953,6 +2977,7 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                                     .any(|node| node.is(WordVocabulary::Word, b"txbxContent")),
                                 anydoc,
                                 word,
+                                deleted,
                             });
                         }
                     }
@@ -9992,7 +10017,42 @@ mod tests {
         ));
         // With no branch AnyDoc reads, Word still counts its own.
         assert!(differs(
-            &format!("{}{}", alternate(list, None), item("C")),
+            &format!("{}{}", alternate(list.clone(), None), item("C")),
+            &[]
+        ));
+        // Branches that number differently count each for its own side: a
+        // fallback numbering a note the choice leaves plain, one flattening
+        // the choice's list, and one numbering it at another level.
+        let plain = |text: &str| format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>");
+        assert!(differs(
+            &format!(
+                "{}{}{}",
+                item("A"),
+                alternate(plain("Note"), Some(item("Note"))),
+                item("B")
+            ),
+            &[]
+        ));
+        assert!(differs(
+            &format!(
+                "{}{}{}",
+                item("A"),
+                alternate(list.clone(), Some(format!("{}{}", plain("A"), plain("B")))),
+                item("C")
+            ),
+            &[]
+        ));
+        let sub = |text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        assert!(differs(
+            &format!(
+                "{}{}",
+                alternate(list.clone(), Some(format!("{}{}", sub("A"), sub("B")))),
+                item("C")
+            ),
             &[]
         ));
         // A list through notes stored in another order than their ids and
