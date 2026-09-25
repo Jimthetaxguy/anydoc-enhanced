@@ -622,6 +622,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     750 randomized documents, nor 181 and 216 regression workbooks,
     changed; the 210 randomized list documents still agree with
     LibreOffice.
+  - EPUB: two scans ran in the square of their input or past the tool's
+    timeout. SVG `url(#id)` references are now read once through, as a
+    reader's CSS tokenizer reads them: a 2.4 KB book repeating "url(#"
+    100,000 times in a `fill` attribute had taken 7.5 s and 1 GiB, and one
+    with 200,000 was refused as a resource limit after 18 s and 4 GiB;
+    each now takes 0.01-0.03 s and about 13 MiB. `~` rules whose step requires no id, class, or element name
+    are tried for a parent's children until a sibling settles them: 4,000
+    such rules over 100,000 siblings took 8.8 s, and 16,000 over 400,000
+    ran past the timeout; they now take 0.5 s and 5-6 s. A chapter that
+    runs past the match budget is refused as a resource limit instead of
+    checked with its `~` steps unrecorded.
+  - EPUB: generated content AnyDoc drops passed as converted. A list
+    item's sign ("−1,250.00", "(1,250.00)", "$1,250.00", "12%") now
+    counts; only a hyphen or dash bullet set apart from the item's text
+    stands for AnyDoc's own list marker. Every Unicode currency sign
+    counts, with the full-width, small, and superscript minus, plus,
+    parentheses, and percent signs, the per-mille and Arabic percent
+    signs, and the triangles Japanese accounts mark a loss with; a sign
+    meets an amount that opens with a currency sign or a decimal point.
+    Anything else a box shows between digits, such as a space, a slash, a
+    colon, a raised decimal point, or ", " between page references,
+    counts where the digits on both sides then run together, and
+    characters a reader shows nothing for, which AnyDoc keeps, no longer
+    keep a sign from its digits.
+  - EPUB: every conditional rule was taken as applying. A media query
+    that tests features, `@container`, and `@scope` now may hold, so a
+    rule inside them can neither hide nor show a sign on its own nor lay
+    out a flex row; `print`, `speech`, and unknown media never hold;
+    `@supports` reads `not`, `and`, `or`, and `display` values;
+    `@starting-style` and `@-moz-document` never apply. `@layer` rules
+    are ordered as CSS Cascade 5 orders them: unlayered rules beat
+    layered ones and a later layer an earlier one, the reverse for
+    `!important`.
+  - EPUB: flex items a reader stacks or spaces ran together. A flex
+    item's `width`, `flex-basis`, and `flex` shorthand are read, and in a
+    wrapping row an item taking a whole line stands apart from its
+    neighbors. A margin, padding, or gap written with a custom property
+    (`var(--bs-gutter-x)`, `calc(var(--g) * .5)`) takes its size from
+    the property as the element inherits it, so Bootstrap 5 grid columns
+    that AnyDoc runs together are refused.
+  - EPUB: text in an SVG resource (a symbol, pattern, clip path, mask, or
+    marker) counted as painted wherever anything named it. It now counts
+    only where what refers to it is rendered: shown, not transparent,
+    drawing something, and standing where the image paints; a style rule
+    names a resource only for the elements it matches.
+  - EPUB: CSS nesting was read loosely, `&` as a selector that may match
+    anything. `&` now stands for the elements the enclosing rule
+    matches, as `:is()` takes them with the highest specificity among
+    them, a nested selector without `&` matches inside that rule's
+    elements, and declarations after a nested rule come after it, as
+    Chromium 130 and later order them. Nested rules share their parents'
+    parsed selectors, and a selector standing for more than 4,096
+    compound selectors is undecided, so crafted nesting parses and
+    matches in bounded time.
+  - EPUB: SVG labels moved apart ran together. A `tspan` moved back past
+    half an em (`dx="-190"`), or along its line past half an em with a
+    `y`, stands apart; a `dx` list is read glyph by glyph, as a reader
+    numbers a label's characters, so `dx="0 0 120 0"` on "1250" is two
+    numbers; and a `textPath` stands as a label of its own. `x` and `y`
+    lists are not read.
+  - Against Chromium's layout, 93 of the review's 237 EPUB fixtures are
+    now refused and one refused in error converts, each as Chromium
+    paints it. Of 4,768 EPUBs in the regression sweep two newly refuse,
+    both confirmed in Chromium, and the real books measured check within
+    a few percent of their earlier time and memory.
 - Review round eight checked loops 14 to 17 and the round-seven fixes:
   - PDF: a statement whose rows repeat a cell of two amounts, such as
     "0.00 0.00" quarter- and year-to-date, made the merged-cell check time
@@ -961,7 +1026,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first 32 and the latest 96, counts only where digits meet: "Balance
   due" and "1,250.00" run together under such a rule are not refused. Alt
   text meeting other text counts the same way. Generated counters refuse a
-  book even where they match AnyDoc's own list numbers.
+  book even where they match AnyDoc's own list numbers. A style sheet's own
+  media or layer, given where it is linked (`<link media>`, `<style
+  media>`, `@import ... layer()`), is read as always applying; SVG `x` and
+  `y` lists are not read; and whether free space in a flex row, a `grow`
+  or an `auto` margin, sets its items apart is not decided, as that needs
+  the text's widths.
 - ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
   converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
 - EPUB `noscript` content is treated as shown, as readers without scripting
