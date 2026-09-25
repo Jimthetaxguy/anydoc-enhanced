@@ -1988,6 +1988,116 @@ fn layers_named_in_many_spans_are_judged_once() {
     assert!(started.elapsed() < Duration::from_secs(20));
 }
 
+/// A statement page showing `content` after its heading and balance, in
+/// Helvetica as `/F1` (object 4), with a layer (object 6) off by default, and
+/// `objects` as objects 7 on. Its resources hold `/F1`, the layer as `/MC0`,
+/// and `resources`; they are written in its page tree node when
+/// `inherited`, else in the page.
+fn unseen_text_pdf(content: &[u8], resources: &str, objects: &[&[u8]], inherited: bool) -> Vec<u8> {
+    let resources =
+        format!("/Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> {resources} >>");
+    let (node, page) = if inherited {
+        (resources.as_str(), "")
+    } else {
+        ("", resources.as_str())
+    };
+    let mut body = b"BT /F1 12 Tf 72 740 Td (Statement of account) Tj ET\n\
+                     BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET\n"
+        .to_vec();
+    body.extend_from_slice(content);
+    let mut all = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] >> >> >>"
+            .to_vec(),
+        format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {node} >>").into_bytes(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] {page} /Contents 5 0 R >>")
+            .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream("", &body),
+        b"<< /Type /OCG /Name (Superseded) >>".to_vec(),
+    ];
+    all.extend(objects.iter().map(|object| object.to_vec()));
+    pdf_file(&all)
+}
+
+/// The pages each result's warning of `code` names, if it has one.
+fn warned_pages(results: &[serde_json::Value], code: &str) -> Vec<Option<serde_json::Value>> {
+    results
+        .iter()
+        .map(|result| {
+            result["warnings"].as_array().and_then(|warnings| {
+                warnings
+                    .iter()
+                    .find(|warning| warning["code"] == code)
+                    .map(|warning| warning["pages"].clone())
+            })
+        })
+        .collect()
+}
+
+/// Convert each PDF over one server session.
+fn convert_all(documents: &[Vec<u8>]) -> Vec<serde_json::Value> {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for (index, pdf) in documents.iter().enumerate() {
+        let path = temporary.path().join(format!("document-{index}.pdf"));
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    call_tools(&calls, None)
+}
+
+#[test]
+fn unseen_text_past_ascii_is_reported() {
+    let line = b"(Don\x92t pay the balance above \x96 remplac\xe9) Tj";
+    let results = convert_all(&[
+        // A superseded line in a hidden layer, and a line painted invisibly,
+        // each with letters past ASCII in Windows ANSI.
+        unseen_text_pdf(
+            &[
+                &b"/OC /MC0 BDC BT /F1 10 Tf 72 680 Td "[..],
+                line,
+                b" ET EMC",
+            ]
+            .concat(),
+            "",
+            &[],
+            false,
+        ),
+        unseen_text_pdf(
+            &[&b"3 Tr BT /F1 12 Tf 72 680 Td "[..], line, b" ET"].concat(),
+            "",
+            &[],
+            false,
+        ),
+        // Shown, it is neither.
+        unseen_text_pdf(
+            &[&b"BT /F1 12 Tf 72 680 Td "[..], line, b" ET"].concat(),
+            "",
+            &[],
+            false,
+        ),
+    ]);
+    // pdf-inspector 1.24.0 reads every layer and this invisible line; when
+    // a release reads neither, these expectations go.
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(
+            markdown.contains("Don\u{2019}t pay the balance above \u{2013} remplac\u{e9}"),
+            "{result}"
+        );
+    }
+    assert_eq!(
+        warned_pages(&results, "hidden_layer_text_read"),
+        [Some(serde_json::json!([1])), None, None]
+    );
+    assert_eq!(
+        warned_pages(&results, "invisible_text_read"),
+        [None, Some(serde_json::json!([1])), None]
+    );
+}
+
 /// A filled one-page form whose fields are `fields`, objects 6 on, each
 /// given its number; `annotations` lists the page's widgets (pdf-inspector
 /// issue #504).

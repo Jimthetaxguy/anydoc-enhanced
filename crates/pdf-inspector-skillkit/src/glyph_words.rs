@@ -19,16 +19,17 @@
 //! pdf-inspector places their text, and reported when their own text splits
 //! it, a page for each split the Markdown shows.
 //!
-//! Glyphs are read by the font's ToUnicode map, then the names its
-//! differences give, then, for a simple font, as printable ASCII. Words are
-//! made of ASCII letters and digits and the marks numbers and dates are
-//! written with, and a ligature glyph stands for its letters; any other
-//! character ends a word, as does the end of a text object, since a browser
-//! writes each run of text as one, and a glyph that cannot be read drops
-//! the word it is in.
+//! Glyphs are read as pdf-inspector 1.24.0 reads them: by the font's
+//! ToUnicode map, then the names its differences give, then, for a simple
+//! font, by its encoding (see `Simple`). Words are made of ASCII letters and
+//! digits and the marks numbers and dates are written with, and a ligature
+//! glyph stands for its letters; any other character ends a word, as does
+//! the end of a text object, since a browser writes each run of text as
+//! one, and a glyph that cannot be read drops the word it is in.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
 use lopdf::{Dictionary, Document, Object};
@@ -139,51 +140,196 @@ impl Widths {
     }
 }
 
+/// What each code of a single-byte encoding reads as, where it names a
+/// character.
+type Table = [Option<char>; 256];
+
+/// A predefined encoding pdf-inspector reads a font by, code by code, as
+/// lopdf reads it, which is how pdf-inspector builds its own tables.
+fn predefined(name: &[u8]) -> Option<&'static Table> {
+    fn read(name: &[u8]) -> Table {
+        let mut font = Dictionary::new();
+        font.set("Type", Object::Name(b"Font".to_vec()));
+        font.set("Subtype", Object::Name(b"Type1".to_vec()));
+        font.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+        font.set("Encoding", Object::Name(name.to_vec()));
+        let mut table = [None; 256];
+        if let Ok(encoding) = font.get_font_encoding(&Document::new()) {
+            for (code, slot) in table.iter_mut().enumerate() {
+                *slot = Document::decode_text(&encoding, &[code as u8])
+                    .ok()
+                    .and_then(|text| {
+                        let mut characters = text.chars();
+                        match (characters.next(), characters.next()) {
+                            (Some(character), None) => Some(character),
+                            _ => None,
+                        }
+                    });
+            }
+        }
+        table
+    }
+    static STANDARD: LazyLock<Table> = LazyLock::new(|| read(b"StandardEncoding"));
+    static WIN_ANSI: LazyLock<Table> = LazyLock::new(|| read(b"WinAnsiEncoding"));
+    static MAC_ROMAN: LazyLock<Table> = LazyLock::new(|| read(b"MacRomanEncoding"));
+    static MAC_EXPERT: LazyLock<Table> = LazyLock::new(|| read(b"MacExpertEncoding"));
+    Some(match name {
+        b"StandardEncoding" => &*STANDARD,
+        b"WinAnsiEncoding" => &*WIN_ANSI,
+        b"MacRomanEncoding" => &*MAC_ROMAN,
+        b"MacExpertEncoding" => &*MAC_EXPERT,
+        _ => return None,
+    })
+}
+
+/// How pdf-inspector reads a code that a font's ToUnicode map and
+/// differences leave.
+enum Unnamed {
+    /// In no way the check can tell: a code a composite font's map leaves,
+    /// or a code of a font read through a built-in encoding of symbols.
+    Unknown,
+    /// Printable ASCII as itself, and past it in no way the check can tell:
+    /// a simple font pdf-inspector reads through its embedded program.
+    Ascii,
+    /// By a simple font's encoding (see `Simple`).
+    Simple(Simple),
+}
+
+/// How pdf-inspector reads a simple font's codes that its ToUnicode map and
+/// differences leave. A font with a ToUnicode map or a base encoding reads
+/// them code by code: from 0x20 on by the base encoding, where it names a
+/// character, else byte by byte; a control code as nothing. So does a
+/// string one of whose codes the differences name. Any other string reads
+/// as UTF-16 or UTF-8 where its bytes are so written (see
+/// `read_as_unicode`), else as lopdf reads the font's encoding.
+struct Simple {
+    /// The base encoding the font's encoding dictionary names.
+    base: Option<&'static Table>,
+    /// How lopdf reads the font's encoding.
+    lopdf: Lopdf,
+    /// Whether a byte read byte by byte reads as Windows-1252 has it, not as
+    /// Latin-1 does: as for any font but TeX's and those of symbols.
+    cp1252: bool,
+}
+
+/// How lopdf reads a simple font's encoding, as pdf-inspector reads a
+/// string by it.
+enum Lopdf {
+    /// What it reads each code as; a code it leaves out reads as nothing.
+    Codes(Box<[String]>),
+    /// Not at all: pdf-inspector reads each byte byte by byte, or, for a
+    /// font named as symbols, as its own character, with bullets and a
+    /// check mark where symbol fonts put them; a control code as nothing.
+    Bytes { symbols: bool },
+    /// Through a map the check does not read.
+    Unknown,
+}
+
+impl Simple {
+    /// What an unnamed code reads as: code by code where `by_code`, else as
+    /// lopdf reads it; `None` where the check cannot tell.
+    fn read(&self, byte: u8, by_code: bool) -> Option<String> {
+        let bytewise = |byte: u8| {
+            if self.cp1252 {
+                crate::text_paints::windows_1252(byte)
+            } else {
+                char::from(byte)
+            }
+        };
+        if by_code || self.base.is_some() {
+            if byte < 0x20 {
+                return Some(String::new());
+            }
+            let character = self
+                .base
+                .and_then(|table| table[usize::from(byte)])
+                .unwrap_or_else(|| bytewise(byte));
+            return Some(character.to_string());
+        }
+        match &self.lopdf {
+            // A C1 control character lopdf gives, pdf-inspector reads as
+            // Windows-1252 has its code.
+            Lopdf::Codes(codes) => Some(
+                codes[usize::from(byte)]
+                    .chars()
+                    .map(|character| match u8::try_from(u32::from(character)) {
+                        Ok(code @ 0x80..=0x9F) if self.cp1252 => bytewise(code),
+                        _ => character,
+                    })
+                    .collect(),
+            ),
+            Lopdf::Bytes { .. } if byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r') => {
+                Some(String::new())
+            }
+            Lopdf::Bytes { symbols: true } => Some(
+                match byte {
+                    0xA1 | 0xA7 | 0xB7 => '\u{2022}',
+                    0xFC => '\u{2713}',
+                    _ => char::from(byte),
+                }
+                .to_string(),
+            ),
+            Lopdf::Bytes { symbols: false } => Some(bytewise(byte).to_string()),
+            Lopdf::Unknown => None,
+        }
+    }
+}
+
 /// How the codes of one font read.
 struct Decoder {
-    /// Two bytes per code (a Type0 font with an identity encoding).
+    /// Two bytes per code (a Type0 font).
     two_byte: bool,
     cmap: Option<ToUnicodeCMap>,
     /// For a simple font, the name its differences give each code.
     names: HashMap<u8, String>,
+    /// How a code the map and names leave reads.
+    unnamed: Unnamed,
     /// Its glyphs' widths, when it gives them and its glyphs advance along
     /// the baseline.
     widths: Option<Widths>,
-    /// What the codes read so far read as.
-    read: HashMap<u16, Option<String>>,
+    /// What the codes read so far read as, code by code or not.
+    read: HashMap<(u16, bool), Option<String>>,
     /// The codes shown so far: what each reads as for a word, and its width.
     glyphs: HashMap<u16, (Reading, Option<f64>)>,
 }
 
 impl Decoder {
-    /// What a code reads as, when the font says.
-    fn text(&self, code: u16) -> Option<String> {
+    /// What a code reads as, when the font says; a simple font's code the
+    /// map and names leave, code by code where `by_code`, else as lopdf
+    /// reads it.
+    fn text(&self, code: u16, by_code: bool) -> Option<String> {
         let mapped = self
             .cmap
             .as_ref()
             .and_then(|cmap| cmap.lookup(code))
             .filter(|text| !text.contains('\u{FFFD}'));
-        match mapped {
-            Some(text) => Some(text),
-            None if self.two_byte => None,
-            None => match self.names.get(&(code as u8)) {
-                Some(name) => glyph_name_to_string(name),
-                None if (0x20..=0x7E).contains(&code) => {
-                    char::from_u32(u32::from(code)).map(String::from)
-                }
-                None => None,
-            },
+        if let Some(text) = mapped {
+            return Some(text);
+        }
+        if self.two_byte {
+            return None;
+        }
+        let byte = code as u8;
+        if let Some(name) = self.names.get(&byte) {
+            return glyph_name_to_string(name);
+        }
+        match &self.unnamed {
+            Unnamed::Ascii => (0x20..=0x7E)
+                .contains(&byte)
+                .then(|| char::from(byte).to_string()),
+            Unnamed::Simple(simple) => simple.read(byte, by_code || self.cmap.is_some()),
+            _ => None,
         }
     }
 
     /// What a code reads as for a word, and its width, when the font gives
-    /// its widths.
+    /// its widths: as a string of that code alone reads.
     fn glyph(&mut self, code: u16) -> (Reading, Option<f64>) {
         if let Some(glyph) = self.glyphs.get(&code) {
             return *glyph;
         }
         let glyph = (
-            Reading::of(self.text(code).as_deref()),
+            Reading::of(self.text(code, false).as_deref()),
             self.widths.as_ref().map(|widths| widths.of(code)),
         );
         self.glyphs.insert(code, glyph);
@@ -238,6 +384,20 @@ impl GlyphFonts {
         if !bytes.len().is_multiple_of(width) {
             return None;
         }
+        // A string pdf-inspector reads whole, not code by code.
+        let by_code = match &decoder.unnamed {
+            Unnamed::Simple(simple)
+                if decoder.cmap.is_none()
+                    && simple.base.is_none()
+                    && !bytes.iter().any(|byte| decoder.names.contains_key(byte)) =>
+            {
+                if let Some(text) = crate::text_paints::read_as_unicode(bytes) {
+                    return Some(text);
+                }
+                false
+            }
+            _ => true,
+        };
         let mut text = String::with_capacity(bytes.len());
         for code in bytes.chunks(width) {
             let code = match code {
@@ -245,11 +405,12 @@ impl GlyphFonts {
                 [high, low] => u16::from_be_bytes([*high, *low]),
                 _ => return None,
             };
-            if !decoder.read.contains_key(&code) {
-                let reading = decoder.text(code);
-                decoder.read.insert(code, reading);
+            let key = (code, by_code);
+            if !decoder.read.contains_key(&key) {
+                let reading = decoder.text(code, by_code);
+                decoder.read.insert(key, reading);
             }
-            text.push_str(decoder.read.get(&code)?.as_deref()?);
+            text.push_str(decoder.read[&key].as_deref()?);
         }
         Some(text)
     }
@@ -281,9 +442,13 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
             ToUnicodeCMap::parse(&content)
         })
         .filter(|cmap| usize::from(cmap.code_byte_length) == if two_byte { 2 } else { 1 });
-    if two_byte && cmap.is_none() {
+    let unnamed = if !two_byte {
+        simple(document, font, cmap.is_some(), steps)
+    } else if cmap.is_some() {
+        Unnamed::Unknown
+    } else {
         return None;
-    }
+    };
     let names = if two_byte {
         HashMap::new()
     } else {
@@ -298,10 +463,166 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
         two_byte,
         cmap,
         names,
+        unnamed,
         widths,
         read: HashMap::new(),
         glyphs: HashMap::new(),
     })
+}
+
+/// An object, its reference followed.
+fn resolved<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
+    match object {
+        Object::Reference(id) => document.get_object(*id).ok(),
+        object => Some(object),
+    }
+}
+
+/// How pdf-inspector reads a simple font's codes that its ToUnicode map, if
+/// `mapped`, and its differences leave (see `Simple`).
+fn simple(document: &Document, font: &Dictionary, mapped: bool, steps: &mut usize) -> Unnamed {
+    let base_font = font
+        .get(b"BaseFont")
+        .ok()
+        .and_then(|name| name.as_name().ok());
+    let encoding = font.get(b"Encoding").ok();
+    // The encoding the font names outright, and the base encoding its
+    // encoding dictionary names, references followed as pdf-inspector
+    // follows them.
+    let named = encoding
+        .and_then(|encoding| resolved(document, encoding))
+        .and_then(|encoding| encoding.as_name().ok());
+    let base = match encoding {
+        Some(Object::Reference(id)) => document.get_dictionary(*id).ok(),
+        Some(Object::Dictionary(encoding)) => Some(encoding),
+        _ => None,
+    }
+    .and_then(|encoding| encoding.get(b"BaseEncoding").ok())
+    .and_then(|base| resolved(document, base))
+    .and_then(|base| base.as_name().ok())
+    .and_then(predefined);
+    // Symbol and ZapfDingbats read through built-in encodings of their own,
+    // unless the font names another outright.
+    if base.is_none()
+        && symbol_font(base_font).is_some_and(|own| named.is_none_or(|name| name == own))
+    {
+        return Unnamed::Unknown;
+    }
+    // pdf-inspector reads a font with a ToUnicode map, or without an
+    // encoding, through its embedded program, where it has one; and a font
+    // whose ToUnicode map the check does not read, through that map.
+    let program = font
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|descriptor| resolved(document, descriptor))
+        .and_then(|descriptor| descriptor.as_dict().ok())
+        .is_some_and(|descriptor| {
+            [&b"FontFile2"[..], b"FontFile3"]
+                .iter()
+                .any(|key| descriptor.get(key).and_then(Object::as_reference).is_ok())
+        });
+    let unread_map = !mapped
+        && font
+            .get(b"ToUnicode")
+            .ok()
+            .and_then(|map| resolved(document, map))
+            .is_some_and(|map| map.as_stream().is_ok());
+    let encoded = matches!(
+        encoding,
+        Some(Object::Name(_) | Object::Dictionary(_) | Object::Reference(_))
+    );
+    if unread_map || (program && (mapped || !encoded)) {
+        return Unnamed::Ascii;
+    }
+    // A font with a map or a base encoding reads its strings code by code,
+    // never by lopdf.
+    let lopdf = if mapped || base.is_some() {
+        Lopdf::Unknown
+    } else {
+        lopdf_reading(document, font, base_font, steps)
+    };
+    Unnamed::Simple(Simple {
+        base,
+        lopdf,
+        cp1252: windows_1252_font(base_font),
+    })
+}
+
+/// The encoding a symbol font among the standard 14 reads through when it
+/// names none other, by the name that names it: `SymbolEncoding` for
+/// Symbol, `ZapfDingbatsEncoding` for ZapfDingbats, as pdf-inspector tells
+/// them by name.
+fn symbol_font(base_font: Option<&[u8]>) -> Option<&'static [u8]> {
+    let name = String::from_utf8_lossy(base_font?);
+    let name = match name.split_once('+') {
+        Some((prefix, rest))
+            if prefix.len() == 6 && prefix.chars().all(|letter| letter.is_ascii_uppercase()) =>
+        {
+            rest
+        }
+        _ => &name,
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "zapfdingbats" | "dingbats" | "itczapfdingbats" | "zapfdingbatsitc" => {
+            Some(b"ZapfDingbatsEncoding")
+        }
+        "symbol" | "symbolmt" | "symbolitc" => Some(b"SymbolEncoding"),
+        _ => None,
+    }
+}
+
+/// Whether pdf-inspector reads a simple font's bytes byte by byte as
+/// Windows-1252 has them, not as Latin-1: not for a TeX font, nor one named
+/// for mathematics, symbols, dingbats, or emoji.
+fn windows_1252_font(base_font: Option<&[u8]>) -> bool {
+    const TEX: [&str; 16] = [
+        "cmr", "cmb", "cmmi", "cmsy", "cmex", "cmtt", "cmss", "cmti", "ecrm", "ecbx", "ecti",
+        "tcrm", "tctt", "msam", "msbm", "ttdc",
+    ];
+    let Some(name) = base_font else {
+        return true;
+    };
+    let name = String::from_utf8_lossy(name);
+    let name = name
+        .rsplit_once('+')
+        .map_or(&*name, |(_, name)| name)
+        .to_ascii_lowercase();
+    !TEX.iter().any(|prefix| name.starts_with(prefix))
+        && !["math", "symbol", "dingbat", "emoji"]
+            .iter()
+            .any(|word| name.contains(word))
+}
+
+/// How lopdf reads a simple font's encoding (see `Lopdf`): as pdf-inspector
+/// reads a string by it, code by code.
+fn lopdf_reading(
+    document: &Document,
+    font: &Dictionary,
+    base_font: Option<&[u8]>,
+    steps: &mut usize,
+) -> Lopdf {
+    let symbols = base_font.is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        [&b"symbol"[..], b"wingdings", b"zapfdingbats"]
+            .iter()
+            .any(|word| name.windows(word.len()).any(|window| window == *word))
+    });
+    match font.get_font_encoding_with_limit(document, MAX_CMAP_BYTES) {
+        Ok(lopdf::Encoding::UnicodeMapEncoding(_)) => Lopdf::Unknown,
+        Ok(encoding) => {
+            *steps += 256;
+            let mut codes = Vec::with_capacity(256);
+            for code in 0..=u8::MAX {
+                match Document::decode_text(&encoding, &[code]) {
+                    Ok(text) => codes.push(text),
+                    Err(_) => return Lopdf::Bytes { symbols },
+                }
+            }
+            Lopdf::Codes(codes.into_boxed_slice())
+        }
+        Err(lopdf::Error::Decompress(_)) => Lopdf::Unknown,
+        Err(_) => Lopdf::Bytes { symbols },
+    }
 }
 
 /// The name each code last takes in a simple font's `/Differences`.
@@ -1330,6 +1651,93 @@ mod tests {
             });
         }
         assert_eq!(painted(page), vec![("Benefits".to_string(), 0.125)]);
+    }
+
+    /// What `bytes` read as in `font`, in `document`: `None` where the font
+    /// or a code cannot be read.
+    fn read(document: &Document, font: &Dictionary, bytes: &[u8]) -> Option<String> {
+        let mut fonts = GlyphFonts::default();
+        let font = fonts.font(document, font)?;
+        fonts.text(font, bytes)
+    }
+
+    #[test]
+    fn simple_fonts_read_codes_past_ascii_as_pdf_inspector_reads_them() {
+        use lopdf::dictionary;
+        let mut document = Document::with_version("1.7");
+        let program = document.add_object(lopdf::Stream::new(dictionary! {}, Vec::new()));
+        let helvetica = |encoding: Option<Object>| {
+            let mut font = dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            };
+            if let Some(encoding) = encoding {
+                font.set("Encoding", encoding);
+            }
+            font
+        };
+        let text = |font: &Dictionary, bytes: &[u8]| read(&document, font, bytes);
+        // By the encoding the font names, as lopdf reads it: Windows ANSI,
+        // Mac Roman, and, for a font naming none, Standard, whose apostrophe
+        // is curly.
+        let win_ansi = helvetica(Some("WinAnsiEncoding".into()));
+        assert_eq!(
+            text(&win_ansi, b"remplac\xe9"),
+            Some("remplac\u{e9}".into())
+        );
+        assert_eq!(
+            text(&win_ansi, b"Don\x92t \x96 \x80"),
+            Some("Don\u{2019}t \u{2013} \u{20ac}".into())
+        );
+        let mac_roman = helvetica(Some("MacRomanEncoding".into()));
+        assert_eq!(text(&mac_roman, b"\x8e"), Some("\u{e9}".into()));
+        assert_eq!(
+            text(&helvetica(None), b"don't"),
+            Some("don\u{2019}t".into())
+        );
+        // A string written in UTF-8 reads as UTF-8.
+        assert_eq!(
+            text(&win_ansi, "Jos\u{e9}".as_bytes()),
+            Some("Jos\u{e9}".into())
+        );
+        // A base encoding reads the codes the differences leave; a control
+        // code reads as nothing.
+        let based = helvetica(Some(Object::Dictionary(dictionary! {
+            "Type" => "Encoding", "BaseEncoding" => "MacRomanEncoding",
+            "Differences" => vec![233.into(), "egrave".into()],
+        })));
+        assert_eq!(text(&based, b"\xe9\x8e\x01"), Some("\u{e8}\u{e9}".into()));
+        // With none, a string one of whose codes the differences name reads
+        // its other codes as Windows-1252 has them, and a string with none
+        // reads as lopdf reads Standard, the base it takes.
+        let named = helvetica(Some(Object::Dictionary(dictionary! {
+            "Type" => "Encoding", "Differences" => vec![65.into(), "B".into()],
+        })));
+        assert_eq!(text(&named, b"A\xe9"), Some("B\u{e9}".into()));
+        assert_eq!(text(&named, b"\xe9"), Some("\u{d8}".into()));
+        // A font lopdf cannot read reads byte by byte: a TeX font as
+        // Latin-1, any other as Windows-1252.
+        let untyped = |name: &str| dictionary! { "Subtype" => "Type1", "BaseFont" => name };
+        assert_eq!(text(&untyped("CMR10"), b"\x92"), Some("\u{92}".into()));
+        assert_eq!(
+            text(&untyped("Helvetica"), b"\x92"),
+            Some("\u{2019}".into())
+        );
+        // Symbol reads through an encoding of its own, and a font without
+        // an encoding through its embedded program: past ASCII, the check
+        // cannot tell.
+        let symbol = dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Symbol" };
+        assert_eq!(text(&symbol, b"a"), None);
+        let embedded = dictionary! {
+            "Type" => "Font", "Subtype" => "TrueType", "BaseFont" => "ABCDEF+Sans",
+            "FontDescriptor" => dictionary! { "Type" => "FontDescriptor", "FontFile2" => program },
+        };
+        assert_eq!(text(&embedded, b"AB"), Some("AB".into()));
+        assert_eq!(text(&embedded, b"A\xe9"), None);
+        // A word ends at a letter past ASCII, where it ended at the code.
+        let mut fonts = GlyphFonts::default();
+        let font = fonts.font(&document, &win_ansi).expect("a font");
+        assert_eq!(fonts.glyph(font, 0xE9).0, Reading::Other);
+        assert_eq!(fonts.glyph(font, 0x01).0, Reading::Unread);
     }
 
     #[test]

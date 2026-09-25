@@ -522,6 +522,13 @@ fn strings(text: Option<&Object>) -> impl Iterator<Item = &[u8]> {
 /// four bytes or more and the UTF-16 reads as text; UTF-8 where the bytes
 /// past ASCII form it; otherwise byte by byte, as Windows-1252 has them.
 fn read_without_font(bytes: &[u8]) -> String {
+    read_as_unicode(bytes).unwrap_or_else(|| bytes.iter().map(|&byte| windows_1252(byte)).collect())
+}
+
+/// A string as pdf-inspector reads it where no map or encoding has its say,
+/// before it reads it byte by byte: UTF-16 or UTF-8, as `read_without_font`
+/// reads them; `None` where the bytes are neither.
+pub(crate) fn read_as_unicode(bytes: &[u8]) -> Option<String> {
     let utf16 = |bytes: &[u8]| {
         let units: Vec<u16> = bytes
             .chunks_exact(2)
@@ -530,26 +537,26 @@ fn read_without_font(bytes: &[u8]) -> String {
         String::from_utf16_lossy(&units)
     };
     if let [0xFE, 0xFF, rest @ ..] = bytes {
-        return utf16(rest);
+        return Some(utf16(rest));
     }
     let nulls = bytes.iter().filter(|&&byte| byte == 0).count();
     if bytes.len() >= 4 && bytes.len().is_multiple_of(2) && 4 * nulls > bytes.len() {
         let text = utf16(bytes);
         if reads_as_text(&text) {
-            return text;
+            return Some(text);
         }
     }
     if bytes.iter().any(|&byte| byte > 0x7F) {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            return text.to_string();
+            return Some(text.to_string());
         }
     }
-    bytes.iter().map(|&byte| windows_1252(byte)).collect()
+    None
 }
 
 /// A byte as Windows-1252 reads it; the five codes it leaves undefined, and
 /// the others outside 0x80 to 0x9F, as Latin-1 does.
-fn windows_1252(byte: u8) -> char {
+pub(crate) fn windows_1252(byte: u8) -> char {
     const HIGH: [char; 32] = [
         '\u{20AC}', '\u{81}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
         '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{8D}',
