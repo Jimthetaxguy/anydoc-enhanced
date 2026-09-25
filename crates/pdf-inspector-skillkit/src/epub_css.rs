@@ -5545,6 +5545,10 @@ struct PseudoBox {
     /// For a `::before` box, whether that sign is hyphens or dashes set
     /// apart from the element's content, as a bullet stands.
     bullet: bool,
+    /// It takes room in the line whatever a reader sees of it: in the flow,
+    /// showing anything, or an inline block, or a flex or grid item, a
+    /// width sizes. Between digits, unseen or empty, it keeps them apart.
+    room: bool,
     /// Whether its text is certainly unseen (`visibility: hidden`,
     /// `opacity: 0`); `None` where it takes the element's visibility.
     unseen: Option<bool>,
@@ -7250,11 +7254,19 @@ impl Cascade {
                     _ => Some(false),
                 }
             };
+            let shows_anything =
+                !matches!(surely, None | Some(Generated::Nothing | Generated::Plain));
+            let sized = all_three(geometry(0).max(items), geometry(2), Tri::Yes) == Tri::Yes;
+            let room = exists == Tri::Yes
+                && out_of_flow == Tri::No
+                && breaks == Tri::No
+                && (shows_anything || sized);
             PseudoBox {
                 breaks,
                 text,
                 sign,
                 bullet,
+                room,
                 unseen,
             }
         };
@@ -9813,14 +9825,19 @@ pub(super) fn chapter_text(
                 .any(|pseudo| pseudo.text && seen(pseudo))
         });
         let list_item = parent_reach == Some(Reach::List) && reach == Reach::Walk && !spliced;
-        let sign_before = generated.and_then(|style| {
-            style
-                .before
+        // What a box sets beside the element's content: the sign it shows,
+        // where it is seen, and otherwise room that keeps digits apart.
+        let beside = |pseudo: &PseudoBox| {
+            pseudo
                 .sign
-                .filter(|_| seen(&style.before) && !(list_item && style.before.bullet))
+                .filter(|_| seen(pseudo))
+                .or(pseudo.room.then_some(Sign::Between))
+        };
+        let sign_before = generated.and_then(|style| {
+            let bullet = list_item && style.before.bullet && seen(&style.before);
+            beside(&style.before).filter(|_| !bullet)
         });
-        effects.sign_after =
-            generated.and_then(|style| style.after.sign.filter(|_| seen(&style.after)));
+        effects.sign_after = generated.and_then(|style| beside(&style.after));
         state.effects.sign_after = effects.sign_after;
         // A sign before the element's content sits before the text after
         // it, and after the text the line holds before it.
@@ -11690,6 +11707,30 @@ mod tests {
             ),
         ] {
             assert!(!drops_shown(&[sheets], body), "{sheets} {body}");
+        }
+    }
+
+    #[test]
+    fn unseen_or_empty_boxes_between_digits_keep_them_apart() {
+        let units = r#"<p>Units 12<span class="s">50</span> shipped.</p>"#;
+        // A box a reader does not see, or an empty one a width sizes, still
+        // takes room between two numbers, which AnyDoc runs together.
+        for sheet in [
+            r#".s::before { content: " "; visibility: hidden }"#,
+            r#".s::before { content: "\2013"; opacity: 0 }"#,
+            r#".s::before { content: "x"; visibility: hidden }"#,
+            r#".s::before { content: ""; display: inline-block; width: 1em }"#,
+        ] {
+            assert!(drops_shown(&[sheet], units), "{sheet}");
+        }
+        // Empty and unsized, or out of the flow, it takes none.
+        for sheet in [
+            r#".s::before { content: ""; visibility: hidden }"#,
+            r#".s::before { content: ""; display: inline-block }"#,
+            r#".s::before { content: ""; width: 1em }"#,
+            r#".s::before { content: " "; visibility: hidden; position: absolute }"#,
+        ] {
+            assert!(!drops_shown(&[sheet], units), "{sheet}");
         }
     }
 
