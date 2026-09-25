@@ -4307,6 +4307,16 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
     Ok(result)
 }
 
+/// Whether a compound file's bytes name a stream: its directory stores names
+/// in UTF-16LE, and the ASCII spelling is accepted too.
+fn ole_names_stream(bytes: &[u8], name: &str) -> bool {
+    let wide: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.windows(wide.len()).any(|part| part == wide)
+        || bytes
+            .windows(name.len())
+            .any(|part| part == name.as_bytes())
+}
+
 fn preflight_package(
     bytes: &[u8],
     kind: DocumentKind,
@@ -4326,12 +4336,10 @@ fn preflight_package(
     }
     const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
     if bytes.starts_with(&OLE_MAGIC) {
-        let encrypted = bytes
-            .windows("EncryptedPackage".len())
-            .any(|part| part == b"EncryptedPackage")
-            || bytes
-                .windows("EncryptionInfo".len())
-                .any(|part| part == b"EncryptionInfo");
+        // A password-protected Office file is a compound file holding these
+        // two streams.
+        let encrypted = ole_names_stream(bytes, "EncryptedPackage")
+            || ole_names_stream(bytes, "EncryptionInfo");
         return Err(if encrypted {
             DocumentError::Encrypted
         } else {
@@ -6316,6 +6324,27 @@ mod tests {
     #[test]
     fn worker_error_codes_are_stable() {
         assert_eq!(DocumentError::Encrypted.code(), "encrypted");
+        // A password-protected Office file names its streams in UTF-16LE.
+        let ole = |name: &str| {
+            let mut bytes = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+            bytes.resize(512, 0);
+            bytes.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        for name in ["EncryptedPackage", "EncryptionInfo"] {
+            assert!(matches!(
+                preflight_package(&ole(name), DocumentKind::Docx, DocumentVariant::Docx),
+                Err(DocumentError::Encrypted)
+            ));
+        }
+        assert!(matches!(
+            preflight_package(
+                &ole("WordDocument"),
+                DocumentKind::Docx,
+                DocumentVariant::Docx
+            ),
+            Err(DocumentError::Malformed)
+        ));
         assert_eq!(
             DocumentError::OcrRequired { pages: vec![1] }.code(),
             "needs_ocr"
