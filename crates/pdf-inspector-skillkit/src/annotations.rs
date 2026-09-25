@@ -18,9 +18,11 @@
 //! annotations share it, to `MAX_APPEARANCE_BYTES` decoded, and a
 //! document's streams to `MAX_APPEARANCE_TOTAL` in all, looking through the
 //! forms it draws to `MAX_FORM_DEPTH` deep, for an operator that shows a
-//! string. Past the bounds, a stamp is taken to draw no text; a stream
-//! whose verdict the bounds cut short is read again where it is reached
-//! another way, as a form nearer a stamp than it was to the first.
+//! string in a render mode that paints: text in mode 3, which paints
+//! nothing, or 7, which only clips, is not drawn. Past the bounds, a stamp
+//! is taken to draw no text; a stream whose verdict the bounds cut short is
+//! read again where it is reached another way, as a form nearer a stamp
+//! than it was to the first.
 
 use std::collections::{HashMap, HashSet};
 
@@ -278,20 +280,26 @@ fn image_end(content: &[u8], start: usize) -> usize {
     content.len()
 }
 
-/// Whether `content` shows a string with `Tj`, `TJ`, `'`, or `"`; the names
-/// of the XObjects it draws with `Do` go in `drawn`, up to
-/// `MAX_FORMS_DRAWN`. The content is read token by token, its strings,
+/// Whether `content` shows a string with `Tj`, `TJ`, `'`, or `"` in a
+/// render mode that paints, starting `invisible` or not as the mode it is
+/// drawn in says; the names of the XObjects it draws with `Do` go in
+/// `drawn`, up to `MAX_FORMS_DRAWN`, each with whether the mode it is drawn
+/// in paints nothing. The content is read token by token, its strings,
 /// comments, and inline images passed over whole: an image's data for the
 /// length its dictionary gives, else to the `EI` that ends it (see
 /// `image_end`).
-fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
+fn shows_text(content: &[u8], invisible: bool, drawn: &mut Vec<(Vec<u8>, bool)>) -> bool {
     let mut at = 0;
-    // The last name, and whether a string with text in it came, since the
-    // last operator; and the length the dictionary of an inline image
-    // being read gives its data.
+    // The last name and number, and whether a string with text in it came,
+    // since the last operator; the length the dictionary of an inline image
+    // being read gives its data; and whether the render mode, which `q`
+    // saves and `Q` restores, paints nothing.
     let mut operand: Option<&[u8]> = None;
+    let mut number: Option<f64> = None;
     let mut string = false;
     let mut length: Option<usize> = None;
+    let mut invisible = invisible;
+    let mut saved: Vec<bool> = Vec::new();
     while at < content.len() {
         match content[at] {
             b'%' => {
@@ -343,18 +351,29 @@ fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
                 }
                 let token = &content[start..at];
                 if matches!(token[0], b'0'..=b'9' | b'+' | b'-' | b'.') {
+                    let value = std::str::from_utf8(token).ok();
                     if matches!(operand, Some(b"L" | b"Length")) {
-                        length = std::str::from_utf8(token)
-                            .ok()
-                            .and_then(|length| length.parse().ok());
+                        length = value.and_then(|length| length.parse().ok());
                     }
+                    number = value.and_then(|number| number.parse().ok());
                     continue;
                 }
                 match token {
-                    b"Tj" | b"TJ" | b"'" | b"\"" if string => return true,
+                    b"Tj" | b"TJ" | b"'" | b"\"" if string && !invisible => return true,
+                    // A viewer takes a mode it knows, cut to a whole number.
+                    b"Tr" => {
+                        if let Some(mode) = number
+                            .map(|mode| mode as i64)
+                            .filter(|mode| (0..=7).contains(mode))
+                        {
+                            invisible = matches!(mode, 3 | 7);
+                        }
+                    }
+                    b"q" => saved.push(invisible),
+                    b"Q" => invisible = saved.pop().unwrap_or(invisible),
                     b"Do" => {
                         if let Some(operand) = operand.filter(|_| drawn.len() < MAX_FORMS_DRAWN) {
-                            drawn.push(name(operand));
+                            drawn.push((name(operand), invisible));
                         }
                     }
                     b"BI" => length = None,
@@ -370,6 +389,7 @@ fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
                     _ => {}
                 }
                 operand = None;
+                number = None;
                 string = false;
             }
         }
@@ -377,12 +397,14 @@ fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
     false
 }
 
-/// The appearance streams of a document, each read at most once, within a
-/// budget for the whole document, but where its verdict was cut short.
+/// The appearance streams of a document, each read at most once in each
+/// render mode it may be drawn in, within a budget for the whole document,
+/// but where its verdict was cut short.
 struct Appearances<'a> {
     document: &'a Document,
-    /// Whether each stream read draws text, and `None` for one being read.
-    drawn: HashMap<ObjectId, Option<bool>>,
+    /// Whether each stream read draws text, drawn in a mode that paints
+    /// nothing or not, and `None` for one being read.
+    drawn: HashMap<(ObjectId, bool), Option<bool>>,
     /// Decoded bytes left to read.
     budget: usize,
 }
@@ -440,16 +462,18 @@ impl<'a> Appearances<'a> {
                 .and_then(|state| states.get(state).ok()),
             _ => Some(normal),
         };
-        stream.is_some_and(|stream| self.object(stream, 0).drawn)
+        stream.is_some_and(|stream| self.object(stream, 0, false).drawn)
     }
 
-    /// Whether a stream, given as it is referred to, draws text. A verdict
-    /// read whole, or that it draws text, is kept; any other depends on the
-    /// way the stream was reached, and is not.
-    fn object(&mut self, object: &Object, depth: usize) -> Verdict {
+    /// Whether a stream, given as it is referred to and drawn `invisible`
+    /// or not (see `shows_text`), draws text. A verdict read whole, or that
+    /// it draws text, is kept; any other depends on the way the stream was
+    /// reached, and is not.
+    fn object(&mut self, object: &Object, depth: usize, invisible: bool) -> Verdict {
         match object {
             Object::Reference(id) => {
-                match self.drawn.get(id) {
+                let key = (*id, invisible);
+                match self.drawn.get(&key) {
                     Some(Some(drawn)) => {
                         return Verdict {
                             drawn: *drawn,
@@ -461,26 +485,27 @@ impl<'a> Appearances<'a> {
                     Some(None) => return Verdict::CUT_SHORT,
                     None => {}
                 }
-                self.drawn.insert(*id, None);
+                self.drawn.insert(key, None);
                 let document = self.document;
                 let verdict = match document.get_object(*id) {
-                    Ok(Object::Stream(stream)) => self.read(stream, depth),
+                    Ok(Object::Stream(stream)) => self.read(stream, depth, invisible),
                     _ => Verdict::NONE,
                 };
                 if verdict.drawn || verdict.whole {
-                    self.drawn.insert(*id, Some(verdict.drawn));
+                    self.drawn.insert(key, Some(verdict.drawn));
                 } else {
-                    self.drawn.remove(id);
+                    self.drawn.remove(&key);
                 }
                 verdict
             }
-            Object::Stream(stream) => self.read(stream, depth),
+            Object::Stream(stream) => self.read(stream, depth, invisible),
             _ => Verdict::NONE,
         }
     }
 
-    /// Whether a stream draws text, itself or through the forms it draws.
-    fn read(&mut self, stream: &Stream, depth: usize) -> Verdict {
+    /// Whether a stream draws text, itself or through the forms it draws,
+    /// drawn `invisible` or not.
+    fn read(&mut self, stream: &Stream, depth: usize, invisible: bool) -> Verdict {
         let limit = self.budget.min(MAX_APPEARANCE_BYTES);
         if limit == 0 {
             return Verdict::CUT_SHORT;
@@ -507,7 +532,7 @@ impl<'a> Appearances<'a> {
         };
         self.budget -= content.len().min(limit);
         let mut drawn = Vec::new();
-        if shows_text(&content, &mut drawn) {
+        if shows_text(&content, invisible, &mut drawn) {
             return Verdict::DRAWN;
         }
         if drawn.is_empty() {
@@ -527,9 +552,9 @@ impl<'a> Appearances<'a> {
         else {
             return Verdict::NONE;
         };
-        let mut looked: HashSet<Vec<u8>> = HashSet::new();
+        let mut looked: HashSet<(Vec<u8>, bool)> = HashSet::new();
         let mut whole = true;
-        for name in drawn {
+        for (name, invisible) in drawn {
             let form = xobjects.get(&name).ok().filter(|form| {
                 resolve(document, form)
                     .and_then(|form| form.as_stream().ok())
@@ -537,10 +562,10 @@ impl<'a> Appearances<'a> {
                     .and_then(|subtype| subtype.as_name().ok())
                     == Some(b"Form")
             });
-            let Some(form) = form.filter(|_| looked.insert(name)) else {
+            let Some(form) = form.filter(|_| looked.insert((name, invisible))) else {
                 continue;
             };
-            let verdict = self.object(form, depth + 1);
+            let verdict = self.object(form, depth + 1, invisible);
             if verdict.drawn {
                 return Verdict::DRAWN;
             }
@@ -909,6 +934,44 @@ mod tests {
     }
 
     #[test]
+    fn stamps_whose_text_paints_nothing_are_passed_over() {
+        let found = document(|document| {
+            let text = document.add_object(Stream::new(
+                dictionary! { "Subtype" => "Form" },
+                b"BT /F1 12 Tf (VOID) Tj ET".to_vec(),
+            ));
+            let drawing = |document: &mut Document, content: &[u8]| {
+                document.add_object(Stream::new(
+                    dictionary! {
+                        "Subtype" => "Form",
+                        "Resources" => dictionary! { "XObject" => dictionary! { "Fx" => text } },
+                    },
+                    content.to_vec(),
+                ))
+            };
+            // The same form drawn in a mode that paints nothing, under a
+            // box, and in one restored to paint.
+            let unseen = drawing(document, b"0 0 200 50 re S 3 Tr /Fx Do");
+            let seen = drawing(document, b"q 3 Tr Q /Fx Do");
+            let stamp = |contents: &str, appearance: ObjectId| {
+                dictionary! {
+                    "Subtype" => "Stamp", "Contents" => Object::string_literal(contents),
+                    "AP" => dictionary! { "N" => appearance },
+                }
+            };
+            vec![
+                stamp("Boxed stamp reviewed", unseen),
+                stamp("Void stamp reviewed", seen),
+            ]
+        });
+        let texts: Vec<String> = unread(&found, None, None)
+            .into_iter()
+            .map(|annotation| annotation.text)
+            .collect();
+        assert_eq!(texts, ["Void stamp reviewed"]);
+    }
+
+    #[test]
     fn links_do_not_count_against_the_annotations_read() {
         // A page of links, as a table of contents has, before a text box.
         let found = document(|_| {
@@ -930,7 +993,7 @@ mod tests {
 
     #[test]
     fn only_operators_that_show_a_string_count() {
-        let shows = |content: &[u8]| shows_text(content, &mut Vec::new());
+        let shows = |content: &[u8]| shows_text(content, false, &mut Vec::new());
         assert!(shows(b"BT (x) Tj ET"));
         assert!(shows(b"BT [(A) -120 (B)] TJ ET"));
         assert!(shows(b"BT 1 2 (y) \" ET"));
@@ -956,9 +1019,24 @@ mod tests {
             b"BI /W 1 /H 1 ID \x00 EI q BT /F1 12 Tf (Re\xe7u) Tj ET Q"
         ));
         assert!(!shows(b"(unclosed Tj"));
+        // Text in a mode that paints nothing is not drawn; the mode goes on
+        // across text objects, and `Q` restores the one `q` saved.
+        assert!(!shows(
+            b"0 0 200 50 re S BT 3 Tr /F1 12 Tf (hidden words) Tj ET"
+        ));
+        assert!(!shows(b"BT 7 Tr (clip) Tj ET BT (clip) Tj ET"));
+        assert!(shows(b"BT 3 Tr (a) Tj 0 Tr (b) Tj ET"));
+        assert!(shows(b"q 3 Tr Q BT (a) Tj ET"));
+        // A mode no viewer knows leaves the mode as it was.
+        assert!(!shows(b"BT 3 Tr 9 Tr (a) Tj ET"));
+        assert!(shows_text(b"BT 0 Tr (a) Tj ET", true, &mut Vec::new()));
         let mut drawn = Vec::new();
-        assert!(!shows_text(b"q /Im1 Do /Fm#231 Do Q", &mut drawn));
-        assert_eq!(drawn, [b"Im1".to_vec(), b"Fm#1".to_vec()]);
+        assert!(!shows_text(
+            b"q /Im1 Do 3 Tr /Fm#231 Do Q",
+            false,
+            &mut drawn
+        ));
+        assert_eq!(drawn, [(b"Im1".to_vec(), false), (b"Fm#1".to_vec(), true)]);
         assert_eq!(
             entities("a &unknown; &#65; &#x42; & b"),
             "a &unknown; A B & b"
