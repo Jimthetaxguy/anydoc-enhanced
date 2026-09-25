@@ -3269,11 +3269,9 @@ fn scan_docx_element(
             }
         }
         b"pStyle" if word_path_ends_with(stack, &[b"p", b"pPr"]) => {
-            if scan.mark.style.is_none() {
-                scan.mark.style = xml_attribute_values(event, b"val")
-                    .into_iter()
-                    .next()
-                    .map(|style| style.trim().to_string())
+            // Both sides find a paragraph's style by its exact id.
+            if scan.mark.style.is_none() && node.vocabulary == WordVocabulary::Word {
+                scan.mark.style = word_attribute(resolver, event, b"val")
                     .filter(|style| style.len() <= MAX_STYLE_ID_BYTES);
             }
             record_style(event, scan)?;
@@ -4142,17 +4140,12 @@ impl DocxNumberings {
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
         let mut word = DocxReading::new(true, &self.word, &styles.styles);
         let mut anydoc = DocxReading::new(false, &self.anydoc, &styles.anydoc_styles);
-        // Word numbers a paragraph that names no style, or one the parts do
-        // not define, through the default paragraph style; AnyDoc through
-        // none.
         let resolved: Vec<DocxResolved> = scan
             .list_uses
             .iter()
             .map(|used| {
                 let style = used.style.as_deref();
-                let word_style = style
-                    .filter(|&style| word.chains.defined(style))
-                    .or(styles.default_paragraph.as_deref());
+                let word_style = styles.word_paragraph_style(&word.chains, style);
                 DocxResolved {
                     word: word.resolve(used, word_style),
                     anydoc: anydoc.resolve(used, style),
@@ -4251,21 +4244,26 @@ impl DocxNumberings {
 }
 
 /// Paragraph styles' numbering (`w:pPr/w:numPr/w:numId`), with the styles
-/// they are based on, from every styles part. AnyDoc ignores a style's
-/// `w:ilvl`, as ECMA-376 says to, and takes the level from the list
-/// levels' style bindings; Word reads it.
+/// they are based on, as each side reads its styles part: the
+/// WordprocessingML `w:style` children of the part's first `w:styles`,
+/// each found by its exact id. AnyDoc ignores a style's `w:ilvl`, as
+/// ECMA-376 says to, and takes the level from the list levels' style
+/// bindings; Word reads it.
 #[derive(Default)]
 struct DocxStyleNumbering {
     /// Word's reading, as LibreOffice shows it: every definition of an id,
-    /// its values merged, later ones winning.
+    /// its values merged, later ones winning. A style without an id is kept
+    /// under its name, behind a NUL no id can hold.
     styles: HashMap<String, DocxStyleList>,
+    /// The style Word finds by each name (`w:name`) where no style has the
+    /// id a paragraph names: the first so named.
+    style_names: HashMap<String, String>,
     /// AnyDoc's reading: each id's last definition among the part's
     /// styles, alone, with its first `w:basedOn` and the list its first
     /// `w:pPr/w:numPr/w:numId` names.
     anydoc_styles: HashMap<String, DocxStyleList>,
     /// The default paragraph style (`w:default="1"`), which Word applies to
-    /// a paragraph naming no style or one the parts do not define. AnyDoc
-    /// reads no default.
+    /// a paragraph naming no style it finds. AnyDoc reads no default.
     default_paragraph: Option<String>,
 }
 
@@ -4275,6 +4273,40 @@ struct DocxStyleList {
     list: Option<u64>,
     /// The level its numbering names (`w:numPr/w:ilvl`).
     level: Option<usize>,
+    /// Not a character, table, or numbering style, as Word's last
+    /// definition of the id says.
+    paragraph: bool,
+}
+
+impl DocxStyleNumbering {
+    /// The style Word, as LibreOffice shows it, numbers a paragraph through
+    /// when the paragraph names `named`: a paragraph style with that exact
+    /// id, else the first with that name; a style of another type with the
+    /// id where its chain names a list; and otherwise the default paragraph
+    /// style. ECMA-376 finds a style by its id alone and has Word apply the
+    /// default where none has it; LibreOffice also matches names, and
+    /// takes a character, table, or numbering style's own list.
+    fn word_paragraph_style<'s>(
+        &'s self,
+        chains: &DocxStyleChains,
+        named: Option<&'s str>,
+    ) -> Option<&'s str> {
+        let default = self.default_paragraph.as_deref();
+        let Some(named) = named else {
+            return default;
+        };
+        match chains.kind(named) {
+            Some(true) => Some(named),
+            Some(false) if chains.list(named).is_some() => Some(named),
+            Some(false) => default,
+            None => self
+                .style_names
+                .get(named)
+                .map(String::as_str)
+                .filter(|&style| chains.kind(style) == Some(true))
+                .or(default),
+        }
+    }
 }
 
 /// Paragraph styles' numbering read along their `w:basedOn` chains once,
@@ -4384,9 +4416,12 @@ impl<'a> DocxStyleChains<'a> {
         chains
     }
 
-    /// Whether the styles parts define a style.
-    fn defined(&self, style: &str) -> bool {
-        self.index.contains_key(style)
+    /// Whether the styles part defines a style of this id, and whether it
+    /// is a paragraph style.
+    fn kind(&self, style: &str) -> Option<bool> {
+        self.index
+            .get(style)
+            .map(|&style| self.definitions[style].paragraph)
     }
 
     /// The list instance a style's own numbering names, without its chain.
@@ -4469,40 +4504,52 @@ struct DocxKeptStyle {
     lists: u32,
 }
 
-/// Read paragraph styles' numbering from a styles part, streamed under
-/// AnyDoc's depth and node bounds.
+/// Read paragraph styles' numbering from a styles part, as Word and as
+/// AnyDoc read it, streamed under AnyDoc's depth and node bounds: the
+/// WordprocessingML `w:style` children of the part's first `w:styles`, each
+/// found by its exact id, and each attribute as AnyDoc picks it.
 fn docx_style_numbering(
     reader: impl std::io::BufRead,
     numbering: &mut DocxStyleNumbering,
 ) -> Result<(), DocumentError> {
-    let mut reader = quick_xml::Reader::from_reader(reader);
+    let mut reader = quick_xml::NsReader::from_reader(reader);
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut stack: Vec<DocxNumberingNode> = Vec::new();
     let mut nodes = 0usize;
-    let mut open: Option<String> = None;
-    // The definition AnyDoc keeps, a style of the part's root, as it is
-    // read.
+    // Whether the part's first `w:styles` is open, and has been read.
+    let mut in_root = false;
+    let mut root_read = false;
+    // The style being read, as Word merges it, and the definition AnyDoc
+    // keeps of it.
+    let mut open: Option<DocxOpenStyle> = None;
     let mut kept: Option<DocxKeptStyle> = None;
     loop {
-        let (event, start) = match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(event)) => (event, true),
-            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
-            Ok(quick_xml::events::Event::End(_)) => {
-                if stack.pop().as_deref() == Some(b"style".as_slice()) {
-                    open = None;
-                    if stack.len() == 1 {
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        let in_word = WordVocabulary::of(&namespace) == WordVocabulary::Word;
+        let (event, start) = match event {
+            quick_xml::events::Event::Start(event) => (event, true),
+            quick_xml::events::Event::Empty(event) => (event, false),
+            quick_xml::events::Event::End(_) => {
+                if let Some(closed) = stack.pop() {
+                    if in_root && stack.len() == 1 && closed.word && closed.local == b"style" {
+                        open = None;
                         if let Some(kept) = kept.take() {
                             numbering.anydoc_styles.insert(kept.id, kept.style);
                         }
+                    }
+                    if stack.is_empty() {
+                        in_root = false;
                     }
                 }
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::Eof) => return Ok(()),
-            Ok(_) => {
+            quick_xml::events::Event::Eof => return Ok(()),
+            _ => {
                 nodes += 1;
                 if nodes > MAX_XML_NODES {
                     return Err(DocumentError::ResourceLimit);
@@ -4510,113 +4557,175 @@ fn docx_style_numbering(
                 buffer.clear();
                 continue;
             }
-            Err(_) => return Err(DocumentError::Malformed),
         };
         nodes += 1;
         if nodes > MAX_XML_NODES || (start && stack.len() >= MAX_XML_DEPTH) {
             return Err(DocumentError::ResourceLimit);
         }
-        let local = xml_local_name(event.name().as_ref()).to_vec();
-        // The attributes are decoded once: a style id can run to kilobytes.
-        let attributes = xml_attributes(&event);
-        let named = |wanted: &'static [u8]| {
-            attributes
-                .iter()
-                .filter(move |attribute| attribute.local() == wanted)
-                .map(|attribute| attribute.value.as_str())
+        let node = DocxNumberingNode {
+            local: xml_local_name(event.name().as_ref()).to_vec(),
+            word: in_word,
         };
-        let raw = named(b"val").next();
-        let value = || raw.map(|value| value.trim().to_string());
-        // AnyDoc reads the first `w:basedOn` of a style, and the list of the
-        // first `w:numId` of the first `w:numPr` of its first `w:pPr`.
-        if let Some(kept) = kept.as_mut() {
-            let under =
-                |path: &[&[u8]]| stack.len() == path.len() + 1 && xml_path_ends_with(&stack, path);
-            match local.as_slice() {
-                b"basedOn" if under(&[b"style"]) => {
-                    kept.bases += 1;
-                    if kept.bases == 1 {
-                        kept.style.based_on = value();
-                    }
-                }
-                b"pPr" if under(&[b"style"]) => kept.marks += 1,
-                b"numPr" if kept.marks == 1 && under(&[b"style", b"pPr"]) => {
-                    kept.numberings += 1;
-                }
-                b"numId"
-                    if kept.marks == 1
-                        && kept.numberings == 1
-                        && under(&[b"style", b"pPr", b"numPr"]) =>
-                {
-                    kept.lists += 1;
-                    if kept.lists == 1 {
-                        kept.style.list = raw.and_then(|list| list.parse().ok());
-                    }
-                }
-                _ => {}
+        let attribute = |name: &[u8]| word_attribute(reader.resolver(), &event, name);
+        // A WordprocessingML element at `path` below the root, every element
+        // along it WordprocessingML's too.
+        let under = |path: &[&[u8]]| {
+            node.word
+                && stack.len() == path.len() + 1
+                && stack[1..]
+                    .iter()
+                    .zip(path)
+                    .all(|(open, wanted)| open.word && open.local == *wanted)
+        };
+        let local = node.local.as_slice();
+        if stack.is_empty() {
+            if node.word && local == b"styles" && !root_read {
+                root_read = true;
+                in_root = start;
             }
-        }
-        match local.as_slice() {
-            b"style" => {
-                let id = named(b"styleId")
-                    .next()
-                    .map(|id| id.trim().to_string())
-                    .filter(|id| id.len() <= MAX_STYLE_ID_BYTES);
-                if let Some(id) = &id {
-                    if numbering.styles.len() >= MAX_DOCX_STYLES
-                        && !numbering.styles.contains_key(id)
-                    {
-                        return Err(DocumentError::ResourceLimit);
-                    }
-                    numbering.styles.entry(id.clone()).or_default();
-                    // A later definition of the id replaces this one.
-                    if stack.len() == 1 {
-                        if start {
-                            kept = Some(DocxKeptStyle {
-                                id: id.clone(),
-                                ..DocxKeptStyle::default()
-                            });
-                        } else {
-                            numbering
-                                .anydoc_styles
-                                .insert(id.clone(), DocxStyleList::default());
+        } else if in_root && local == b"style" && under(&[]) {
+            let id = attribute(b"styleId").filter(|id| id.len() <= MAX_STYLE_ID_BYTES);
+            let paragraph = attribute(b"type")
+                .is_none_or(|kind| !matches!(kind.trim(), "character" | "table" | "numbering"));
+            // The last paragraph style marked the default one.
+            let default = paragraph && attribute(b"default").is_some_and(|value| xml_true(&value));
+            if let Some(id) = &id {
+                docx_word_style(numbering, id, paragraph, default)?;
+                // A later definition of the id replaces this one for AnyDoc.
+                if start {
+                    kept = Some(DocxKeptStyle {
+                        id: id.clone(),
+                        ..DocxKeptStyle::default()
+                    });
+                } else {
+                    numbering
+                        .anydoc_styles
+                        .insert(id.clone(), DocxStyleList::default());
+                }
+            }
+            if start {
+                open = Some(DocxOpenStyle {
+                    key: id,
+                    paragraph,
+                    default,
+                    named: false,
+                });
+            }
+        } else if in_root {
+            // AnyDoc reads the first `w:basedOn` of a style, and the list of
+            // the first `w:numId` of the first `w:numPr` of its first
+            // `w:pPr`, as it stands.
+            if let Some(kept) = kept.as_mut() {
+                match local {
+                    b"basedOn" if under(&[b"style"]) => {
+                        kept.bases += 1;
+                        if kept.bases == 1 {
+                            kept.style.based_on = attribute(b"val");
                         }
                     }
-                    // The last paragraph style marked the default one.
-                    let paragraph = named(b"type").all(|kind| kind.trim() == "paragraph");
-                    if paragraph && named(b"default").any(xml_true) {
-                        numbering.default_paragraph = Some(id.clone());
+                    b"pPr" if under(&[b"style"]) => kept.marks += 1,
+                    b"numPr" if kept.marks == 1 && under(&[b"style", b"pPr"]) => {
+                        kept.numberings += 1;
+                    }
+                    b"numId"
+                        if kept.marks == 1
+                            && kept.numberings == 1
+                            && under(&[b"style", b"pPr", b"numPr"]) =>
+                    {
+                        kept.lists += 1;
+                        if kept.lists == 1 {
+                            kept.style.list = attribute(b"val").and_then(|list| list.parse().ok());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(style) = open.as_mut() {
+                // Word finds a paragraph style by its first name too, and a
+                // style without an id by its name alone.
+                if local == b"name" && under(&[b"style"]) && !style.named {
+                    style.named = true;
+                    if let Some(name) =
+                        attribute(b"val").filter(|name| name.len() <= MAX_STYLE_ID_BYTES)
+                    {
+                        if style.key.is_none() {
+                            let key = format!("\0{name}");
+                            docx_word_style(numbering, &key, style.paragraph, style.default)?;
+                            style.key = Some(key);
+                        }
+                        if let Some(key) = style.key.as_ref().filter(|_| style.paragraph) {
+                            numbering
+                                .style_names
+                                .entry(name)
+                                .or_insert_with(|| key.clone());
+                        }
                     }
                 }
-                if start {
-                    open = id;
+            }
+            // Word merges every value, reading numbers with white space
+            // collapsed.
+            if let Some(key) = open.as_ref().and_then(|style| style.key.as_ref()) {
+                match local {
+                    b"basedOn" if under(&[b"style"]) => {
+                        if let Some(base) = attribute(b"val") {
+                            numbering.styles.entry(key.clone()).or_default().based_on = Some(base);
+                        }
+                    }
+                    b"numId" if under(&[b"style", b"pPr", b"numPr"]) => {
+                        if let Some(list) =
+                            attribute(b"val").and_then(|list| list.trim().parse().ok())
+                        {
+                            numbering.styles.entry(key.clone()).or_default().list = Some(list);
+                        }
+                    }
+                    b"ilvl" if under(&[b"style", b"pPr", b"numPr"]) => {
+                        if let Some(level) =
+                            attribute(b"val").and_then(|level| level.trim().parse::<usize>().ok())
+                        {
+                            numbering.styles.entry(key.clone()).or_default().level = Some(level);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            b"basedOn" if xml_path_ends_with(&stack, &[b"style"]) => {
-                if let (Some(id), Some(base)) = (&open, value()) {
-                    numbering.styles.entry(id.clone()).or_default().based_on = Some(base);
-                }
-            }
-            b"numId" if xml_path_ends_with(&stack, &[b"style", b"pPr", b"numPr"]) => {
-                if let (Some(id), Some(list)) = (&open, value().and_then(|list| list.parse().ok()))
-                {
-                    numbering.styles.entry(id.clone()).or_default().list = Some(list);
-                }
-            }
-            b"ilvl" if xml_path_ends_with(&stack, &[b"style", b"pPr", b"numPr"]) => {
-                if let (Some(id), Some(level)) =
-                    (&open, value().and_then(|level| level.parse::<usize>().ok()))
-                {
-                    numbering.styles.entry(id.clone()).or_default().level = Some(level);
-                }
-            }
-            _ => {}
         }
         if start {
-            stack.push(local);
+            stack.push(node);
         }
         buffer.clear();
     }
+}
+
+/// A style Word is reading: the key its values merge under, whether it is
+/// a paragraph style marked the default, and whether its name has been
+/// read.
+struct DocxOpenStyle {
+    key: Option<String>,
+    paragraph: bool,
+    default: bool,
+    named: bool,
+}
+
+/// Enter a definition of a style in Word's reading, under the bound on the
+/// styles a part may define.
+fn docx_word_style(
+    numbering: &mut DocxStyleNumbering,
+    key: &str,
+    paragraph: bool,
+    default: bool,
+) -> Result<(), DocumentError> {
+    if numbering.styles.len() >= MAX_DOCX_STYLES && !numbering.styles.contains_key(key) {
+        return Err(DocumentError::ResourceLimit);
+    }
+    numbering
+        .styles
+        .entry(key.to_string())
+        .or_default()
+        .paragraph = paragraph;
+    if default {
+        numbering.default_paragraph = Some(key.to_string());
+    }
+    Ok(())
 }
 
 /// The attribute AnyDoc 0.2.4 reads for `attr(ns::W, name)`: the first in
@@ -5115,6 +5224,7 @@ fn docx_list_styles(
     let anydoc = read(Some(&parts.anydoc_styles))?;
     Ok(DocxStyleNumbering {
         styles: word.styles,
+        style_names: word.style_names,
         default_paragraph: word.default_paragraph,
         anydoc_styles: anydoc.anydoc_styles,
     })
@@ -12350,6 +12460,113 @@ mod tests {
             ]);
             assert!(preflight.unsupported_content, "{target}");
         }
+    }
+
+    #[test]
+    fn docx_paragraphs_take_the_style_word_finds() {
+        const FOREIGN: &str = r#"xmlns:x="urn:x""#;
+        // Normal, the default paragraph style, numbers in upper Roman;
+        // list 1 is decimal.
+        let differs = |named: &str, styles: &str| {
+            let body = format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="{named}"/></w:pPr><w:r><w:t>Clause</w:t></w:r></w:p>"#
+            )
+            .repeat(2);
+            let document = word_part("document", &body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#
+            );
+            let styles = format!(
+                r#"<w:styles {WORD_NS} {FOREIGN}><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:style>{styles}</w:styles>"#
+            );
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let style = |kind: &str, id: &str, name: &str, numbered: bool| {
+            let numbering = if numbered {
+                r#"<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>"#
+            } else {
+                ""
+            };
+            format!(
+                r#"<w:style w:type="{kind}" w:styleId="{id}"><w:name w:val="{name}"/>{numbering}</w:style>"#
+            )
+        };
+        // A paragraph style with the exact id is taken; one Word cannot find
+        // leaves the paragraph with the default style, numbered in Word and
+        // not in AnyDoc: another id, a style nested in another, or a style
+        // element in another vocabulary.
+        assert!(!differs("Foo", &style("paragraph", "Foo", "Foo", false)));
+        assert!(differs("Missing", ""));
+        assert!(differs("Foo ", &style("paragraph", "Foo", "Foo", false)));
+        assert!(differs("Foo", &style("paragraph", "Foo ", "Bar", false)));
+        assert!(differs(
+            "Inner",
+            &format!(
+                r#"<w:style w:type="paragraph" w:styleId="Outer">{}</w:style>"#,
+                style("paragraph", "Inner", "Inner", false)
+            )
+        ));
+        assert!(differs(
+            "Foo",
+            r#"<x:style w:type="paragraph" w:styleId="Foo"><w:name w:val="Foo"/></x:style>"#
+        ));
+        // Word, as LibreOffice shows it, also finds a paragraph style by its
+        // name, and a style without an id by its name alone.
+        assert!(!differs("Foo", &style("paragraph", "Zed", "Foo", false)));
+        assert!(!differs("Foo", &style("paragraph", "Foo ", "Foo", false)));
+        assert!(!differs(
+            "Foo",
+            r#"<w:style w:type="paragraph" x:styleId="Foo"><w:name w:val="Foo"/></w:style>"#
+        ));
+        // A character, table, or numbering style numbers the paragraph with
+        // its own list, as AnyDoc does, and otherwise leaves it the
+        // default's.
+        for kind in ["character", "table", "numbering"] {
+            assert!(
+                !differs("Other", &style(kind, "Other", "Other", true)),
+                "{kind}"
+            );
+            assert!(
+                differs("Other", &style(kind, "Other", "Other", false)),
+                "{kind}"
+            );
+        }
+        // Of two default paragraph styles, the last is Word's.
+        let two_defaults = |numbered_first: bool| {
+            let normal = |numbered: bool| {
+                format!(
+                    r#"<w:style w:type="paragraph" w:default="1" w:styleId="Body{numbered}">{}</w:style>"#,
+                    if numbered {
+                        r#"<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>"#
+                    } else {
+                        ""
+                    }
+                )
+            };
+            let body = "<w:p><w:r><w:t>Clause</w:t></w:r></w:p>".repeat(2);
+            let document = word_part("document", &body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            let styles = format!(
+                "<w:styles {WORD_NS}>{}{}</w:styles>",
+                normal(numbered_first),
+                normal(!numbered_first)
+            );
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        assert!(!two_defaults(true));
+        assert!(two_defaults(false));
     }
 
     #[test]
