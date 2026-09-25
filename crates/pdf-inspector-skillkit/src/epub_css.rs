@@ -788,11 +788,18 @@ enum Property {
     MarginRight,
     PaddingLeft,
     PaddingRight,
+    /// For a flex item: whether its width, or its flex basis where one is
+    /// set (`flex-basis`, `flex`), takes a whole line (see
+    /// [`full_line`]); `FlexBasisAuto` for a basis that takes the width.
+    Width,
+    FlexBasis,
+    FlexBasisAuto,
 }
 
 impl Property {
-    /// A margin or padding, which only a flex or grid item, and an inline
-    /// box laying such items out, is read for.
+    /// A margin or padding, or a flex item's width or basis, which only a
+    /// flex or grid item, and an inline box laying such items out, is read
+    /// for.
     fn spaces(self) -> bool {
         matches!(
             self,
@@ -800,6 +807,9 @@ impl Property {
                 | Property::MarginRight
                 | Property::PaddingLeft
                 | Property::PaddingRight
+                | Property::Width
+                | Property::FlexBasis
+                | Property::FlexBasisAuto
         )
     }
 }
@@ -1350,14 +1360,17 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
 /// What a declaration of flex items' layout, or a margin or padding, says
 /// (see [`parse_declarations`]): one property; the left and the right of a
 /// margin or padding, from one to four lengths from the top clockwise, or
-/// one or two from the start; a flex box's direction and wrapping; or the
-/// gap between columns, after that between rows.
+/// one or two from the start; a flex box's direction and wrapping; the
+/// gap between columns, after that between rows; or a flex item's basis,
+/// alone or after its growth and shrinking (`flex`).
 #[derive(Clone, Copy)]
 enum Reads {
     One(Property, fn(&[&[Token]]) -> Option<Tri>),
     Sides(Property, Property, bool),
     FlexFlow,
     Gap,
+    Basis,
+    Flex,
 }
 
 /// The declarations a token run holds that the check reads. Most set one
@@ -1397,6 +1410,9 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
         "padding-right" | "padding-inline-end" | "-webkit-padding-end" => {
             Reads::One(Property::PaddingRight, one_positive_length)
         }
+        "width" => Reads::One(Property::Width, one_full_line),
+        "flex-basis" | "-webkit-flex-basis" => Reads::Basis,
+        "flex" | "-webkit-flex" | "-ms-flex" => Reads::Flex,
         _ => return [parse_declaration(&name, rest), None],
     };
     let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
@@ -1456,6 +1472,37 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             ),
             None,
         ],
+        Reads::Basis => match keyword(&parts).as_deref() {
+            Some("auto" | "content") => [declare(Property::FlexBasisAuto, Some(Tri::No)), None],
+            _ => [declare(Property::FlexBasis, one_full_line(&parts)), None],
+        },
+        // `flex: none`, `auto`, and `initial` take the width; a basis
+        // after the numbers, or 0% where none is written (`flex: 1`).
+        Reads::Flex => match keyword(&parts).as_deref() {
+            Some("none" | "auto" | "initial") => {
+                [declare(Property::FlexBasisAuto, Some(Tri::No)), None]
+            }
+            _ => {
+                let number = |part: &&[Token]| matches!(part, [Token::Numeric(number)] if number.parse::<f64>().is_ok());
+                match parts.iter().position(|part| !number(part)) {
+                    None if !parts.is_empty() && parts.len() <= 2 => {
+                        [declare(Property::FlexBasis, Some(Tri::No)), None]
+                    }
+                    Some(at) if at == parts.len() - 1 && at <= 2 => {
+                        match keyword(&parts[at..]).as_deref() {
+                            Some("auto" | "content") => {
+                                [declare(Property::FlexBasisAuto, Some(Tri::No)), None]
+                            }
+                            _ => [
+                                declare(Property::FlexBasis, one_full_line(&parts[at..])),
+                                None,
+                            ],
+                        }
+                    }
+                    _ => [None, None],
+                }
+            }
+        },
     }
 }
 
@@ -1577,6 +1624,48 @@ fn positive_length(part: &[Token]) -> Option<Tri> {
 fn one_positive_length(parts: &[&[Token]]) -> Option<Tri> {
     match parts {
         [part] => positive_length(part),
+        _ => None,
+    }
+}
+
+/// Whether a flex item's width or basis takes a whole line of wrapping
+/// items: a percentage of 100 or more. A smaller one, `auto`, and zero do
+/// not; a length, whose share of the line is not known, and a value
+/// computed from others (`calc()`) or sized to the content (`max-content`)
+/// may.
+fn full_line(part: &[Token]) -> Option<Tri> {
+    match part {
+        [Token::Numeric(number)] => match number.strip_suffix('%') {
+            Some(percent) => {
+                let share: f64 = percent.parse().ok()?;
+                Some(if share >= 100.0 { Tri::Yes } else { Tri::No })
+            }
+            None => match positive_length(part)? {
+                Tri::No => Some(Tri::No),
+                _ => Some(Tri::Maybe),
+            },
+        },
+        [Token::Ident(word)] => match word.to_ascii_lowercase().as_str() {
+            "auto" | "initial" | "unset" => Some(Tri::No),
+            "min-content"
+            | "max-content"
+            | "fit-content"
+            | "stretch"
+            | "-webkit-fill-available"
+            | "inherit"
+            | "revert"
+            | "revert-layer" => Some(Tri::Maybe),
+            _ => None,
+        },
+        [Token::Function(_), ..] => Some(Tri::Maybe),
+        _ => None,
+    }
+}
+
+/// [`full_line`] for a value that must be one width.
+fn one_full_line(parts: &[&[Token]]) -> Option<Tri> {
+    match parts {
+        [part] => full_line(part),
         _ => None,
     }
 }
@@ -2905,8 +2994,8 @@ impl AncestorKeys {
 /// A stylesheet reduced to what the check reads: its rules that set
 /// `display`, `visibility`, or `content-visibility` where their conditions
 /// may hold, and the stylesheets it imports for a screen, in order. Rules
-/// that set a margin or padding are kept apart as well, and counted where
-/// they set nothing else.
+/// that set a margin, padding, width, or flex basis are kept apart as well,
+/// and counted where they set nothing else.
 #[derive(Debug, Default)]
 pub(super) struct Stylesheet {
     rules: Vec<Rc<StyleRule>>,
@@ -3215,8 +3304,8 @@ fn parse_style_block(
         // `visibility` and `opacity` may keep unseen, and for whether its
         // margins and padding set a dash apart from the element's content.
         // An element's own `content`, `white-space`, and `opacity` are not
-        // read, and its margins and padding only for flex and grid items
-        // (see [`Cascade::spacing`]).
+        // read, and its margins, padding, width, and flex basis only for
+        // flex and grid items (see [`Cascade::item_box`]).
         let lays_out = declarations.iter().any(|declaration| {
             matches!(
                 declaration.property,
@@ -3378,6 +3467,18 @@ struct ItemLayout {
     spaced: Tri,
     /// They may wrap onto more lines.
     wraps: Tri,
+}
+
+/// How an item's own box stands among the items beside it (see
+/// [`Cascade::item_box`]): whether its left and its right margin or
+/// padding set it apart, and whether its width or flex basis takes a
+/// whole line, so that where the items wrap, it stands on a line of its
+/// own.
+#[derive(Clone, Copy, Debug, Default)]
+struct ItemBox {
+    left: Tri,
+    right: Tri,
+    full: Tri,
 }
 
 /// What a `::before` or `::after` box does, as far as the check reads it.
@@ -3554,10 +3655,10 @@ pub(super) struct Cascade {
     steps_by_key: HashMap<u64, Vec<u32>>,
     steps_anywhere: Vec<u32>,
     step_key_bits: [u64; 4],
-    /// Rules that set a margin or padding, each with its place among them,
-    /// by an id, class, or element name their rightmost compound requires,
-    /// and those that require none (see [`Cascade::spacing`]); and how many
-    /// of them set nothing else.
+    /// Rules that set a margin, padding, width, or flex basis, each with its
+    /// place among them and its layer, by an id, class, or element name
+    /// their rightmost compound requires, and those that require none (see
+    /// [`Cascade::item_box`]); and how many of them set nothing else.
     spacing_rules: Vec<(Rc<StyleRule>, u32, u32)>,
     spacing_by_key: HashMap<u64, Vec<usize>>,
     spacing_anywhere: Vec<usize>,
@@ -3779,17 +3880,16 @@ impl Cascade {
         self.rules.len() + self.spacing_only
     }
 
-    /// Whether the left and the right margin or padding of the element at
-    /// the top of the tree certainly set it apart from what stands beside
-    /// it: read only for flex and grid items, and for an inline box laying
-    /// them out, from the rules that set a margin or padding and its inline
-    /// style.
-    fn spacing(
+    /// How the box of the element at the top of the tree stands among the
+    /// items beside it: read only for flex and grid items, and for an
+    /// inline box laying them out, from the rules that set a margin,
+    /// padding, width, or flex basis and its inline style.
+    fn item_box(
         &self,
         tree: &Tree,
         ancestors: &AncestorKeys,
         work: &mut u64,
-    ) -> Result<(Tri, Tri), DocumentError> {
+    ) -> Result<ItemBox, DocumentError> {
         let element = tree.stack.last().expect("an element to style");
         let mut candidates: Vec<usize> = element
             .keys()
@@ -3800,15 +3900,26 @@ impl Cascade {
             .collect();
         candidates.sort_unstable();
         candidates.dedup();
-        // The left margin, the right margin, the left padding, and the
-        // right padding.
-        let mut sides: [Vec<(Precedence, Tri, Tri)>; 4] = Default::default();
+        // The left margin, the right margin, the left padding, the right
+        // padding, and the width; and the flex basis, `None` where it
+        // takes the width.
+        let mut sides: [Vec<(Precedence, Tri, Tri)>; 5] = Default::default();
+        let mut bases: Vec<(Precedence, Tri, Option<Tri>)> = Vec::new();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
             let slot = match declaration.property {
                 Property::MarginLeft => 0,
                 Property::MarginRight => 1,
                 Property::PaddingLeft => 2,
                 Property::PaddingRight => 3,
+                Property::Width => 4,
+                Property::FlexBasis => {
+                    bases.push((precedence, certainty, declaration.flow));
+                    return;
+                }
+                Property::FlexBasisAuto => {
+                    bases.push((precedence, certainty, None));
+                    return;
+                }
                 _ => return,
             };
             if let Some(wide) = declaration.flow {
@@ -3854,13 +3965,24 @@ impl Cascade {
         // definition's, a quote's, and a figure's margins, and a list's
         // padding at the start of its lines.
         let defaults = match element.lower.as_str() {
-            "dd" => [true, false, false, false],
-            "blockquote" | "figure" => [true, true, false, false],
-            "ul" | "ol" | "menu" | "dir" => [false, false, true, false],
-            _ => [false; 4],
+            "dd" => [true, false, false, false, false],
+            "blockquote" | "figure" => [true, true, false, false, false],
+            "ul" | "ol" | "menu" | "dir" => [false, false, true, false, false],
+            _ => [false; 5],
         };
         let side = |slot: usize| resolve_flow(&sides[slot], defaults[slot]);
-        Ok((side(0).max(side(2)), side(1).max(side(3))))
+        // A basis other than `auto` sets the item's size along the line in
+        // place of its width.
+        let full = match resolve_value(&bases, None) {
+            (_, true) => Tri::Maybe,
+            (None, false) => side(4),
+            (Some(basis), false) => basis,
+        };
+        Ok(ItemBox {
+            left: side(0).max(side(2)),
+            right: side(1).max(side(3)),
+            full,
+        })
     }
 
     /// Record how the element that has just ended among the siblings at
@@ -4049,12 +4171,15 @@ impl Cascade {
                     }
                     return;
                 }
-                // What only `::before` and `::after` boxes read, and margins
-                // and padding, read only for flex and grid items (see
-                // [`Cascade::spacing`]).
+                // What only `::before` and `::after` boxes read, and margins,
+                // padding, widths, and flex bases, read only for flex and
+                // grid items (see [`Cascade::item_box`]).
                 Property::Content
                 | Property::WhiteSpace
                 | Property::Opacity
+                | Property::Width
+                | Property::FlexBasis
+                | Property::FlexBasisAuto
                 | Property::MarginLeft
                 | Property::MarginRight
                 | Property::PaddingLeft
@@ -4692,7 +4817,7 @@ struct Open {
     inline_items: bool,
     /// For an item, or an inline box laying out items: whether its left
     /// and its right margin or padding set it apart from what stands
-    /// beside it (see [`Cascade::spacing`]).
+    /// beside it (see [`Cascade::item_box`]).
     edges: (Tri, Tri),
     /// It has no box (`display: contents`): its children stand among its
     /// parent's items, as its text does.
@@ -4714,33 +4839,44 @@ struct Row {
     /// Whether the last item's right margin or padding, or the lines of its
     /// own items, set it apart from the next.
     last_right: Tri,
+    /// Whether the last item takes a whole line (see [`ItemBox`]).
+    last_full: Tri,
+    /// Whether the items certainly wrapped onto another line.
+    wrapped: Tri,
     /// Text straight inside came last: text after it goes on its item.
     text: bool,
 }
 
 impl Row {
-    /// Take in the next item, whose left margin or padding is `left`, and
-    /// tell whether a reader sets it apart from the one before: `Yes` where
-    /// the layout or the spacing certainly does; otherwise the two may
-    /// touch, which counts where digits meet. The first item starts where
-    /// the box does, as far along as its own left edge sets it.
-    fn next(&mut self, left: Tri) -> Tri {
+    /// Take in the next item, whose box is `item`, and tell whether a
+    /// reader sets it apart from the one before: `Yes` where the layout or
+    /// the spacing certainly does, or where the items wrap and this item or
+    /// the one before takes a whole line; otherwise the two may touch,
+    /// which counts where digits meet. The first item starts where the box
+    /// does, as far along as its own left edge sets it.
+    fn next(&mut self, item: ItemBox) -> Tri {
+        let wrapped = self.layout.wraps.min(item.full.max(self.last_full));
         let apart = match self.count {
-            0 => left,
-            _ => match self
-                .layout
-                .turned
-                .max(self.layout.spaced)
-                .max(self.last_right)
-                .max(left)
-            {
-                Tri::Yes => Tri::Yes,
-                _ => Tri::Maybe,
-            },
+            0 => item.left,
+            _ => {
+                self.wrapped = self.wrapped.max(wrapped);
+                match self
+                    .layout
+                    .turned
+                    .max(self.layout.spaced)
+                    .max(self.last_right)
+                    .max(item.left)
+                    .max(wrapped)
+                {
+                    Tri::Yes => Tri::Yes,
+                    _ => Tri::Maybe,
+                }
+            }
         };
         self.count += 1;
         self.text = false;
         self.last_right = Tri::No;
+        self.last_full = item.full;
         apart
     }
 
@@ -4750,7 +4886,7 @@ impl Row {
         if self.text {
             return Tri::No;
         }
-        let apart = self.next(Tri::No);
+        let apart = self.next(ItemBox::default());
         self.text = true;
         apart
     }
@@ -4765,7 +4901,7 @@ impl Row {
             (_, Tri::Maybe, _) | (_, _, Tri::Yes | Tri::Maybe) => Tri::Maybe,
             _ => Tri::No,
         };
-        lines.max(self.last_right)
+        lines.max(self.wrapped).max(self.last_right)
     }
 }
 
@@ -6335,18 +6471,19 @@ pub(super) fn chapter_text(
             && style
                 .as_ref()
                 .is_some_and(|style| style.items == Tri::Yes && style.inline == Tri::Yes);
-        let edges = if item || inline_items {
+        let item_box = if item || inline_items {
             let tree = Tree {
                 stack: &elements,
                 earlier: &earlier,
             };
-            reader.spacing(&tree, &ancestors, work)?
+            reader.item_box(&tree, &ancestors, work)?
         } else {
-            (Tri::No, Tri::No)
+            ItemBox::default()
         };
+        let edges = (item_box.left, item_box.right);
         let apart = match open.last_mut() {
-            Some(parent) if item => parent.row.next(edges.0),
-            _ if inline_items => edges.0,
+            Some(parent) if item => parent.row.next(item_box),
+            _ if inline_items => item_box.left,
             _ => Tri::No,
         };
         if let Some(run) = runs.last_mut() {
@@ -7734,6 +7871,38 @@ mod tests {
         ] {
             assert!(!fuses(sheets, &body), "{body}");
         }
+    }
+
+    #[test]
+    fn wrapping_flex_items_a_whole_line_wide_stand_apart() {
+        let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
+        let rows = r#"<div class="r"><div class="l">Balance due</div><div class="a">Grand total</div></div>"#;
+        // Where the items wrap, one whose width or basis takes the whole
+        // line stands on a line of its own.
+        for sheet in [
+            ".r { display: flex; flex-wrap: wrap } .r > * { width: 100% }",
+            ".r { display: flex; flex-flow: row wrap } .r > .a { flex-basis: 100% }",
+            ".r { display: flex; flex-wrap: wrap } .r > .l { flex: 0 0 100% }",
+            // A basis of auto takes the width: Bootstrap's row-cols-1.
+            ".r { display: flex; flex-wrap: wrap } .r > * { width: 100% } .l, .a { flex: 1 0 0% } .r > * { flex: 0 0 auto }",
+        ] {
+            assert!(fuses(&[sheet], rows), "{sheet}");
+        }
+        // Items that fit on one line, or do not wrap, may touch; a basis
+        // other than auto sets aside the width.
+        for sheet in [
+            ".r { display: flex; flex-wrap: wrap } .r > * { width: 50% }",
+            ".r { display: flex } .r > * { width: 100% }",
+            ".r { display: flex; flex-wrap: wrap } .r > * { width: 100%; flex: 1 0 0% }",
+            ".r { display: flex; flex-wrap: wrap } .r > * { width: 30em }",
+        ] {
+            assert!(!fuses(&[sheet], rows), "{sheet}");
+        }
+        // An inline box whose items wrap so ends below its first line.
+        assert!(fuses(
+            &[".r { display: inline-flex; flex-wrap: wrap } .r > * { width: 100% }"],
+            r#"<p>Due <span class="r"><span>Balance</span><span>1,250.00</span></span>Grand total</p>"#
+        ));
     }
 
     #[test]
