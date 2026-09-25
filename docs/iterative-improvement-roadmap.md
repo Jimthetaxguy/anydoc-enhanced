@@ -337,7 +337,9 @@ Each of these is a policy choice the checks make one way today:
 - **EPUB page numbers and navigation.** Page numbers hidden through attribute
   or descendant selectors (Project Gutenberg's `.pagenum`) refuse the book, as
   AnyDoc converts them; books whose navigation does not list every spine
-  chapter, as pandoc and InDesign write them, are refused.
+  chapter, as InDesign writes them, are refused. A navigation document placed
+  in the spine need not list itself, but pandoc's hides its landmarks list,
+  which AnyDoc then converts, so such books are refused as hidden content.
 - **External hyperlinks** outside DOCX, as in the next slices.
 
 ## Go/no-go rules

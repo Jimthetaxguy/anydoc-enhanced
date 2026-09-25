@@ -187,6 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- An EPUB whose navigation document sits in the spine, as pandoc places it,
+  is no longer refused because the navigation does not list itself. Books
+  whose navigation leaves out a chapter are still refused.
 - A DOCX page number or date that Word fills in where a run shows it
   (`w:pgNum` and the legacy date blocks), which AnyDoc drops, is disclosed:
   the document converts as `partial` with the `characters_omitted` warning.

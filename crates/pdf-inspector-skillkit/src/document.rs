@@ -5534,11 +5534,18 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
             if !archive_names.contains(&nav_target) {
                 result.missing_required_content = true;
             } else {
+                // A navigation document in the spine, as pandoc places it,
+                // cannot list itself.
+                let chapters: Vec<String> = spine_targets
+                    .iter()
+                    .filter(|target| **target != nav_target)
+                    .cloned()
+                    .collect();
                 match epub_read_xml_part(&mut archive, &nav_target).and_then(|nav| {
                     epub_nav_spine_mismatch(
                         &nav,
                         &nav_target,
-                        &spine_targets,
+                        &chapters,
                         &archive_names,
                         &mut result,
                     )
@@ -10773,6 +10780,52 @@ mod tests {
         }
         writer.finish().unwrap().into_inner()
     }
+
+    #[test]
+    fn epub_navigation_in_the_spine_need_not_list_itself() {
+        let package = |spine: &str, nav: &str| {
+            let opf = EPUB_OPF_WITH_SPINE.replace("{spine}", spine);
+            let nav = EPUB_NAV_WITH_LINKS.replace("{links}", nav);
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("mimetype", stored).unwrap();
+            writer.write_all(b"application/epub+zip").unwrap();
+            for (name, bytes) in [
+                ("META-INF/container.xml", EPUB_CONTAINER),
+                ("OPS/package.opf", opf.as_bytes()),
+                ("OPS/nav.xhtml", nav.as_bytes()),
+                ("OPS/Text/ch1.xhtml", EPUB_CHAPTER_TWO),
+                ("OPS/Text/ch2.xhtml", EPUB_CHAPTER_TWO),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            let bytes = writer.finish().unwrap().into_inner();
+            preflight_package(&bytes, DocumentKind::Epub, DocumentVariant::Epub)
+                .unwrap()
+                .missing_required_content
+        };
+        let both =
+            r#"<li><a href="Text/ch1.xhtml">One</a></li><li><a href="Text/ch2.xhtml">Two</a></li>"#;
+        // pandoc places the navigation document in the spine.
+        let with_nav = r#"<itemref idref="nav"/><itemref idref="ch1"/><itemref idref="ch2"/>"#;
+        assert!(!package(with_nav, both));
+        // A chapter the navigation leaves out is still refused.
+        assert!(package(
+            with_nav,
+            r#"<li><a href="Text/ch1.xhtml">One</a></li>"#
+        ));
+        assert!(package(
+            r#"<itemref idref="ch1"/><itemref idref="ch2"/>"#,
+            r#"<li><a href="Text/ch2.xhtml">Two</a></li>"#
+        ));
+    }
+
+    const EPUB_OPF_WITH_SPINE: &str = r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="ch1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/><item id="ch2" href="Text/ch2.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine>{spine}</spine></package>"#;
+    const EPUB_NAV_WITH_LINKS: &str = r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head/><body><nav type="toc"><ol>{links}</ol></nav></body></html>"#;
 
     #[test]
     fn epub_preflight_accepts_complete_spine_and_local_assets() {
