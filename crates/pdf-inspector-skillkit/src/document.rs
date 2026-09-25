@@ -33,6 +33,8 @@ mod epub_css;
 mod odf_walk;
 #[path = "tabular_csv.rs"]
 mod tabular_csv;
+#[path = "xlsx_numfmt.rs"]
+mod xlsx_numfmt;
 
 /// Maximum document input accepted by the generic document route.
 pub const MAX_DOCUMENT_SIZE: u64 = 50 * 1024 * 1024;
@@ -977,7 +979,16 @@ struct WorksheetScan {
     /// `sheetData` in the first `worksheet`, all in SpreadsheetML's
     /// namespace), which it drops.
     unreached_cell: bool,
+    /// The style index and value class of each cell AnyDoc renders, to be
+    /// checked against the workbook's number formats.
+    format_uses: HashSet<(u32, xlsx_numfmt::CellClass)>,
+    /// More distinct uses than a workbook can hold.
+    too_many_formats: bool,
 }
+
+/// Distinct (style, value class) pairs kept per worksheet: Excel allows
+/// 64,000 cell formats, each met by four classes of value.
+const MAX_FORMAT_USES: usize = 1 << 18;
 
 /// The formula cell being read.
 struct FormulaCandidate {
@@ -990,6 +1001,11 @@ struct FormulaCandidate {
     /// Depth of that `v` while it is open.
     value_depth: Option<usize>,
     inline_string: bool,
+    /// The cell's `s`, an index into `cellXfs`; `None` when it indexes no
+    /// entry a workbook can hold.
+    style: Option<u32>,
+    /// Whether AnyDoc reads the cell.
+    reached: bool,
 }
 
 impl FormulaCandidate {
@@ -1007,6 +1023,46 @@ impl FormulaCandidate {
             "b" => value.is_some_and(|value| matches!(value, "1" | "true" | "0" | "false")),
             "e" | "d" => value.is_some_and(|value| !value.is_empty()),
             _ => value.is_some_and(|value| !value.is_empty() && value.parse::<f64>().is_ok()),
+        }
+    }
+
+    /// The cell's style and the class of value its format meets, for a cell
+    /// AnyDoc renders through a format.
+    fn format_use(&self) -> Option<(u32, xlsx_numfmt::CellClass)> {
+        use xlsx_numfmt::CellClass;
+        if !self.reached {
+            return None;
+        }
+        let class = match self.kind.as_str() {
+            "s" | "str" | "inlineStr" => CellClass::Text,
+            "b" | "e" | "d" => return None,
+            _ => {
+                let number: f64 = self.value.as_deref()?.trim().parse().ok()?;
+                if !number.is_finite() {
+                    return None;
+                }
+                if number < 0.0 {
+                    CellClass::Negative
+                } else if number > 0.0 {
+                    CellClass::Positive
+                } else {
+                    CellClass::Zero
+                }
+            }
+        };
+        Some((self.style?, class))
+    }
+}
+
+impl WorksheetScan {
+    fn close_cell(&mut self, cell: &FormulaCandidate) {
+        self.uncached_formula |= cell.formula && !cell.renders();
+        if let Some(format_use) = cell.format_use() {
+            if self.format_uses.len() < MAX_FORMAT_USES {
+                self.format_uses.insert(format_use);
+            } else if !self.format_uses.contains(&format_use) {
+                self.too_many_formats = true;
+            }
         }
     }
 }
@@ -1035,6 +1091,7 @@ fn scan_worksheet(bytes: &[u8]) -> WorksheetScan {
                 return WorksheetScan {
                     uncached_formula: true,
                     unreached_cell: true,
+                    ..WorksheetScan::default()
                 };
             }
         };
@@ -1054,7 +1111,7 @@ fn scan_worksheet(bytes: &[u8]) -> WorksheetScan {
                     }
                 }
                 if let Some(closed) = cell.take_if(|open| open.depth == depth) {
-                    scan.uncached_formula |= closed.formula && !closed.renders();
+                    scan.close_cell(&closed);
                 }
                 buffer.clear();
                 continue;
@@ -1087,21 +1144,32 @@ fn scan_worksheet(bytes: &[u8]) -> WorksheetScan {
             worksheet_seen = true;
             worksheet_open = start;
         }
+        let reached = sml
+            && local == b"c"
+            && worksheet_open
+            && depth == 3
+            && stack[1] == (true, b"sheetData".to_vec())
+            && stack[2] == (true, b"row".to_vec());
         if sml && local == b"c" {
-            let reached = worksheet_open
-                && depth == 3
-                && stack[1] == (true, b"sheetData".to_vec())
-                && stack[2] == (true, b"row".to_vec());
             scan.unreached_cell |= !reached;
         }
         match cell.as_mut() {
             // A formula cell in any namespace counts: its value renders only
             // from a SpreadsheetML `v`.
             None if local == b"c" && start => {
-                let kind = xml_attributes(&element)
-                    .into_iter()
-                    .find(|attribute| !attribute.prefixed() && attribute.local() == b"t")
-                    .map_or_else(|| "n".to_string(), |attribute| attribute.value);
+                let attributes = xml_attributes(&element);
+                let unprefixed = |name: &[u8]| {
+                    attributes
+                        .iter()
+                        .find(|attribute| !attribute.prefixed() && attribute.local() == name)
+                        .map(|attribute| attribute.value.clone())
+                };
+                let kind = unprefixed(b"t").unwrap_or_else(|| "n".to_string());
+                // AnyDoc reads an `s` it cannot parse as style 0.
+                let style = match unprefixed(b"s").map(|style| style.parse::<usize>()) {
+                    Some(Ok(index)) => u32::try_from(index).ok(),
+                    _ => Some(0),
+                };
                 cell = Some(FormulaCandidate {
                     depth,
                     kind,
@@ -1109,6 +1177,8 @@ fn scan_worksheet(bytes: &[u8]) -> WorksheetScan {
                     value: None,
                     value_depth: None,
                     inline_string: false,
+                    style,
+                    reached,
                 });
             }
             Some(open) => {
@@ -1131,9 +1201,234 @@ fn scan_worksheet(bytes: &[u8]) -> WorksheetScan {
         buffer.clear();
     }
     if let Some(open) = cell {
-        scan.uncached_formula |= open.formula && !open.renders();
+        scan.close_cell(&open);
     }
     scan
+}
+
+/// A styles part's number formats as AnyDoc reads them
+/// (`sheet::xlsx::Styles`): the file's own codes by id, from every
+/// `numFmts` with later entries winning, and the numFmtId of each `xf` in
+/// the first `cellXfs`, in order. A part AnyDoc cannot parse gives none, so
+/// every cell renders as General.
+#[derive(Default)]
+struct XlsxFormats {
+    codes: HashMap<u32, String>,
+    cell_formats: Vec<u32>,
+}
+
+fn xlsx_formats(bytes: &[u8]) -> XlsxFormats {
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut formats = XlsxFormats::default();
+    let mut depth = 0usize;
+    // Depths of the open `numFmts` elements, and of the first `cellXfs`
+    // while it is open.
+    let mut number_formats: Vec<usize> = Vec::new();
+    let (mut cell_xfs, mut cell_xfs_seen) = (None, false);
+    loop {
+        let (namespace, event) = match reader.read_resolved_event_into(&mut buffer) {
+            Ok(resolved) => resolved,
+            Err(_) => return XlsxFormats::default(),
+        };
+        let sml = spreadsheetml(&namespace);
+        let (element, start) = match event {
+            quick_xml::events::Event::Start(element) => (element, true),
+            quick_xml::events::Event::Empty(element) => (element, false),
+            quick_xml::events::Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if number_formats.last() == Some(&depth) {
+                    number_formats.pop();
+                }
+                if cell_xfs == Some(depth) {
+                    cell_xfs = None;
+                }
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::Eof => return formats,
+            _ => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let attribute = |name: &[u8]| {
+            xml_attributes(&element)
+                .into_iter()
+                .find(|attribute| !attribute.prefixed() && attribute.local() == name)
+                .map(|attribute| attribute.value)
+        };
+        match element.local_name().as_ref() {
+            b"numFmts" if sml && start => number_formats.push(depth),
+            b"numFmt" if sml && number_formats.last().is_some_and(|open| open + 1 == depth) => {
+                if let (Some(id), Some(code)) = (
+                    attribute(b"numFmtId").and_then(|id| id.parse().ok()),
+                    attribute(b"formatCode"),
+                ) {
+                    formats.codes.insert(id, code);
+                }
+            }
+            b"cellXfs" if sml && !cell_xfs_seen => {
+                cell_xfs_seen = true;
+                if start {
+                    cell_xfs = Some(depth);
+                }
+            }
+            b"xf" if sml && cell_xfs.is_some_and(|open| open + 1 == depth) => {
+                let id = attribute(b"numFmtId")
+                    .and_then(|id| id.parse().ok())
+                    .unwrap_or(0);
+                formats.cell_formats.push(id);
+            }
+            _ => {}
+        }
+        if start {
+            depth += 1;
+        }
+        buffer.clear();
+    }
+}
+
+/// Whether a worksheet's DrawingML drawings, found through its `drawing`
+/// relationships, show text AnyDoc never reads: a text box or a shape with
+/// text, not hidden and not linked to a cell. Pictures and charts hold no
+/// text of their own here.
+fn xlsx_sheets_have_drawing_text(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    sheets: &HashSet<String>,
+) -> Result<bool, DocumentError> {
+    let mut drawings = HashSet::new();
+    for sheet in sheets {
+        for relationship in read_relationships(archive, &ooxml_rels_part(sheet))? {
+            if !relationship.external && relationship.kind.trim().ends_with("/drawing") {
+                drawings.extend(anydoc_resolve(sheet, &relationship.target));
+            }
+        }
+    }
+    for drawing in drawings {
+        if read_optional_xml_part(archive, &drawing)?
+            .is_some_and(|bytes| drawing_shows_text(&bytes))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a drawing part holds text in a shape a viewer shows. A part that
+/// does not parse counts as holding some.
+fn drawing_shows_text(bytes: &[u8]) -> bool {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    // For each open element: whether it is a shape, and whether text in it
+    // is shown (not in a hidden or cell-linked shape).
+    let mut stack: Vec<(bool, bool)> = Vec::new();
+    let mut in_text = 0usize;
+    loop {
+        let (element, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(element)) => (element, true),
+            Ok(quick_xml::events::Event::Empty(element)) => (element, false),
+            Ok(quick_xml::events::Event::End(end)) => {
+                if xml_local_name(end.name().as_ref()) == b"t" {
+                    in_text = in_text.saturating_sub(1);
+                }
+                stack.pop();
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Text(text)) => {
+                let shown = stack
+                    .iter()
+                    .rev()
+                    .find(|(shape, _)| *shape)
+                    .is_some_and(|&(_, shown)| shown);
+                if in_text > 0
+                    && shown
+                    && String::from_utf8_lossy(text.as_ref())
+                        .chars()
+                        .any(|c| !c.is_whitespace())
+                {
+                    return true;
+                }
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::GeneralRef(_)) => {
+                let shown = stack
+                    .iter()
+                    .rev()
+                    .find(|(shape, _)| *shape)
+                    .is_some_and(|&(_, shown)| shown);
+                if in_text > 0 && shown {
+                    return true;
+                }
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) => return false,
+            Err(_) => return true,
+            Ok(_) => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let local = xml_local_name(element.name().as_ref()).to_vec();
+        let attributes = xml_attributes(&element);
+        let value = |name: &[u8]| {
+            attributes
+                .iter()
+                .find(|attribute| attribute.local() == name)
+                .map(|attribute| attribute.value.trim().to_string())
+        };
+        match local.as_slice() {
+            // A shape; one linked to a cell repeats the cell's text.
+            b"sp" => {
+                let parent_shown = stack
+                    .iter()
+                    .rev()
+                    .find(|(shape, _)| *shape)
+                    .is_none_or(|&(_, shown)| shown);
+                let linked = value(b"textlink").is_some_and(|link| !link.is_empty());
+                if start {
+                    stack.push((true, parent_shown && !linked));
+                }
+                buffer.clear();
+                continue;
+            }
+            b"grpSp" => {
+                let parent_shown = stack
+                    .iter()
+                    .rev()
+                    .find(|(shape, _)| *shape)
+                    .is_none_or(|&(_, shown)| shown);
+                if start {
+                    stack.push((true, parent_shown));
+                }
+                buffer.clear();
+                continue;
+            }
+            // A hidden shape or group, such as the drawing copy of a form
+            // control, shows none of its text.
+            b"cNvPr"
+                if value(b"hidden")
+                    .is_some_and(|hidden| matches!(hidden.as_str(), "1" | "true")) =>
+            {
+                if let Some(shape) = stack.iter_mut().rev().find(|(shape, _)| *shape) {
+                    shape.1 = false;
+                }
+            }
+            b"t" if start => in_text += 1,
+            _ => {}
+        }
+        if start {
+            stack.push((false, false));
+        }
+        buffer.clear();
+    }
 }
 
 /// Add text to the open cell's cached value, if its first `v` is open.
@@ -4365,6 +4660,8 @@ fn preflight_package(
     let layout = ooxml_layout(&mut archive, kind)?;
     let mut docx_scan = DocxStoryScan::default();
     let mut odp_visibility = OdpVisibility::default();
+    // XLSX cells by style and value class, checked once the styles are read.
+    let mut format_uses: HashSet<(u32, xlsx_numfmt::CellClass)> = HashSet::new();
     let mut result = PackagePreflight::default();
     let mut ppt_presentation = None;
     let mut ppt_presentation_rels = None;
@@ -4545,6 +4842,8 @@ fn preflight_package(
                         result.unsupported_content |= walk.dropped_text;
                         if spreadsheet {
                             result.missing_formula_cache |= walk.uncached_formula;
+                            result.hidden_content |= walk.hidden_value;
+                            result.unsupported_content |= walk.sign_lost;
                         }
                     }
                     if matches!(kind, DocumentKind::Ods) {
@@ -4618,6 +4917,13 @@ fn preflight_package(
                     let sheet = scan_worksheet(&content);
                     result.missing_formula_cache |= sheet.uncached_formula;
                     result.unsupported_content |= sheet.unreached_cell;
+                    if sheet.too_many_formats {
+                        return Err(DocumentError::ResourceLimit);
+                    }
+                    format_uses.extend(sheet.format_uses);
+                    if format_uses.len() > MAX_FORMAT_USES {
+                        return Err(DocumentError::ResourceLimit);
+                    }
                 }
             }
             if matches!(kind, DocumentKind::Pptx) {
@@ -4688,6 +4994,26 @@ fn preflight_package(
                 return Err(DocumentError::ResourceLimit);
             }
         }
+        // Each candidate styles part is checked, as AnyDoc reads one.
+        for part in &layout.styles_parts {
+            let Some(styles) = read_optional_xml_part(&mut archive, part)? else {
+                continue;
+            };
+            let formats = xlsx_formats(&styles);
+            let mut losses = HashMap::new();
+            for &(style, class) in &format_uses {
+                let Some(&id) = formats.cell_formats.get(style as usize) else {
+                    continue;
+                };
+                let loss = *losses.entry((id, class)).or_insert_with(|| {
+                    xlsx_numfmt::loss(id, formats.codes.get(&id).map(String::as_str), class)
+                });
+                result.hidden_content |= loss.hidden;
+                result.unsupported_content |= loss.misrendered;
+            }
+        }
+        result.unsupported_content |=
+            xlsx_sheets_have_drawing_text(&mut archive, &layout.worksheet_parts)?;
     }
     if matches!(kind, DocumentKind::Docx) {
         let mut hidden_styles = HashSet::new();
@@ -8090,6 +8416,126 @@ mod tests {
         )
         .unwrap();
         assert!(result.hidden_content);
+    }
+
+    /// Preflight a one-sheet workbook with `cells` in its first row,
+    /// `styles` as its styles part, and `extra` parts.
+    fn preflight_workbook(
+        cells: &str,
+        styles: &str,
+        sheet_rels: Option<&str>,
+        extra: &[(&str, &[u8])],
+    ) -> PackagePreflight {
+        let sheet = format!(
+            r#"<worksheet {SML_NS}><sheetData><row r="1">{cells}</row></sheetData></worksheet>"#
+        );
+        let workbook = format!(
+            r#"<workbook {SML_NS} xmlns:r="{REL_NS}"><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        );
+        let workbook_rels = format!(
+            r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{REL_NS}/styles" Target="styles.xml"/></Relationships>"#
+        );
+        let styles = format!(r#"<styleSheet {SML_NS}>{styles}</styleSheet>"#);
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("[Content_Types].xml", XLSX_TYPES),
+            ("xl/workbook.xml", workbook.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", workbook_rels.as_bytes()),
+            ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+            ("xl/styles.xml", styles.as_bytes()),
+        ];
+        if let Some(rels) = sheet_rels {
+            entries.push(("xl/worksheets/_rels/sheet1.xml.rels", rels.as_bytes()));
+        }
+        entries.extend_from_slice(extra);
+        preflight_package(
+            &zip_entries(&entries),
+            DocumentKind::Xlsx,
+            DocumentVariant::Xlsx,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn xlsx_number_formats_are_read_as_anydoc_renders_cells() {
+        let styles = |code: &str| {
+            let code = code.replace('"', "&quot;");
+            format!(
+                r#"<numFmts count="1"><numFmt numFmtId="164" formatCode="{code}"/></numFmts><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="31"/></cellXfs>"#
+            )
+        };
+        let workbook =
+            |cells: &str, code: &str| preflight_workbook(cells, &styles(code), None, &[]);
+        // A negative marked only by a colour loses its sign.
+        let red = "#,##0;[Red]#,##0";
+        assert!(workbook(r#"<c r="A1" s="1"><v>-1234</v></c>"#, red).unsupported_content);
+        assert!(!workbook(r#"<c r="A1" s="1"><v>1234</v></c>"#, red).unsupported_content);
+        assert!(!workbook(r#"<c r="A1" s="0"><v>-1234</v></c>"#, red).unsupported_content);
+        let parens = r#"#,##0;[Red]\(#,##0\)"#;
+        assert!(!workbook(r#"<c r="A1" s="1"><v>-1234</v></c>"#, parens).unsupported_content);
+        // A value a format hides is hidden content; a hidden zero is not.
+        let hide = ";;;";
+        assert!(workbook(r#"<c r="A1" s="1"><v>98765</v></c>"#, hide).hidden_content);
+        assert!(
+            workbook(
+                r#"<c r="A1" s="1" t="inlineStr"><is><t>Note</t></is></c>"#,
+                hide
+            )
+            .hidden_content
+        );
+        let zeros = "#,##0;(#,##0);";
+        assert!(!workbook(r#"<c r="A1" s="1"><v>0</v></c>"#, zeros).hidden_content);
+        // A locale date id AnyDoc cannot resolve renders a serial number.
+        assert!(workbook(r#"<c r="A1" s="2"><v>45762</v></c>"#, red).unsupported_content);
+        // A style index past `cellXfs` renders as General.
+        assert!(!workbook(r#"<c r="A1" s="9"><v>-1</v></c>"#, red).unsupported_content);
+        // Cells AnyDoc never reads are not checked here.
+        let clean = preflight_workbook(r#"<c r="A1" s="1"><v>1</v></c>"#, &styles(red), None, &[]);
+        assert!(!clean.unsupported_content && !clean.hidden_content);
+    }
+
+    #[test]
+    fn xlsx_drawing_text_is_found() {
+        let rels = format!(
+            r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#
+        );
+        let drawing = |shape: &str| {
+            format!(
+                r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><xdr:twoCellAnchor>{shape}</xdr:twoCellAnchor></xdr:wsDr>"#
+            )
+        };
+        let text_box = |attributes: &str, cnv: &str, text: &str| {
+            format!(
+                r#"<xdr:sp {attributes}><xdr:nvSpPr><xdr:cNvPr id="2" name="TextBox 1" {cnv}/></xdr:nvSpPr><xdr:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></xdr:txBody></xdr:sp>"#
+            )
+        };
+        let check = |shape: String| {
+            let drawing = drawing(&shape);
+            preflight_workbook(
+                r#"<c r="A1"><v>1</v></c>"#,
+                "",
+                Some(&rels),
+                &[("xl/drawings/drawing1.xml", drawing.as_bytes())],
+            )
+            .unsupported_content
+        };
+        assert!(check(text_box("", "", "Amounts restated; see note 4")));
+        assert!(check(format!(
+            r#"<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="Group"/></xdr:nvGrpSpPr>{}</xdr:grpSp>"#,
+            text_box("", "", "Grouped note")
+        )));
+        // A hidden shape, such as a form control's drawing copy, a shape
+        // linked to a cell, a picture, and an empty box show nothing new.
+        assert!(!check(text_box("", r#"hidden="1""#, "Check Box 1")));
+        assert!(!check(text_box(r#"textlink="$A$1""#, "", "1")));
+        assert!(!check(text_box("", "", " ")));
+        assert!(!check(
+            r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="3" name="Picture 1" descr="Scanned receipt"/></xdr:nvPicPr></xdr:pic>"#
+                .to_string()
+        ));
+        assert!(!check(format!(
+            r#"<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="Group" hidden="1"/></xdr:nvGrpSpPr>{}</xdr:grpSp>"#,
+            text_box("", "", "Inside a hidden group")
+        )));
     }
 
     #[test]

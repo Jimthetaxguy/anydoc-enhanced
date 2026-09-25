@@ -56,6 +56,12 @@ pub(super) struct OdfWalk {
     pub(super) dropped_text: bool,
     /// A formula cell AnyDoc converts without a value.
     pub(super) uncached_formula: bool,
+    /// A cell whose display text is empty, as a format that hides the value
+    /// leaves it, while AnyDoc converts the typed value instead.
+    pub(super) hidden_value: bool,
+    /// A negative value displayed without a sign, which only its colour
+    /// marked as negative.
+    pub(super) sign_lost: bool,
 }
 
 /// How AnyDoc treats an element's children.
@@ -133,6 +139,14 @@ struct CellState {
     /// A list or nested table, which stops AnyDoc from falling back to the
     /// typed value.
     structured: bool,
+    /// A paragraph was written for the cell's display text.
+    paragraph: bool,
+    /// The typed value is a number below zero.
+    negative: bool,
+    /// The typed value is anything but a number equal to zero.
+    nonzero: bool,
+    /// The converted text shows a sign: a minus, a parenthesis, `CR`, `DR`.
+    sign_shown: bool,
 }
 
 impl Open {
@@ -338,9 +352,18 @@ pub(super) fn walk_content(
             &mut content_taken,
         );
         if matches!(open.mode, Mode::Cell) && open.cell.is_none() {
+            let number = match attribute(&attributes, OFFICE, b"value-type") {
+                Some("percentage" | "currency" | "float") => {
+                    attribute(&attributes, OFFICE, b"value")
+                        .and_then(|value| value.trim().parse::<f64>().ok())
+                }
+                _ => None,
+            };
             open.cell = Some(CellState {
                 formula: attributes.iter().any(|(_, name, _)| name == b"formula"),
                 value_renders: value_renders(&attributes),
+                negative: number.is_some_and(|number| number < 0.0),
+                nonzero: number != Some(0.0),
                 ..CellState::default()
             });
         }
@@ -408,10 +431,12 @@ fn child(
         }
         Mode::Container => block_child(namespace, local),
         Mode::Cell => {
-            if spreadsheet && (namespace == DRAW || (namespace == OFFICE && local == b"annotation"))
-            {
-                // Drawings over the grid and cell comments.
+            if spreadsheet && namespace == OFFICE && local == b"annotation" {
+                // Cell comments, which no conversion covers.
                 Mode::Ignored
+            } else if spreadsheet && namespace == DRAW {
+                // A drawing anchored to the cell: text in it is lost.
+                Mode::Skipped
             } else {
                 block_child(namespace, local)
             }
@@ -465,10 +490,8 @@ fn child(
         Mode::Table => match (namespace, local) {
             (TABLE, b"table-header-rows" | b"table-rows" | b"table-row-group") => Mode::Table,
             (TABLE, b"table-row") => Mode::Row,
-            // Drawings over the grid are not converted; like a workbook's
-            // drawings, they are outside what a spreadsheet conversion
-            // covers.
-            (TABLE, b"shapes") => Mode::Ignored,
+            // Drawings over the grid are not converted: text in them is lost.
+            (TABLE, b"shapes") => Mode::Skipped,
             _ if ignored(namespace, local) => Mode::Ignored,
             _ => Mode::Skipped,
         },
@@ -573,6 +596,11 @@ fn child(
             cell.structured = true;
         }
     }
+    if parent.mode == Mode::Cell && mode == Mode::Inline {
+        if let Some(cell) = parent.cell.as_mut() {
+            cell.paragraph = true;
+        }
+    }
     let skipped_here = matches!(mode, Mode::Skipped | Mode::Notes);
     let paragraph = namespace == TEXT && matches!(local, b"p" | b"h");
     let mut open = Open::new(mode);
@@ -603,6 +631,10 @@ fn on_text(stack: &mut [Open], text: &[u8], walk: &mut OdfWalk) {
     // shape AnyDoc has not yet chosen to walk.
     if let Some(cell) = stack.iter_mut().rev().find_map(|open| open.cell.as_mut()) {
         cell.rendered = true;
+        let text = String::from_utf8_lossy(text);
+        cell.sign_shown |= text.contains(['-', '(', ')', '\u{2212}'])
+            || text.contains("CR")
+            || text.contains("DR");
     }
     if let Some(shape) = stack.iter_mut().rev().find(|open| open.mode == Mode::Shape) {
         if !shape.walked {
@@ -616,9 +648,18 @@ fn finish(closed: Open, walk: &mut OdfWalk) {
         walk.dropped_text = true;
     }
     if let Some(cell) = closed.cell {
-        let renders = cell.rendered || (!cell.structured && cell.value_renders);
-        if cell.formula && !renders {
+        let fallback = !cell.rendered && !cell.structured && cell.value_renders;
+        if cell.formula && !(cell.rendered || fallback) {
             walk.uncached_formula = true;
+        }
+        // An empty display paragraph is what LibreOffice writes for a value
+        // its format hides; AnyDoc converts the typed value in its place.
+        // A hidden zero is the common "hide zeros" format and hides nothing.
+        if cell.paragraph && fallback && cell.nonzero {
+            walk.hidden_value = true;
+        }
+        if cell.negative && cell.rendered && !cell.sign_shown {
+            walk.sign_lost = true;
         }
     }
 }
@@ -771,16 +812,70 @@ mod tests {
     #[test]
     fn spreadsheet_drawings_comments_and_merges_are_outside_the_grid() {
         let dropped = |table: &str| walk(OdfBody::Spreadsheet, table).dropped_text;
+        // Comments, merged-away cells, and validation help are not content.
         for converted in [
-            r#"<table:table><table:shapes><draw:frame><draw:text-box><text:p>Sheet note</text:p></draw:text-box></draw:frame></table:shapes><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row></table:table>"#,
             r#"<table:table><table:table-row><table:table-cell><office:annotation><text:p>Comment</text:p></office:annotation><text:p>A</text:p></table:table-cell><table:covered-table-cell><text:p>Merged away</text:p></table:covered-table-cell></table:table-row></table:table>"#,
-            r#"<table:table><table:table-row><table:table-cell><draw:frame><draw:text-box><text:p>Anchored</text:p></draw:text-box></draw:frame></table:table-cell></table:table-row></table:table>"#,
             r#"<table:content-validations><table:content-validation><table:help-message><text:p>Help</text:p></table:help-message></table:content-validation></table:content-validations>"#,
+            r#"<table:table><table:table-row><table:table-cell><draw:frame><draw:image/></draw:frame><text:p>A</text:p></table:table-cell></table:table-row></table:table>"#,
         ] {
             assert!(!dropped(converted), "{converted}");
         }
-        assert!(dropped(
-            r#"<table:table><table:table-row><x:cell><text:p>Foreign</text:p></x:cell></table:table-row></table:table>"#
-        ));
+        // Text in a drawing over the grid, or anchored to a cell, is lost.
+        for lost in [
+            r#"<table:table><table:shapes><draw:frame><draw:text-box><text:p>Sheet note</text:p></draw:text-box></draw:frame></table:shapes><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row></table:table>"#,
+            r#"<table:table><table:table-row><table:table-cell><draw:frame><draw:text-box><text:p>Anchored</text:p></draw:text-box></draw:frame></table:table-cell></table:table-row></table:table>"#,
+            r#"<table:table><table:table-row><table:table-cell><draw:custom-shape><text:p>Shape</text:p></draw:custom-shape></table:table-cell></table:table-row></table:table>"#,
+            r#"<table:table><table:table-row><x:cell><text:p>Foreign</text:p></x:cell></table:table-row></table:table>"#,
+        ] {
+            assert!(dropped(lost), "{lost}");
+        }
+    }
+
+    #[test]
+    fn spreadsheet_values_a_format_hides_or_unsigns_are_found() {
+        let cell = |attributes: &str, text: &str| {
+            let body = if text.is_empty() {
+                "<text:p/>".to_string()
+            } else {
+                format!("<text:p>{text}</text:p>")
+            };
+            walk(
+                OdfBody::Spreadsheet,
+                &format!(
+                    r#"<table:table><table:table-row><table:table-cell {attributes}>{body}</table:table-cell></table:table-row></table:table>"#
+                ),
+            )
+        };
+        let float = |value: &str| format!(r#"office:value-type="float" office:value="{value}""#);
+        // An empty display paragraph hides a value AnyDoc then converts.
+        assert!(cell(&float("98765"), "").hidden_value);
+        assert!(
+            cell(
+                r#"office:value-type="string" office:string-value="Adjusted basis""#,
+                ""
+            )
+            .hidden_value
+        );
+        // A hidden zero, or a cell without a typed value, hides nothing.
+        assert!(!cell(&float("0"), "").hidden_value);
+        assert!(!cell("", "").hidden_value);
+        assert!(!cell(&float("98765"), "98,765").hidden_value);
+        // A cell with no display paragraph at all shows its value.
+        let bare = walk(
+            OdfBody::Spreadsheet,
+            &format!(
+                r#"<table:table><table:table-row><table:table-cell {}/></table:table-row></table:table>"#,
+                float("12")
+            ),
+        );
+        assert!(!bare.hidden_value);
+        // A negative shown without a sign lost it to a colour.
+        assert!(cell(&float("-1234.1"), "1234.10").sign_lost);
+        for shown in ["-1234.10", "(1,234.10)", "\u{2212}1234.10", "1,234.10 CR"] {
+            assert!(!cell(&float("-1234.1"), shown).sign_lost, "{shown}");
+        }
+        assert!(!cell(&float("1234.1"), "1234.10").sign_lost);
+        // With no display text AnyDoc writes the typed value, sign and all.
+        assert!(!cell(&float("-1234.1"), "").sign_lost);
     }
 }
