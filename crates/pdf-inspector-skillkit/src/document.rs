@@ -3802,7 +3802,7 @@ impl DocxNumbering {
     fn resolve_definition<'a>(
         &'a self,
         definition: &'a str,
-        styles: &DocxStyleNumbering,
+        chains: &DocxStyleChains,
         word: bool,
     ) -> Option<&'a str> {
         let mut current = definition;
@@ -3811,10 +3811,8 @@ impl DocxNumbering {
             let Some(style) = &found.style_link else {
                 return Some(current);
             };
-            let through_style = styles
-                .styles
-                .get(style)
-                .and_then(|style| style.list)
+            let through_style = chains
+                .own_list(style)
                 .and_then(|list| self.lists.get(&list))
                 .and_then(|list| list.definition.as_deref());
             let next = match through_style {
@@ -3848,15 +3846,9 @@ impl DocxNumbering {
     }
 
     /// A list instance as Word or as AnyDoc counts it.
-    fn instance(
-        &self,
-        list: u64,
-        styles: &DocxStyleNumbering,
-        chains: &DocxStyleChains,
-        word: bool,
-    ) -> Option<DocxInstance> {
+    fn instance(&self, list: u64, chains: &DocxStyleChains, word: bool) -> Option<DocxInstance> {
         let instance = self.lists.get(&list)?;
-        let definition = self.resolve_definition(instance.definition.as_deref()?, styles, word)?;
+        let definition = self.resolve_definition(instance.definition.as_deref()?, chains, word)?;
         let levels = self.levels_from(instance, definition)?;
         Some(DocxInstance {
             definition: definition.to_string(),
@@ -3874,6 +3866,66 @@ impl DocxNumbering {
     }
 }
 
+/// How Word or AnyDoc reads a document's lists: its reading of the
+/// numbering part and of the style chains, and the list instances read so
+/// far.
+struct DocxReading<'a> {
+    word: bool,
+    numbering: &'a DocxNumbering,
+    chains: DocxStyleChains<'a>,
+    instances: DocxInstances,
+}
+
+impl<'a> DocxReading<'a> {
+    fn new(
+        word: bool,
+        numbering: &'a DocxNumbering,
+        styles: &'a HashMap<String, DocxStyleList>,
+    ) -> Self {
+        DocxReading {
+            word,
+            numbering,
+            chains: DocxStyleChains::new(styles),
+            instances: DocxInstances::new(),
+        }
+    }
+
+    /// A list instance as this side counts it.
+    fn instance(&mut self, list: u64) -> Option<&DocxInstance> {
+        let DocxReading {
+            word,
+            numbering,
+            chains,
+            instances,
+        } = self;
+        instances
+            .entry(list)
+            .or_insert_with(|| numbering.instance(list, chains, *word))
+            .as_ref()
+    }
+
+    /// Where this side numbers a paragraph asking for `used` through
+    /// `style`: the list given directly or the style chain's, and the level
+    /// given directly or read from the style chain (see
+    /// [`DocxStyleChains::level`]). A list instance of 0 removes numbering.
+    fn resolve(&mut self, used: &DocxListUse, style: Option<&str>) -> Option<(u64, usize)> {
+        let list = match used.list {
+            Some(list) => list,
+            None => self.chains.list(style?)?,
+        };
+        if list == 0 {
+            return None;
+        }
+        let bound = self.instance(list)?.bound.clone();
+        let level = match (used.level, style) {
+            (Some(level), _) => level,
+            (None, Some(style)) => self.chains.level(style, &bound, self.word),
+            (None, None) => 0,
+        };
+        Some((list, level.min(DOCX_LIST_LEVELS - 1)))
+    }
+}
+
 /// A numbering part as Word and as AnyDoc read it.
 struct DocxNumberings {
     word: DocxNumbering,
@@ -3881,57 +3933,6 @@ struct DocxNumberings {
 }
 
 impl DocxNumberings {
-    /// Where a paragraph's numbering resolves, for Word and for AnyDoc: the
-    /// list given directly or its style chain's, and the level given
-    /// directly or read from the style chain (see
-    /// [`DocxStyleChains::level`]). Word numbers a paragraph that names no
-    /// style, or one the parts do not define, through the default
-    /// paragraph style; AnyDoc through none. A list instance of 0 removes
-    /// numbering.
-    fn resolve_use(
-        &self,
-        used: &DocxListUse,
-        styles: &DocxStyleNumbering,
-        chains: &DocxStyleChains,
-        word_instances: &mut DocxInstances,
-        anydoc_instances: &mut DocxInstances,
-    ) -> DocxResolved {
-        let word_style = used
-            .style
-            .as_deref()
-            .filter(|&style| chains.defined(style))
-            .or(styles.default_paragraph.as_deref());
-        let side = |word: bool, instances: &mut DocxInstances| {
-            let style = if word {
-                word_style
-            } else {
-                used.style.as_deref()
-            };
-            let list = match used.list {
-                Some(list) => list,
-                None => chains.list(style?)?,
-            };
-            if list == 0 {
-                return None;
-            }
-            let numbering = if word { &self.word } else { &self.anydoc };
-            let instance = instances
-                .entry(list)
-                .or_insert_with(|| numbering.instance(list, styles, chains, word))
-                .as_ref()?;
-            let level = match (used.level, style) {
-                (Some(level), _) => level,
-                (None, Some(style)) => chains.level(style, &instance.bound, word),
-                (None, None) => 0,
-            };
-            Some((list, level.min(DOCX_LIST_LEVELS - 1)))
-        };
-        DocxResolved {
-            word: side(true, word_instances),
-            anydoc: side(false, anydoc_instances),
-        }
-    }
-
     /// Whether a list runs through notes whose stored order, id order, and
     /// order of reference disagree. AnyDoc numbers the notes as they are
     /// stored; LibreOffice numbers them by id, and Word lays them out as the
@@ -3988,28 +3989,31 @@ impl DocxNumberings {
         if scan.padded_numbering || self.word.padded || styles.padded {
             return !scan.list_paragraphs.is_empty();
         }
-        let chains = DocxStyleChains::new(styles);
-        let mut word_instances = DocxInstances::new();
-        let mut anydoc_instances = DocxInstances::new();
+        let mut word = DocxReading::new(true, &self.word, &styles.styles);
+        let mut anydoc = DocxReading::new(false, &self.anydoc, &styles.anydoc_styles);
+        // Word numbers a paragraph that names no style, or one the parts do
+        // not define, through the default paragraph style; AnyDoc through
+        // none.
         let resolved: Vec<DocxResolved> = scan
             .list_uses
             .iter()
             .map(|used| {
-                self.resolve_use(
-                    used,
-                    styles,
-                    &chains,
-                    &mut word_instances,
-                    &mut anydoc_instances,
-                )
+                let style = used.style.as_deref();
+                let word_style = style
+                    .filter(|&style| word.chains.defined(style))
+                    .or(styles.default_paragraph.as_deref());
+                DocxResolved {
+                    word: word.resolve(used, word_style),
+                    anydoc: anydoc.resolve(used, style),
+                }
             })
             .collect();
         if Self::notes_out_of_order(scan, &resolved) {
             return true;
         }
         // Word's stories: a part, or `None` for the text boxes.
-        let mut word: HashMap<(Option<DocxPart>, String), DocxCounters> = HashMap::new();
-        let mut anydoc: HashMap<u64, DocxCounters> = HashMap::new();
+        let mut word_counters: HashMap<(Option<DocxPart>, String), DocxCounters> = HashMap::new();
+        let mut anydoc_counters: HashMap<u64, DocxCounters> = HashMap::new();
         let mut restarted: HashSet<(Option<DocxPart>, u64)> = HashSet::new();
         let in_order = [DocxPart::Body, DocxPart::Footnotes, DocxPart::Endnotes]
             .into_iter()
@@ -4024,15 +4028,12 @@ impl DocxNumberings {
                 .copied()
                 .unwrap_or_default();
             let anydoc_label = match resolved.anydoc.filter(|_| paragraph.anydoc) {
-                Some((list, level)) => match anydoc_instances
-                    .entry(list)
-                    .or_insert_with(|| self.anydoc.instance(list, styles, &chains, false))
-                {
+                Some((list, level)) => match anydoc.instance(list) {
                     Some(instance) if matches!(instance.markers[level], DocxMarker::Count(_)) => {
                         let start = |level: usize| {
                             instance.starts[level].unwrap_or_else(|| instance.levels[level].start())
                         };
-                        let counters = anydoc.entry(list).or_default();
+                        let counters = anydoc_counters.entry(list).or_default();
                         let value = counters.next(level, start(level), None, &instance.levels);
                         instance.anydoc_label(level, value, counters, start)
                     }
@@ -4052,15 +4053,12 @@ impl DocxNumberings {
                 continue;
             }
             let word_label = match resolved.word {
-                Some((list, level)) => match word_instances
-                    .entry(list)
-                    .or_insert_with(|| self.word.instance(list, styles, &chains, true))
-                {
+                Some((list, level)) => match word.instance(list) {
                     Some(instance) => {
                         let story = (!paragraph.in_text_box).then_some(paragraph.part);
                         let restart_at =
                             instance.starts[level].filter(|_| restarted.insert((story, list)));
-                        let counters = word
+                        let counters = word_counters
                             .entry((story, instance.definition.clone()))
                             .or_default();
                         counters.imply_parents(level, &instance.levels);
@@ -4102,7 +4100,13 @@ impl DocxNumberings {
 /// levels' style bindings; Word reads it.
 #[derive(Default)]
 struct DocxStyleNumbering {
+    /// Word's reading, as LibreOffice shows it: every definition of an id,
+    /// its values merged, later ones winning.
     styles: HashMap<String, DocxStyleList>,
+    /// AnyDoc's reading: each id's last definition among the part's
+    /// styles, alone, with its first `w:basedOn` and the list its first
+    /// `w:pPr/w:numPr/w:numId` names.
+    anydoc_styles: HashMap<String, DocxStyleList>,
     /// The default paragraph style (`w:default="1"`), which Word applies to
     /// a paragraph naming no style or one the parts do not define. AnyDoc
     /// reads no default.
@@ -4126,6 +4130,7 @@ struct DocxStyleList {
 /// document whose converted text reaches such a cycle.
 struct DocxStyleChains<'a> {
     index: HashMap<&'a str, usize>,
+    definitions: Vec<&'a DocxStyleList>,
     /// Each style's list instance: the first along its chain naming one.
     list: Vec<Option<u64>>,
     /// The first style along each chain that names its own level, and the
@@ -4140,12 +4145,12 @@ struct DocxStyleChains<'a> {
 }
 
 impl<'a> DocxStyleChains<'a> {
-    fn new(styles: &'a DocxStyleNumbering) -> Self {
-        let mut ids: Vec<&str> = styles.styles.keys().map(String::as_str).collect();
+    fn new(styles: &'a HashMap<String, DocxStyleList>) -> Self {
+        let mut ids: Vec<&str> = styles.keys().map(String::as_str).collect();
         ids.sort_unstable();
         let index: HashMap<&str, usize> =
             ids.iter().enumerate().map(|(at, &id)| (id, at)).collect();
-        let definitions: Vec<&DocxStyleList> = ids.iter().map(|&id| &styles.styles[id]).collect();
+        let definitions: Vec<&DocxStyleList> = ids.iter().map(|&id| &styles[id]).collect();
         let mut bases: Vec<Option<usize>> = definitions
             .iter()
             .map(|definition| {
@@ -4188,6 +4193,7 @@ impl<'a> DocxStyleChains<'a> {
         }
         let mut chains = DocxStyleChains {
             index,
+            definitions,
             list: vec![None; ids.len()],
             named: vec![None; ids.len()],
             depth: vec![0; ids.len()],
@@ -4209,7 +4215,7 @@ impl<'a> DocxStyleChains<'a> {
             chains.entered[style] = clock;
             clock += 1;
             let base = bases[style];
-            let definition = definitions[style];
+            let definition = chains.definitions[style];
             chains.depth[style] = base.map_or(0, |base| chains.depth[base] + 1);
             chains.list[style] = definition
                 .list
@@ -4227,6 +4233,13 @@ impl<'a> DocxStyleChains<'a> {
     /// Whether the styles parts define a style.
     fn defined(&self, style: &str) -> bool {
         self.index.contains_key(style)
+    }
+
+    /// The list instance a style's own numbering names, without its chain.
+    fn own_list(&self, style: &str) -> Option<u64> {
+        self.index
+            .get(style)
+            .and_then(|&style| self.definitions[style].list)
     }
 
     /// The list instance a paragraph style numbers with.
@@ -4288,6 +4301,20 @@ impl<'a> DocxStyleChains<'a> {
     }
 }
 
+/// A style definition AnyDoc keeps, as it is read: its id, what it says,
+/// and how many `w:basedOn` and `w:pPr` children have opened, `w:numPr` in
+/// the first mark, and `w:numId` in the first numbering, since AnyDoc
+/// reads the first of each.
+#[derive(Default)]
+struct DocxKeptStyle {
+    id: String,
+    style: DocxStyleList,
+    bases: u32,
+    marks: u32,
+    numberings: u32,
+    lists: u32,
+}
+
 /// Read paragraph styles' numbering from a styles part, streamed under
 /// AnyDoc's depth and node bounds.
 fn docx_style_numbering(
@@ -4301,6 +4328,9 @@ fn docx_style_numbering(
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut nodes = 0usize;
     let mut open: Option<String> = None;
+    // The definition AnyDoc keeps, a style of the part's root, as it is
+    // read.
+    let mut kept: Option<DocxKeptStyle> = None;
     loop {
         let (event, start) = match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event)) => (event, true),
@@ -4308,6 +4338,11 @@ fn docx_style_numbering(
             Ok(quick_xml::events::Event::End(_)) => {
                 if stack.pop().as_deref() == Some(b"style".as_slice()) {
                     open = None;
+                    if stack.len() == 1 {
+                        if let Some(kept) = kept.take() {
+                            numbering.anydoc_styles.insert(kept.id, kept.style);
+                        }
+                    }
                 }
                 buffer.clear();
                 continue;
@@ -4332,6 +4367,35 @@ fn docx_style_numbering(
         let value = || raw.as_ref().map(|value| value.trim().to_string());
         numbering.padded |=
             local == b"numId" && raw.as_ref().is_some_and(|value| value.trim() != value);
+        // AnyDoc reads the first `w:basedOn` of a style, and the list of the
+        // first `w:numId` of the first `w:numPr` of its first `w:pPr`.
+        if let Some(kept) = kept.as_mut() {
+            let under =
+                |path: &[&[u8]]| stack.len() == path.len() + 1 && xml_path_ends_with(&stack, path);
+            match local.as_slice() {
+                b"basedOn" if under(&[b"style"]) => {
+                    kept.bases += 1;
+                    if kept.bases == 1 {
+                        kept.style.based_on = value();
+                    }
+                }
+                b"pPr" if under(&[b"style"]) => kept.marks += 1,
+                b"numPr" if kept.marks == 1 && under(&[b"style", b"pPr"]) => {
+                    kept.numberings += 1;
+                }
+                b"numId"
+                    if kept.marks == 1
+                        && kept.numberings == 1
+                        && under(&[b"style", b"pPr", b"numPr"]) =>
+                {
+                    kept.lists += 1;
+                    if kept.lists == 1 {
+                        kept.style.list = value().and_then(|list| list.parse().ok());
+                    }
+                }
+                _ => {}
+            }
+        }
         match local.as_slice() {
             b"style" => {
                 let id = xml_attribute_values(&event, b"styleId")
@@ -4346,6 +4410,19 @@ fn docx_style_numbering(
                         return Err(DocumentError::ResourceLimit);
                     }
                     numbering.styles.entry(id.clone()).or_default();
+                    // A later definition of the id replaces this one.
+                    if stack.len() == 1 {
+                        if start {
+                            kept = Some(DocxKeptStyle {
+                                id: id.clone(),
+                                ..DocxKeptStyle::default()
+                            });
+                        } else {
+                            numbering
+                                .anydoc_styles
+                                .insert(id.clone(), DocxStyleList::default());
+                        }
+                    }
                     // The last paragraph style marked the default one.
                     let paragraph = xml_attribute_values(&event, b"type")
                         .iter()
@@ -11056,6 +11133,34 @@ mod tests {
             styled("Quiet")
         );
         assert!(!differs(reference, &quiet, Some(&notes)));
+    }
+
+    #[test]
+    fn docx_styles_defined_twice_are_read_as_each_side_keeps_them() {
+        let differs = |styles: &str| {
+            let body = r#"<w:p><w:r><w:t>Lead in</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="ListItem"/></w:pPr><w:r><w:t>Point</w:t></w:r></w:p>"#.repeat(2);
+            let document = word_part("document", &body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let numbered = r#"<w:style w:type="paragraph" w:styleId="ListItem"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>"#;
+        let plain = r#"<w:style w:type="paragraph" w:styleId="ListItem"><w:pPr><w:spacing w:after="0"/></w:pPr></w:style>"#;
+        // Word, as LibreOffice shows it, numbers the paragraphs whichever
+        // definition of the id numbers them; AnyDoc keeps the last alone.
+        assert!(differs(&format!("{numbered}{plain}")));
+        assert!(!differs(&format!("{plain}{numbered}")));
+        assert!(!differs(numbered));
+        // AnyDoc reads only the first `w:pPr` of a style.
+        let second_mark = r#"<w:style w:type="paragraph" w:styleId="ListItem"><w:pPr><w:spacing w:after="0"/></w:pPr><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>"#;
+        assert!(differs(second_mark));
     }
 
     #[test]
