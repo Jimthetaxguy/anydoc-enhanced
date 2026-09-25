@@ -740,6 +740,10 @@ pub(crate) struct Findings {
     /// Whether the document is a dynamic XFA form, whose content
     /// pdf-inspector never reads, when the pages are read for repeats.
     pub(crate) xfa_dynamic: bool,
+    /// The files the document embeds, which pdf-inspector never reads, and
+    /// whether it is a portfolio of them, when the pages are read for
+    /// repeats.
+    pub(crate) embedded_files: (usize, bool),
 }
 
 /// Words shown glyph by glyph kept across a document.
@@ -773,6 +777,7 @@ pub(crate) fn scan(
         found.form_values = crate::form_fields::misread(&document);
         found.annotation_texts = crate::annotations::unread(&document, only);
         found.xfa_dynamic = crate::form_fields::needs_rendering(&document);
+        found.embedded_files = crate::form_fields::embedded_files(&document);
     }
     // Words shown glyph by glyph, by page and font, and the fonts seen
     // painting their spaces on any page.

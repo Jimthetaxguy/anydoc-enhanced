@@ -1101,6 +1101,76 @@ fn dynamic_xfa_forms_pdf_inspector_cannot_read_are_reported() {
     assert!(!reported(&results[1]), "{}", results[1]);
 }
 
+/// A cover page bundling two embedded tax forms, as a portfolio when
+/// `portfolio`, else as attachments.
+fn bundled_forms_pdf(portfolio: bool) -> Vec<u8> {
+    let collection = if portfolio {
+        " /Collection << /Type /Collection >>"
+    } else {
+        ""
+    };
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R{collection} /Names << /EmbeddedFiles << /Names [(1099-DIV.pdf) 6 0 R (1099-INT.pdf) 8 0 R] >> >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Year-end tax package: open this portfolio to see its documents.) Tj ET",
+        ),
+        b"<< /Type /Filespec /F (1099-DIV.pdf) /EF << /F 7 0 R >> >>".to_vec(),
+        stream("/Type /EmbeddedFile", b"%PDF-1.4 dividends 1,250.00"),
+        b"<< /Type /Filespec /F (1099-INT.pdf) /EF << /F 9 0 R >> >>".to_vec(),
+        stream("/Type /EmbeddedFile", b"%PDF-1.4 interest 310.00"),
+    ])
+}
+
+#[test]
+fn embedded_files_pdf_inspector_never_reads_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for portfolio in [true, false] {
+        let path = temporary.path().join(format!("bundle-{portfolio}.pdf"));
+        std::fs::write(&path, bundled_forms_pdf(portfolio)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    calls.push((
+        "pdf_to_markdown",
+        serde_json::json!({ "path": fixture("source/sample-1.pdf") }),
+    ));
+    let results = call_tools(&calls, None);
+    let message = |result: &serde_json::Value| -> Option<String> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "embedded_files_unread")
+                .and_then(|warning| warning["message"].as_str())
+                .map(str::to_string)
+        })
+    };
+    // pdf-inspector 1.24.0 reads the cover's page alone.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("Year-end tax package") && !markdown.contains("1,250.00"),
+        "{markdown}"
+    );
+    let portfolio = message(&results[0]).unwrap_or_default();
+    assert!(
+        portfolio.contains("portfolio of 2 embedded files"),
+        "{portfolio}"
+    );
+    let attachments = message(&results[1]).unwrap_or_default();
+    assert!(
+        attachments.contains("carries 2 embedded files"),
+        "{attachments}"
+    );
+    assert_eq!(message(&results[2]), None, "{}", results[2]);
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

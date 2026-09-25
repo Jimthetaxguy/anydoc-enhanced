@@ -288,6 +288,7 @@ came back clean. The evidence and dispositions are in
 | 21 | PDF form values pdf-inspector reads as UTF-8 or never reads (upstream issue #504) | `form_values_misread`; a UTF-16 payee name that read as "��\0J\0o\0s…", an accented city, and a radio group's filing status that the Markdown left out are reported, while plain values on their own widgets are not |
 | 22 | PDF annotation text pdf-inspector never reads (text boxes, stamps and watermarks drawn in text) | `annotation_text_unread`; a reviewer's "Adjusted basis 12,500.00 per preparer" text box and a "RECEIVED APR 15 2025" stamp, missing from the Markdown, are reported, and the same text set in the page's own content is not |
 | 23 | PDF dynamic XFA forms pdf-inspector never reads | `xfa_form_unread`; a filled return made in dynamic XFA, converted as its "Please wait..." notice alone at confidence 1.0, is reported, and a static XFA form is not |
+| 25 | PDF files embedded in a portfolio or attached, which pdf-inspector never reads | `embedded_files_unread`, with the count and whether the PDF is a portfolio; a year-end package of two 1099s behind a cover page, converted as its cover alone, is reported |
 
 ## Next slices
 

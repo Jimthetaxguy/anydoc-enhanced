@@ -19,7 +19,9 @@
 //! A dynamic XFA form, which its catalog marks as needing rendering, keeps
 //! its whole content in XFA, which a viewer lays out; its pages hold only
 //! the notice a viewer without XFA shows, "Please wait...". pdf-inspector
-//! reads no XFA, so such a form converts to that notice alone.
+//! reads no XFA, so such a form converts to that notice alone. Nor does it
+//! read the files a PDF embeds: a portfolio, which bundles documents such
+//! as a year's tax forms behind a cover page, converts to its cover.
 
 use std::collections::{HashMap, HashSet};
 
@@ -258,6 +260,93 @@ impl Walk<'_> {
             });
         }
     }
+}
+
+/// Files embedded in a document: in its catalog's name tree, and in file
+/// attachment annotations, counted to `MAX_FIELD_NODES`; and whether the
+/// catalog makes it a portfolio (a collection), whose pages hold only a
+/// cover while its documents are the files.
+pub(crate) fn embedded_files(document: &Document) -> (usize, bool) {
+    let resolve = |object: &Object| -> Option<Object> {
+        match object {
+            Object::Reference(id) => document.get_object(*id).ok().cloned(),
+            object => Some(object.clone()),
+        }
+    };
+    let Some(root) = document
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(resolve)
+        .and_then(|root| root.as_dict().ok().cloned())
+    else {
+        return (0, false);
+    };
+    let portfolio = root.has(b"Collection");
+    // The name tree: `/Names` pairs in its leaves, `/Kids` above them.
+    let mut files = 0;
+    let mut stack: Vec<(Object, usize)> = root
+        .get(b"Names")
+        .ok()
+        .and_then(resolve)
+        .and_then(|names| {
+            names
+                .as_dict()
+                .ok()
+                .and_then(|names| names.get(b"EmbeddedFiles").ok().cloned())
+        })
+        .map(|tree| vec![(tree, 0)])
+        .unwrap_or_default();
+    let mut visited = 0;
+    while let Some((node, depth)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_FIELD_NODES || depth > MAX_FIELD_DEPTH || files >= MAX_FIELD_NODES {
+            break;
+        }
+        let Some(node) = resolve(&node).and_then(|node| node.as_dict().ok().cloned()) else {
+            continue;
+        };
+        if let Some(names) = node.get(b"Names").ok().and_then(resolve) {
+            if let Ok(names) = names.as_array() {
+                files += names.len() / 2;
+            }
+        }
+        if let Some(kids) = node.get(b"Kids").ok().and_then(resolve) {
+            if let Ok(kids) = kids.as_array() {
+                stack.extend(kids.iter().map(|kid| (kid.clone(), depth + 1)));
+            }
+        }
+    }
+    for (_, page) in document.get_pages() {
+        let Some(annotations) = document
+            .get_dictionary(page)
+            .ok()
+            .and_then(|page| page.get(b"Annots").ok())
+            .and_then(resolve)
+        else {
+            continue;
+        };
+        let Ok(annotations) = annotations.as_array() else {
+            continue;
+        };
+        files += annotations
+            .iter()
+            .filter_map(resolve)
+            .filter(|annotation| {
+                annotation.as_dict().is_ok_and(|annotation| {
+                    annotation
+                        .get(b"Subtype")
+                        .ok()
+                        .and_then(|subtype| subtype.as_name().ok())
+                        .is_some_and(|subtype| subtype == b"FileAttachment")
+                })
+            })
+            .count();
+        if files >= MAX_FIELD_NODES {
+            break;
+        }
+    }
+    (files, portfolio)
 }
 
 /// Whether `document` is a dynamic XFA form: its catalog says it needs
@@ -501,6 +590,19 @@ mod tests {
             dynamic.add_object(dictionary! { "Type" => "Catalog", "NeedsRendering" => true });
         dynamic.trailer.set("Root", catalog);
         assert!(needs_rendering(&dynamic));
+        assert_eq!(embedded_files(&document), (0, false));
+        let mut portfolio = Document::with_version("1.7");
+        let file = portfolio.add_object(dictionary! { "Type" => "Filespec" });
+        let leaf = portfolio.add_object(dictionary! {
+            "Names" => vec![Object::string_literal("1099-DIV.pdf"), file.into(), Object::string_literal("1099-INT.pdf"), file.into()],
+        });
+        let catalog = portfolio.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Collection" => dictionary! { "Type" => "Collection" },
+            "Names" => dictionary! { "EmbeddedFiles" => dictionary! { "Kids" => vec![leaf.into()] } },
+        });
+        portfolio.trailer.set("Root", catalog);
+        assert_eq!(embedded_files(&portfolio), (2, true));
         assert!(garbled("S\u{FFFD}o", "São"));
         assert!(!garbled("José", "Jos\u{e9}"));
         assert_eq!(written("", "x"), "x");

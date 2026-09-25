@@ -98,6 +98,9 @@ pub const PDF_WARNING_FORM_VALUES_MISREAD: &str = "form_values_misread";
 pub const PDF_WARNING_ANNOTATION_TEXT_UNREAD: &str = "annotation_text_unread";
 /// A dynamic XFA form's content is not in the Markdown.
 pub const PDF_WARNING_XFA_FORM_UNREAD: &str = "xfa_form_unread";
+/// The files a PDF embeds, such as a portfolio's documents, are not in the
+/// Markdown.
+pub const PDF_WARNING_EMBEDDED_FILES_UNREAD: &str = "embedded_files_unread";
 
 /// Pages read again for lines dropped as running headers and footers, how
 /// many are read at a time and grouped into lines at a time, and the time
@@ -693,6 +696,18 @@ impl PdfInfo {
                 "This is a dynamic XFA form: its content and filled values are kept in XFA, which a viewer lays out and pdf-inspector 1.24.0 does not read, so the Markdown shows only what its pages hold without XFA, such as a \"Please wait...\" notice; read the form another way.",
                 Vec::new(),
             ));
+        }
+        match found.embedded_files {
+            (0, _) => {}
+            (files, portfolio) => self.warnings.push(PdfWarning::new(
+                PDF_WARNING_EMBEDDED_FILES_UNREAD,
+                &if portfolio {
+                    format!("This PDF is a portfolio of {files} embedded files, such as a year's tax forms bundled behind a cover page; pdf-inspector 1.24.0 reads only the cover's pages, not the files, so convert each file separately.")
+                } else {
+                    format!("This PDF carries {files} embedded files as attachments, which pdf-inspector 1.24.0 does not read; convert them separately.")
+                },
+                Vec::new(),
+            )),
         }
         if found.hidden_layer.is_empty() {
             return found;

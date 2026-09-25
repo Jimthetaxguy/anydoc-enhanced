@@ -51,9 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PDF results carry a `warnings` list, absent when empty, naming text the
   Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
   form text it does not read, pages that lose a line it takes for a running
-  header, form values it garbles or leaves out, annotation text and dynamic
-  XFA forms it never reads, and tables whose amounts may sit in the wrong
-  row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
+  header, form values it garbles or leaves out, annotation text, dynamic
+  XFA forms and embedded files it never reads, and tables whose amounts may
+  sit in the wrong row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -194,6 +194,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Files a PDF embeds, which pdf-inspector 1.24.0 never reads, are reported.
+  A portfolio bundles documents, such as a year's tax forms, as embedded
+  files behind a cover page, and converted as that cover alone; attachments
+  and file attachment annotations were passed over the same way, with no
+  sign. A PDF embedding files now carries the new `embedded_files_unread`
+  warning, which counts them and says whether the PDF is a portfolio, so
+  each file can be converted on its own; the Markdown is not changed.
 - A dynamic XFA form, whose content pdf-inspector 1.24.0 never reads, is
   reported. Such a form, marked as needing rendering, keeps its fields and
   filled values in XFA, which a viewer lays out; its pages hold only the
