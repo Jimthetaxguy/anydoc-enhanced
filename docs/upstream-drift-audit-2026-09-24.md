@@ -311,7 +311,7 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 329 tests pass (259 skillkit unit, 13
+- `cargo test --workspace --locked`: 330 tests pass (260 skillkit unit, 13
   skillkit integration, 30 document-tool and 24 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
@@ -423,6 +423,14 @@ When pdf-inspector publishes a release after 1.24.0:
 4. Re-run the sixth-round furniture, white-copy, and clip fixtures: the
    repeat warning is confirmed against the Markdown, so a release that
    strips or hides differently changes which pages it names.
+5. If the release keeps the text render mode across text objects (#572),
+   retire `invisible_text_read` and its expectations; if it parses the
+   Japan1, GB1, and CNS1 maps (#573), retire `cjk_text_misread`. Both are
+   checked against the Markdown, so a partial fix only narrows the pages
+   they name. If it reads optional-content settings, annotations, XFA, or
+   embedded files, re-check `hidden_layer_text_read`,
+   `annotation_text_unread`, `xfa_form_unread`, and `embedded_files_unread`
+   the same way.
 
 ## Sources
 

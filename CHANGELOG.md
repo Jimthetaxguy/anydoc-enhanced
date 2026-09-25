@@ -216,6 +216,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Invisible text and text in hidden layers are noted a page with a running
   count of their bytes, where each run noted summed all the runs before: a
   page of 60,000 glyphs set one by one had taken 0.6 s longer to convert.
+- Invisible text and text in hidden layers set glyph by glyph, each glyph a
+  text object of its own, are reported: runs going on along one line
+  within a glyph of each other, with no other string shown between, are
+  looked for in the Markdown as one text, where each glyph was looked for
+  alone and was too short to tell.
 - Text a page paints invisibly, which pdf-inspector 1.24.0 reads as shown,
   is reported. Text in render mode 3 paints nothing, and no viewer shows
   it. pdf-inspector skips it only when the mode is set inside the text
@@ -858,9 +863,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose text mostly paints nothing is taken for a scan, and invisible text
   on it is not reported, whatever it says; and text pdf-inspector reads
   only through its retry of a document with no visible text, or clip-only
-  text (render mode 7), is not reported; neither is such text set glyph by
-  glyph, as its glyphs are looked for one by one and each is too short to
-  tell. Japanese or Chinese text in a font that embeds a TrueType or
+  text (render mode 7), is not reported. Japanese or Chinese text in a font that embeds a TrueType or
   OpenType program is taken to read through that program's map; text in a
   font whose ToUnicode map cannot be read, or under a predefined CMap other
   than `Identity-H` or `Identity-V`, is not checked; and a page whose every

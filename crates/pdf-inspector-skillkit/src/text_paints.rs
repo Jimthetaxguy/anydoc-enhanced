@@ -610,6 +610,8 @@ fn without_controls(text: &str) -> String {
 struct PageText {
     hidden_bytes: u64,
     visible_bytes: u64,
+    /// The strings shown on the page so far.
+    shows: u64,
     /// Area of the page the drawn images cover, clipped to the page box,
     /// counting overlaps more than once.
     image_area: f64,
@@ -655,6 +657,43 @@ struct PageText {
 struct Noted {
     texts: Vec<String>,
     bytes: usize,
+    last: Option<Last>,
+}
+
+/// The last string noted: where its run starts on an upright line, the
+/// characters shown from there, and its place among the page's strings.
+#[derive(Clone, Copy)]
+struct Last {
+    start: Option<Start>,
+    shown: usize,
+    show: u64,
+}
+
+/// Where an upright string starts on the page, and its size.
+#[derive(Clone, Copy)]
+struct Start {
+    x: f64,
+    y: f64,
+    size: f64,
+}
+
+impl Start {
+    /// Where a string shown under `text_matrix` starts, when its line is
+    /// upright.
+    fn of(state: State, text_matrix: [f64; 6]) -> Option<Start> {
+        let matrix = multiply(text_matrix, state.ctm);
+        let upright =
+            matrix[1].abs() < 1e-6 && matrix[2].abs() < 1e-6 && matrix[0] > 0.0 && matrix[3] > 0.0;
+        let start = Start {
+            x: matrix[4],
+            y: matrix[3] * state.rise + matrix[5],
+            size: state.size.abs() * matrix[3],
+        };
+        (upright
+            && start.size > 0.0
+            && [start.x, start.y, start.size].iter().all(|v| v.is_finite()))
+        .then_some(start)
+    }
 }
 
 impl Noted {
@@ -663,19 +702,50 @@ impl Noted {
         self.bytes < MAX_HIDDEN_TEXT
     }
 
-    /// Note `text`: a run where the text matrix was just set, else more of
-    /// the run before.
-    fn note(&mut self, text: &str, placed: bool) {
+    /// Note `text`, the page's `show`th string: more of the run before
+    /// when no other string was shown since and the text matrix was not
+    /// just set, or was set on the run's line no further than a glyph past
+    /// its characters, as text set glyph by glyph is; else a run of its
+    /// own.
+    fn note(&mut self, text: &str, placed: bool, start: Option<Start>, show: u64) {
         self.bytes += text.len();
-        match self.texts.last_mut().filter(|_| !placed) {
+        let characters = text.chars().count();
+        let goes_on = |from: Start, shown: usize, start: Start| {
+            (start.y - from.y).abs() <= 0.3 * from.size
+                && (start.size - from.size).abs() <= 0.5 * from.size
+                && start.x > from.x
+                && start.x - from.x <= from.size * (shown as f64 + 1.0)
+        };
+        let joined = self.last.is_some_and(|last| {
+            last.show + 1 == show
+                && (!placed
+                    || last
+                        .start
+                        .zip(start)
+                        .is_some_and(|(from, start)| goes_on(from, last.shown, start)))
+        });
+        match self.texts.last_mut().filter(|_| joined) {
             Some(last) => last.push_str(text),
             None => self.texts.push(text.to_owned()),
         }
+        self.last = Some(match self.last.filter(|_| joined && !placed) {
+            Some(last) => Last {
+                shown: last.shown + characters,
+                show,
+                ..last
+            },
+            None => Last {
+                start,
+                shown: characters,
+                show,
+            },
+        });
     }
 }
 
 impl PageText {
     fn show(&mut self, state: State, bytes: &[u8]) {
+        self.shows += 1;
         let bytes = bytes.len() as u64;
         match state.render_mode {
             // Mode 3 paints nothing.
@@ -878,10 +948,17 @@ impl PageText {
     }
 
     /// Note text pdf-inspector reads that a reader does not see, in a layer
-    /// it hides or, when `invisible`, painted in render mode 3: a run where
-    /// the text matrix was just set, else more of the run before; its text
-    /// where its font can be read, to `MAX_HIDDEN_TEXT` bytes a page.
-    fn note_unseen(&mut self, state: State, bytes: &[u8], placed: bool, invisible: bool) {
+    /// it hides or, when `invisible`, painted in render mode 3, run by run
+    /// (see `Noted::note`); its text where its font can be read, to
+    /// `MAX_HIDDEN_TEXT` bytes a page.
+    fn note_unseen(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        bytes: &[u8],
+        placed: bool,
+        invisible: bool,
+    ) {
         let noted = if invisible {
             &self.invisible_text
         } else {
@@ -897,13 +974,14 @@ impl PageText {
         else {
             return;
         };
+        let show = self.shows;
         let noted = if invisible {
             self.invisible_text.as_mut()
         } else {
             self.hidden_text.as_mut()
         };
         if let Some(noted) = noted {
-            noted.note(&text, placed);
+            noted.note(&text, placed, Start::of(state, text_matrix), show);
         }
     }
 
@@ -913,6 +991,7 @@ impl PageText {
     /// string with U+FFFD. Such a string reads otherwise, or not at all,
     /// unless it shows only spaces.
     fn note_unmapped(&mut self, bytes: &[u8], placed: bool) {
+        let show = self.shows;
         let Some(noted) = self.cjk_text.as_mut().filter(|noted| noted.has_room()) else {
             return;
         };
@@ -921,9 +1000,9 @@ impl PageText {
                 self.cjk_misread |= bytes
                     .chunks_exact(2)
                     .any(|code| u16::from_be_bytes([code[0], code[1]]) > 1);
-                noted.note(&reading, placed);
+                noted.note(&reading, placed, None, show);
             }
-            None => noted.note(" ", placed),
+            None => noted.note(" ", placed, None, show),
         }
     }
 
@@ -1722,12 +1801,12 @@ fn execute<'a>(
                 if in_text {
                     page.note_edge(state, text_matrix, &bytes, placed);
                     if state.hidden || layered.contains(&true) {
-                        page.note_unseen(state, &bytes, placed, false);
+                        page.note_unseen(state, text_matrix, &bytes, placed, false);
                     }
                     // Mode 3 paints nothing; pdf-inspector reads it where it
                     // takes the text object to start in mode 0 (#572).
                     if state.render_mode == 3 {
-                        page.note_unseen(state, &bytes, placed, true);
+                        page.note_unseen(state, text_matrix, &bytes, placed, true);
                     }
                     if state.unmapped && state.font && state.reached && state.read_mode != 3 {
                         page.note_unmapped(&bytes, placed);
@@ -2389,6 +2468,44 @@ pub(crate) mod tests {
         let found = scan(&pdf, &HashSet::from([1]), Some(&HashSet::new()), None);
         assert!(found.hidden_layer.is_empty());
         found.painted_twice == [1]
+    }
+
+    #[test]
+    fn runs_set_glyph_by_glyph_along_a_line_are_noted_as_one() {
+        let start = |x: f64, y: f64| Some(Start { x, y, size: 12.0 });
+        let mut noted = Noted::default();
+        // Glyphs placed one by one along a line, spaces left as gaps.
+        for (index, glyph) in "Ignore".chars().enumerate() {
+            let at = start(72.0 + 7.0 * index as f64, 700.0);
+            noted.note(&glyph.to_string(), true, at, index as u64 + 1);
+        }
+        noted.note("the", true, start(72.0 + 7.0 * 6.0 + 3.0, 700.0), 7);
+        // More of that run, then a new line, a run far along the same line,
+        // one whose line is not upright, and runs after another string was
+        // shown between.
+        noted.note(" balance", false, None, 8);
+        noted.note("above", true, start(72.0, 686.0), 9);
+        noted.note("Total", true, start(400.0, 686.0), 10);
+        noted.note("rotated", true, None, 11);
+        noted.note("text", true, start(110.0, 686.0), 12);
+        noted.note("after", true, start(140.0, 686.0), 14);
+        noted.note(" more", false, None, 16);
+        assert_eq!(
+            noted.texts,
+            [
+                "Ignorethe balance",
+                "above",
+                "Total",
+                "rotated",
+                "text",
+                "after",
+                " more"
+            ]
+        );
+        assert_eq!(
+            noted.bytes,
+            "Ignorethe balanceaboveTotalrotatedtextafter more".len()
+        );
     }
 
     #[test]

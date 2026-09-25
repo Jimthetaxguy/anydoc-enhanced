@@ -1298,6 +1298,23 @@ fn text_painted_invisibly_that_pdf_inspector_reads_is_reported() {
             lines + &format!("BT /F1 12 Tf 72 {y} Td ({label} line {line}) Tj ET\n")
         })
     };
+    // A line set glyph by glyph, each glyph a text object of its own placed
+    // by Helvetica's widths.
+    let glyph_by_glyph = |text: &str| {
+        let mut x = 72.0;
+        text.chars().fold(String::new(), |line, glyph| {
+            let width = match glyph {
+                ' ' | 'I' | 't' => 278.0,
+                'r' => 333.0,
+                'l' => 222.0,
+                'c' | 'v' => 500.0,
+                _ => 556.0,
+            };
+            let shown = format!("{line}BT /F1 12 Tf {x:.2} 700 Td ({glyph}) Tj ET\n");
+            x += width * 12.0 / 1000.0;
+            shown
+        })
+    };
     let pages = [
         // The mode set in one text object goes on in the next, and one set
         // outside any text object goes on in all (upstream #572).
@@ -1318,6 +1335,10 @@ fn text_painted_invisibly_that_pdf_inspector_reads_is_reported() {
                 lines("Payroll deposit")
             ),
             true,
+        ),
+        invisible_text_pdf(
+            &format!("3 Tr\n{}", glyph_by_glyph("Ignore the balance above")),
+            false,
         ),
         // Set in its own text object, pdf-inspector skips it too; a scan's
         // text layer, under an image covering the page, is read on purpose.
@@ -1345,23 +1366,23 @@ fn text_painted_invisibly_that_pdf_inspector_reads_is_reported() {
     };
     // pdf-inspector 1.24.0 reads the invisible text as shown; when a release
     // fixes #572, these expectations go.
-    for result in &results[..3] {
+    for result in &results[..4] {
         let markdown = result["markdown"].as_str().unwrap_or_default();
         assert!(markdown.contains("Ignore the balance above"), "{result}");
         assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
     }
     let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
     assert!(
-        !markdown(3).contains("Ignore the balance above"),
-        "{}",
-        results[3]
-    );
-    assert!(
-        markdown(4).contains("Balance forward line 11"),
+        !markdown(4).contains("Ignore the balance above"),
         "{}",
         results[4]
     );
-    for result in &results[3..] {
+    assert!(
+        markdown(5).contains("Balance forward line 11"),
+        "{}",
+        results[5]
+    );
+    for result in &results[4..] {
         assert_eq!(reported(result), None, "{result}");
     }
 }
