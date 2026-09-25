@@ -109,6 +109,12 @@ pub const PDF_WARNING_EMBEDDED_FILES_UNREAD: &str = "embedded_files_unread";
 pub const PDF_WARNING_HIDDEN_LAYER_TEXT_READ: &str = "hidden_layer_text_read";
 /// The Markdown holds text the page paints invisibly (upstream #572).
 pub const PDF_WARNING_INVISIBLE_TEXT_READ: &str = "invisible_text_read";
+/// Text in a Japanese or Chinese font without a map of its characters reads
+/// otherwise, or not at all, with no sign (upstream #573).
+pub const PDF_WARNING_CJK_TEXT_MISREAD: &str = "cjk_text_misread";
+/// Characters a text in such a font needs, bare, to tell whether the
+/// Markdown shows it.
+const MIN_CJK_CHARS: usize = 4;
 /// Characters a text in a hidden layer needs, bare, for the Markdown's
 /// showing it to count.
 const MIN_HIDDEN_CHARS: usize = 6;
@@ -738,6 +744,47 @@ impl PdfInfo {
         }
     }
 
+    /// Report the pages whose text in a font pdf-inspector reads without its
+    /// collection's map (see `cjk_fonts`) reads otherwise with no sign, and
+    /// mark the document's encoding. Where the fonts' letters and digits are
+    /// long enough to look for, the Markdown must miss some: had it shown
+    /// them all, pdf-inspector read the fonts after all.
+    fn check_cjk_text(
+        &mut self,
+        pages: &[u32],
+        texts: &[(u32, Vec<String>)],
+        only: Option<&HashSet<u32>>,
+    ) {
+        let pages: Vec<u32> = pages
+            .iter()
+            .copied()
+            .filter(|page| only.is_none_or(|only| only.contains(page)))
+            .collect();
+        if pages.is_empty() {
+            return;
+        }
+        let numbers: Vec<[u32; 1]> = texts.iter().map(|(page, _)| [*page]).collect();
+        let readings: Vec<(&[u32], &str)> = numbers
+            .iter()
+            .zip(texts)
+            .flat_map(|(page, (_, texts))| {
+                texts
+                    .iter()
+                    .filter(|text| repeated_lines::bare(text).chars().count() >= MIN_CJK_CHARS)
+                    .map(move |text| (page.as_slice(), text.as_str()))
+            })
+            .collect();
+        if !readings.is_empty() && self.unshown(&readings, only).is_empty() {
+            return;
+        }
+        self.has_encoding_issues = true;
+        self.warnings.push(PdfWarning::new(
+            PDF_WARNING_CJK_TEXT_MISREAD,
+            "On these pages text set in a Japanese or Chinese font that carries no map of its characters reads as other letters, and its digits and punctuation drop out, with no sign: pdf-inspector 1.24.0 cannot parse the Adobe Japan1, GB1, and CNS1 maps such a font is read through (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
+            pages,
+        ));
+    }
+
     /// Report the pages whose text in layers a reader hides (see
     /// `optional_content`) the Markdown shows: pdf-inspector read it.
     fn check_hidden_layers(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
@@ -841,6 +888,8 @@ impl PdfInfo {
         self.check_hidden_layers(&hidden, only);
         let invisible = std::mem::take(&mut found.invisible_texts);
         self.check_invisible_text(&invisible, only);
+        let cjk = std::mem::take(&mut found.cjk_texts);
+        self.check_cjk_text(&found.cjk_pages, &cjk, only);
         if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
@@ -957,6 +1006,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 }
 
 mod annotations;
+mod cjk_fonts;
 pub mod document;
 pub mod domain;
 mod doubled_text;

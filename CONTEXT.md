@@ -48,6 +48,7 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form values pdf-inspector 1.24.0 garbles or leaves out |
 | `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.24.0 drops as running headers that differ from the one it keeps, and the page scan's gate on reading pages again for them |
 | `crates/pdf-inspector-skillkit/src/optional_content.rs` | PDF layers a reader hides by default, whose text pdf-inspector 1.24.0 reads anyway |
+| `crates/pdf-inspector-skillkit/src/cjk_fonts.rs` | PDF Japanese and Chinese fonts pdf-inspector 1.24.0 reads without their collection's map (upstream #573) |
 | `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF table rows pdf-inspector 1.24.0 repeats, amounts it merges, and amounts it pushes out of their rows |
 | `crates/pdf-inspector-mcp/` | MCP server binary, worker mode, and tool registration |
 | `docs/` | Handoff, Sweet demo notes |

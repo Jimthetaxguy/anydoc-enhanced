@@ -139,6 +139,8 @@ through the server:
 | (none filed) | Annotations other than links and form fields are never read | Found locally: pdf-inspector 1.24.0 has no code for FreeText, Stamp, or appearance streams, so a text box typed onto a page, or a stamp drawn in text, is missing from the Markdown. Reported as `annotation_text_unread` (Loop 22) where the Markdown does not show its text. |
 | #504 | Form field names and values are decoded as UTF-8, mangling UTF-16 text strings | Reproduced, and wider than reported: PDFDocEncoding values lose their accented letters ("S�o Paulo"), and pdf-inspector reads a value only from a field that is its own widget, so a radio group's choice or a field shown twice is not written at all. Reported as `form_values_misread` (Loop 21) where the Markdown does not show the value read right. |
 | #572 | The text rendering mode is reset at every `BT` and ignored when set outside a text object | Reproduced: a page that sets mode 3 before its text objects, or in one text object before the next, converts its invisible text as shown ("Ignore the balance above"), where a viewer paints nothing. Reported as `invisible_text_read` (Loop 26) where the Markdown shows it; a scan's text layer, on a page images cover and whose text mostly paints nothing, is not reported. Forms keep the mode they are drawn in, as 1.24.0 reads them. |
+| #573 | Adobe's Japanese and Chinese collection maps fail to parse, so a CID font without a ToUnicode map reads as its code bytes | Reproduced on 1.24.0: under `Identity-H` or `Identity-V`, Japan1, GB1, and CNS1 text reads as other letters with its digits dropped ("Total wages 52,000.00" as "5PUBMXBHFT") at confidence 1.0, and as U+FFFD where a byte passes 0x7F; Korean reads through a table of its own, and byte-coded and Unicode-coded CMaps read their ASCII right. Reported as `cjk_text_misread` (Loop 27) on the pages whose text reads otherwise with no sign, with `has_encoding_issues` set. |
+| #554, #500 | Text PDFs, such as Internet Archive scans with a glyphless OCR layer or early Acrobat captures, that convert to no text at all | Not rerun with the reporters' downloads. Where 1.24.0 returns no Markdown for a full run of a text PDF, its confidence is reported as 0 (the rule for #443), and a page whose text is all invisible under an image covering it is listed for OCR. |
 | #575 | Vertical writing is assembled row by row across columns | Not detected: Japanese or Chinese columns set side by side interleave glyph by glyph. |
 | #574 | Follow-ups from #567 (control-character ToUnicode destinations) | Internal; no change to the output. |
 | #585 | High extraction time and memory through the npm package | The Node binding only; here the Rust crate runs in the bounded PDF worker. |
@@ -309,8 +311,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 317 tests pass (249 skillkit unit, 13
-  skillkit integration, 29 document-tool and 23 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 321 tests pass (252 skillkit unit, 13
+  skillkit integration, 29 document-tool and 24 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI

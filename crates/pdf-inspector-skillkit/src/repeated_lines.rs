@@ -421,9 +421,10 @@ fn masked(text: &str, page: u32) -> (String, bool) {
             .map(|value| value - i64::from(page))
             .filter(|offset| offset.abs() <= MAX_FOLIO_OFFSET);
         // After a page word or between dashes, a number no higher than the
-        // page's own numbers it too, as a bundle's documents restart.
+        // page's own numbers it too, as a bundle's documents restart, or as
+        // pages numbered from 0 run a page behind.
         let restarted =
-            (paged || framed) && value.is_some_and(|value| (1..=i64::from(page)).contains(&value));
+            (paged || framed) && value.is_some_and(|value| (0..=i64::from(page)).contains(&value));
         match offset.filter(|_| paged || framed || folio) {
             _ if restarted => masked.push('#'),
             Some(offset) => masked.push_str(&format!("#{offset}#")),
@@ -1136,6 +1137,8 @@ mod tests {
             ("Statement date 3/5/2025", 2)
         ));
         assert!(same(("Statement page 5", 5), ("Statement page 1", 1)));
+        assert!(same(("Statement page 0", 1), ("Statement page 1", 2)));
+        assert!(same(("Report - 0 -", 1), ("Report - 7 -", 8)));
         assert!(same(("Disclosures, page 2", 7), ("Disclosures, page 1", 1)));
         assert!(same(("Excerpt page 102", 2), ("Excerpt page 101", 1)));
         // Roman numerals number front matter.

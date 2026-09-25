@@ -194,6 +194,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Japanese and Chinese text that pdf-inspector 1.24.0 reads without its
+  font's map is reported. A font keyed by CID in Adobe's Japan1, GB1, or
+  CNS1 collection, with no ToUnicode map and no embedded program to read a
+  map from, is read through its collection's map, which pdf-inspector
+  bundles but cannot parse (upstream #573); it then reads the codes as the
+  bytes they are made of. A string with a byte past 0x7F reads as U+FFFD,
+  which already marked the page garbled; any other read as other letters,
+  "Total wages 52,000.00" as "5PUBMXBHFT", its digits and punctuation
+  dropped, at confidence 1.0 with no sign. A page showing such a string now
+  carries the new `cjk_text_misread` warning, and the document is marked as
+  having encoding issues; the Markdown is not changed. Where the fonts'
+  letters and digits are long enough to look for and the Markdown shows
+  them all, pdf-inspector read the fonts after all, and nothing is
+  reported. Korean, which pdf-inspector reads through a table of its own,
+  and fonts with a ToUnicode map or a predefined CMap whose codes are
+  Unicode, are not reported.
+- A running header numbering its pages from 0 ("Statement page 0" on the
+  first page) is no longer reported as dropped: its number counted as a
+  page number on every page but the first, which the check held to differ.
+- Invisible text and text in hidden layers are noted a page with a running
+  count of their bytes, where each run noted summed all the runs before: a
+  page of 60,000 glyphs set one by one had taken 0.6 s longer to convert.
 - Text a page paints invisibly, which pdf-inspector 1.24.0 reads as shown,
   is reported. Text in render mode 3 paints nothing, and no viewer shows
   it. pdf-inspector skips it only when the mode is set inside the text
@@ -782,7 +804,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose text mostly paints nothing is taken for a scan, and invisible text
   on it is not reported, whatever it says; and text pdf-inspector reads
   only through its retry of a document with no visible text, or clip-only
-  text (render mode 7), is not reported.
+  text (render mode 7), is not reported; neither is such text set glyph by
+  glyph, as its glyphs are looked for one by one and each is too short to
+  tell. Japanese or Chinese text in a font that embeds a TrueType or
+  OpenType program is taken to read through that program's map; text in a
+  font whose ToUnicode map cannot be read, or under a predefined CMap other
+  than `Identity-H` or `Identity-V`, is not checked; and a page whose every
+  such string pdf-inspector marks with U+FFFD is left to its own
+  garbled-text reason.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen

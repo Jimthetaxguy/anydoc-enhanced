@@ -1366,6 +1366,92 @@ fn text_painted_invisibly_that_pdf_inspector_reads_is_reported() {
     }
 }
 
+/// A statement page whose lines are set in a CID font of Adobe's `ordering`
+/// collection under `encoding`, each code as `code` writes it, with a
+/// ToUnicode map when `mapped`.
+fn cjk_statement_pdf(
+    ordering: &str,
+    encoding: &str,
+    code: fn(u8) -> String,
+    mapped: bool,
+) -> Vec<u8> {
+    let lines = ["Total wages 52,000.00", "Federal tax withheld 6,240.00"];
+    let content = lines.iter().enumerate().fold(
+        String::from("BT /F2 12 Tf 72 740 Td (Statement of account) Tj ET\n"),
+        |content, (index, line)| {
+            let codes: String = line.bytes().map(code).collect();
+            content + &format!("BT /F1 12 Tf 72 {} Td <{codes}> Tj ET\n", 700 - 20 * index)
+        },
+    );
+    let to_unicode = if mapped { " /ToUnicode 8 0 R" } else { "" };
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 7 0 R >>".to_vec(),
+        format!("<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /{encoding} /DescendantFonts [6 0 R]{to_unicode} >>").into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        format!("<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering ({ordering}) /Supplement 6 >> /FontDescriptor 9 0 R /DW 1000 >>").into_bytes(),
+        stream("", content.as_bytes()),
+        stream(
+            "",
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+              1 begincodespacerange <0000> <FFFF> endcodespacerange \
+              1 beginbfrange <0001> <005F> <0020> endbfrange \
+              endcmap CMapName currentdict /CMap defineresource pop end end",
+        ),
+        b"<< /Type /FontDescriptor /FontName /KozMinPr6N-Regular /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >>".to_vec(),
+    ])
+}
+
+#[test]
+fn cjk_text_read_without_its_collection_map_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    // CIDs 1-95 are the ASCII characters in every Adobe collection.
+    let cid = |byte: u8| format!("{:04X}", byte - 0x1F);
+    let unicode = |byte: u8| format!("{byte:04X}");
+    let pages = [
+        // Japanese and Chinese collections pdf-inspector 1.24.0 cannot
+        // parse the map of (upstream #573).
+        cjk_statement_pdf("Japan1", "Identity-H", cid, false),
+        cjk_statement_pdf("GB1", "Identity-V", cid, false),
+        // The Korean one it keeps a table of, a ToUnicode map, and a
+        // predefined CMap whose codes are Unicode read as the page shows.
+        cjk_statement_pdf("Korea1", "Identity-H", cid, false),
+        cjk_statement_pdf("Japan1", "Identity-H", cid, true),
+        cjk_statement_pdf("Japan1", "UniJIS-UCS2-H", unicode, false),
+    ];
+    let mut calls = Vec::new();
+    for (index, pdf) in pages.iter().enumerate() {
+        let path = temporary.path().join(format!("cjk-{index}.pdf"));
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "cjk_text_misread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // pdf-inspector 1.24.0 reads "Total wages" as "5PUBMXBHFT" and drops
+    // the amounts; when a release fixes #573, these expectations go.
+    for result in &results[..2] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(!markdown.contains("52,000.00"), "{result}");
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+        assert_eq!(result["has_encoding_issues"], true, "{result}");
+    }
+    for result in &results[2..] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("Total wages 52,000.00"), "{result}");
+        assert_eq!(reported(result), None, "{result}");
+        assert_eq!(result["has_encoding_issues"], false, "{result}");
+    }
+}
+
 /// A statement page whose superseded balance sits in a layer that is off
 /// unless `shown`, in a marked-content span, with a draft note in a form in
 /// that layer and a text box the layer holds.

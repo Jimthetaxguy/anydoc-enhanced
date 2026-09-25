@@ -82,7 +82,8 @@ const COVERED_SHARE: f64 = 0.5;
 const MAX_PAGE_TREE_DEPTH: usize = 32;
 /// Runs noted per page for the repeat check.
 const MAX_RUNS_PER_PAGE: usize = 100_000;
-/// Bytes of text in hidden layers noted a page, at most.
+/// Bytes of text a reader does not see, or sees otherwise, noted a page for
+/// each check, at most.
 const MAX_HIDDEN_TEXT: usize = 64 << 10;
 /// Repeated runs recorded per page.
 const MAX_REPEATS_PER_PAGE: usize = 16;
@@ -185,6 +186,9 @@ struct State {
     /// Whether a layer a reader hides holds what is drawn here, as a form
     /// in such a layer does.
     hidden: bool,
+    /// Whether pdf-inspector reads the font in force without its
+    /// collection's map (see `cjk_fonts`), when the page is read for it.
+    unmapped: bool,
 }
 
 impl State {
@@ -205,6 +209,7 @@ impl State {
         leading: 0.0,
         rise: 0.0,
         hidden: false,
+        unmapped: false,
     };
 }
 
@@ -634,10 +639,39 @@ struct PageText {
     /// reader hides, when the page is read for repeats and the document has
     /// layers.
     layers: Option<std::rc::Rc<Layers>>,
-    hidden_text: Option<Vec<String>>,
+    hidden_text: Option<Noted>,
     /// Text a viewer never paints, in render mode 3, that pdf-inspector
     /// reads as shown, when the page is read for repeats.
-    invisible_text: Option<Vec<String>>,
+    invisible_text: Option<Noted>,
+    /// Text shown in a font pdf-inspector reads without its collection's
+    /// map, as the font says it (see `cjk_fonts`), and whether any of it
+    /// reads otherwise with no sign, when the page is read for repeats.
+    cjk_text: Option<Noted>,
+    cjk_misread: bool,
+}
+
+/// Texts noted on a page, run by run, and the bytes they hold.
+#[derive(Default)]
+struct Noted {
+    texts: Vec<String>,
+    bytes: usize,
+}
+
+impl Noted {
+    /// Whether there is room for more: `MAX_HIDDEN_TEXT` bytes a page.
+    fn has_room(&self) -> bool {
+        self.bytes < MAX_HIDDEN_TEXT
+    }
+
+    /// Note `text`: a run where the text matrix was just set, else more of
+    /// the run before.
+    fn note(&mut self, text: &str, placed: bool) {
+        self.bytes += text.len();
+        match self.texts.last_mut().filter(|_| !placed) {
+            Some(last) => last.push_str(text),
+            None => self.texts.push(text.to_owned()),
+        }
+    }
 }
 
 impl PageText {
@@ -848,14 +882,12 @@ impl PageText {
     /// the text matrix was just set, else more of the run before; its text
     /// where its font can be read, to `MAX_HIDDEN_TEXT` bytes a page.
     fn note_unseen(&mut self, state: State, bytes: &[u8], placed: bool, invisible: bool) {
-        let texts = if invisible {
+        let noted = if invisible {
             &self.invisible_text
         } else {
             &self.hidden_text
         };
-        let room = texts
-            .as_ref()
-            .is_some_and(|texts| texts.iter().map(String::len).sum::<usize>() < MAX_HIDDEN_TEXT);
+        let room = noted.as_ref().is_some_and(Noted::has_room);
         if !(room && state.font && state.reached && state.read_mode != 3) {
             return;
         }
@@ -865,17 +897,33 @@ impl PageText {
         else {
             return;
         };
-        let texts = if invisible {
+        let noted = if invisible {
             self.invisible_text.as_mut()
         } else {
             self.hidden_text.as_mut()
         };
-        let Some(texts) = texts else {
+        if let Some(noted) = noted {
+            noted.note(&text, placed);
+        }
+    }
+
+    /// Note a string shown in a font pdf-inspector reads without its
+    /// collection's map: what it says where pdf-inspector reads it with no
+    /// sign, none of its bytes past 0x7F, and a gap where it marks the
+    /// string with U+FFFD. Such a string reads otherwise, or not at all,
+    /// unless it shows only spaces.
+    fn note_unmapped(&mut self, bytes: &[u8], placed: bool) {
+        let Some(noted) = self.cjk_text.as_mut().filter(|noted| noted.has_room()) else {
             return;
         };
-        match texts.last_mut().filter(|_| !placed) {
-            Some(last) => last.push_str(&text),
-            None => texts.push(text),
+        match crate::cjk_fonts::silent_reading(bytes) {
+            Some(reading) => {
+                self.cjk_misread |= bytes
+                    .chunks_exact(2)
+                    .any(|code| u16::from_be_bytes([code[0], code[1]]) > 1);
+                noted.note(&reading, placed);
+            }
+            None => noted.note(" ", placed),
         }
     }
 
@@ -1061,6 +1109,12 @@ pub(crate) struct Findings {
     /// reads as shown (upstream issue #572), by page, on the pages read for
     /// repeats but a scan's with its text layer.
     pub(crate) invisible_texts: Vec<(u32, Vec<String>)>,
+    /// The pages, among those read for repeats, whose text in a font
+    /// pdf-inspector reads without its collection's map (upstream issue
+    /// #573) reads otherwise with no sign; and that text as the font says
+    /// it, by page.
+    pub(crate) cjk_pages: Vec<u32>,
+    pub(crate) cjk_texts: Vec<(u32, Vec<String>)>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -1162,6 +1216,12 @@ pub(crate) fn scan_document(
                 if !page.invisible_text.is_empty() {
                     found.invisible_texts.push((number, page.invisible_text));
                 }
+                if page.cjk_misread {
+                    found.cjk_pages.push(number);
+                }
+                if !page.cjk_text.is_empty() {
+                    found.cjk_texts.push((number, page.cjk_text));
+                }
                 if let Some(edges) = edges
                     .as_mut()
                     .filter(|edges| edges.len() < crate::repeated_lines::MAX_REPEAT_PAGES)
@@ -1244,6 +1304,10 @@ struct PageFindings {
     /// Text a viewer never paints that pdf-inspector reads, on a page that
     /// is not a scan with its text layer.
     invisible_text: Vec<String>,
+    /// Text in fonts pdf-inspector reads without their collection's map, as
+    /// the fonts say it, and whether any reads otherwise with no sign.
+    cjk_text: Vec<String>,
+    cjk_misread: bool,
 }
 
 fn scan_page(
@@ -1298,8 +1362,10 @@ fn scan_page(
         runs: check_twice.then(Runs::default),
         edges: check_twice.then(Vec::new),
         layers: layers.cloned(),
-        hidden_text: (check_twice && layers.is_some()).then(Vec::new),
-        invisible_text: check_twice.then(Vec::new),
+        hidden_text: (check_twice && layers.is_some()).then(Noted::default),
+        invisible_text: check_twice.then(Noted::default),
+        cjk_text: check_twice.then(Noted::default),
+        cjk_misread: false,
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
@@ -1356,12 +1422,23 @@ fn scan_page(
     );
     Ok(PageFindings {
         edges,
-        hidden_text: page.hidden_text.take().unwrap_or_default(),
+        hidden_text: page
+            .hidden_text
+            .take()
+            .map(|noted| noted.texts)
+            .unwrap_or_default(),
         invisible_text: page
             .invisible_text
             .take()
             .filter(|_| !page.scanned(page_box))
+            .map(|noted| noted.texts)
             .unwrap_or_default(),
+        cjk_text: page
+            .cjk_text
+            .take()
+            .map(|noted| noted.texts)
+            .unwrap_or_default(),
+        cjk_misread: page.cjk_misread,
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
@@ -1534,6 +1611,9 @@ fn execute<'a>(
                         .filter(|_| page.glyph_words.is_some() && judged)
                         .and_then(|font| page.glyph_fonts.font(document, font));
                     state.raw = !read;
+                    state.unmapped = judged
+                        && page.cjk_text.is_some()
+                        && resolved.is_some_and(|font| crate::cjk_fonts::unmapped(document, font));
                     state.decoded = resolved.filter(|_| page.forms).and_then(|font| {
                         let two_bytes = font
                             .get(b"Subtype")
@@ -1648,6 +1728,9 @@ fn execute<'a>(
                     // takes the text object to start in mode 0 (#572).
                     if state.render_mode == 3 {
                         page.note_unseen(state, &bytes, placed, true);
+                    }
+                    if state.unmapped && state.font && state.reached && state.read_mode != 3 {
+                        page.note_unmapped(&bytes, placed);
                     }
                 }
                 if in_text && !forms.is_empty() {
