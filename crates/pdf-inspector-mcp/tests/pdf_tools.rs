@@ -2032,6 +2032,47 @@ fn layers_a_viewer_hides_on_opening_are_reported() {
     );
 }
 
+/// A statement page with a form whose superseded balance is a text field on
+/// a widget in a layer that is off unless `shown`.
+fn layered_field_pdf(shown: bool) -> Vec<u8> {
+    let state = if shown { "/ON [4 0 R]" } else { "/OFF [4 0 R]" };
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> /OCProperties << /OCGs [4 0 R] /D << {state} >> >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [6 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        b"<< /Type /OCG /Name (Superseded) >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Checking account statement) Tj ET \
+              BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET",
+        ),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [7 0 R] >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (old_balance) /V (1,000.00 superseded) /Rect [300 680 500 700] /OC 4 0 R /P 6 0 R /F 4 >>".to_vec(),
+    ])
+}
+
+#[test]
+fn form_values_in_layers_a_reader_hides_are_reported() {
+    let results = convert_all(&[layered_field_pdf(false), layered_field_pdf(true)]);
+    // pdf-inspector 1.24.0 writes every field's value, whatever layer its
+    // widget is in; when a release reads layers, this expectation goes.
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(
+            markdown.contains("old_balance: 1,000.00 superseded"),
+            "{markdown}"
+        );
+    }
+    assert_eq!(
+        warned_pages(&results, "hidden_layer_text_read"),
+        [Some(serde_json::json!([1])), None]
+    );
+    assert_eq!(warned_pages(&results, "form_values_misread"), [None, None]);
+}
+
 /// A statement page showing `content` after its heading and balance, in
 /// Helvetica as `/F1` (object 4), with a layer (object 6) off by default, and
 /// `objects` as objects 7 on. Its resources hold `/F1`, the layer as `/MC0`,

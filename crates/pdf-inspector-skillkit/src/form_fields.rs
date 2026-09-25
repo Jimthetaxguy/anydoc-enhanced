@@ -14,9 +14,11 @@
 //! The walk follows pdf-inspector's through the field tree, within its
 //! bounds, and gives each value it misreads or passes over, as it would
 //! write it if it read it right, with the pages a viewer shows it on: those
-//! whose annotations hold a widget of the field not hidden. The Markdown
-//! decides: a value it shows was not lost, as when the page itself draws
-//! the value.
+//! whose annotations hold a widget of the field not hidden, by its flags or
+//! by a layer a reader hides. The Markdown decides: a value it shows was
+//! not lost, as when the page itself draws the value. A value pdf-inspector
+//! writes from a widget in a hidden layer is one no reader sees, and is
+//! given as it writes it, with the hidden-layer text of its page.
 //!
 //! A dynamic XFA form, whose catalog marks it as needing rendering and whose
 //! form holds XFA, keeps its content in XFA, which a viewer lays out; its
@@ -29,6 +31,8 @@
 use std::collections::{HashMap, HashSet};
 
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
+
+use crate::optional_content::Layers;
 
 /// Field tree nodes pdf-inspector visits, and how deep it goes.
 const MAX_FIELD_NODES: usize = 100_000;
@@ -50,6 +54,17 @@ const NO_VIEW: i64 = 32;
 pub(crate) struct FormValue {
     pub(crate) text: String,
     pub(crate) pages: Vec<u32>,
+}
+
+/// The values of a form the Markdown may hold otherwise than a viewer
+/// shows them.
+#[derive(Debug, Default)]
+pub(crate) struct Values {
+    /// Values pdf-inspector misreads or passes over, as a viewer shows them.
+    pub(crate) misread: Vec<FormValue>,
+    /// Values pdf-inspector writes from a widget in a layer a reader hides,
+    /// as it writes them, on the page it writes each for.
+    pub(crate) hidden: Vec<FormValue>,
 }
 
 /// An object, its references followed.
@@ -101,12 +116,14 @@ fn button(name: &[u8]) -> String {
 
 struct Walk<'a> {
     document: &'a Document,
+    /// The document's layers, if it has any.
+    layers: Option<&'a Layers>,
     /// Pages by object, and the pages whose annotations hold a widget.
     pages: HashMap<ObjectId, u32>,
     annotation_pages: HashMap<ObjectId, u32>,
     visited: HashSet<ObjectId>,
     examined: usize,
-    values: Vec<FormValue>,
+    values: Values,
 }
 
 impl<'a> Walk<'a> {
@@ -135,8 +152,15 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// Whether a widget is in a layer a reader hides.
+    fn layered(&self, widget: &Dictionary) -> bool {
+        self.layers
+            .is_some_and(|layers| layers.hide(self.document, widget))
+    }
+
     /// The page a viewer shows a widget on: the page whose annotations hold
-    /// it, or its `/P`; `None` where it is hidden or on no page.
+    /// it, or its `/P`; `None` where it is hidden, by its flags or by a
+    /// layer, or on no page.
     fn page(&self, id: ObjectId, widget: &Dictionary) -> Option<u32> {
         let flags = widget
             .get(b"F")
@@ -144,7 +168,7 @@ impl<'a> Walk<'a> {
             .and_then(|flags| resolved(self.document, flags))
             .and_then(|flags| flags.as_i64().ok())
             .unwrap_or(0);
-        if flags & (HIDDEN | NO_VIEW) != 0 {
+        if flags & (HIDDEN | NO_VIEW) != 0 || self.layered(widget) {
             return None;
         }
         self.annotation_pages.get(&id).copied().or_else(|| {
@@ -154,6 +178,18 @@ impl<'a> Walk<'a> {
                 .and_then(|page| page.as_reference().ok())
                 .and_then(|page| self.pages.get(&page).copied())
         })
+    }
+
+    /// The page pdf-inspector writes a widget's value for: its `/P`, else
+    /// the page whose annotations hold it, else the first.
+    fn written_page(&self, id: ObjectId, widget: &Dictionary) -> u32 {
+        widget
+            .get(b"P")
+            .ok()
+            .and_then(|page| page.as_reference().ok())
+            .and_then(|page| self.pages.get(&page).copied())
+            .or_else(|| self.annotation_pages.get(&id).copied())
+            .unwrap_or(1)
     }
 
     /// A value as pdf-inspector reads it and as the PDF means it, for a
@@ -251,7 +287,7 @@ impl<'a> Walk<'a> {
         } else {
             shown
         };
-        self.values.push(FormValue { text, pages });
+        self.values.misread.push(FormValue { text, pages });
     }
 
     /// Walk a field and its kids as pdf-inspector does, with the type, the
@@ -353,6 +389,18 @@ impl<'a> Walk<'a> {
         let Some(kind) = kind.filter(|kind| *kind != b"Sig") else {
             return;
         };
+        // A widget in a layer a reader hides shows no value, and
+        // pdf-inspector writes the value it holds all the same.
+        if self.layered(dictionary) {
+            if let Some((read, _)) = own.and_then(|own| self.value(kind, own)) {
+                let page = self.written_page(id, dictionary);
+                self.values.hidden.push(FormValue {
+                    text: written(&name_read, &read),
+                    pages: vec![page],
+                });
+            }
+            return;
+        }
         let Some(page) = self.page(id, dictionary) else {
             return;
         };
@@ -365,7 +413,7 @@ impl<'a> Walk<'a> {
                     } else {
                         meant
                     };
-                    self.values.push(FormValue {
+                    self.values.misread.push(FormValue {
                         text,
                         pages: vec![page],
                     });
@@ -563,9 +611,10 @@ pub(crate) fn dynamic_xfa(document: &Document) -> bool {
     needs_rendering && holds_xfa
 }
 
-/// The field values pdf-inspector misreads or passes over in the form of
-/// `document`, if it has one.
-pub(crate) fn misread(document: &Document) -> Vec<FormValue> {
+/// The field values of the form of `document`, if it has one, that the
+/// Markdown may hold otherwise than a viewer shows them, with the layers
+/// the document sets (see `Values`).
+pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
     let pages: HashMap<ObjectId, u32> = document
         .get_pages()
         .into_iter()
@@ -573,11 +622,12 @@ pub(crate) fn misread(document: &Document) -> Vec<FormValue> {
         .collect();
     let mut walk = Walk {
         document,
+        layers,
         pages,
         annotation_pages: HashMap::new(),
         visited: HashSet::new(),
         examined: 0,
-        values: Vec::new(),
+        values: Values::default(),
     };
     let fields: Vec<ObjectId> = {
         let Some(root) = document
@@ -586,21 +636,21 @@ pub(crate) fn misread(document: &Document) -> Vec<FormValue> {
             .ok()
             .and_then(|root| walk.dictionary(root))
         else {
-            return Vec::new();
+            return Values::default();
         };
         let Some(form) = root
             .get(b"AcroForm")
             .ok()
             .and_then(|form| walk.dictionary(form))
         else {
-            return Vec::new();
+            return Values::default();
         };
         let Some(fields) = form
             .get(b"Fields")
             .ok()
             .and_then(|fields| walk.array(fields))
         else {
-            return Vec::new();
+            return Values::default();
         };
         fields
             .iter()
@@ -608,7 +658,7 @@ pub(crate) fn misread(document: &Document) -> Vec<FormValue> {
             .collect()
     };
     if fields.is_empty() {
-        return Vec::new();
+        return Values::default();
     }
     let mut annotation_pages = HashMap::new();
     for (&page, &number) in &walk.pages {
@@ -705,7 +755,7 @@ mod tests {
             (vec![name, city, amount], vec![name, city, amount])
         });
         assert_eq!(
-            misread(&document),
+            values(&document, None).misread,
             vec![
                 FormValue {
                     text: "José García".to_string(),
@@ -757,7 +807,7 @@ mod tests {
             )
         });
         assert_eq!(
-            misread(&document),
+            values(&document, None).misread,
             vec![
                 FormValue {
                     text: "filing_status: Married".to_string(),
@@ -846,7 +896,8 @@ mod tests {
                 ],
             )
         });
-        let texts: Vec<(String, Vec<u32>)> = misread(&document)
+        let texts: Vec<(String, Vec<u32>)> = values(&document, None)
+            .misread
             .into_iter()
             .map(|value| (value.text, value.pages))
             .collect();
@@ -869,11 +920,75 @@ mod tests {
     }
 
     #[test]
+    fn values_in_a_layer_a_reader_hides_are_found_as_written() {
+        let mut layer = None;
+        let mut document = form(|document, page| {
+            let superseded = document.add_object(dictionary! {
+                "Type" => "OCG", "Name" => Object::string_literal("Superseded"),
+            });
+            layer = Some(superseded);
+            // A value in the layer, which pdf-inspector writes though no
+            // reader sees it, on the page its widget names.
+            let old = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("old_balance"),
+                "V" => Object::string_literal("1,000.00 superseded"), "P" => page,
+                "OC" => superseded,
+            });
+            // A group whose one widget is in the layer shows no value.
+            let widget = document.add_object(dictionary! {
+                "Subtype" => "Widget", "P" => page, "OC" => superseded,
+            });
+            let group = document.add_object(dictionary! {
+                "FT" => "Btn", "T" => Object::string_literal("filing_status"),
+                "V" => "Married", "Kids" => vec![widget.into()],
+            });
+            (vec![old, group], vec![old, widget])
+        });
+        // With no layers, the group's value is shown and passed over.
+        let shown = values(&document, None);
+        assert!(shown.hidden.is_empty());
+        assert_eq!(
+            shown.misread,
+            vec![FormValue {
+                text: "filing_status: Married".to_string(),
+                pages: vec![1]
+            }]
+        );
+        let superseded = layer.expect("a layer");
+        let catalog = document
+            .trailer
+            .get(b"Root")
+            .and_then(Object::as_reference)
+            .expect("a catalog");
+        document
+            .get_dictionary_mut(catalog)
+            .expect("a catalog")
+            .set(
+                "OCProperties",
+                dictionary! {
+                    "OCGs" => vec![superseded.into()],
+                    "D" => dictionary! { "OFF" => vec![superseded.into()] },
+                },
+            );
+        let layers = Layers::new(&document).expect("layers");
+        let hidden = values(&document, Some(&layers));
+        assert!(hidden.misread.is_empty(), "{:?}", hidden.misread);
+        assert_eq!(
+            hidden.hidden,
+            vec![FormValue {
+                text: "old_balance: 1,000.00 superseded".to_string(),
+                pages: vec![1]
+            }]
+        );
+    }
+
+    #[test]
     fn a_document_without_a_form_has_no_values() {
         let mut document = Document::with_version("1.7");
         let catalog = document.add_object(dictionary! { "Type" => "Catalog" });
         document.trailer.set("Root", catalog);
-        assert!(misread(&document).is_empty());
+        let found = values(&document, None);
+        assert!(found.misread.is_empty() && found.hidden.is_empty());
         assert!(!dynamic_xfa(&document));
         assert_eq!(embedded_files(&document), (0, false));
         // Needing rendering makes a dynamic XFA form only with XFA to render.

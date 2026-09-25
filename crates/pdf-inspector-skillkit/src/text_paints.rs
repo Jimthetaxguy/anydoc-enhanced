@@ -1589,8 +1589,13 @@ pub(crate) fn scan_document(
     let mut cjk_fonts = crate::cjk_fonts::CjkFonts::default();
     let mut found = Findings::default();
     let layers = Layers::new(&document).map(std::rc::Rc::new);
+    // Form values pdf-inspector writes from widgets in a layer a reader
+    // hides, looked for with the hidden-layer text of their pages.
+    let mut hidden_values = Vec::new();
     if twice_skip.is_some() {
-        found.form_values = crate::form_fields::misread(&document);
+        let values = crate::form_fields::values(&document, layers.as_deref());
+        found.form_values = values.misread;
+        hidden_values = values.hidden;
         found.annotation_texts = crate::annotations::unread(&document, only, layers.as_deref());
     }
     if whole {
@@ -1738,6 +1743,20 @@ pub(crate) fn scan_document(
                 found.unchecked_from.get_or_insert(number);
                 break;
             }
+        }
+    }
+    for value in hidden_values {
+        if fits(value.text.len()) {
+            found
+                .hidden_layer_texts
+                .extend(value.pages.into_iter().map(|page| {
+                    let texts = PageTexts {
+                        texts: vec![value.text.clone()],
+                        overflowed: false,
+                        on_page: true,
+                    };
+                    (page, texts)
+                }));
         }
     }
     found.glyph_words = glyph_words.finish();
