@@ -141,7 +141,7 @@ through the server:
 | #572 | The text rendering mode is reset at every `BT` and ignored when set outside a text object | Reproduced: a page that sets mode 3 before its text objects, or in one text object before the next, converts its invisible text as shown ("Ignore the balance above"), where a viewer paints nothing. Reported as `invisible_text_read` (Loop 26) where the Markdown shows it; a scan's text layer, on a page images cover and whose text mostly paints nothing, is not reported. Forms keep the mode they are drawn in, as 1.24.0 reads them. |
 | #573 | Adobe's Japanese and Chinese collection maps fail to parse, so a CID font without a ToUnicode map reads as its code bytes | Reproduced on 1.24.0: under `Identity-H` or `Identity-V`, Japan1, GB1, and CNS1 text reads as other letters with its digits dropped ("Total wages 52,000.00" as "5PUBMXBHFT") at confidence 1.0, and as U+FFFD where a byte passes 0x7F; Korean reads through a table of its own, and byte-coded and Unicode-coded CMaps read their ASCII right. Reported as `cjk_text_misread` (Loop 27) on the pages whose text reads otherwise with no sign, with `has_encoding_issues` set. |
 | #554, #500 | Text PDFs, such as Internet Archive scans with a glyphless OCR layer or early Acrobat captures, that convert to no text at all | Not rerun with the reporters' downloads. Where 1.24.0 returns no Markdown for a full run of a text PDF, its confidence is reported as 0 (the rule for #443), and a page whose text is all invisible under an image covering it is listed for OCR. |
-| #575 | Vertical writing is assembled row by row across columns | Not detected: Japanese or Chinese columns set side by side interleave glyph by glyph. |
+| #575 | Vertical writing is assembled row by row across columns | Reproduced on 1.24.0: three Japanese columns set glyph by glyph under `Identity-V` read row by row across them ("住源源 民泉泉 税徴徴"), and set one string each they read left to right, in reverse, both at confidence 1.0; a column standing alone reads in order. Reported as `vertical_text_misread` (Loop 28) where the Markdown does not show neighbouring columns' text in order, right before left. |
 | #574 | Follow-ups from #567 (control-character ToUnicode destinations) | Internal; no change to the output. |
 | #585 | High extraction time and memory through the npm package | The Node binding only; here the Rust crate runs in the bounded PDF worker. |
 | #588 | A table row continuing onto the next page loses its continuation | Not reproduced as a loss: in a generated statement whose last row wraps onto the next page, the continuation reads there, as a heading of its own, apart from its row. |
@@ -311,8 +311,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 330 tests pass (260 skillkit unit, 13
-  skillkit integration, 30 document-tool and 24 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 334 tests pass (263 skillkit unit, 13
+  skillkit integration, 30 document-tool and 25 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI
@@ -425,9 +425,11 @@ When pdf-inspector publishes a release after 1.24.0:
    strips or hides differently changes which pages it names.
 5. If the release keeps the text render mode across text objects (#572),
    retire `invisible_text_read` and its expectations; if it parses the
-   Japan1, GB1, and CNS1 maps (#573), retire `cjk_text_misread`. Both are
-   checked against the Markdown, so a partial fix only narrows the pages
-   they name. If it reads optional-content settings, annotations, XFA, or
+   Japan1, GB1, and CNS1 maps (#573), retire `cjk_text_misread`; if it
+   lays vertical writing out in columns (#575), retire
+   `vertical_text_misread`. All three are
+   checked against the Markdown, vertical columns only where their font
+   can be read, so a partial fix only narrows the pages they name. If it reads optional-content settings, annotations, XFA, or
    embedded files, re-check `hidden_layer_text_read`,
    `annotation_text_unread`, `xfa_form_unread`, and `embedded_files_unread`
    the same way.

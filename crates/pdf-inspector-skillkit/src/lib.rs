@@ -115,6 +115,13 @@ pub const PDF_WARNING_CJK_TEXT_MISREAD: &str = "cjk_text_misread";
 /// Characters a text in such a font needs, bare, to tell whether the
 /// Markdown shows it.
 const MIN_CJK_CHARS: usize = 4;
+/// Columns of vertical writing side by side read row by row across them, or
+/// out of order (upstream #575).
+pub const PDF_WARNING_VERTICAL_TEXT_MISREAD: &str = "vertical_text_misread";
+/// Characters each of two neighbouring columns of vertical writing holds for
+/// them to be read in order, right before left, as a passage's columns are,
+/// where a form's labels standing in cells side by side read across.
+const MIN_VERTICAL_PASSAGE_CHARS: usize = 6;
 /// Characters a text in a hidden layer needs, bare, for the Markdown's
 /// showing it to count.
 const MIN_HIDDEN_CHARS: usize = 6;
@@ -785,6 +792,55 @@ impl PdfInfo {
         ));
     }
 
+    /// Report the pages whose neighbouring columns of vertical writing (see
+    /// `vertical_text`) the Markdown does not show each whole and, where both
+    /// hold a passage's lines, in order, the right column's text and then the
+    /// left one's; or whose text cannot be read to tell.
+    fn check_vertical_text(
+        &mut self,
+        pairs: &[(u32, Vec<vertical_text::ColumnPair>)],
+        only: Option<&HashSet<u32>>,
+    ) {
+        let numbers: Vec<[u32; 1]> = pairs.iter().map(|(page, _)| [*page]).collect();
+        let read: Vec<(&[u32], String)> = numbers
+            .iter()
+            .zip(pairs)
+            .flat_map(|(page, (_, pairs))| {
+                pairs.iter().flatten().flat_map(move |(right, left)| {
+                    let passage = [right, left]
+                        .iter()
+                        .all(|column| column.chars().count() >= MIN_VERTICAL_PASSAGE_CHARS);
+                    [right.clone(), left.clone()]
+                        .into_iter()
+                        .chain(passage.then(|| format!("{right}{left}")))
+                        .map(move |text| (page.as_slice(), text))
+                })
+            })
+            .collect();
+        let texts: Vec<(&[u32], &str)> = read
+            .iter()
+            .map(|(page, text)| (*page, text.as_str()))
+            .collect();
+        let mut pages = self.unshown(&texts, only);
+        pages.extend(
+            pairs
+                .iter()
+                .filter(|(page, pairs)| {
+                    pairs.iter().any(Option::is_none) && only.is_none_or(|only| only.contains(page))
+                })
+                .map(|(page, _)| *page),
+        );
+        pages.sort_unstable();
+        pages.dedup();
+        if !pages.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_VERTICAL_TEXT_MISREAD,
+                "On these pages text set in vertical writing, in columns side by side, reads row by row across the columns or with the columns out of order: pdf-inspector 1.24.0 lays vertical text out as if it were horizontal (upstream #575), so a Japanese or Chinese passage set in columns reads scrambled; read these pages another way, such as by OCR.",
+                pages,
+            ));
+        }
+    }
+
     /// Report the pages whose text in layers a reader hides (see
     /// `optional_content`) the Markdown shows: pdf-inspector read it.
     fn check_hidden_layers(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
@@ -890,6 +946,8 @@ impl PdfInfo {
         self.check_invisible_text(&invisible, only);
         let cjk = std::mem::take(&mut found.cjk_texts);
         self.check_cjk_text(&found.cjk_pages, &cjk, only);
+        let vertical = std::mem::take(&mut found.vertical_pairs);
+        self.check_vertical_text(&vertical, only);
         if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
@@ -1017,6 +1075,7 @@ mod optional_content;
 pub mod pdf_worker;
 mod repeated_lines;
 mod text_paints;
+mod vertical_text;
 mod word_gaps;
 
 /// Errors from the facade layer.
@@ -1318,6 +1377,64 @@ mod tests {
         assert!(garbled.has_encoding_issues);
         // Warnings stay off the wire until one is found.
         assert!(!serde_json::to_string(&read).unwrap().contains("warnings"));
+    }
+
+    #[test]
+    fn text_checks_stand_down_where_the_markdown_reads_right() {
+        let read = |markdown: &str| {
+            PdfInfo::from_result(
+                upstream(PdfType::TextBased, Some(markdown), &[]),
+                &ProcessMode::Full,
+            )
+        };
+        let reported = |info: &PdfInfo| -> Vec<(String, Vec<u32>)> {
+            info.warnings
+                .iter()
+                .map(|warning| (warning.code.clone(), warning.pages.clone()))
+                .collect()
+        };
+        // A passage's vertical columns the Markdown shows in order, the right
+        // one first, stand; shown left to right, or where their text cannot
+        // be read, they are reported.
+        let passage = [(
+            1,
+            vec![Some((
+                "源泉徴収票の支払金額".to_owned(),
+                "住民税は別に通知".to_owned(),
+            ))],
+        )];
+        let mut info = read("源泉徴収票の支払金額\n\n住民税は別に通知\n");
+        info.check_vertical_text(&passage, None);
+        assert!(info.warnings.is_empty());
+        let mut info = read("住民税は別に通知 源泉徴収票の支払金額\n");
+        info.check_vertical_text(&passage, None);
+        let vertical = PDF_WARNING_VERTICAL_TEXT_MISREAD.to_owned();
+        assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
+        // A form's labels standing in cells side by side read across, left
+        // to right; read row by row across them, they are reported.
+        let labels = [(1, vec![Some(("種別".to_owned(), "金額".to_owned()))])];
+        let mut info = read("| 金額 | 種別 |\n");
+        info.check_vertical_text(&labels, None);
+        assert!(info.warnings.is_empty());
+        let mut info = read("種金 別額\n");
+        info.check_vertical_text(&labels, None);
+        assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
+        let mut info = read("源泉徴収票の支払金額\n\n住民税は別に通知\n");
+        info.check_vertical_text(&[(2, vec![None])], None);
+        assert_eq!(reported(&info), [(vertical, vec![2])]);
+        // Text in a font read without its collection's map that the
+        // Markdown shows as the font says it was read after all.
+        let texts = [(1, vec!["Total wages 52,000.00".to_owned()])];
+        let mut info = read("Total wages 52,000.00\n");
+        info.check_cjk_text(&[1], &texts, None);
+        assert!(info.warnings.is_empty() && !info.has_encoding_issues);
+        let mut info = read("5PUBMXBHFT\n");
+        info.check_cjk_text(&[1], &texts, None);
+        assert_eq!(
+            reported(&info),
+            [(PDF_WARNING_CJK_TEXT_MISREAD.to_owned(), vec![1])]
+        );
+        assert!(info.has_encoding_issues);
     }
 
     #[test]

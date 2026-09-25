@@ -189,6 +189,9 @@ struct State {
     /// Whether pdf-inspector reads the font in force without its
     /// collection's map (see `cjk_fonts`), when the page is read for it.
     unmapped: bool,
+    /// Whether the font in force writes vertically (see `vertical_text`),
+    /// when the page is read for it.
+    vertical: bool,
 }
 
 impl State {
@@ -210,6 +213,7 @@ impl State {
         rise: 0.0,
         hidden: false,
         unmapped: false,
+        vertical: false,
     };
 }
 
@@ -650,6 +654,9 @@ struct PageText {
     /// reads otherwise with no sign, when the page is read for repeats.
     cjk_text: Option<Noted>,
     cjk_misread: bool,
+    /// Strings shown in fonts that write vertically, when the page is read
+    /// for repeats.
+    vertical: Option<Vec<crate::vertical_text::VerticalRun>>,
 }
 
 /// Texts noted on a page, run by run, and the bytes they hold.
@@ -1006,6 +1013,47 @@ impl PageText {
         }
     }
 
+    /// Note a string shown in a font that writes vertically: more of the
+    /// run before when it was the page's last string and the text matrix
+    /// was not set since, as its glyphs go on down its column; else a run
+    /// of its own where its line is upright.
+    fn note_vertical(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], placed: bool) {
+        let show = self.shows;
+        let text = state
+            .glyph_font
+            .and_then(|font| self.glyph_fonts.text(font, bytes));
+        let Some(runs) = self
+            .vertical
+            .as_mut()
+            .filter(|runs| runs.len() < MAX_RUNS_PER_PAGE)
+        else {
+            return;
+        };
+        let glyphs = (bytes.len() / 2) as f64;
+        if let Some(last) = runs
+            .last_mut()
+            .filter(|last| !placed && last.show + 1 == show)
+        {
+            last.bottom -= glyphs * last.size;
+            last.text = last.text.take().zip(text).map(|(mut before, text)| {
+                before.push_str(&text);
+                before
+            });
+            last.show = show;
+            return;
+        }
+        if let Some(start) = Start::of(state, text_matrix) {
+            runs.push(crate::vertical_text::VerticalRun {
+                x: start.x,
+                top: start.y,
+                bottom: start.y - glyphs * start.size,
+                size: start.size,
+                text,
+                show,
+            });
+        }
+    }
+
     /// Note a run pdf-inspector reads for the running-header check's gate:
     /// where it starts, when the text matrix was just set, else as more of
     /// the run before; with its text, where its font can be read.
@@ -1194,6 +1242,10 @@ pub(crate) struct Findings {
     /// it, by page.
     pub(crate) cjk_pages: Vec<u32>,
     pub(crate) cjk_texts: Vec<(u32, Vec<String>)>,
+    /// The neighbouring columns of text in vertical writing (upstream issue
+    /// #575), right to left, as what each pair reads as where its fonts can
+    /// be read, by page, on the pages read for repeats.
+    pub(crate) vertical_pairs: Vec<(u32, Vec<crate::vertical_text::ColumnPair>)>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -1301,6 +1353,9 @@ pub(crate) fn scan_document(
                 if !page.cjk_text.is_empty() {
                     found.cjk_texts.push((number, page.cjk_text));
                 }
+                if !page.vertical_pairs.is_empty() {
+                    found.vertical_pairs.push((number, page.vertical_pairs));
+                }
                 if let Some(edges) = edges
                     .as_mut()
                     .filter(|edges| edges.len() < crate::repeated_lines::MAX_REPEAT_PAGES)
@@ -1387,6 +1442,8 @@ struct PageFindings {
     /// the fonts say it, and whether any reads otherwise with no sign.
     cjk_text: Vec<String>,
     cjk_misread: bool,
+    /// The neighbouring columns of text in vertical writing, right to left.
+    vertical_pairs: Vec<crate::vertical_text::ColumnPair>,
 }
 
 fn scan_page(
@@ -1445,6 +1502,7 @@ fn scan_page(
         invisible_text: check_twice.then(Noted::default),
         cjk_text: check_twice.then(Noted::default),
         cjk_misread: false,
+        vertical: check_twice.then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
@@ -1518,6 +1576,11 @@ fn scan_page(
             .map(|noted| noted.texts)
             .unwrap_or_default(),
         cjk_misread: page.cjk_misread,
+        vertical_pairs: page
+            .vertical
+            .take()
+            .map(|runs| crate::vertical_text::neighbours(&runs))
+            .unwrap_or_default(),
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
@@ -1693,6 +1756,9 @@ fn execute<'a>(
                     state.unmapped = judged
                         && page.cjk_text.is_some()
                         && resolved.is_some_and(|font| crate::cjk_fonts::unmapped(document, font));
+                    state.vertical = judged
+                        && page.vertical.is_some()
+                        && resolved.is_some_and(crate::vertical_text::writes_vertically);
                     state.decoded = resolved.filter(|_| page.forms).and_then(|font| {
                         let two_bytes = font
                             .get(b"Subtype")
@@ -1810,6 +1876,9 @@ fn execute<'a>(
                     }
                     if state.unmapped && state.font && state.reached && state.read_mode != 3 {
                         page.note_unmapped(&bytes, placed);
+                    }
+                    if state.vertical && state.font && state.reached && state.read_mode != 3 {
+                        page.note_vertical(state, text_matrix, &bytes, placed);
                     }
                 }
                 if in_text && !forms.is_empty() {

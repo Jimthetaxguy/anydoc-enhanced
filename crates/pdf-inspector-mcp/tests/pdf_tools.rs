@@ -1473,6 +1473,115 @@ fn cjk_text_read_without_its_collection_map_is_reported() {
     }
 }
 
+/// A page of Japanese `columns` set under `encoding` in a CID font with a
+/// ToUnicode map; with `Identity-V`, in columns read right to left from the
+/// top, 18 pt apart, each glyph placed on its own when `glyph_by_glyph`;
+/// otherwise one line a column.
+fn vertical_text_pdf(columns: &[&str], encoding: &str, glyph_by_glyph: bool) -> Vec<u8> {
+    let mut glyphs: Vec<char> = columns.iter().flat_map(|column| column.chars()).collect();
+    glyphs.sort_unstable();
+    glyphs.dedup();
+    let cid = |glyph: char| glyphs.iter().position(|known| *known == glyph).unwrap_or(0) + 1;
+    let codes = |text: &str| -> String {
+        text.chars()
+            .map(|glyph| format!("{:04X}", cid(glyph)))
+            .collect()
+    };
+    let vertical = encoding == "Identity-V";
+    let mut content = String::new();
+    for (index, column) in columns.iter().enumerate() {
+        if !vertical {
+            let y = 720 - 20 * index;
+            content += &format!("BT /F1 12 Tf 72 {y} Td <{}> Tj ET\n", codes(column));
+        } else if glyph_by_glyph {
+            for (row, glyph) in column.chars().enumerate() {
+                let (x, y) = (500 - 18 * index, 720 - 12 * row);
+                content += &format!("BT /F1 12 Tf {x} {y} Td <{:04X}> Tj ET\n", cid(glyph));
+            }
+        } else {
+            let x = 500 - 18 * index;
+            content += &format!("BT /F1 12 Tf {x} 720 Td <{}> Tj ET\n", codes(column));
+        }
+    }
+    let entries: String = glyphs
+        .iter()
+        .enumerate()
+        .map(|(index, glyph)| format!("<{:04X}> <{:04X}>\n", index + 1, u32::from(*glyph)))
+        .collect();
+    let to_unicode = format!(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap 1 begincodespacerange <0000> <FFFF> endcodespacerange {} beginbfchar\n{entries}endbfchar endcmap CMapName currentdict /CMap defineresource pop end end",
+        glyphs.len()
+    );
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>".to_vec(),
+        format!("<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /{encoding} /DescendantFonts [5 0 R] /ToUnicode 7 0 R >>").into_bytes(),
+        b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R /DW 1000 /DW2 [880 -1000] >>".to_vec(),
+        stream("", content.as_bytes()),
+        stream("", to_unicode.as_bytes()),
+        b"<< /Type /FontDescriptor /FontName /KozMinPr6N-Regular /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >>".to_vec(),
+    ])
+}
+
+#[test]
+fn vertical_text_in_columns_side_by_side_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let columns = [
+        "源泉徴収票の支払金額は五百万円です",
+        "源泉徴収税額は十六万二千円です",
+        "住民税は別に通知されます",
+    ];
+    let pages = [
+        // pdf-inspector 1.24.0 reads the columns row by row across them, or
+        // left to right (upstream #575).
+        vertical_text_pdf(&columns, "Identity-V", true),
+        vertical_text_pdf(&columns, "Identity-V", false),
+        // A column standing alone, and the same text set horizontally, read
+        // as a reader reads them.
+        vertical_text_pdf(&columns[..1], "Identity-V", true),
+        vertical_text_pdf(&columns, "Identity-H", false),
+    ];
+    let mut calls = Vec::new();
+    for (index, pdf) in pages.iter().enumerate() {
+        let path = temporary.path().join(format!("vertical-{index}.pdf"));
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "vertical_text_misread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // When a release reads vertical columns in order, these expectations go.
+    for result in &results[..2] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(
+            !markdown.contains("源泉徴収票の支払金額は五百万円です 源泉徴収税額"),
+            "{result}"
+        );
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+    }
+    for result in &results[2..] {
+        // A column standing alone reads a glyph at a time, spaced.
+        let markdown: String = result["markdown"]
+            .as_str()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        assert!(
+            markdown.contains("源泉徴収票の支払金額は五百万円です"),
+            "{result}"
+        );
+        assert_eq!(reported(result), None, "{result}");
+    }
+}
+
 /// A statement page whose superseded balance sits in a layer that is off
 /// unless `shown`, in a marked-content span, with a draft note in a form in
 /// that layer and a text box the layer holds.

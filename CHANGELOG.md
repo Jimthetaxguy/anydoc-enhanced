@@ -194,6 +194,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Japanese and Chinese text set in vertical writing, in columns side by
+  side, is reported. A font under a CMap for vertical writing advances down
+  the page, and its columns read top to bottom, right to left;
+  pdf-inspector 1.24.0 groups glyphs into lines by their height instead
+  (upstream #575), so columns set glyph by glyph read row by row across
+  them ("住源源 民泉泉 税徴徴" for three columns of a withholding notice),
+  and columns set as one string each read left to right, their order
+  reversed, at confidence 1.0 with no sign. The page scan now places the
+  strings such fonts show, gathers them into columns, and pairs the
+  neighbouring columns whose heights overlap; a page where the Markdown
+  does not show each such column whole, or, where both columns of a pair
+  hold six characters or more as a passage's do, in order, the right
+  column and then the left one, or whose font cannot be read to tell,
+  carries the new `vertical_text_misread` warning. The Markdown is not
+  changed. A column standing alone, which pdf-inspector reads in order, and
+  a form's short labels standing in cells side by side, which it reads
+  whole from left to right, are not reported.
 - Japanese and Chinese text that pdf-inspector 1.24.0 reads without its
   font's map is reported. A font keyed by CID in Adobe's Japan1, GB1, or
   CNS1 collection, with no ToUnicode map and no embedded program to read a
@@ -868,7 +885,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   font whose ToUnicode map cannot be read, or under a predefined CMap other
   than `Identity-H` or `Identity-V`, is not checked; and a page whose every
   such string pdf-inspector marks with U+FFFD is left to its own
-  garbled-text reason.
+  garbled-text reason. Vertical writing is placed a glyph an em down its
+  column, whatever the font's vertical metrics say, and only on upright
+  pages; columns under a CMap the scan cannot read, which is any
+  predefined vertical CMap but `Identity-V` with a ToUnicode map, are
+  reported wherever two stand side by side, without the Markdown to
+  confirm it.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - DOCX list checks follow ECMA-376 where Word and LibreOffice part: a
