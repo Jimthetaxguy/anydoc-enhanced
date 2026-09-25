@@ -54,6 +54,8 @@ const COVERED_SHARE: f64 = 0.5;
 const MAX_PAGE_TREE_DEPTH: usize = 32;
 /// Runs noted per page for the repeat check.
 const MAX_RUNS_PER_PAGE: usize = 100_000;
+/// Repeated runs recorded per page.
+const MAX_REPEATS_PER_PAGE: usize = 16;
 /// How near a run must start again to repeat one, as a share of its size,
 /// and at least.
 const REPEAT_SHARE: f64 = 0.1;
@@ -133,12 +135,20 @@ impl State {
 struct Runs {
     starts: HashMap<u64, Vec<[f64; 2]>>,
     noted: usize,
-    repeated: bool,
+    /// Where repeated runs start, with their size.
+    repeats: Vec<Repeat>,
+}
+
+/// Where a repeated run starts, in user space, and its size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Repeat {
+    pub(crate) at: [f64; 2],
+    pub(crate) size: f64,
 }
 
 impl Runs {
     fn note(&mut self, text: &[u8], at: [f64; 2], size: f64) {
-        if self.repeated || self.noted >= MAX_RUNS_PER_PAGE {
+        if self.repeats.len() >= MAX_REPEATS_PER_PAGE || self.noted >= MAX_RUNS_PER_PAGE {
             return;
         }
         let near = (REPEAT_SHARE * size).max(MIN_REPEAT_DISTANCE);
@@ -149,7 +159,7 @@ impl Runs {
                 if entry.get().iter().any(|start| {
                     (start[0] - at[0]).abs() <= near && (start[1] - at[1]).abs() <= near
                 }) {
-                    self.repeated = true;
+                    self.repeats.push(Repeat { at, size });
                     return;
                 }
                 entry.get_mut().push(at);
@@ -306,13 +316,16 @@ impl PageText {
 }
 
 /// The 1-indexed pages the scan reports.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct Findings {
     /// Pages whose text is mostly an invisible layer over images covering
     /// the page.
     pub(crate) hidden_layer: Vec<u32>,
     /// Pages that paint a visible run again over itself.
     pub(crate) painted_twice: Vec<u32>,
+    /// Where those runs start again, by page, measured from the page's
+    /// visible box, as pdf-inspector places its text.
+    pub(crate) repeats: Vec<(u32, Repeat)>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -355,8 +368,11 @@ pub(crate) fn scan(
                 if page.hidden_layer {
                     found.hidden_layer.push(number);
                 }
-                if page.painted_twice {
+                if !page.repeats.is_empty() {
                     found.painted_twice.push(number);
+                    found
+                        .repeats
+                        .extend(page.repeats.into_iter().map(|repeat| (number, repeat)));
                 }
             }
             // The repeat check's limits ran out on a page read for it alone:
@@ -379,7 +395,8 @@ struct Budgets<'a> {
 #[derive(Default)]
 struct PageFindings {
     hidden_layer: bool,
-    painted_twice: bool,
+    /// Runs painted again over themselves, measured from the visible box.
+    repeats: Vec<Repeat>,
 }
 
 fn scan_page(
@@ -440,7 +457,18 @@ fn scan_page(
     page.ended();
     Ok(PageFindings {
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
-        painted_twice: page.runs.is_some_and(|runs| runs.repeated),
+        repeats: page
+            .runs
+            .map(|runs| {
+                runs.repeats
+                    .into_iter()
+                    .map(|repeat| Repeat {
+                        at: [repeat.at[0] - page_box[0], repeat.at[1] - page_box[1]],
+                        size: repeat.size,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 

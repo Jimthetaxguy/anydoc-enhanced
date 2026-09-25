@@ -73,6 +73,10 @@ pub struct PdfWarning {
 
 /// Text a page paints twice over itself, which pdf-inspector repeats.
 pub const PDF_WARNING_TEXT_PAINTED_TWICE: &str = "text_painted_twice";
+
+/// Pages painting text twice whose text is read again to confirm the
+/// repeat in the Markdown.
+const MAX_CONFIRMED_PAGES: usize = 64;
 /// A table's first rows also end the paragraph before it.
 pub const PDF_WARNING_TABLE_ROW_REPEATED: &str = "table_row_repeated";
 /// A table cell holds two or more amounts.
@@ -276,11 +280,12 @@ impl PdfInfo {
             text_paints::scan(buffer, &layer_skip, twice_skip.as_ref(), only)
         }))
         .unwrap_or_default();
-        if !found.painted_twice.is_empty() {
+        let painted_twice = self.confirm_painted_twice(buffer, found.painted_twice, &found.repeats);
+        if !painted_twice.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_TEXT_PAINTED_TWICE,
                 "Text these pages paint twice over itself appears twice in the Markdown, as in \"TToottaall\" or \"84.19 84.19\"; read it once.",
-                found.painted_twice,
+                painted_twice,
             ));
         }
         if found.hidden_layer.is_empty() {
@@ -308,6 +313,39 @@ impl PdfInfo {
         self.pages_needing_ocr.sort_unstable();
         self.pages_needing_ocr.dedup();
         self.ocr_reasons_by_page.sort_by_key(|entry| entry.page);
+    }
+
+    /// The pages painting text twice whose repeat the Markdown shows (see
+    /// `doubled_text`), read from the pages' own text. Past
+    /// `MAX_CONFIRMED_PAGES`, or when their text cannot be read, pages stand
+    /// as the scan found them.
+    fn confirm_painted_twice(
+        &self,
+        buffer: &[u8],
+        pages: Vec<u32>,
+        repeats: &[(u32, text_paints::Repeat)],
+    ) -> Vec<u32> {
+        let Some(markdown) = self.markdown.as_deref() else {
+            return pages;
+        };
+        if pages.is_empty() {
+            return pages;
+        }
+        let checked = &pages[..pages.len().min(MAX_CONFIRMED_PAGES)];
+        let wanted: HashSet<u32> = checked.iter().copied().collect();
+        let items = std::panic::catch_unwind(|| {
+            pdf_inspector::extract_text_with_positions_mem_in_frame(
+                buffer,
+                Some(&wanted),
+                pdf_inspector::PositionFrame::Sheet,
+            )
+        });
+        let Ok(Ok(items)) = items else {
+            return pages;
+        };
+        let mut confirmed = doubled_text::confirm(checked, repeats, &items, markdown);
+        confirmed.extend_from_slice(&pages[checked.len()..]);
+        confirmed
     }
 
     /// Check the Markdown's tables for rows pdf-inspector repeats and
@@ -380,6 +418,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 
 pub mod document;
 pub mod domain;
+mod doubled_text;
 mod markdown_tables;
 pub mod pdf_worker;
 mod text_paints;

@@ -12,9 +12,12 @@
 //! so adjacent columns of amounts, such as a 1099-B's wash-sale adjustments
 //! beside the cost basis, can land in one cell (open upstream #424).
 //!
-//! Both are read from the Markdown alone and reported, never repaired: the
-//! repeat is the paragraph's text exactly, and a cell holding two amounts
-//! can hold them by design.
+//! Both are read from the Markdown alone and reported, never repaired. A
+//! repeat counts where it stands as the detector leaves it: on a line of
+//! its own, after a label, or as a whole emphasized span; a sentence that
+//! restates the first row does not. A cell holding two amounts counts only
+//! beside an empty cell, or in a column whose other rows hold one amount: a
+//! column that stacks two amounts by design holds two in every row.
 
 /// What the checks found.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -71,7 +74,6 @@ pub(crate) fn check(markdown: &str) -> TableFindings {
             .filter(|row| !is_separator(row))
             .map(cells)
             .collect();
-        let before = normalize(&paragraph.join(" "));
         for row in rows.iter().take(2) {
             let shown: Vec<&str> = row
                 .iter()
@@ -81,17 +83,75 @@ pub(crate) fn check(markdown: &str) -> TableFindings {
             let joined = normalize(&shown.join(" "));
             found.row_repeated |= joined.chars().count() > MIN_REPEATED_ROW_CHARS
                 && joined.contains(|character: char| character.is_ascii_digit())
-                && ends_with_words(&before, &joined);
+                && repeats_as_detected(&paragraph, &joined);
         }
-        found.values_merged |= rows
-            .iter()
-            .skip(1)
-            .flatten()
-            .any(|cell| holds_amounts(cell));
+        found.values_merged |= merged_cell(&rows);
         paragraph.clear();
         closed = false;
     }
     found
+}
+
+/// Whether the text block ends with `repeat` where the detector leaves a
+/// row it misreads: starting a line, after a label ending in a colon, or
+/// as a whole emphasized span at the end of the last line.
+fn repeats_as_detected(paragraph: &[&str], repeat: &str) -> bool {
+    let before = normalize(&paragraph.join(" "));
+    if !ends_with_words(&before, repeat) {
+        return false;
+    }
+    let prefix = before[..before.len() - repeat.len()].trim_end();
+    // The text of the block's first lines, line by line.
+    let mut lines_before = String::new();
+    let mut starts_line = false;
+    for line in paragraph {
+        if lines_before == prefix {
+            starts_line = true;
+            break;
+        }
+        if lines_before.len() > prefix.len() {
+            break;
+        }
+        let line = normalize(line);
+        if !line.is_empty() && !lines_before.is_empty() {
+            lines_before.push(' ');
+        }
+        lines_before.push_str(&line);
+    }
+    let emphasized = paragraph.last().is_some_and(|line| {
+        ["**", "__", "*", "_"].iter().any(|marker| {
+            line.strip_suffix(marker)
+                .and_then(|inner| inner.rsplit_once(marker))
+                .is_some_and(|(_, span)| normalize(span) == repeat)
+        })
+    });
+    starts_line || prefix.ends_with(':') || emphasized
+}
+
+/// Whether a body cell holding two or more amounts shows signs of a merge:
+/// an empty cell beside it, or another body row holding exactly one amount
+/// in its column.
+fn merged_cell(rows: &[Vec<String>]) -> bool {
+    let body = rows.get(1..).unwrap_or_default();
+    body.iter().enumerate().any(|(index, row)| {
+        row.iter().enumerate().any(|(column, cell)| {
+            if amount_count(cell) < 2 {
+                return false;
+            }
+            let beside_empty = [column.checked_sub(1), Some(column + 1)]
+                .into_iter()
+                .flatten()
+                .filter_map(|neighbour| row.get(neighbour))
+                .any(String::is_empty);
+            let single_below = body
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .filter_map(|(_, other)| other.get(column))
+                .any(|other| amount_count(other) == 1);
+            beside_empty || single_below
+        })
+    })
 }
 
 fn is_table_row(line: &str) -> bool {
@@ -148,10 +208,14 @@ fn ends_with_words(text: &str, words: &str) -> bool {
             .is_some_and(|rest| rest.is_empty() || rest.ends_with(' '))
 }
 
-/// Whether a cell holds only amounts, two or more of them.
-fn holds_amounts(cell: &str) -> bool {
+/// How many amounts a cell holds, when it holds nothing else.
+fn amount_count(cell: &str) -> usize {
     let tokens: Vec<&str> = cell.split_whitespace().collect();
-    tokens.len() >= 2 && tokens.iter().all(|token| is_amount(token))
+    if tokens.iter().all(|token| is_amount(token)) {
+        tokens.len()
+    } else {
+        0
+    }
 }
 
 /// An amount: digits grouped by commas or with decimals, with an optional
@@ -200,6 +264,13 @@ mod tests {
         ] {
             assert!(!check(markdown).row_repeated, "{markdown}");
         }
+        // The detector leaves a repeat after a label, as on pages of the
+        // Internal Revenue Code; a sentence that restates the row is text
+        // the page shows.
+        let labelled = "**Beginning after: And before: Percent:** December 31, 1983 January 1, 1988 11.40\n\n|December 31, 1983|January 1, 1988|11.40|\n|---|---|---|\n";
+        assert!(check(labelled).row_repeated);
+        let sentence = "One Form W-2 was received from Example Manufacturing Inc. 52,000.00\n\n|Example Manufacturing Inc.|52,000.00|\n|---|---|\n|Total wages|52,000.00|\n";
+        assert!(!check(sentence).row_repeated);
     }
 
     #[test]
@@ -221,6 +292,14 @@ mod tests {
         }
         // A header row is not a body row.
         assert!(!check("| 2024 2025 | 1.5 2.5 |\n| --- | --- |\n| a | b |\n").values_merged);
+        // A column that stacks two amounts in every row does so by design;
+        // one row with a single amount below shows a merge.
+        let stacked = "| Employer | Wages | Withheld federal / state |\n| --- | --- | --- |\n| Example Manufacturing Inc. | 52,000.00 | 6,240.00 2,600.00 |\n| Example Services LLC | 18,000.00 | 2,160.00 900.00 |\n";
+        assert!(!check(stacked).values_merged);
+        let price = "| Item | Price | Total |\n| --- | --- | --- |\n| Return preparation | 750.00 (75.00) | 675.00 |\n";
+        assert!(!check(price).values_merged);
+        let uneven = "| Item | Basis | Adjustment |\n| --- | --- | --- |\n| Lot 1 | 2,610.25 205.25 | 12.00 |\n| Lot 2 | 1,200.00 | 3.00 |\n";
+        assert!(check(uneven).values_merged);
         // Tables inside code are not read.
         assert!(!check("```\n| a | 1.00 2.00 |\n```\n").values_merged);
         assert!(is_amount("$1,234.56") && is_amount("(12.00)") && is_amount("5.25%"));

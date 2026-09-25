@@ -126,6 +126,9 @@ struct Section {
     decimals: i32,
     /// An exponent, which shows a digit other than zero for any value.
     exponent: bool,
+    /// A fraction (`# ?/?`), which shows a value too small for a digit
+    /// before its point as a fraction ("1/4").
+    fraction: bool,
 }
 
 /// A format code as AnyDoc reads it.
@@ -350,6 +353,7 @@ fn parse_section(section: &str) -> Option<Section> {
             '$' | '-' | '+' | '(' | ')' | ':' | ' ' | '/' => {
                 tokens += 1;
                 parsed.sign |= matches!(character, '-' | '(' | ')');
+                parsed.fraction |= character == '/' && (digits || bare_digits);
                 push_literal(&mut parsed.literal, &character.to_string());
             }
             _ => return None,
@@ -507,7 +511,7 @@ pub(super) fn loss(id: u32, code: Option<&str>, class: CellClass) -> FormatLoss 
     let section = &numeric_sections[index];
     if let CellClass::Negative { shown_from } = class {
         // Too small to show a digit: a zero, however it is marked.
-        if !section.exponent && i32::from(shown_from) > section.decimals {
+        if !section.exponent && !section.fraction && i32::from(shown_from) > section.decimals {
             return FormatLoss::default();
         }
     }
@@ -595,6 +599,9 @@ mod tests {
             ("#,##0,;[Red]#,##0,", -400.0, false),
             ("#,##0,;[Red]#,##0,", -600.0, true),
             ("0.00E+00;[Red]0.00E+00", -2.91e-11, true),
+            // A fraction shows a quarter as "1/4".
+            ("# ?/?;[Red]# ?/?", -0.25, true),
+            ("# ??/??;[Red]# ??/??", -0.25, true),
         ] {
             assert_eq!(
                 loss(164, Some(code), class(value)).misrendered,
