@@ -129,6 +129,9 @@ struct Section {
     /// A fraction (`# ?/?`), which shows a value too small for a digit
     /// before its point as a fraction ("1/4").
     fraction: bool,
+    /// The digits of its denominator: placeholders (`?/??` shows up to 99)
+    /// or a fixed number (`?/16`).
+    denominator_digits: i32,
 }
 
 /// A format code as AnyDoc reads it.
@@ -207,6 +210,8 @@ fn parse_section(section: &str) -> Option<Section> {
     // The number's decimals, its trailing (scaling) commas, and percents.
     let (mut after_point, mut placeholders_after_point) = (false, 0i32);
     let (mut commas_after_digit, mut percents) = (0i32, 0i32);
+    // Whether the denominator of a fraction is being read.
+    let mut denominator = false;
     let mut index = 0;
     while index < characters.len() {
         let character = characters[index];
@@ -283,6 +288,11 @@ fn parse_section(section: &str) -> Option<Section> {
             }
             '0' | '#' | '?' | '.' | ',' | '%' => {
                 digits |= matches!(character, '0' | '#' | '?' | '.');
+                if denominator && matches!(character, '0' | '#' | '?') {
+                    parsed.denominator_digits += 1;
+                } else {
+                    denominator = false;
+                }
                 match character {
                     '.' => after_point = true,
                     ',' => commas_after_digit += 1,
@@ -346,6 +356,7 @@ fn parse_section(section: &str) -> Option<Section> {
                 bare_digits = true;
                 tokens += 1;
                 while index < characters.len() && characters[index].is_ascii_digit() {
+                    parsed.denominator_digits += i32::from(denominator);
                     index += 1;
                 }
                 continue;
@@ -353,7 +364,8 @@ fn parse_section(section: &str) -> Option<Section> {
             '$' | '-' | '+' | '(' | ')' | ':' | ' ' | '/' => {
                 tokens += 1;
                 parsed.sign |= matches!(character, '-' | '(' | ')');
-                parsed.fraction |= character == '/' && (digits || bare_digits);
+                denominator = character == '/' && (digits || bare_digits);
+                parsed.fraction |= denominator;
                 push_literal(&mut parsed.literal, &character.to_string());
             }
             _ => return None,
@@ -510,8 +522,16 @@ pub(super) fn loss(id: u32, code: Option<&str>, class: CellClass) -> FormatLoss 
     };
     let section = &numeric_sections[index];
     if let CellClass::Negative { shown_from } = class {
-        // Too small to show a digit: a zero, however it is marked.
-        if !section.exponent && !section.fraction && i32::from(shown_from) > section.decimals {
+        // Too small to show a digit: a zero, however it is marked. A
+        // fraction shows zero below half its smallest step, one over its
+        // largest denominator: a value too small for as many decimals as
+        // the denominator has digits.
+        let zero = if section.fraction {
+            i32::from(shown_from) > section.denominator_digits
+        } else {
+            !section.exponent && i32::from(shown_from) > section.decimals
+        };
+        if zero {
             return FormatLoss::default();
         }
     }
@@ -599,9 +619,19 @@ mod tests {
             ("#,##0,;[Red]#,##0,", -400.0, false),
             ("#,##0,;[Red]#,##0,", -600.0, true),
             ("0.00E+00;[Red]0.00E+00", -2.91e-11, true),
-            // A fraction shows a quarter as "1/4".
+            // A fraction shows a quarter as "1/4", and zero below half its
+            // smallest step: 1/18 for one digit, 1/198 for two, 1/32 for
+            // sixteenths (where a value between a thousandth and that step
+            // is still taken as shown).
             ("# ?/?;[Red]# ?/?", -0.25, true),
             ("# ??/??;[Red]# ??/??", -0.25, true),
+            ("# ?/?;[Red]# ?/?", -5.55e-17, false),
+            ("?/?;[Red]?/?", -0.03, false),
+            ("# ??/??;[Red]# ??/??", -0.004, false),
+            ("# ??/??;[Red]# ??/??", -0.006, true),
+            ("# ?/16;[Red]# ?/16", -0.001, false),
+            ("# ?/16;[Red]# ?/16", -0.1, true),
+            ("# ?/?;[Red]# ?/?", -1.5, true),
         ] {
             assert_eq!(
                 loss(164, Some(code), class(value)).misrendered,

@@ -2416,6 +2416,11 @@ struct DocxStoryScan {
     /// A paragraph's list instance or level written with white space
     /// around it, which Word reads and AnyDoc cannot parse.
     padded_numbering: bool,
+    /// The notes of the note parts in the order they are stored, the note
+    /// being read, and where the body first references each.
+    notes_stored: Vec<(bool, String)>,
+    note: Option<u32>,
+    note_references: HashMap<(bool, String), usize>,
 }
 
 /// A Word story part, in the order AnyDoc converts them.
@@ -2433,6 +2438,8 @@ struct DocxListParagraph {
     /// Its entry in `DocxStoryScan::list_uses`.
     used: u32,
     part: DocxPart,
+    /// The note it is in: its entry in `DocxStoryScan::notes_stored`.
+    note: Option<u32>,
     /// It sits in a text box. Word numbers the text boxes of a document as
     /// one story, apart from the text around them, as it does all the
     /// footnotes and all the endnotes; AnyDoc counts on through every
@@ -2585,6 +2592,14 @@ struct WordNode {
     /// For `mc:AlternateContent`: AnyDoc, or Word, has taken a branch.
     anydoc_took: bool,
     word_took: bool,
+    /// For `mc:AlternateContent`: the branches AnyDoc has taken, and the
+    /// numbered paragraphs of Word's branch, which Word shows only if AnyDoc
+    /// takes no branch.
+    anydoc_branches: u32,
+    pending: Vec<usize>,
+    /// For an `mc:Choice` or `mc:Fallback`: the first branch of its
+    /// alternate content that AnyDoc takes, which stands for Word's.
+    anydoc_first: bool,
 }
 
 impl WordNode {
@@ -2776,8 +2791,40 @@ fn take_word_branch<R>(
     let word_takes = !alternate.word_took && (!choice || mc_choice_understood(reader, event));
     alternate.anydoc_took |= anydoc_takes && !searching;
     alternate.word_took |= word_takes;
+    node.anydoc_first = anydoc_takes && alternate.anydoc_branches == 0;
+    alternate.anydoc_branches += u32::from(anydoc_takes);
     node.anydoc_skips = !anydoc_takes;
     node.word_skips = !word_takes;
+}
+
+/// Whether Word shows a numbered paragraph as far as the branches of
+/// `mc:AlternateContent` around it decide, where the two take different
+/// branches: those hold the same content in two vocabularies, so the first
+/// branch AnyDoc takes stands for Word's, and Word's own branch counts only
+/// if AnyDoc takes none, which the end of its alternate content decides.
+/// `Some(index)` is the stack index of that alternate content.
+fn word_branch_shows(stack: &[WordNode]) -> Result<bool, usize> {
+    let mut pending = None;
+    for (index, node) in stack.iter().enumerate() {
+        let branch = node.vocabulary == WordVocabulary::MarkupCompatibility
+            && matches!(node.local.as_slice(), b"Choice" | b"Fallback");
+        if !branch {
+            continue;
+        }
+        if !node.anydoc_skips {
+            if !node.anydoc_first {
+                return Ok(false);
+            }
+        } else if node.word_skips || pending.is_some() {
+            return Ok(false);
+        } else {
+            match index.checked_sub(1).map(|parent| &stack[parent]) {
+                Some(alternate) if alternate.anydoc_branches == 0 => pending = Some(index - 1),
+                _ => return Ok(false),
+            }
+        }
+    }
+    pending.map_or(Ok(true), Err)
 }
 
 /// Scan one Word story part into `scan`. Parse errors fail closed as
@@ -2806,8 +2853,12 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     word_skips: false,
                     anydoc_took: false,
                     word_took: false,
+                    anydoc_branches: 0,
+                    pending: Vec::new(),
+                    anydoc_first: false,
                 };
                 if stack.is_empty() {
+                    scan.note = None;
                     scan.part = match node.local.as_slice() {
                         b"footnotes" => DocxPart::Footnotes,
                         b"endnotes" => DocxPart::Endnotes,
@@ -2827,6 +2878,9 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     word_skips: false,
                     anydoc_took: false,
                     word_took: false,
+                    anydoc_branches: 0,
+                    pending: Vec::new(),
+                    anydoc_first: false,
                 };
                 take_word_branch(&reader, &event, &mut node, &mut stack);
                 scan.hidden_run |= drawing_choice_word_skips(&reader, &event, &node, &stack);
@@ -2834,6 +2888,18 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
             }
             quick_xml::events::Event::End(_) => {
                 let closed = stack.pop();
+                // Word's branch of alternate content AnyDoc took no branch
+                // of is what Word shows.
+                if let Some(alternate) = closed
+                    .as_ref()
+                    .filter(|node| node.anydoc_branches == 0 && !node.pending.is_empty())
+                {
+                    for &index in &alternate.pending {
+                        if let Some(paragraph) = scan.list_paragraphs.get_mut(index) {
+                            paragraph.word = true;
+                        }
+                    }
+                }
                 if closed.is_some_and(|node| node.is(WordVocabulary::Word, b"pPr"))
                     && word_path_ends_with(&stack, &[b"p"])
                 {
@@ -2861,19 +2927,27 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                         if scan.list_paragraphs.len() >= MAX_DOCX_LIST_PARAGRAPHS {
                             return Err(DocumentError::ResourceLimit);
                         }
-                        let branch_taken = |skips: fn(&WordNode) -> bool| !stack.iter().any(skips);
-                        let anydoc =
-                            branch_taken(|node| node.anydoc_skips) && !word_content_omitted(&stack);
-                        let word = branch_taken(|node| node.word_skips)
-                            && !mark.deleted
-                            && !stack.iter().any(|node| {
+                        let anydoc = !stack.iter().any(|node| node.anydoc_skips)
+                            && !word_content_omitted(&stack);
+                        let deleted = mark.deleted
+                            || stack.iter().any(|node| {
                                 node.vocabulary == WordVocabulary::Word
                                     && matches!(node.local.as_slice(), b"del" | b"moveFrom")
                             });
-                        if anydoc || word {
+                        let branch = if deleted {
+                            Ok(false)
+                        } else {
+                            word_branch_shows(&stack)
+                        };
+                        let word = branch == Ok(true);
+                        if let Err(alternate) = branch {
+                            stack[alternate].pending.push(scan.list_paragraphs.len());
+                        }
+                        if anydoc || word || branch.is_err() {
                             scan.list_paragraphs.push(DocxListParagraph {
                                 used: id,
                                 part: scan.part,
+                                note: scan.note.filter(|_| scan.part != DocxPart::Body),
                                 in_text_box: stack
                                     .iter()
                                     .any(|node| node.is(WordVocabulary::Word, b"txbxContent")),
@@ -2963,7 +3037,10 @@ fn scan_docx_element(
         {
             if let Some(id) = xml_attribute_value(event, b"id") {
                 let endnote = node.local == b"endnoteReference";
-                record_note(&mut scan.notes_referenced, (endnote, id.trim().to_string()))?;
+                let note = (endnote, id.trim().to_string());
+                record_note(&mut scan.notes_referenced, note.clone())?;
+                let order = scan.note_references.len();
+                scan.note_references.entry(note).or_insert(order);
             }
         }
         b"footnote" | b"endnote"
@@ -2980,8 +3057,17 @@ fn scan_docx_element(
                 }) =>
         {
             let endnote = node.local == b"endnote";
-            for id in xml_attribute_values(event, b"id") {
+            let ids = xml_attribute_values(event, b"id");
+            for id in &ids {
                 record_note(&mut scan.notes_defined, (endnote, id.trim().to_string()))?;
+            }
+            scan.note = None;
+            if let Some(id) = ids.first() {
+                if scan.notes_stored.len() >= MAX_DOCX_NOTES {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                scan.note = Some(scan.notes_stored.len() as u32);
+                scan.notes_stored.push((endnote, id.trim().to_string()));
             }
         }
         // A row deleted with tracked changes, which AnyDoc converts as
@@ -3478,6 +3564,35 @@ impl DocxNumbering {
     /// AnyDoc resolves them: a list given directly or its style chain's, and
     /// a level given directly, or the level bound to the first style along
     /// the chain, or the first. A list instance of 0 removes numbering.
+    /// Whether Word numbers a paragraph at another level than AnyDoc: one
+    /// its style's numbering names, where no level of the list is bound to
+    /// the style. AnyDoc reads only that binding, else the first level.
+    fn style_level_differs(&self, used: &DocxListUse, styles: &DocxStyleNumbering) -> bool {
+        let (None, Some(style)) = (used.level, used.style.as_deref()) else {
+            return false;
+        };
+        let Some((list, level)) = self.resolve_use(used, styles) else {
+            return false;
+        };
+        let bound = self.lists.get(&list).is_some_and(|instance| {
+            self.resolve_definition(&instance.definition, styles, false)
+                .and_then(|definition| self.levels_from(instance, definition))
+                .is_some_and(|levels| {
+                    styles.chain(style).any(|style| {
+                        levels.iter().any(|level| {
+                            level
+                                .as_ref()
+                                .is_some_and(|level| level.style.as_deref() == Some(style))
+                        })
+                    })
+                })
+        });
+        !bound
+            && styles
+                .level(style)
+                .is_some_and(|named| named.min(DOCX_LIST_LEVELS - 1) != level)
+    }
+
     fn resolve_use(&self, used: &DocxListUse, styles: &DocxStyleNumbering) -> Option<(u64, usize)> {
         let list = match used.list {
             Some(list) => list,
@@ -3523,6 +3638,42 @@ impl DocxNumbering {
     /// starts at 1 where a level names no start. A paragraph Word does not
     /// show, such as one whose mark is deleted, still takes a number in
     /// AnyDoc.
+    /// Whether a list runs through notes whose stored order, id order, and
+    /// order of reference disagree. AnyDoc numbers the notes as they are
+    /// stored; LibreOffice numbers them by id, and Word lays them out as the
+    /// text references them. With the three apart, which numbers the reader
+    /// sees is uncertain, and the list is disclosed.
+    fn notes_out_of_order(scan: &DocxStoryScan, resolved: &[Option<(u64, usize)>]) -> bool {
+        let mut notes: HashMap<(DocxPart, u64), Vec<u32>> = HashMap::new();
+        for paragraph in &scan.list_paragraphs {
+            let (Some(note), Some(Some((list, _)))) =
+                (paragraph.note, resolved.get(paragraph.used as usize))
+            else {
+                continue;
+            };
+            let seen = notes.entry((paragraph.part, *list)).or_default();
+            if seen.last() != Some(&note) {
+                seen.push(note);
+            }
+        }
+        notes.values().filter(|seen| seen.len() > 1).any(|seen| {
+            let stored: Vec<&(bool, String)> = seen
+                .iter()
+                .filter_map(|&note| scan.notes_stored.get(note as usize))
+                .collect();
+            let ids: Option<Vec<i64>> = stored.iter().map(|(_, id)| id.parse().ok()).collect();
+            let references: Option<Vec<usize>> = stored
+                .iter()
+                .map(|note| scan.note_references.get(*note).copied())
+                .collect();
+            let rising = |values: &[i64]| values.windows(2).all(|pair| pair[0] < pair[1]);
+            let ids_rise = ids.as_deref().is_some_and(rising);
+            let references_rise = references
+                .is_some_and(|references| references.windows(2).all(|pair| pair[0] < pair[1]));
+            !(ids_rise && references_rise)
+        })
+    }
+
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
         // A value only Word can read may number what AnyDoc does not.
         if scan.padded_numbering || self.padded || styles.padded {
@@ -3533,6 +3684,23 @@ impl DocxNumbering {
             .iter()
             .map(|used| self.resolve_use(used, styles))
             .collect();
+        if Self::notes_out_of_order(scan, &resolved) {
+            return true;
+        }
+        // A level only Word reads from the paragraph's style.
+        let shown_by_both: HashSet<u32> = scan
+            .list_paragraphs
+            .iter()
+            .filter(|paragraph| paragraph.anydoc && paragraph.word)
+            .map(|paragraph| paragraph.used)
+            .collect();
+        if shown_by_both.iter().any(|&used| {
+            scan.list_uses
+                .get(used as usize)
+                .is_some_and(|used| self.style_level_differs(used, styles))
+        }) {
+            return true;
+        }
         let mut instances: HashMap<u64, Option<DocxInstance>> = HashMap::new();
         // Word's stories: a part, or `None` for the text boxes.
         let mut word: HashMap<(Option<DocxPart>, String), DocxCounters> = HashMap::new();
@@ -3668,6 +3836,8 @@ struct DocxStyleNumbering {
 struct DocxStyleList {
     based_on: Option<String>,
     list: Option<u64>,
+    /// The level its numbering names (`w:numPr/w:ilvl`).
+    level: Option<usize>,
 }
 
 /// Styles stepped through along `w:basedOn` chains in one document. AnyDoc
@@ -3699,6 +3869,16 @@ impl DocxStyleNumbering {
     /// Whether the chains stepped through ran past their budget.
     fn exhausted(&self) -> bool {
         self.steps.get() > MAX_DOCX_CHAIN_STEPS
+    }
+
+    /// The level a paragraph style's numbering names: the first along its
+    /// chain that names one.
+    fn level(&self, style: &str) -> Option<usize> {
+        self.chain(style).find_map(|style| {
+            self.styles
+                .get(style)
+                .and_then(|definition| definition.level)
+        })
     }
 
     /// The list instance a paragraph style numbers with: the first along its
@@ -3781,6 +3961,13 @@ fn docx_style_numbering(
                 if let (Some(id), Some(list)) = (&open, value().and_then(|list| list.parse().ok()))
                 {
                     numbering.styles.entry(id.clone()).or_default().list = Some(list);
+                }
+            }
+            b"ilvl" if xml_path_ends_with(&stack, &[b"style", b"pPr", b"numPr"]) => {
+                if let (Some(id), Some(level)) =
+                    (&open, value().and_then(|level| level.parse::<usize>().ok()))
+                {
+                    numbering.styles.entry(id.clone()).or_default().level = Some(level);
                 }
             }
             _ => {}
@@ -9616,6 +9803,109 @@ mod tests {
             pptx_slide_relationship_ids(presentation.as_bytes()),
             Err(DocumentError::Malformed)
         ));
+    }
+
+    #[test]
+    fn docx_list_numbers_across_branches_notes_and_styles() {
+        let item = |text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let numbering = format!(
+            r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        );
+        let differs = |body: &str, extra: &[(&str, Vec<u8>)]| {
+            let document = word_part("document", body);
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+            ];
+            entries.extend(extra.iter().map(|(name, bytes)| (*name, bytes.as_slice())));
+            docx_preflight(&entries).list_numbering_differs
+        };
+        // Word takes a choice AnyDoc cannot read, and AnyDoc the fallback
+        // holding the same list: one list, numbered alike.
+        let alternate = |choice: String, fallback: Option<String>| {
+            format!(
+                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><mc:Choice Requires="w14">{choice}</mc:Choice>{}</mc:AlternateContent>"#,
+                fallback
+                    .map(|fallback| format!("<mc:Fallback>{fallback}</mc:Fallback>"))
+                    .unwrap_or_default()
+            )
+        };
+        let list = format!("{}{}", item("A"), item("B"));
+        assert!(!differs(
+            &format!(
+                "{}{}",
+                alternate(list.clone(), Some(list.clone())),
+                item("C")
+            ),
+            &[]
+        ));
+        // With no branch AnyDoc reads, Word still counts its own.
+        assert!(differs(
+            &format!("{}{}", alternate(list, None), item("C")),
+            &[]
+        ));
+        // A list through notes stored in another order than their ids and
+        // references reads in an order no one oracle settles.
+        let reference =
+            |id: u32| format!(r#"<w:p><w:r><w:footnoteReference w:id="{id}"/></w:r></w:p>"#);
+        let footnotes = |ids: &[u32]| {
+            let notes: String = ids
+                .iter()
+                .map(|id| {
+                    format!(
+                        r#"<w:footnote w:id="{id}">{}</w:footnote>"#,
+                        item(&format!("Note {id}"))
+                    )
+                })
+                .collect();
+            format!("<w:footnotes {WORD_NS}>{notes}</w:footnotes>").into_bytes()
+        };
+        let body = format!("{}{}", reference(1), reference(2));
+        assert!(!differs(
+            &body,
+            &[("word/footnotes.xml", footnotes(&[1, 2]))]
+        ));
+        assert!(differs(
+            &body,
+            &[("word/footnotes.xml", footnotes(&[2, 1]))]
+        ));
+        let reversed = format!("{}{}", reference(2), reference(1));
+        assert!(differs(
+            &reversed,
+            &[("word/footnotes.xml", footnotes(&[1, 2]))]
+        ));
+        // A paragraph style naming a level no level binds: Word numbers at
+        // it, AnyDoc at the first.
+        let styled = |bound: bool| {
+            let styles = format!(
+                r#"<w:styles {WORD_NS}><w:style w:type="paragraph" w:styleId="ListSub"><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>"#
+            );
+            let numbering = if bound {
+                numbering.replace(
+                    r#"<w:lvl w:ilvl="1">"#,
+                    r#"<w:lvl w:ilvl="1"><w:pStyle w:val="ListSub"/>"#,
+                )
+            } else {
+                numbering.clone()
+            };
+            let body: String = ["A", "B"]
+                .iter()
+                .map(|text| format!(r#"<w:p><w:pPr><w:pStyle w:val="ListSub"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#))
+                .collect();
+            let document = word_part("document", &body);
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        assert!(styled(false));
+        assert!(!styled(true));
     }
 
     #[test]

@@ -282,6 +282,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     first row repeated after a line of form fields ("Acct: 5678 Period:
     April 2025"), which the detector keeps out of the table, is reported;
     the upstream #406 fixtures now show it.
+  - DOCX: where Word and AnyDoc take different branches of
+    `mc:AlternateContent` (a drawing canvas or a Word 2010 block Word reads,
+    and the fallback AnyDoc reads), the branches hold the same list, which
+    had been flagged; the first branch AnyDoc takes now stands for Word's.
+    Word's branch still counts where AnyDoc takes none. A paragraph style
+    naming its own list level (`w:numPr/w:ilvl`), with no level bound to
+    the style, is numbered at that level by Word and at the first by
+    AnyDoc ("a)" against "1."); it is disclosed. So is a list running
+    through footnotes or endnotes stored in another order than their ids
+    or their references: AnyDoc numbers them as stored, LibreOffice by id,
+    and Word in the order the text references them.
+  - XLSX and ODS: a negative residue such as -5.55e-17 in a colour-only
+    fraction format shows as 0 in Excel, and is no longer refused; a
+    fraction shows zero below half its smallest step.
 - Review round six found four missed losses and seven false positives in
   loops 12 and 13 and the round-five fixes; all are fixed:
   - EPUB: AnyDoc flattens a link's content into the text around it, so
@@ -444,8 +458,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compared as the level's number text shows them, in each level's format
   or, for legal numbering (`w:isLgl`), in decimal; a format other than
   decimal, roman, or letters counts as differing. A paragraph style's own
-  `w:ilvl` is ignored, as AnyDoc and ECMA-376 ignore it. Where Word supports
-  a block-level `mc:Choice` that AnyDoc does not, AnyDoc converts the
-  `mc:Fallback`; the check assumes the two branches hold the same text.
-  A level with `w:lvlRestart="0"` is taken never to restart, as Word does,
-  although LibreOffice restarts it.
+  `w:ilvl`, which AnyDoc and ECMA-376 ignore and Word and LibreOffice read,
+  is disclosed where no level is bound to the style. Where Word and AnyDoc
+  take different branches of `mc:AlternateContent`, the check assumes the
+  branches hold the same text. A list through notes stored out of id or
+  reference order is disclosed without a verdict; no application at hand
+  settles which order Word numbers them in. A level with
+  `w:lvlRestart="0"` is taken never to restart, as Word does, although
+  LibreOffice restarts it.
