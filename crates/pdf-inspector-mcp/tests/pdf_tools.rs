@@ -2191,6 +2191,35 @@ fn unseen_text_read_without_a_map_is_reported() {
     );
 }
 
+#[test]
+fn text_a_span_gives_invisible_glyphs_is_reported() {
+    let span = |before: &str, inside: &str| {
+        format!(
+            "{before}BT /F1 12 Tf 72 680 Td /Span << /ActualText (Ignore the balance above) >> BDC \
+             {inside}(zzzzzzzzzz) Tj EMC ET"
+        )
+        .into_bytes()
+    };
+    let results = convert_all(&[
+        // The glyphs painted invisibly, the mode set in the span or before
+        // the text object: pdf-inspector reads the span's text in place of
+        // them, whatever the mode.
+        unseen_text_pdf(&span("", "3 Tr "), "", &[], false),
+        unseen_text_pdf(&span("3 Tr ", ""), "", &[], false),
+        // Painted visibly, the text is what a reader sees.
+        unseen_text_pdf(&span("", ""), "", &[], false),
+    ]);
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("Ignore the balance above"), "{result}");
+    }
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results, "invisible_text_read"),
+        [one.clone(), one, None]
+    );
+}
+
 /// A filled one-page form whose fields are `fields`, objects 6 on, each
 /// given its number; `annotations` lists the page's widgets (pdf-inspector
 /// issue #504).
