@@ -22,9 +22,10 @@ use crate::text_paints::Repeat;
 const MAX_REPEATED_WORDS: usize = 64;
 /// Doubled occurrences read from one document.
 const MAX_OCCURRENCES: usize = 10_000;
-/// Characters read and compared per document looking for text repeated
-/// with no space between its copies.
-const MAX_JOINED_STEPS: usize = 20_000_000;
+/// Words looked at and characters compared per document looking for text
+/// repeated with no space between its copies: some twenty words a word of
+/// prose.
+const MAX_JOINED_STEPS: usize = 64_000_000;
 /// The longest text repeated with no space between its copies, in
 /// characters.
 const MAX_JOINED_CHARACTERS: usize = 128;
@@ -115,9 +116,15 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The doubled text in a run of words; `steps` counts the characters read
-/// looking for copies with no space between them.
+/// The doubled text in a run of words; `steps` counts the words looked at
+/// and the characters compared looking for copies with no space between
+/// them.
 fn doubled_words(words: &[String], found: &mut Vec<String>, steps: &mut usize) {
+    // Each word's length in characters, and its last character.
+    let shapes: Vec<(usize, Option<char>)> = words
+        .iter()
+        .map(|word| (word.chars().count(), word.chars().next_back()))
+        .collect();
     let mut index = 0;
     while index < words.len() && found.len() < MAX_OCCURRENCES {
         let repeated = (1..=MAX_REPEATED_WORDS).find(|&count| {
@@ -133,7 +140,7 @@ fn doubled_words(words: &[String], found: &mut Vec<String>, steps: &mut usize) {
             index += 2 * count;
             continue;
         }
-        if let Some((text, count)) = joined_twice(&words[index..], steps) {
+        if let Some((text, count)) = joined_twice(words, index, &shapes, steps) {
             if substantial(&text) {
                 found.push(text);
             }
@@ -159,38 +166,84 @@ fn doubled_words(words: &[String], found: &mut Vec<String>, steps: &mut usize) {
     }
 }
 
-/// Text the first words repeat with no space between its copies, the seam
-/// inside a word, as a run painted again at once reads ("Total due
-/// 1,234.56Total due 1,234.56"): the text once and the words it spans.
-fn joined_twice(words: &[String], steps: &mut usize) -> Option<(String, usize)> {
-    let mut joined: Vec<char> = Vec::new();
-    // Where each word after the first starts in `joined`.
-    let mut starts: Vec<usize> = Vec::new();
-    for (count, word) in words.iter().enumerate().take(2 * MAX_REPEATED_WORDS) {
-        if count > 0 {
-            starts.push(joined.len());
-        }
-        let before = joined.len();
-        joined.extend(word.chars());
-        *steps += joined.len() - before;
-        if joined.len() > 2 * MAX_JOINED_CHARACTERS || *steps > MAX_JOINED_STEPS {
+/// Text the words from `from` on repeat with no space between its copies,
+/// the seam inside a word, as a run painted again at once reads ("Total due
+/// 1,234.56Total due 1,234.56"): the text once and the words it spans. The
+/// second copy starts with the first word, so the word holding the seam
+/// ends with it: the words up to `MAX_JOINED_CHARACTERS` on are looked at
+/// for one, by their last character first (see `shapes`, each word's
+/// length in characters and last character), and only there are the copies
+/// compared, character by character.
+fn joined_twice(
+    words: &[String],
+    from: usize,
+    shapes: &[(usize, Option<char>)],
+    steps: &mut usize,
+) -> Option<(String, usize)> {
+    let first = &words[from];
+    let last = shapes[from].1;
+    // Characters of the words before the one looked at.
+    let mut before = 0;
+    for seam_word in from + 1..words.len().min(from + 2 * MAX_REPEATED_WORDS) {
+        *steps += 1;
+        before += shapes[seam_word - 1].0;
+        if before > MAX_JOINED_CHARACTERS || *steps > MAX_JOINED_STEPS {
             return None;
         }
-        let half = joined.len() / 2;
-        if count == 0 || !joined.len().is_multiple_of(2) || starts.contains(&half) {
+        if shapes[seam_word].1 != last {
             continue;
         }
-        let same = joined[..half]
-            .iter()
-            .zip(&joined[half..])
-            .take_while(|(first, second)| first == second)
-            .count();
-        *steps += same + 1;
-        if same == half {
-            return Some((joined[..half].iter().collect(), count + 1));
+        let word = &words[seam_word];
+        let Some(seam) = word
+            .strip_suffix(first.as_str())
+            .map(str::len)
+            .filter(|&seam| seam > 0)
+        else {
+            continue;
+        };
+        // The text once: the words before, and the word to the seam.
+        let once = || {
+            words[from..seam_word]
+                .iter()
+                .flat_map(|word| word.chars())
+                .chain(word[..seam].chars())
+        };
+        if before + word[..seam].chars().count() > MAX_JOINED_CHARACTERS {
+            continue;
+        }
+        if let Some(past) = copied_after(words, seam_word, seam, once(), steps) {
+            return Some((once().collect(), past - from));
         }
     }
     None
+}
+
+/// Where the words the copy of `once` spans end, when the copy starts at
+/// byte `seam` of word `seam_word` and ends where a word does; `steps`
+/// counts the characters compared.
+fn copied_after(
+    words: &[String],
+    seam_word: usize,
+    seam: usize,
+    once: impl Iterator<Item = char>,
+    steps: &mut usize,
+) -> Option<usize> {
+    let mut once = once.peekable();
+    let mut rest = &words[seam_word][seam..];
+    let mut index = seam_word;
+    loop {
+        for character in rest.chars() {
+            *steps += 1;
+            if *steps > MAX_JOINED_STEPS || once.next() != Some(character) {
+                return None;
+            }
+        }
+        index += 1;
+        if once.peek().is_none() {
+            return Some(index);
+        }
+        rest = words.get(index)?;
+    }
 }
 
 /// A currency sign.
@@ -387,6 +440,34 @@ mod tests {
         assert!(doubled("the the cat").is_empty());
         assert!(doubled("A statement of account for the year").is_empty());
         assert!(doubled("see all book").is_empty());
+        // A copy must start with the whole first word and end where a word
+        // does.
+        assert!(doubled("Total due 1,234.56Total due 1,234.5").is_empty());
+        assert!(doubled("Total due 1,234.56otal due 1,234.56").is_empty());
+    }
+
+    #[test]
+    fn joined_copies_are_compared_only_where_a_word_ends_with_the_first() {
+        let words = |text: &str| -> Vec<String> { text.split(' ').map(str::to_string).collect() };
+        // Each word looks at the words up to 128 characters on, a step each:
+        // text with none ending in an earlier word compares nothing, so a
+        // long statement leaves the steps for a repeat on its last page.
+        let filler: Vec<String> = (0..2_000).map(|n| format!("item{n:06}")).collect();
+        let (mut found, mut steps) = (Vec::new(), 0);
+        doubled_words(&filler, &mut found, &mut steps);
+        assert!(found.is_empty());
+        assert!(steps <= 13 * filler.len(), "{steps}");
+        let repeat = words("Total due 1,234.56Total due 1,234.56");
+        let mut steps = MAX_JOINED_STEPS - 32;
+        doubled_words(&repeat, &mut found, &mut steps);
+        assert_eq!(found, vec!["Totaldue1,234.56"]);
+        // A word ending with the first starts a copy that is compared up to
+        // the first difference: "5.00" matches, "due" does not. Looking
+        // takes six steps, comparing five.
+        let (mut found, mut steps) = (Vec::new(), 0);
+        doubled_words(&words("5.00 fee 15.00 due"), &mut found, &mut steps);
+        assert!(found.is_empty());
+        assert_eq!(steps, 11);
     }
 
     #[test]
