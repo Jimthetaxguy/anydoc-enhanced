@@ -2876,6 +2876,8 @@ fn match_complex(
 struct StyleRule {
     selector: ComplexSelector,
     declarations: Rc<[Declaration]>,
+    /// Its painting declarations (see [`Cascade::references`]).
+    paintings: Rc<[Painting]>,
     /// The classes, ids, and element names its ancestor compounds require
     /// (see [`AncestorKeys`]).
     ancestor_keys: Box<[u64]>,
@@ -2994,13 +2996,16 @@ impl AncestorKeys {
 /// A stylesheet reduced to what the check reads: its rules that set
 /// `display`, `visibility`, or `content-visibility` where their conditions
 /// may hold, and the stylesheets it imports for a screen, in order. Rules
-/// that set a margin, padding, width, or flex basis are kept apart as well,
-/// and counted where they set nothing else.
+/// that set a margin, padding, width, or flex basis, or that name an SVG
+/// resource to paint, are kept apart as well, and counted where they set
+/// nothing else.
 #[derive(Debug, Default)]
 pub(super) struct Stylesheet {
     rules: Vec<Rc<StyleRule>>,
     spacing: Vec<Rc<StyleRule>>,
-    spacing_only: usize,
+    painting: Vec<Rc<StyleRule>>,
+    /// The rules kept only for their spacing or painting.
+    others: usize,
     pub(super) imports: Vec<String>,
     /// The cascade layers it declares, in order, each by its names from the
     /// outermost; an anonymous one by a name no sheet can write.
@@ -3009,7 +3014,7 @@ pub(super) struct Stylesheet {
 
 impl Stylesheet {
     pub(super) fn rule_count(&self) -> usize {
-        self.rules.len() + self.spacing_only
+        self.rules.len() + self.others
     }
 
     /// The layer named `names` inside `parent` (an anonymous one where
@@ -3255,6 +3260,7 @@ fn parse_style_block(
     nesting: usize,
 ) -> Result<(), DocumentError> {
     let mut declarations = Vec::new();
+    let mut paintings = Vec::new();
     let mut index = 0;
     while index < block.len() {
         match &block[index] {
@@ -3291,21 +3297,25 @@ fn parse_style_block(
                             .into_iter()
                             .flatten(),
                     );
+                    paintings.extend(parse_painting(&block[start..index]));
                     index += 1;
                 }
             }
         }
     }
-    if context.condition != Tri::No && !declarations.is_empty() {
+    if context.condition != Tri::No && !(declarations.is_empty() && paintings.is_empty()) {
         let declarations: Rc<[Declaration]> = declarations.into();
+        let paintings: Rc<[Painting]> = paintings.into();
         // A `::before` or `::after` box matters for where a reader breaks
         // lines, which its `display`, `content`, `float`, `position`, and
         // `white-space` decide, for the text it shows, which its
         // `visibility` and `opacity` may keep unseen, and for whether its
         // margins and padding set a dash apart from the element's content.
-        // An element's own `content`, `white-space`, and `opacity` are not
-        // read, and its margins, padding, width, and flex basis only for
-        // flex and grid items (see [`Cascade::item_box`]).
+        // An element's own `content` and `white-space` are not read, its
+        // `opacity` only where it refers to an SVG resource, and its
+        // margins, padding, width, and flex basis only for flex and grid
+        // items (see [`Cascade::item_box`]). Painting properties that name
+        // an SVG resource are kept apart (see [`Cascade::references`]).
         let lays_out = declarations.iter().any(|declaration| {
             matches!(
                 declaration.property,
@@ -3322,7 +3332,7 @@ fn parse_style_block(
             !declaration.property.spaces()
                 && !matches!(
                     declaration.property,
-                    Property::Content | Property::WhiteSpace | Property::Opacity
+                    Property::Content | Property::WhiteSpace
                 )
         });
         let spaces = declarations
@@ -3335,19 +3345,24 @@ fn parse_style_block(
                 PseudoElement::Other => false,
             };
             let spacing = spaces && selector.pseudo_element == PseudoElement::None;
-            if kept || spacing {
+            let painting = !paintings.is_empty() && selector.pseudo_element == PseudoElement::None;
+            if kept || spacing || painting {
                 let ancestor_keys = ancestor_keys(&selector, selector.compounds.len() - 1);
                 let rule = Rc::new(StyleRule {
                     selector,
                     declarations: declarations.clone(),
+                    paintings: paintings.clone(),
                     ancestor_keys,
                     condition: context.condition,
                     layer: context.layer,
                 });
+                if painting {
+                    sheet.painting.push(rule.clone());
+                }
                 if spacing {
                     sheet.spacing.push(rule.clone());
-                    sheet.spacing_only += usize::from(!kept);
                 }
+                sheet.others += usize::from(!kept);
                 if kept {
                     sheet.rules.push(rule);
                 }
@@ -3355,6 +3370,70 @@ fn parse_style_block(
         }
     }
     Ok(())
+}
+
+/// Where a painting declaration stands in the cascade, how surely it
+/// applies, and the SVG resource it names, if one (see
+/// [`Cascade::references`]).
+type Named = (Precedence, Tri, Option<Rc<str>>);
+
+/// A declaration of a painting property (see [`PAINTING_PROPERTIES`]): which
+/// one, whether it is `!important`, and the SVG resource its value names
+/// (`url(#id)`), `None` for any other value, which names none.
+#[derive(Clone, Debug)]
+struct Painting {
+    property: u8,
+    important: bool,
+    target: Option<Rc<str>>,
+}
+
+/// The painting declaration a token run holds, if it holds one.
+fn parse_painting(tokens: &[Token]) -> Option<Painting> {
+    let [Token::Ident(name), rest @ ..] = trim_whitespace(tokens) else {
+        return None;
+    };
+    let property = PAINTING_PROPERTIES
+        .iter()
+        .position(|property| name.eq_ignore_ascii_case(property))? as u8;
+    let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
+        return None;
+    };
+    let mut value = trim_whitespace(value);
+    let mut important = false;
+    if let [before @ .., Token::Ident(word)] = value {
+        if word.eq_ignore_ascii_case("important") {
+            if let [before @ .., Token::Delim('!')] = trim_whitespace(before) {
+                important = true;
+                value = trim_whitespace(before);
+            }
+        }
+    }
+    Some(Painting {
+        property,
+        important,
+        target: url_target(value).map(Rc::from),
+    })
+}
+
+/// The id the first `url(#id)` reference among a value's tokens names: a
+/// `url` token, or a `url()` function holding a string.
+fn url_target(value: &[Token]) -> Option<&str> {
+    let mut index = 0;
+    while index < value.len() {
+        match &value[index] {
+            Token::Url(target) => return fragment(target),
+            Token::Function(function) if function.eq_ignore_ascii_case("url") => {
+                let (arguments, _) = block_at(value, index);
+                return match trim_whitespace(arguments) {
+                    [Token::Str(target)] => fragment(target),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        index = skip_component(value, index);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3441,6 +3520,9 @@ pub(super) struct ReaderStyle {
     /// Whether it is positioned out of the flow (`absolute`, `fixed`),
     /// apart from the lines around it.
     positioned: Tri,
+    /// Whether it is transparent (`opacity: 0`), with all it holds, which
+    /// is read only for an SVG element that refers to a resource.
+    transparent: Tri,
     /// Whether it lays its children out as flex or grid items, and how
     /// they stand.
     items: Tri,
@@ -3532,12 +3614,12 @@ impl ReaderStyle {
 
 /// The value of the certain declaration that wins the cascade, or `default`
 /// when none does, and whether one that may apply above it says otherwise.
-fn resolve_value<T: Copy + PartialEq>(applied: &[(Precedence, Tri, T)], default: T) -> (T, bool) {
+fn resolve_value<T: Clone + PartialEq>(applied: &[(Precedence, Tri, T)], default: T) -> (T, bool) {
     let best = applied
         .iter()
         .filter(|(_, certainty, _)| *certainty == Tri::Yes)
         .max_by_key(|(precedence, _, _)| *precedence);
-    let value = best.map_or(default, |best| best.2);
+    let value = best.map_or(default, |best| best.2.clone());
     let contested = applied.iter().any(|(precedence, certainty, other)| {
         *certainty != Tri::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
     });
@@ -3662,7 +3744,15 @@ pub(super) struct Cascade {
     spacing_rules: Vec<(Rc<StyleRule>, u32, u32)>,
     spacing_by_key: HashMap<u64, Vec<usize>>,
     spacing_anywhere: Vec<usize>,
-    spacing_only: usize,
+    /// Rules that set a painting property, indexed as those setting a
+    /// margin or padding are (see [`Cascade::references`]), and the ids
+    /// they name.
+    painting_rules: Vec<(Rc<StyleRule>, u32, u32)>,
+    painting_by_key: HashMap<u64, Vec<usize>>,
+    painting_anywhere: Vec<usize>,
+    painted_ids: std::collections::HashSet<Rc<str>>,
+    /// The rules kept only for their spacing or painting.
+    others: usize,
     /// The cascade layers of its sheets, by the names and sublayers of
     /// each, the unlayered rules' first; and each layer's place, found
     /// once all the sheets are in (see [`Cascade::layer_order`]).
@@ -3773,7 +3863,21 @@ impl Cascade {
             self.spacing_rules
                 .push((rule.clone(), index as u32 + 1, layer(rule)));
         }
-        self.spacing_only += sheet.spacing_only;
+        for rule in &sheet.painting {
+            let index = self.painting_rules.len();
+            match rule.selector.compounds.last().and_then(rarest_key) {
+                Some(key) => self.painting_by_key.entry(key).or_default().push(index),
+                None => self.painting_anywhere.push(index),
+            }
+            self.painted_ids.extend(
+                rule.paintings
+                    .iter()
+                    .filter_map(|painting| painting.target.clone()),
+            );
+            self.painting_rules
+                .push((rule.clone(), index as u32 + 1, layer(rule)));
+        }
+        self.others += sheet.others;
     }
 
     /// Take in the cascade layers a sheet declares, in its order: a named
@@ -3863,21 +3967,146 @@ impl Cascade {
         order: u32,
         layer: u32,
     ) -> Precedence {
-        let tier = if declaration.important {
+        self.rule_precedence(declaration.important, rule, order, layer)
+    }
+
+    fn rule_precedence(
+        &self,
+        important: bool,
+        rule: &StyleRule,
+        order: u32,
+        layer: u32,
+    ) -> Precedence {
+        let tier = if important {
             TIER_AUTHOR_IMPORTANT
         } else {
             TIER_AUTHOR
         };
         Precedence {
             tier,
-            layer: self.layer_order(layer, declaration.important),
+            layer: self.layer_order(layer, important),
             specificity: rule.selector.specificity,
             order,
         }
     }
 
+    /// Whether a rule may name the SVG resource of this id to paint with,
+    /// and whether any rule names one.
+    fn may_paint(&self, id: &str) -> bool {
+        self.painted_ids.contains(id)
+    }
+
+    fn paints_resources(&self) -> bool {
+        !self.painting_rules.is_empty()
+    }
+
+    /// The ids of the SVG resources the element at the top of the tree
+    /// paints with: a pattern as its fill or stroke, a clip path, a mask,
+    /// or its markers. For each painting property, the declaration that
+    /// certainly wins the cascade among its presentation attributes, the
+    /// rules that set the property, and its inline style names the one it
+    /// uses; where a declaration that may apply above it says otherwise,
+    /// it names none for certain.
+    fn references(
+        &self,
+        tree: &Tree,
+        ancestors: &AncestorKeys,
+        work: &mut u64,
+    ) -> Result<Vec<Rc<str>>, DocumentError> {
+        let element = tree.stack.last().expect("an element to style");
+        // The fill, the stroke, the clip path, the mask, and the start,
+        // middle, and end markers, which `marker` sets together.
+        let mut slots: [Vec<Named>; 7] = Default::default();
+        let mut add = |painting: &Painting, precedence: Precedence, certainty: Tri| {
+            let targets: &[usize] = match painting.property {
+                0..=3 => &[painting.property as usize][..],
+                4 => &[4, 5, 6],
+                property => &[property as usize - 1][..],
+            };
+            for &slot in targets {
+                slots[slot].push((precedence, certainty, painting.target.clone()));
+            }
+        };
+        let presentation = Precedence {
+            tier: TIER_AUTHOR,
+            layer: 0,
+            specificity: (0, 0, 0),
+            order: 0,
+        };
+        for (property, name) in PAINTING_PROPERTIES.iter().enumerate() {
+            for (prefixed, value) in element.values(name) {
+                let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+                let tokens = tokenize(value)?;
+                let painting = Painting {
+                    property: property as u8,
+                    important: false,
+                    target: url_target(trim_whitespace(&tokens)).map(Rc::from),
+                };
+                add(&painting, presentation, certainty);
+            }
+        }
+        let mut candidates: Vec<usize> = element
+            .keys()
+            .filter_map(|key| self.painting_by_key.get(&key))
+            .flatten()
+            .chain(&self.painting_anywhere)
+            .copied()
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        for index in candidates {
+            let (rule, order, layer) = &self.painting_rules[index];
+            if !ancestors.hold(&rule.ancestor_keys) {
+                *work += 1;
+                continue;
+            }
+            let certainty = match_complex(&rule.selector, &[], tree, work).min(rule.condition);
+            if certainty == Tri::No {
+                continue;
+            }
+            for painting in rule.paintings.iter() {
+                let precedence = self.rule_precedence(painting.important, rule, *order, *layer);
+                add(painting, precedence, certainty);
+            }
+        }
+        if *work > MAX_MATCH_WORK {
+            return Err(DocumentError::ResourceLimit);
+        }
+        for (prefixed, style) in element.values("style") {
+            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            let tokens = tokenize(style)?;
+            for painting in split_top_level(&tokens, &Token::Semicolon)
+                .into_iter()
+                .filter_map(parse_painting)
+            {
+                let tier = if painting.important {
+                    TIER_INLINE_IMPORTANT
+                } else {
+                    TIER_INLINE
+                };
+                let precedence = Precedence {
+                    tier,
+                    layer: 0,
+                    specificity: (0, 0, 0),
+                    order: 0,
+                };
+                add(&painting, precedence, certainty);
+            }
+        }
+        let mut targets: Vec<Rc<str>> = slots
+            .iter()
+            .filter_map(|slot| match resolve_value(slot, None) {
+                (Some(target), false) => Some(target),
+                _ => None,
+            })
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        Ok(targets)
+    }
+
     pub(super) fn rule_count(&self) -> usize {
-        self.rules.len() + self.spacing_only
+        self.rules.len() + self.others
     }
 
     /// How the box of the element at the top of the tree stands among the
@@ -4126,12 +4355,12 @@ impl Cascade {
 
         let mut applied: [Vec<Applied>; 3] = Default::default();
         // Whether the box is inline-level, floats, is positioned out of the
-        // flow, and floats to the start of the line; how it lays out its
-        // children; and, for flex items, whether they stand in a column or
-        // in reverse, may wrap, stand in a column of an old flexible box,
-        // are spread along the line, and have a gap between them, and
-        // whether an old flexible box clamps its lines.
-        let mut flows: [Vec<(Precedence, Tri, Tri)>; 4] = Default::default();
+        // flow, floats to the start of the line, and is transparent; how it
+        // lays out its children; and, for flex items, whether they stand in
+        // a column or in reverse, may wrap, stand in a column of an old
+        // flexible box, are spread along the line, and have a gap between
+        // them, and whether an old flexible box clamps its lines.
+        let mut flows: [Vec<(Precedence, Tri, Tri)>; 5] = Default::default();
         let mut layouts: Vec<(Precedence, Tri, Layout)> = Vec::new();
         let mut item_flags: [Vec<(Precedence, Tri, Tri)>; 6] = Default::default();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
@@ -4171,12 +4400,17 @@ impl Cascade {
                     }
                     return;
                 }
+                Property::Opacity => {
+                    if let Some(clear) = declaration.flow {
+                        flows[4].push((precedence, certainty, clear));
+                    }
+                    return;
+                }
                 // What only `::before` and `::after` boxes read, and margins,
                 // padding, widths, and flex bases, read only for flex and
                 // grid items (see [`Cascade::item_box`]).
                 Property::Content
                 | Property::WhiteSpace
-                | Property::Opacity
                 | Property::Width
                 | Property::FlexBasis
                 | Property::FlexBasisAuto
@@ -4398,6 +4632,24 @@ impl Cascade {
                 certainty,
             );
         }
+        for (prefixed, value) in element.values("opacity") {
+            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            let clear =
+                svg_number(value).map(|opacity| if opacity <= 0.0 { Tri::Yes } else { Tri::No });
+            add(
+                &Declaration {
+                    property: Property::Opacity,
+                    effect: Effect::Neutral,
+                    important: false,
+                    flow: clear,
+                    layout: None,
+                    side: None,
+                    generated: None,
+                },
+                presentation,
+                certainty,
+            );
+        }
         // User-agent rules (HTML's rendering section) that hide content.
         let user_agent = Precedence {
             tier: TIER_USER_AGENT,
@@ -4571,6 +4823,7 @@ impl Cascade {
             floats: resolve_flow(&flows[1], false),
             floats_to_start: resolve_flow(&flows[3], false),
             positioned: resolve_flow(&flows[2], false),
+            transparent: resolve_flow(&flows[4], false),
             items,
             item_layout,
             contents: layout == Layout::Contents && !contested,
@@ -4792,11 +5045,13 @@ struct Open {
     contents_hidden: bool,
     /// Children are fallback content a reader replaces.
     fallback: bool,
+    /// It is, or may be, transparent (`opacity: 0`), with all it holds.
+    transparent: bool,
     /// Children sit in an SVG image, outside a `foreignObject`.
     in_svg: bool,
-    /// A reader paints nothing inside where it stands (see
-    /// [`svg_unpainted`]).
-    unpainted: bool,
+    /// Whether a reader paints what it holds where it stands (see
+    /// [`Resources`]).
+    paint: Paint,
     /// Inside an SVG `text` element, whose text a reader paints; other SVG
     /// elements paint none right inside them.
     svg_text: bool,
@@ -5500,21 +5755,23 @@ fn anydoc_block(local: &str) -> bool {
 struct Facts {
     /// A child element is one of AnyDoc's blocks (`has_block_children`).
     has_blocks: bool,
+    /// It holds an element.
+    has_elements: bool,
     position: Position,
 }
 
 /// What the pass before the walk finds in a chapter: the facts of each
-/// element in document order, and the ids something refers to where that
-/// makes a reader paint an SVG resource (see [`svg_unpainted`]).
+/// element in document order, and the ids an SVG element may refer to,
+/// whose elements the walk notes as resources (see [`Resources`]).
 #[derive(Default)]
 struct ChapterFacts {
     elements: Vec<Facts>,
-    /// The ids an SVG `use` element draws.
+    /// The ids an SVG `use` element names.
     used: std::collections::HashSet<String>,
-    /// The ids a fill, stroke, clip path, mask, or marker paints
-    /// (`url(#id)`), in an SVG element's attribute or inline style, or in
-    /// a `style` element. An HTML element's inline style is not read: a
-    /// resource only it refers to, as a clip path on a box, counts as
+    /// The ids a fill, stroke, clip path, mask, or marker names
+    /// (`url(#id)`) in an SVG element's attribute or inline style; those a
+    /// stylesheet names, the cascade holds. An HTML element is not read:
+    /// a resource only it refers to, as a clip path on a box, counts as
     /// unpainted.
     painted: std::collections::HashSet<String>,
 }
@@ -5544,8 +5801,8 @@ enum PaintedScan {
 }
 
 /// Add to `ids` the ids that painting declarations name through `url(#id)`
-/// references: in a `style` element's rules or a `style` attribute's
-/// declarations, or, with `value`, in a presentation attribute's value. A
+/// references: in a `style` attribute's declarations, or rules, or, with
+/// `value`, in a presentation attribute's value. A
 /// declaration is a name and a colon, then the tokens up to the next `;`,
 /// `{`, or `}`. A reference is a `url` token, or a `url()` function holding
 /// a string, as a reader tokenizes them: a URL a reader rejects, such as
@@ -5599,8 +5856,7 @@ fn fragment(target: &str) -> Option<&str> {
 
 /// An open element in the pass before the walk, or the chapter's top
 /// level: its element children so far, each with the name it carries, and
-/// how many carry each name; whether its children sit in an SVG image, and
-/// whether it is a `style` element, whose text is a stylesheet.
+/// how many carry each name; and whether its children sit in an SVG image.
 #[derive(Default)]
 struct Family {
     fact: Option<usize>,
@@ -5608,7 +5864,6 @@ struct Family {
     names: HashMap<String, u32>,
     counts: Vec<u32>,
     svg: bool,
-    style: bool,
 }
 
 impl Family {
@@ -5624,8 +5879,8 @@ impl Family {
 }
 
 /// For each element of a chapter in document order: whether a child is one
-/// of AnyDoc's blocks, and where it sits among its siblings; and the ids
-/// that make a reader paint an SVG resource.
+/// of AnyDoc's blocks, or any element, and where it sits among its
+/// siblings; and the ids an SVG element may refer to.
 fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
     let mut xml = quick_xml::Reader::from_reader(std::io::Cursor::new(chapter));
     xml.config_mut().trim_text(false);
@@ -5645,28 +5900,6 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
                 if open.len() > 1 {
                     open.pop().expect("an open element").finish(facts);
                 }
-                buffer.clear();
-                continue;
-            }
-            quick_xml::events::Event::Text(text)
-                if open.last().is_some_and(|family| family.style) =>
-            {
-                add_painted(
-                    &String::from_utf8_lossy(text.as_ref()),
-                    false,
-                    &mut found.painted,
-                );
-                buffer.clear();
-                continue;
-            }
-            quick_xml::events::Event::CData(text)
-                if open.last().is_some_and(|family| family.style) =>
-            {
-                add_painted(
-                    &String::from_utf8_lossy(text.as_ref()),
-                    false,
-                    &mut found.painted,
-                );
                 buffer.clear();
                 continue;
             }
@@ -5718,8 +5951,8 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
         }
         if let Some(parent) = family.fact {
             facts[parent].has_blocks |= anydoc_block(&local);
+            facts[parent].has_elements = true;
         }
-        let style = local == "style";
         let foreign = local == "foreignObject";
         let next = family.names.len() as u32;
         let name = *family.names.entry(local).or_insert(next);
@@ -5730,6 +5963,7 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
         family.children.push((facts.len() as u32, name));
         facts.push(Facts {
             has_blocks: false,
+            has_elements: false,
             position: Position {
                 index: family.children.len() as u32,
                 index_of_type: family.counts[name as usize],
@@ -5741,7 +5975,6 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
             open.push(Family {
                 fact: Some(facts.len() - 1),
                 svg: svg && !foreign,
-                style,
                 ..Family::default()
             });
         }
@@ -5796,19 +6029,247 @@ fn svg_paints(local: &str) -> bool {
     )
 }
 
-/// Whether a reader paints nothing an element inside an SVG image holds,
-/// where it stands. A resource paints only where something refers to it:
-/// a `symbol`, or an element inside `defs`, where a `use` element draws it,
-/// and a pattern, clip path, mask, or marker where a fill, stroke, clip,
-/// mask, or marker names it. Gradients, filters, and elements SVG does not
-/// define paint nothing.
-fn svg_unpainted(element: &Element, facts: &ChapterFacts, parent_unpainted: bool) -> bool {
-    let local = element.local.as_str();
-    let referenced = element.first("id").is_some_and(|id| match local {
-        "pattern" | "clipPath" | "mask" | "marker" => facts.painted.contains(id),
-        _ => (svg_paints(local) || local == "symbol") && facts.used.contains(id),
-    });
-    !referenced && (parent_unpainted || !svg_paints(local))
+/// SVG elements a reader draws where they stand, which may refer to a
+/// resource to draw it: those that paint what they hold, shapes, images,
+/// and `use` elements.
+fn svg_graphics(local: &str) -> bool {
+    svg_paints(local)
+        || matches!(
+            local,
+            "use"
+                | "rect"
+                | "circle"
+                | "ellipse"
+                | "line"
+                | "polyline"
+                | "polygon"
+                | "path"
+                | "image"
+        )
+}
+
+/// Whether an SVG element draws anything a resource it refers to could
+/// show in: a shape of some size, text, an image, a `use` element, or an
+/// element holding others. A rectangle, circle, or ellipse sized zero, a
+/// path whose points are empty, and an empty group, draw nothing; one
+/// whose size or points no attribute gives may take them from a style.
+fn svg_draws(element: &Element, has_children: bool, has_elements: bool) -> bool {
+    let zero = |name: &str| element.first(name).and_then(svg_number) == Some(0.0);
+    let empty = |name: &str| {
+        element
+            .first(name)
+            .is_some_and(|value| value.trim().is_empty())
+    };
+    match element.local.as_str() {
+        "use" | "line" | "image" => true,
+        "path" => !empty("d"),
+        "polyline" | "polygon" => !empty("points"),
+        "rect" => !zero("width") && !zero("height"),
+        "circle" => !zero("r"),
+        "ellipse" => !zero("rx") && !zero("ry"),
+        "text" | "tspan" | "textPath" => has_children,
+        _ => has_elements,
+    }
+}
+
+/// SVG resources a reader paints only where a fill, stroke, clip, mask,
+/// or marker names them.
+fn svg_painted_resource(local: &str) -> bool {
+    matches!(local, "pattern" | "clipPath" | "mask" | "marker")
+}
+
+/// Whether a reader paints what an element holds where it stands, as far
+/// as references to SVG resources decide it (see [`Resources`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Paint {
+    Yes,
+    No,
+    /// Only where a resource it stands in is drawn: the last of the links
+    /// (see [`Resources::links`]) up to where the image paints for certain.
+    If(u32),
+}
+
+/// The resources of a chapter's SVG images, which a reader paints only
+/// where something it renders refers to them: a `symbol`, or an element
+/// inside `defs`, where a `use` element draws it, and a pattern, clip
+/// path, mask, or marker where a fill, stroke, clip, mask, or marker names
+/// it. Gradients, filters, and elements SVG does not define paint nothing.
+/// A reference may come before or after what it names, and what refers to
+/// one resource may stand inside another, so the walk notes each resource
+/// and each reference as it comes, and settles them as it ends (see
+/// [`Resources::settle`]).
+#[derive(Default)]
+struct Resources {
+    /// By the id a reference names, and whether a painting property or a
+    /// `use` element names it: the slot of what it names.
+    slots: HashMap<(bool, Rc<str>), u32>,
+    /// By slot: whether something a reader certainly renders refers to it.
+    live: Vec<bool>,
+    /// A resource that paints where its slot is live, or where the element
+    /// it stands in paints.
+    links: Vec<(u32, Paint)>,
+    /// References from elements a reader renders only where a link paints:
+    /// the link, and the slot the reference names.
+    edges: Vec<(u32, u32)>,
+    /// Links text a reader hides stands under, unless the link paints.
+    pending: Vec<u32>,
+    /// By slot: whether a `symbol` or `svg` element takes it, whose
+    /// viewport a `use` element sized zero draws nothing in.
+    viewport: Vec<bool>,
+    /// References from `use` elements sized zero, which draw only what is
+    /// not such an element: where the element stands, and the slot.
+    sized_zero: Vec<(Paint, u32)>,
+    /// The ids references may name that an element carried already: a
+    /// reference names the first element that carries its id.
+    taken: std::collections::HashSet<Rc<str>>,
+}
+
+impl Resources {
+    fn slot(&mut self, painting: bool, id: &str) -> u32 {
+        let next = self.live.len() as u32;
+        let slot = *self.slots.entry((painting, Rc::from(id))).or_insert(next);
+        if slot == next {
+            self.live.push(false);
+            self.viewport.push(false);
+        }
+        slot
+    }
+
+    /// What paints where a resource in `slot` is drawn, or where `outer`
+    /// paints.
+    fn either(&mut self, slot: u32, outer: Paint) -> Paint {
+        if outer == Paint::Yes || self.live[slot as usize] {
+            return Paint::Yes;
+        }
+        self.links.push((slot, outer));
+        Paint::If(self.links.len() as u32 - 1)
+    }
+
+    /// How an element inside an SVG image, which its parent places where
+    /// `placed` says, stands: whether a reader draws it where it stands,
+    /// or as an instance a `use` element draws, and whether it paints what
+    /// it holds. A reference names it only where it is the `first` element
+    /// with its id; `facts` and `reader` tell what references may name.
+    fn svg_element(
+        &mut self,
+        element: &Element,
+        placed: Paint,
+        first: bool,
+        facts: &ChapterFacts,
+        reader: &Cascade,
+    ) -> (Paint, Paint) {
+        let local = element.local.as_str();
+        let painting = svg_painted_resource(local);
+        let slot = element.first("id").filter(|_| first).and_then(|id| {
+            let named = if painting {
+                facts.painted.contains(id) || reader.may_paint(id)
+            } else {
+                facts.used.contains(id)
+            };
+            named.then(|| self.slot(painting, id))
+        });
+        if let (Some(slot), "symbol" | "svg") = (slot, local) {
+            self.viewport[slot as usize] = true;
+        }
+        let position = match slot {
+            Some(slot) if !painting => self.either(slot, placed),
+            _ => placed,
+        };
+        let paint = if painting || local == "symbol" {
+            slot.map_or(Paint::No, |slot| self.either(slot, Paint::No))
+        } else if svg_paints(local) {
+            position
+        } else {
+            Paint::No
+        };
+        (position, paint)
+    }
+
+    /// Whether an element carries an id a reference may name that no
+    /// element before it carried; noted for every element, as a reference
+    /// names the first.
+    fn first_with_id(&mut self, element: &Element, facts: &ChapterFacts, reader: &Cascade) -> bool {
+        let Some(id) = element.first("id") else {
+            return false;
+        };
+        let named = facts.used.contains(id) || facts.painted.contains(id) || reader.may_paint(id);
+        named && self.taken.insert(Rc::from(id))
+    }
+
+    /// Note a reference from an element a reader renders where `position`
+    /// says: a `use` element `sized_zero` draws only what has no viewport
+    /// of its own, which the walk knows only once it has met what it names.
+    fn refer(&mut self, painting: bool, id: &str, position: Paint, sized_zero: bool) {
+        let slot = self.slot(painting, id);
+        if sized_zero {
+            self.sized_zero.push((position, slot));
+            return;
+        }
+        match position {
+            Paint::Yes => self.live[slot as usize] = true,
+            Paint::No => {}
+            Paint::If(link) => self.edges.push((link, slot)),
+        }
+    }
+
+    /// Note text a reader hides unless `link` paints.
+    fn pending(&mut self, link: u32) {
+        if self.pending.last() != Some(&link) {
+            self.pending.push(link);
+        }
+    }
+
+    /// Settle what paints once the walk has noted every resource and
+    /// reference: a slot is live where something certainly rendered refers
+    /// to it, or something rendered under a link that paints; a link paints
+    /// where its slot is live or what it stands in paints. Whether text
+    /// under a link that does not paint remains.
+    fn settle(&self) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let mut live = self.live.clone();
+        let mut painted = vec![false; self.links.len()];
+        let mut by_slot: Vec<Vec<u32>> = vec![Vec::new(); live.len()];
+        let mut inside: Vec<Vec<u32>> = vec![Vec::new(); self.links.len()];
+        for (link, &(slot, outer)) in self.links.iter().enumerate() {
+            by_slot[slot as usize].push(link as u32);
+            if let Paint::If(outer) = outer {
+                inside[outer as usize].push(link as u32);
+            }
+        }
+        let mut from: Vec<Vec<u32>> = vec![Vec::new(); self.links.len()];
+        for &(link, slot) in &self.edges {
+            from[link as usize].push(slot);
+        }
+        for &(position, slot) in &self.sized_zero {
+            match position {
+                _ if self.viewport[slot as usize] => {}
+                Paint::Yes => live[slot as usize] = true,
+                Paint::No => {}
+                Paint::If(link) => from[link as usize].push(slot),
+            }
+        }
+        let mut slots: Vec<u32> = (0..live.len() as u32)
+            .filter(|slot| live[*slot as usize])
+            .collect();
+        let mut links: Vec<u32> = Vec::new();
+        while let Some(slot) = slots.pop() {
+            links.extend(&by_slot[slot as usize]);
+            while let Some(link) = links.pop() {
+                if std::mem::replace(&mut painted[link as usize], true) {
+                    continue;
+                }
+                links.extend(&inside[link as usize]);
+                for &named in &from[link as usize] {
+                    if !std::mem::replace(&mut live[named as usize], true) {
+                        slots.push(named);
+                    }
+                }
+            }
+        }
+        self.pending.iter().any(|link| !painted[*link as usize])
+    }
 }
 
 /// Whether a reader renders a child of an SVG `switch`, which renders only
@@ -6218,6 +6679,7 @@ pub(super) fn chapter_text(
     let mut body_taken = false;
     let mut found = ChapterText::default();
     let facts = element_facts(chapter)?;
+    let mut resources = Resources::default();
     let mut element_index = 0usize;
     let mut runs: Vec<Run> = Vec::new();
     // Glyphs, and digits among them, taken into runs so far, to tell a
@@ -6259,7 +6721,10 @@ pub(super) fn chapter_text(
                     reference.as_ref(),
                 ))),
             ),
-            quick_xml::events::Event::Eof => return Ok(found),
+            quick_xml::events::Event::Eof => {
+                found.converts_hidden |= resources.settle();
+                return Ok(found);
+            }
             _ => {
                 buffer.clear();
                 continue;
@@ -6304,18 +6769,26 @@ pub(super) fn chapter_text(
                     || state.invisible
                     || state.contents_hidden
                     || state.fallback
-                    || state.unpainted
+                    || state.paint == Paint::No
                     || (state.in_svg && !state.svg_text);
+                let shown_anyway = match state.exempt {
+                    Exempt::None => false,
+                    Exempt::Description => true,
+                    Exempt::RubyParenthesis => !text.chars().any(char::is_alphanumeric),
+                };
                 match state.reach {
                     Reach::Walk | Reach::Whole if hidden => {
-                        let shown_anyway = match state.exempt {
-                            Exempt::None => false,
-                            Exempt::Description => true,
-                            Exempt::RubyParenthesis => !text.chars().any(char::is_alphanumeric),
-                        };
                         found.converts_hidden |= !shown_anyway;
                     }
-                    Reach::Walk | Reach::Whole | Reach::Dropped => {}
+                    // Text in a resource converts hidden unless something a
+                    // reader renders draws the resource, which the walk
+                    // settles as it ends.
+                    Reach::Walk | Reach::Whole => {
+                        if let (Paint::If(link), false) = (state.paint, shown_anyway) {
+                            resources.pending(link);
+                        }
+                    }
+                    Reach::Dropped => {}
                     // Text in a list, a table, a row group, a row, or the
                     // root element outside the body is skipped, like
                     // everything in an omitted element.
@@ -6425,16 +6898,56 @@ pub(super) fn chapter_text(
         elements.push(element);
         earlier.push(Earlier::default());
         let element = elements.last().expect("the element just pushed");
+        let parent_in_svg = open.last().is_some_and(|parent| parent.in_svg);
+        let svg_element = parent_in_svg || element.lower == "svg";
+        let first_id = resources.first_with_id(element, &facts, reader);
+        // What an SVG element refers to: the element a `use` element draws
+        // (by `href`, before `xlink:href`), and the resources its painting
+        // properties name.
+        let references: Vec<(bool, Rc<str>)> = if svg_element {
+            let mut references: Vec<(bool, Rc<str>)> = Vec::new();
+            if element.local == "use" {
+                let href = element
+                    .values("href")
+                    .find(|(prefixed, _)| !prefixed)
+                    .or_else(|| element.values("href").next());
+                if let Some(id) = href.and_then(|(_, href)| fragment(href.trim())) {
+                    references.push((false, Rc::from(id)));
+                }
+            }
+            let may_paint = reader.paints_resources()
+                || PAINTING_PROPERTIES
+                    .iter()
+                    .chain(&["style"])
+                    .any(|name| element.values(name).next().is_some());
+            if may_paint {
+                let tree = Tree {
+                    stack: &elements,
+                    earlier: &earlier,
+                };
+                references.extend(
+                    reader
+                        .references(&tree, &ancestors, work)?
+                        .into_iter()
+                        .map(|id| (true, id)),
+                );
+            }
+            references
+        } else {
+            Vec::new()
+        };
         // The reader's style: for the text below the element, for whether a
         // reader shows an element AnyDoc skips, a line break, or an image,
-        // and how it lays them out, and for the `::before` and `::after`
-        // boxes of an empty element. Nothing below a dropped or empty
-        // element converts or shows.
+        // and how it lays them out, for the `::before` and `::after` boxes
+        // of an empty element, and for whether a reader renders an SVG
+        // element that refers to a resource. Nothing below a dropped or
+        // empty element converts or shows.
         let style = if (has_children && reach != Reach::Dropped)
             || (anydoc_hidden && (reach == Reach::Omitted || matches!(local.as_str(), "br" | "hr")))
             || (parent_reach == Some(Reach::Walk)
                 && matches!(local.as_str(), "br" | "img" | "image"))
             || (reach != Reach::Dropped && reader.styles_pseudo_boxes())
+            || !references.is_empty()
         {
             let tree = Tree {
                 stack: &elements,
@@ -6453,8 +6966,7 @@ pub(super) fn chapter_text(
         // run around it (see [`Splice`]).
         let spliced = runs.last().is_some_and(|run| !run.splices.is_empty());
         let parent_items = open.last().map_or(Tri::No, |parent| parent.items);
-        let parent_in_svg = open.last().is_some_and(|parent| parent.in_svg);
-        let svg_font = (parent_in_svg || element.lower == "svg")
+        let svg_font = svg_element
             .then(|| svg_font_size(element).or(open.last().and_then(|parent| parent.svg_font)))
             .flatten();
         // A flex or grid item meets the item before it as its row sets it
@@ -6520,8 +7032,8 @@ pub(super) fn chapter_text(
         };
         let element = elements.last().expect("the element just pushed");
         // Whether a reader paints what the element holds where it stands:
-        // inside an SVG image, see [`svg_unpainted`]; of a `switch`'s
-        // children, one it renders at most.
+        // inside an SVG image, see [`Resources`]; of a `switch`'s children,
+        // one it renders at most.
         let rendered = match open
             .last_mut()
             .and_then(|parent| parent.switch_taken.as_mut())
@@ -6538,12 +7050,17 @@ pub(super) fn chapter_text(
             None => Tri::Yes,
         };
         let parent = open.last();
-        let in_svg = parent_in_svg || element.lower == "svg";
-        let parent_unpainted = parent.is_some_and(|parent| parent.unpainted);
-        let unpainted = if parent_in_svg {
-            svg_unpainted(element, &facts, parent_unpainted) || rendered != Tri::Yes
+        let in_svg = svg_element;
+        let parent_paint = parent.map_or(Paint::Yes, |parent| parent.paint);
+        let (position, paint) = if parent_in_svg {
+            let placed = if rendered == Tri::Yes {
+                parent_paint
+            } else {
+                Paint::No
+            };
+            resources.svg_element(element, placed, first_id, &facts, reader)
         } else {
-            parent_unpainted
+            (parent_paint, parent_paint)
         };
         let svg_text = parent.is_some_and(|parent| parent.svg_text)
             || (parent_in_svg && element.local == "text");
@@ -6559,8 +7076,9 @@ pub(super) fn chapter_text(
                 invisible: false,
                 contents_hidden: false,
                 fallback: false,
+                transparent: false,
                 in_svg: children_in_svg,
-                unpainted,
+                paint,
                 svg_text,
                 switch_taken,
                 svg_font,
@@ -6609,8 +7127,10 @@ pub(super) fn chapter_text(
                     },
                     contents_hidden: style.content_visibility == Resolved::Hidden,
                     fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
+                    transparent: parent.is_some_and(|parent| parent.transparent)
+                        || style.transparent != Tri::No,
                     in_svg: children_in_svg,
-                    unpainted,
+                    paint,
                     svg_text,
                     switch_taken,
                     svg_font,
@@ -6632,7 +7152,27 @@ pub(super) fn chapter_text(
         // with a list marker of its own, which stands in for a bullet the
         // item's `::before` box shows, a hyphen or dash set apart from the
         // item's text; any other sign on an item is lost as it is elsewhere.
-        let hidden = state.undisplayed || state.contents_hidden || state.unpainted;
+        // A reference counts where a reader renders what refers: shown, not
+        // transparent, drawing something, and standing where the image
+        // paints, or in a resource that paints where drawn.
+        if !references.is_empty()
+            && !state.undisplayed
+            && !state.invisible
+            && !state.transparent
+            && svg_draws(element, has_children, fact.has_elements)
+        {
+            let drawn = if svg_graphics(&element.local) {
+                position
+            } else {
+                paint
+            };
+            let zero = |name: &str| element.first(name).and_then(svg_number) == Some(0.0);
+            let sized_zero = element.local == "use" && (zero("width") || zero("height"));
+            for (painting, id) in &references {
+                resources.refer(*painting, id, drawn, sized_zero);
+            }
+        }
+        let hidden = state.undisplayed || state.contents_hidden || state.paint == Paint::No;
         let generated = style
             .as_ref()
             .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
@@ -7219,9 +7759,6 @@ mod tests {
             format!(
                 r##"<svg {svg}><mask id="m"><text>Shown</text></mask><rect style="mask: url(#m)"/></svg>"##
             ),
-            format!(
-                r##"<svg {svg}><style>.r {{ marker-end: url(#k) }}</style><marker id="k"><text>Shown</text></marker><path class="r"/></svg>"##
-            ),
             // Text in text elements, links, and paths, and HTML in an SVG image.
             format!(
                 r##"<svg {svg}><a href="#x"><text>Shown <tspan>more</tspan><textPath href="#p">on a path</textPath></text></a></svg>"##
@@ -7238,6 +7775,13 @@ mod tests {
         ] {
             assert!(!converts_hidden(&[], &body), "{body}");
         }
+        // A stylesheet's rule names a resource for the elements it matches.
+        assert!(!converts_hidden(
+            &[".r { marker-end: url(#k) }"],
+            &format!(
+                r#"<svg {svg}><marker id="k"><text>Shown</text></marker><path class="r"/></svg>"#
+            )
+        ));
         // A `::before` box in an SVG image's HTML shows, as in a page.
         let label = r#".x::before { content: "Balance due " }"#;
         assert!(drops_shown(
@@ -7283,6 +7827,132 @@ mod tests {
         assert_eq!(walk(&[], &body), ChapterText::default());
         let facts = element_facts(&chapter(&body)).expect("chapter facts");
         assert!(facts.painted.is_empty() && facts.used.is_empty());
+    }
+
+    #[test]
+    fn only_what_a_reader_renders_draws_a_resource() {
+        let svg =
+            r#"xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink""#;
+        let text = r#"<text x="10" y="30">Wire 1,250.00</text>"#;
+        let named = r#"<text id="t" x="10" y="30">Wire 1,250.00</text>"#;
+        let image = |inner: &str| format!(r#"<p>Figure 1.</p><svg {svg}>{inner}</svg>"#);
+        // What refers to a resource draws it only where a reader renders
+        // it: shown, not transparent, drawing something, and standing
+        // where the image paints, or in a resource something draws; and
+        // a rule names one only for the elements it matches.
+        for (sheet, inner) in [
+            (
+                "",
+                format!(r##"<defs>{named}</defs><use href="#t" display="none"/>"##),
+            ),
+            (
+                "",
+                format!(r##"<defs>{named}</defs><use xlink:href="#t" visibility="hidden"/>"##),
+            ),
+            ("", format!(r##"<defs>{named}<use href="#t"/></defs>"##)),
+            (
+                "",
+                format!(r##"<defs>{named}</defs><use href="#t" opacity="0"/>"##),
+            ),
+            (
+                ".off { display: none }",
+                format!(r##"<defs>{named}</defs><use class="off" href="#t"/>"##),
+            ),
+            (
+                ".nothing { mask: url(#m) }",
+                format!(r#"<mask id="m">{text}</mask>"#),
+            ),
+            (
+                "",
+                format!(r##"<clipPath id="c">{text}</clipPath><g clip-path="url(#c)"/>"##),
+            ),
+            (
+                "",
+                format!(
+                    r##"<mask id="m">{text}</mask><rect mask="url(#m)" width="0" height="0"/>"##
+                ),
+            ),
+            (
+                "",
+                format!(
+                    r##"<pattern id="p" width="200" height="50">{text}</pattern><rect fill="url(#p)" width="0" height="40"/>"##
+                ),
+            ),
+            (
+                "",
+                format!(
+                    r##"<clipPath id="c">{text}</clipPath><rect clip-path="url(#c)" width="400" height="60" display="none"/>"##
+                ),
+            ),
+            (
+                ".r { fill: url(#p) } .r.plain { fill: black }",
+                format!(
+                    r#"<pattern id="p">{text}</pattern><rect class="r plain" width="10" height="10"/>"#
+                ),
+            ),
+            (
+                "",
+                format!(
+                    r##"<symbol id="a"><use href="#b"/></symbol><symbol id="b">{text}</symbol>"##
+                ),
+            ),
+            (
+                "",
+                format!(
+                    r##"<defs><symbol id="s" viewBox="0 0 200 50">{text}</symbol></defs><use href="#s" width="0" height="0"/>"##
+                ),
+            ),
+            (
+                "",
+                format!(r##"<marker id="k">{text}</marker><path marker-start="url(#k)" d=""/>"##),
+            ),
+        ] {
+            let body = image(&inner);
+            assert!(converts_hidden(&[sheet], &body), "{sheet} {body}");
+        }
+        // A reference names the first element with its id.
+        assert!(converts_hidden(
+            &[],
+            &format!(
+                r##"<p id="t">Note</p><svg {svg}><defs>{named}</defs><use href="#t"/></svg>"##
+            )
+        ));
+        // What a reader renders draws what it refers to, whatever comes
+        // first, and through a resource it stands in.
+        for (sheet, inner) in [
+            ("", format!(r##"<defs>{named}</defs><use href="#t"/>"##)),
+            ("", format!(r##"<use href="#t"/><defs>{named}</defs>"##)),
+            (
+                "",
+                format!(
+                    r##"<clipPath id="c">{text}</clipPath><rect clip-path="url(#c)" width="400" height="60" fill="black"/>"##
+                ),
+            ),
+            (
+                ".r { fill: url(#p) }",
+                format!(
+                    r#"<pattern id="p">{text}</pattern><rect class="r" width="10" height="10"/>"#
+                ),
+            ),
+            (
+                "",
+                format!(
+                    r##"<symbol id="a"><use href="#b"/></symbol><symbol id="b">{text}</symbol><use href="#a"/>"##
+                ),
+            ),
+            (
+                "",
+                format!(r##"<defs>{named}<g id="g"><use href="#t"/></g></defs><use href="#g"/>"##),
+            ),
+            // A `use` element sized zero still draws what has no viewport.
+            (
+                "",
+                format!(r##"<defs><g id="g">{text}</g></defs><use href="#g" width="0"/>"##),
+            ),
+        ] {
+            let body = image(&inner);
+            assert!(!converts_hidden(&[sheet], &body), "{sheet} {body}");
+        }
     }
 
     #[test]
