@@ -21,12 +21,19 @@
 //! where each visible run starts when its position was just set, and
 //! reports a page on which a run with the same bytes starts again within a
 //! tenth of its size of an earlier one, in whatever font.
+//!
+//! **Word gaps judged against the wrong space.** On the same pages, text
+//! shown in a subset font whose differences name the space at another code
+//! than 32 is checked for gaps pdf-inspector judges otherwise than its open
+//! fix would (open upstream #532; see `word_gaps`).
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
+
+use crate::word_gaps::{leading_travel, shows_glyphs, Candidate, GapFont, GapFonts, Shown};
 
 /// Bytes any one content stream may decode to.
 const MAX_STREAM_BYTES: usize = 32 << 20;
@@ -111,7 +118,14 @@ struct State {
     render_mode: i64,
     /// Whether `Tf` has set a font; text shown before shows nothing.
     font: bool,
+    /// The font, when pdf-inspector and its fix take different word-gap
+    /// thresholds from it and the page is checked for them.
+    gaps: Option<GapFont>,
     size: f64,
+    char_spacing: f64,
+    word_spacing: f64,
+    /// Horizontal scaling, as a share.
+    horizontal_scale: f64,
     leading: f64,
     rise: f64,
 }
@@ -121,7 +135,11 @@ impl State {
         ctm: IDENTITY,
         render_mode: 0,
         font: false,
+        gaps: None,
         size: 0.0,
+        char_spacing: 0.0,
+        word_spacing: 0.0,
+        horizontal_scale: 1.0,
         leading: 0.0,
         rise: 0.0,
     };
@@ -172,6 +190,55 @@ impl Runs {
     }
 }
 
+/// A string whose spacing pdf-inspector and its fix read differently,
+/// waiting for the next run of its text object to show whether the spacing
+/// after it is taken back (see `word_gaps`): where it was shown, in device
+/// space, the pen after it when where it started is known, and whether the
+/// text has been placed anew since.
+struct Pending {
+    candidate: Candidate,
+    origin: [f64; 2],
+    /// One unscaled text space unit along its baseline.
+    unit: [f64; 2],
+    pen: Option<[f64; 2]>,
+    moved: bool,
+}
+
+impl Pending {
+    /// Whether `text`, the next run, shown at `text_matrix`, starts where
+    /// the spacing is taken back. A run placed anew on the same baseline,
+    /// with the pen unknown, may.
+    fn taken_back(&self, state: State, text_matrix: [f64; 6], text: &Object) -> bool {
+        let travel = f64::from(leading_travel(text, state.size as f32));
+        if !self.moved {
+            return self.candidate.taken_back(-travel as f32);
+        }
+        let matrix = multiply(text_matrix, state.ctm);
+        let next = [
+            matrix[4] + travel * state.horizontal_scale * matrix[0],
+            matrix[5] + travel * state.horizontal_scale * matrix[1],
+        ];
+        let scale = self.unit[0] * self.unit[0] + self.unit[1] * self.unit[1];
+        // A degenerate or unreadable baseline decides nothing.
+        if scale.is_nan() || scale <= 0.0 {
+            return false;
+        }
+        let from = self.pen.unwrap_or(self.origin);
+        let (dx, dy) = (next[0] - from[0], next[1] - from[1]);
+        let across = (dx * self.unit[1] - dy * self.unit[0]) / scale;
+        if !self.candidate.on_line(across) {
+            return false;
+        }
+        match self.pen {
+            Some(_) => {
+                let along = (dx * self.unit[0] + dy * self.unit[1]) / scale;
+                self.candidate.taken_back(-along as f32)
+            }
+            None => true,
+        }
+    }
+}
+
 /// The bytes a text-showing operand holds: a string, or an array's strings.
 fn shown_bytes(text: Option<&Object>) -> Vec<u8> {
     match text {
@@ -204,6 +271,10 @@ struct PageText {
     clip_levels: Vec<u64>,
     /// The runs noted for the repeat check, when it is made.
     runs: Option<Runs>,
+    /// Whether text pdf-inspector reads has a gap it judges otherwise than
+    /// its fix would, and the fonts read for that so far in the document.
+    gaps_misread: bool,
+    gap_fonts: GapFonts,
 }
 
 impl PageText {
@@ -326,6 +397,9 @@ pub(crate) struct Findings {
     /// Where those runs start again, by page, measured from the page's
     /// visible box, as pdf-inspector places its text.
     pub(crate) repeats: Vec<(u32, Repeat)>,
+    /// Pages with a gap between glyphs that pdf-inspector judges against
+    /// the wrong space width.
+    pub(crate) gaps_misread: Vec<u32>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -349,6 +423,7 @@ pub(crate) fn scan(
     let mut layer_budget = Budget::new(MAX_CONTENT_BYTES, MAX_OPERATIONS);
     let mut repeat_budget = Budget::new(MAX_REPEAT_CONTENT_BYTES, MAX_REPEAT_OPERATIONS);
     let mut repeats = twice_skip.is_some();
+    let mut gap_fonts = GapFonts::default();
     let mut found = Findings::default();
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
@@ -362,11 +437,15 @@ pub(crate) fn scan(
         let budgets = Budgets {
             layer: &mut layer_budget,
             repeat: &mut repeat_budget,
+            gap_fonts: &mut gap_fonts,
         };
         match scan_page(&document, page_id, check_layer, check_twice, budgets) {
             Ok(page) => {
                 if page.hidden_layer {
                     found.hidden_layer.push(number);
+                }
+                if page.gaps_misread {
+                    found.gaps_misread.push(number);
                 }
                 if !page.repeats.is_empty() {
                     found.painted_twice.push(number);
@@ -385,16 +464,18 @@ pub(crate) fn scan(
 }
 
 /// The limits a page is read under: the layer check's when the page is
-/// read for it, the repeat check's otherwise.
+/// read for it, the repeat check's otherwise; and the fonts read so far.
 struct Budgets<'a> {
     layer: &'a mut Budget,
     repeat: &'a mut Budget,
+    gap_fonts: &'a mut GapFonts,
 }
 
 /// What the scan found on one page.
 #[derive(Default)]
 struct PageFindings {
     hidden_layer: bool,
+    gaps_misread: bool,
     /// Runs painted again over themselves, measured from the visible box.
     repeats: Vec<Repeat>,
 }
@@ -420,11 +501,12 @@ fn scan_page(
     if !check_layer && !check_twice {
         return Ok(PageFindings::default());
     }
-    let budget = if check_layer {
-        budgets.layer
-    } else {
-        budgets.repeat
-    };
+    let Budgets {
+        layer,
+        repeat,
+        gap_fonts,
+    } = budgets;
+    let budget = if check_layer { layer } else { repeat };
     let mut content = Vec::new();
     for id in document.get_page_contents(page_id) {
         let Ok(stream) = document.get_object(id).and_then(Object::as_stream) else {
@@ -440,11 +522,12 @@ fn scan_page(
     }
     let mut page = PageText {
         runs: check_twice.then(Runs::default),
+        gap_fonts: std::mem::take(gap_fonts),
         ..PageText::default()
     };
     page.save();
     let mut forms = Vec::new();
-    execute(
+    let executed = execute(
         document,
         &content,
         &resources,
@@ -453,10 +536,13 @@ fn scan_page(
         &mut page,
         &mut forms,
         budget,
-    )?;
+    );
+    *gap_fonts = std::mem::take(&mut page.gap_fonts);
+    executed?;
     page.ended();
     Ok(PageFindings {
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
+        gaps_misread: page.gaps_misread,
         repeats: page
             .runs
             .map(|runs| {
@@ -496,6 +582,10 @@ fn execute<'a>(
     let mut text_matrix = IDENTITY;
     let mut line_matrix = IDENTITY;
     let mut placed = false;
+    // Whether a text object is open, the only place pdf-inspector reads
+    // text, and a string there waiting on the next run.
+    let mut in_text = false;
+    let mut pending: Option<Pending> = None;
     for operation in &content.operations {
         let operands = &operation.operands;
         let operator = operation.operator.as_str();
@@ -504,6 +594,11 @@ fn execute<'a>(
             line_matrix = multiply([1.0, 0.0, 0.0, 1.0, 0.0, -state.leading], line_matrix);
             text_matrix = line_matrix;
             placed = true;
+        }
+        if matches!(operator, "T*" | "'" | "\"" | "Td" | "TD" | "Tm") {
+            if let Some(pending) = pending.as_mut() {
+                pending.moved = true;
+            }
         }
         match operator {
             "q" => {
@@ -535,6 +630,14 @@ fn execute<'a>(
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
                     state.font = name.as_name().is_ok();
+                    // Word gaps are checked with the repeats, on the pages
+                    // read for them.
+                    state.gaps = name
+                        .as_name()
+                        .ok()
+                        .filter(|_| page.runs.is_some())
+                        .and_then(|name| font(document, resources, name))
+                        .and_then(|font| page.gap_fonts.font(document, font));
                     if let Some(size) = number(document, size) {
                         state.size = size;
                     }
@@ -543,6 +646,21 @@ fn execute<'a>(
             "TL" => {
                 if let Some(leading) = operands.first().and_then(|value| number(document, value)) {
                     state.leading = leading;
+                }
+            }
+            "Tc" => {
+                if let Some(spacing) = operands.first().and_then(|value| number(document, value)) {
+                    state.char_spacing = spacing;
+                }
+            }
+            "Tw" => {
+                if let Some(spacing) = operands.first().and_then(|value| number(document, value)) {
+                    state.word_spacing = spacing;
+                }
+            }
+            "Tz" => {
+                if let Some(scale) = operands.first().and_then(|value| number(document, value)) {
+                    state.horizontal_scale = scale / 100.0;
                 }
             }
             "Ts" => {
@@ -554,10 +672,14 @@ fn execute<'a>(
                 text_matrix = IDENTITY;
                 line_matrix = IDENTITY;
                 placed = true;
+                in_text = true;
+                pending = None;
             }
             "ET" => {
                 page.text_object_ended();
                 placed = false;
+                in_text = false;
+                pending = None;
             }
             "Tm" => {
                 if let Some(matrix) = matrix(document, operands) {
@@ -584,8 +706,58 @@ fn execute<'a>(
                 } else {
                     operands.last()
                 };
+                // `"` sets the word and character spacing it shows with; out
+                // of a text object pdf-inspector ignores it, spacing and all.
+                if let [word, character, _] = operands.as_slice() {
+                    if operator == "\"" && in_text {
+                        if let (Some(word), Some(character)) =
+                            (number(document, word), number(document, character))
+                        {
+                            state.word_spacing = word;
+                            state.char_spacing = character;
+                        }
+                    }
+                }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
+                if let Some(text) = text.filter(|_| in_text && !page.gaps_misread) {
+                    // A run that shows glyphs decides for the string before.
+                    if shows_glyphs(text) {
+                        if let Some(waiting) = pending.take() {
+                            page.gaps_misread = waiting.taken_back(state, text_matrix, text);
+                        }
+                    }
+                    // pdf-inspector reads all but mode 3 text.
+                    if let Some(font) = state.gaps.filter(|_| state.font && state.render_mode != 3)
+                    {
+                        let matrix = multiply(text_matrix, state.ctm);
+                        let shown = Shown {
+                            size: state.size as f32,
+                            char_spacing: state.char_spacing as f32,
+                            word_spacing: state.word_spacing as f32,
+                            horizontal: matrix[0].abs() >= matrix[1].abs(),
+                        };
+                        let judged = page.gap_fonts.judge(font, text, shown);
+                        page.gaps_misread |= judged.misjudged;
+                        if let Some(candidate) = judged.candidate {
+                            let unit = [
+                                matrix[0] * state.horizontal_scale,
+                                matrix[1] * state.horizontal_scale,
+                            ];
+                            let origin = [matrix[4], matrix[5]];
+                            let advance = f64::from(judged.advance);
+                            pending = Some(Pending {
+                                candidate,
+                                origin,
+                                unit,
+                                pen: placed.then(|| {
+                                    [origin[0] + advance * unit[0], origin[1] + advance * unit[1]]
+                                }),
+                                moved: false,
+                            });
+                        }
+                    }
+                }
                 // After a run, the next starts where it ended, which the
                 // glyph widths decide.
                 if placed {
@@ -596,6 +768,8 @@ fn execute<'a>(
             "BI" => page.draw_image(state.ctm, page_box),
             "sh" => page.painted(),
             "Do" => {
+                // What a form or an image paints continues no string.
+                pending = None;
                 let Some(name) = operands.first().and_then(|name| name.as_name().ok()) else {
                     continue;
                 };
@@ -730,6 +904,28 @@ fn page_resources(document: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
         .collect()
 }
 
+/// The named font from the first resource dictionary that binds it.
+fn font<'a>(
+    document: &'a Document,
+    resources: &[&'a Dictionary],
+    name: &[u8],
+) -> Option<&'a Dictionary> {
+    for resources in resources {
+        let Some(fonts) = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|fonts| dictionary(document, fonts))
+        else {
+            continue;
+        };
+        let Ok(entry) = fonts.get(name) else {
+            continue;
+        };
+        return dictionary(document, entry);
+    }
+    None
+}
+
 /// The named XObject from the first resource dictionary that binds it, with
 /// its object id.
 fn xobject<'a>(
@@ -857,6 +1053,15 @@ pub(crate) mod tests {
     /// `/F1`, a 64-pixel gray image as `/Im1`, and a form holding `form` as
     /// `/Fm1`.
     pub(crate) fn scan_pdf(page: &str, form: &str) -> Vec<u8> {
+        scan_pdf_in(
+            page,
+            form,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        )
+    }
+
+    /// A one-page document whose `/F1` is the given font.
+    fn scan_pdf_in(page: &str, form: &str, font: &str) -> Vec<u8> {
         let pixels = vec![200u8; 64 * 64];
         let objects: Vec<Vec<u8>> = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
@@ -865,8 +1070,7 @@ pub(crate) mod tests {
               /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R /Fm1 7 0 R >> >> \
               /Contents 5 0 R >>"
                 .to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
-                .to_vec(),
+            font.as_bytes().to_vec(),
             stream("", page.as_bytes()),
             stream(
                 "/Type /XObject /Subtype /Image /Width 64 /Height 64 \
@@ -1015,6 +1219,66 @@ pub(crate) mod tests {
             &format!("{SCAN} q {heading} /Fm1 Do Q {STAMP}"),
             "/Sh1 sh"
         ));
+    }
+
+    #[test]
+    fn word_gaps_pdf_inspector_misjudges_are_found() {
+        let gaps = |font: &str, content: &str| {
+            let pdf = scan_pdf_in(content, "", font);
+            scan(&pdf, &HashSet::new(), Some(&HashSet::new()), None).gaps_misread
+        };
+        let subset = |differences: &str, width_32: u32, width_26: u32| {
+            let widths: Vec<String> = (1..=120)
+                .map(|code| match code {
+                    26 => width_26.to_string(),
+                    32 => width_32.to_string(),
+                    _ => "556".to_string(),
+                })
+                .collect();
+            format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+SubsetSans /FirstChar 1 \
+                 /LastChar 120 /Widths [{}] /Encoding << /Type /Encoding \
+                 /BaseEncoding /WinAnsiEncoding /Differences [{differences}] >> >>",
+                widths.join(" ")
+            )
+        };
+        let kerned = "BT /F1 10 Tf 60 700 Td [(8) -106 (5,000) -108 (.00)] TJ ET";
+        let columns = "BT /F1 10 Tf 60 700 Td [(13,100.00) -300 (1,020.00)] TJ ET";
+        // The space named at code 26 and code 32 unused: pdf-inspector
+        // takes 250 units, and kerning between its threshold and the fix's
+        // splits the amount.
+        assert_eq!(gaps(&subset("26 /space", 0, 288), kerned), vec![1]);
+        // Code 32 holding a wide glyph: a word gap under it is lost.
+        assert_eq!(gaps(&subset("26 /space 32 /M", 833, 288), columns), vec![1]);
+        // Gaps both thresholds judge alike.
+        assert!(gaps(&subset("26 /space 32 /M", 833, 288), kerned).is_empty());
+        assert!(gaps(&subset("26 /space", 0, 288), columns).is_empty());
+        // The space where pdf-inspector reads it, as wide as its fallback,
+        // or at two codes of different widths, which the fix leaves alone.
+        assert!(gaps(&subset("26 /space", 288, 288), kerned).is_empty());
+        assert!(gaps(&subset("26 /space", 0, 250), kerned).is_empty());
+        assert!(gaps(&subset("26 /space 32 /space", 250, 288), kerned).is_empty());
+        assert!(gaps(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            kerned
+        )
+        .is_empty());
+        // Text pdf-inspector does not read.
+        let hidden = "BT /F1 10 Tf 3 Tr 60 700 Td [(8) -106 (5,000) -108 (.00)] TJ ET";
+        assert!(gaps(&subset("26 /space", 0, 288), hidden).is_empty());
+        // Character spacing set with `"` inside a short string counts once
+        // the next run takes it back: by the offset before its first glyph,
+        // or by starting there on the same line (the string, 13.22 units
+        // wide, ends 1.05 past where the run starts).
+        let spaced = |next: &str| {
+            let content = format!("BT /F1 10 Tf 12 TL 60 700 Td 0 1.05 (dt) \" {next} ET");
+            gaps(&subset("26 /space", 0, 288), &content)
+        };
+        assert_eq!(spaced("[105 (oday)] TJ"), vec![1]);
+        assert_eq!(spaced("12.17 0 Td (oday) Tj"), vec![1]);
+        for next in ["(oday) Tj", "20 0 Td (oday) Tj", "0 -12 Td (oday) Tj", ""] {
+            assert!(spaced(next).is_empty(), "{next}");
+        }
     }
 
     #[test]

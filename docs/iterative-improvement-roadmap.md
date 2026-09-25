@@ -278,6 +278,7 @@ came back clean. The evidence and dispositions are in
 | Sanitizer | Keep what the Markdown sanitizer removed wrongly | Cell line breaks (`<br>`) kept, which had fused "52,000" and "1,250" into "52,0001,250" in six lanes; escaped `\<Client name>` placeholders and code kept |
 | 14 | DOCX list labels as Word writes them | Missing number text, composite labels across instances, style chains past 32, and padded numbering numbers disclosed; 15 review fixtures now match LibreOffice, and no randomized or public document changed |
 | Review 6 | Bypass and false-refusal review of loops 12-13 and the round-five fixes, against LibreOffice and AnyDoc's raw output | 4 missed losses and 7 false positives fixed: links holding blocks spliced as AnyDoc splices them, boxes laid out as a reader lays them out, DOCX lists numbered per Word story, PDF repeats confirmed in the Markdown, table warnings only with evidence, a quadratic ODF scan made linear; DOCX list numbers now agree with LibreOffice on all 320 randomized documents |
+| 15 | PDF word gaps pdf-inspector judges against the wrong space width (open upstream #532) | `word_gaps_misread` warning by page; the upstream real-estate fixture ("CBDOffice", "pricingisliketheweather") and three #532 replicas are named, and every page the fix changes among 900 randomized fonts and layouts, with none named in error |
 
 ## Next slices
 
@@ -293,14 +294,13 @@ came back clean. The evidence and dispositions are in
    numbering, and format models, which mirror 0.2.4's behavior.
 3. **Next pdf-inspector release.** If #479 or #501 lands, compare its
    invisible-layer handling with the local scan before removing either; if
-   #317, #377, #406, #424, or #443 lands, retire the matching warning once a
-   fixture shows the release reads it right; if #578 lands, PDF Markdown
-   gains link destinations and must pass through the sanitizer.
+   #317, #377, #406, #424, #443, or #532 lands, retire the matching warning
+   once a fixture shows the release reads it right; if #578 lands, PDF
+   Markdown gains link destinations and must pass through the sanitizer.
 4. **PDF defects not yet detected.** From the open pull requests: amounts
    pushed out of their rows (#424), receipts read as scans (#445), forms with
-   indirect or missing resources (#407, #312), rotated headers (#298), space
-   widths from the wrong code (#532), browser-printed words (#531), and blank
-   pages (#339). Each has a generated fixture and a proposed local check in
+   indirect or missing resources (#407, #312), rotated headers (#298),
+   browser-printed words (#531), and blank pages (#339). Each has a generated fixture and a proposed local check in
    the drift audit. A leaner content tokenizer would also cut the repeat
    check's 20-30% share of `pdf_to_markdown`.
 5. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any

@@ -349,6 +349,86 @@ fn text_the_markdown_repeats_is_reported() {
     );
 }
 
+/// A one-page closing statement in a subset font whose differences name the
+/// space at code 26 and leave code 32 unused, with a price kerned inside
+/// its digits (pdf-inspector #532).
+fn kerned_subset_statement_pdf() -> Vec<u8> {
+    let widths: Vec<String> = (1..=120)
+        .map(|code| match code {
+            26 => "278".to_string(),
+            32 => "0".to_string(),
+            _ => "556".to_string(),
+        })
+        .collect();
+    let font = format!(
+        "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+StatementSans /FirstChar 1 \
+         /LastChar 120 /Widths [{}] /Encoding << /Type /Encoding \
+         /BaseEncoding /WinAnsiEncoding /Differences [26 /space] >> >>",
+        widths.join(" ")
+    );
+    let line = |y: u32, parts: &str| format!("BT /F1 10 Tf 1 0 0 1 72 {y} Tm [{parts}] TJ ET\n");
+    let content = [
+        line(740, "(Closing\\032statement)"),
+        line(
+            700,
+            "(Purchase\\032price) -4000 (8) -106 (5,000) -108 (.00)",
+        ),
+        line(680, "(Deposit) -4000 (1,020.00)"),
+    ]
+    .concat();
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        font.into_bytes(),
+        stream("", content.as_bytes()),
+    ])
+}
+
+#[test]
+fn word_gaps_judged_against_the_wrong_space_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let pdf = temporary.path().join("statement.pdf");
+    std::fs::write(&pdf, kerned_subset_statement_pdf()).expect("write PDF");
+    let pdf = pdf.to_str().expect("UTF-8 path").to_string();
+    let sample = fixture("source/sample-2.pdf");
+    let results = call_tools(
+        &[
+            ("pdf_to_markdown", serde_json::json!({ "path": pdf })),
+            ("pdf_to_markdown", serde_json::json!({ "path": sample })),
+        ],
+        None,
+    );
+    let warnings = results[0]["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "word_gaps_misread"
+                && warning["pages"] == serde_json::json!([1])),
+        "{}",
+        results[0]
+    );
+    // pdf-inspector 1.24.0 splits the kerned price; when a release fixes
+    // #532, this expectation goes.
+    assert!(
+        results[0]["markdown"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("8 5,000 .00")),
+        "{}",
+        results[0]
+    );
+    // The public sample's fonts are read as their fix would read them.
+    assert!(
+        !results[1]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "word_gaps_misread"),
+        "{}",
+        results[1]
+    );
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

@@ -45,8 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `invisible_text_layer` reason, when its text is mostly an invisible layer
   that pdf-inspector 1.24.0 does not read (see Fixed).
 - PDF results carry a `warnings` list, absent when empty, naming text the
-  Markdown repeats and tables whose amounts may sit in the wrong row or
-  column (see Fixed). A full run that yields no Markdown for a text PDF
+  Markdown repeats, pages whose word gaps pdf-inspector misjudges, and tables
+  whose amounts may sit in the wrong row or column (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -187,6 +187,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Words and amounts that pdf-inspector 1.24.0 runs together or splits because
+  it measures word gaps against the wrong space width (open upstream #532)
+  are reported. For a subset font whose differences name the space at a code
+  other than 32, it reads the space width at code 32, or 250 units when code
+  32 has none, so the upstream real-estate fixture read "CBDOffice" and
+  "pricingisliketheweather", and a kerned price "8 5,000 .00". A page whose
+  text has a gap that pdf-inspector judges otherwise than its open fix would
+  now carries a `word_gaps_misread` warning; the Markdown is not changed. The
+  check follows pdf-inspector's rules for the threshold, its fallbacks, its
+  tracked runs of single glyphs, and character spacing that the next run
+  takes back. It reads glyphs with pdf-inspector's own ToUnicode and
+  glyph-name tables. Against pdf-inspector patched with the fix, it names
+  every changed page it checks and no other: 8 pages in 5 of 256 corpus,
+  upstream-fixture, and replica PDFs (the ninth changed page is listed as
+  needing OCR, and not checked), and 212 pages in 900 randomized fonts and
+  layouts.
 - DOCX list numbers are compared as Word writes its labels, found by
   checking the review fixtures against LibreOffice. A level without number
   text (`w:lvlText`) shows no number in Word, while AnyDoc numbers it; a
@@ -357,13 +373,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with few text operators and a logo read as a scan (#445); forms with
   indirect or missing resources (#407, #312), reported only through the
   garbled-text reason where it applies; rotated column headers scattered
-  into cells (#298); a space width read from the wrong code, splitting or
-  fusing amounts (#532); browser-printed words split into letters (#531);
+  into cells (#298); browser-printed words split into letters (#531);
   and blank pages that turn the sparse-extraction rule on for every page
   (#339). The table checks read the Markdown and name no page; the repeat
   check reads runs whose position is set, and stops after 4 million
   operations per document. A repeat is confirmed in the Markdown on up to
-  64 pages; later pages are named unconfirmed.
+  64 pages; later pages are named unconfirmed. The word-gap check runs on
+  the same pages; a page listed as needing OCR is not checked, and a
+  dependent sign's placement and return count as two gaps, where
+  pdf-inspector nets them into one.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen

@@ -73,6 +73,9 @@ pub struct PdfWarning {
 
 /// Text a page paints twice over itself, which pdf-inspector repeats.
 pub const PDF_WARNING_TEXT_PAINTED_TWICE: &str = "text_painted_twice";
+/// Pages with gaps between glyphs that pdf-inspector 1.24.0 judges against
+/// the wrong space width (open upstream #532).
+pub const PDF_WARNING_WORD_GAPS_MISREAD: &str = "word_gaps_misread";
 
 /// Pages painting text twice whose text is read again to confirm the
 /// repeat in the Markdown.
@@ -257,7 +260,8 @@ impl PdfInfo {
     /// with the reason; pages it already gave a reason are not scanned for
     /// that, and a page it listed for sparse text alone is, so it gains the
     /// reason. In a full run with Markdown, pages not needing OCR are also
-    /// checked for text painted twice, which the Markdown repeats.
+    /// checked for text painted twice, which the Markdown repeats, and for
+    /// word gaps judged against the wrong space width (see `word_gaps`).
     fn scan_text_paints(&mut self, buffer: &[u8], only: Option<&HashSet<u32>>, mode: &ProcessMode) {
         let layer_skip: HashSet<u32> = self
             .ocr_reasons_by_page
@@ -280,6 +284,13 @@ impl PdfInfo {
             text_paints::scan(buffer, &layer_skip, twice_skip.as_ref(), only)
         }))
         .unwrap_or_default();
+        if !found.gaps_misread.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_WORD_GAPS_MISREAD,
+                "On these pages pdf-inspector 1.24.0 measures word gaps against the wrong space width, so some words or amounts run together or split apart, as in \"CBDOffice\" or \"8 5,000 .00\"; check amounts against the PDF.",
+                found.gaps_misread.clone(),
+            ));
+        }
         let painted_twice = self.confirm_painted_twice(buffer, found.painted_twice, &found.repeats);
         if !painted_twice.is_empty() {
             self.warnings.push(PdfWarning::new(
@@ -422,6 +433,7 @@ mod doubled_text;
 mod markdown_tables;
 pub mod pdf_worker;
 mod text_paints;
+mod word_gaps;
 
 /// Errors from the facade layer.
 #[derive(Debug, thiserror::Error)]

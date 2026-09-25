@@ -96,7 +96,7 @@ reach this repository:
 | #506 | Bound a cubic cost on dense rectangle clusters | Bounded here by the PDF worker's 25-second deadline, which returns `resource_limit`. |
 | #583 | Explicit invisible-text inclusion in positioned extraction | Not exposed; the region tools keep upstream's default. |
 | #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
-| #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. Not detected yet; the #406 half of #531 is reported as `table_row_repeated`. |
+| #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. #532 is reported as `word_gaps_misread` on each page with a gap 1.24.0 judges otherwise than the fix would; checked against pdf-inspector patched with the fix, it names every changed page it checks and no other. #531's split words are not detected; its #406 half is reported as `table_row_repeated`. |
 
 Thirteen open pull requests that reach the PDF tools were checked against
 1.24.0 with generated fixtures run through the server. Twelve defects are
@@ -272,8 +272,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 243 tests pass (190 skillkit unit, 13
-  skillkit integration, 29 document-tool and 8 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 248 tests pass (194 skillkit unit, 13
+  skillkit integration, 29 document-tool and 9 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI
