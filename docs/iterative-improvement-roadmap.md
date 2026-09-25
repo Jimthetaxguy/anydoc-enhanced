@@ -2,7 +2,7 @@
 
 **Baseline:** `agent/codex-align-firecrawl-20260828`
 **Upstream:** Firecrawl `pdf-inspector 1.24.0` and AnyDoc `0.2.4`
-**Status:** Stages 1-9, including the DOCX happy-path slice, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict CSV, strict ODP, and strict EPUB slices, are implemented; HTML/MHTML, RTF, and OCR remain gated.
+**Status:** Stages 1-9, including the DOCX happy-path slice, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict CSV, strict ODP, and strict EPUB slices, are implemented; the 2026-09-24 upstream refresh is complete; HTML/MHTML, RTF, and OCR remain gated.
 
 ## Objective
 
@@ -248,6 +248,38 @@ provider identity, path/HTML/URL absence, and fail-closed negative outcomes.
 Linux-only worker tests cover the route and hostile matrix; Darwin verifies
 classification and containment preflight but intentionally reports the route as
 disabled because it cannot enforce the worker memory ceiling.
+
+## Upstream refresh cycle (2026-09-24)
+
+This cycle refreshed the repository from the official Firecrawl
+`pdf-inspector` and AnyDoc repositories and ran review loops until each round
+came back clean. The evidence and dispositions are in
+[`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md).
+
+| Loop | Change | Evidence |
+|---|---|---|
+| 1 | `pdf-inspector` 1.17.0 to 1.24.0, `lopdf` 0.45.0 | Object-stream bomb peak RSS 1,100 MiB to 19 MiB; golden output differs by one line |
+| 2 | Surface the new PDF signals (OCR reasons, layout, CMap gaps, provenance dates) and read the IRC structure pdf-inspector actually renders | IRC parsing goes from 0 to 14 sections and 284 provisions on the public corpus |
+| 2b | Run PDF tools inside the bounded worker | A page-content bomb that still peaks at 2.1 GiB in-process returns `resource_limit`; batch high-water mark 1,015 MiB to 192 MiB |
+| 3 | Refuse or disclose what the pinned AnyDoc drops or amplifies, from its open pull requests | Symbol and form checkboxes, hidden text, link-destination schemes, and number-format amplification fixtures |
+| 4 | `rmcp` 3.4.1 with read-only tool annotations | Tool names and schemas unchanged |
+| Review 1–2 | Make every preflight check read what AnyDoc reads: its transcoding, its reference resolution, its exact part names | Five decoy fixtures that converted as complete with no warning now fail closed or disclose |
+
+## Next slices
+
+1. **DOCX inline-content oracle.** AnyDoc 0.2.4 silently drops more run
+   content than the symbols already refused. Reproduced: a non-breaking hyphen
+   (`w:noBreakHyphen`) disappears, so "Form 1040‑SR" converts as "Form 1040SR",
+   and ruby base text disappears with its annotation. Candidates to confirm are
+   `w:altChunk` imported content and `w:subDoc`. Decide per element whether to
+   refuse or to disclose with a warning, add fixtures, and assert the result
+   through the worker.
+2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
+   non-exhaustive `Format` arms, the four Wingdings codes from #177, and a
+   re-check of the ported `to_utf8` and `path::resolve`.
+3. **Non-Linux containment.** PDF and document parsing still lack a memory
+   ceiling on macOS and fall back to in-process parsing where no sandbox
+   exists; filesystem isolation remains open on every platform.
 
 ## Go/no-go rules
 

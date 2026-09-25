@@ -8,8 +8,8 @@ selected production revisions are recorded here.
 
 | Logical mirror | Repository | Local production reference | Latest release observed | Upstream `main` observed | License | Audit date |
 |---|---|---|---|---|---|---|
-| `firecrawl-pdf-inspector` | <https://github.com/firecrawl/pdf-inspector> | crates.io `1.17.0`, checksum `6cdfc6057e1b38a2ae84490c5e64abc5c81738d4d5ac1ccc55cf1a2c9b87334e` | Git tag `v1.15.0` at `06a9bab6b3309309503f2db17851389cee094a62` | `23cf1ad7b37eec6e3a21df61f8e6d5dce66c46bd` (main manifest `1.17.0`) | MIT | 2026-08-28 |
-| firecrawl-anydoc | https://github.com/firecrawl/anydoc | crates.io anydoc 0.2.4, checksum recorded in Cargo.lock; local worker enables DOCX, exact PPTX, XLSX, ODS, ODT, Linux-memory-gated ODP, and Linux-memory-gated strict EPUB | v0.2.4 at 42bf1c5ecdde9eb0d96d6bd75a9e6698cf93b14c | 261fc257d17c3eab0f673be31c408fd9fdc2171a | MIT | 2026-08-28 |
+| `firecrawl-pdf-inspector` | <https://github.com/firecrawl/pdf-inspector> | crates.io `1.24.0`, checksum `e22dc125a533d212c847c8c85e4fcb7358f4384869ef76b2b8721f039b1b633a`; PDF parsing runs in the bounded worker | Git tag `v1.24.0` at `876fe9ac65c1b05512b9a1a182b5c56bcfdd6c39` | `f856d3481d41d564c64d20baa2a4796d98aed03c` (release CI only after the tag) | MIT | 2026-09-24 |
+| firecrawl-anydoc | https://github.com/firecrawl/anydoc | crates.io anydoc 0.2.4, checksum recorded in Cargo.lock; local worker enables DOCX, exact PPTX, XLSX, ODS, ODT, Linux-memory-gated ODP, and Linux-memory-gated strict EPUB | v0.2.4 at 42bf1c5ecdde9eb0d96d6bd75a9e6698cf93b14c (still the latest release) | 261fc257d17c3eab0f673be31c408fd9fdc2171a (README only after the tag); 17 open pull requests reviewed | MIT | 2026-09-24 |
 
 Local sibling mirror conventions:
 
@@ -22,10 +22,14 @@ Absolute machine paths are intentionally excluded from this public record.
 
 | Upstream change | Disposition | Rationale |
 |---|---|---|
-| `pdf-inspector` `1.17.0` registry package | Adopted on this branch | Compiled and passed the existing 13-tool regression suite; optional OCR/vision features remain disabled. |
-| `pdf-inspector` current-main changes beyond the published package | Deferred | Future quality improvements need targeted fixture comparisons before adoption. |
+| `pdf-inspector` `1.17.0` registry package | Superseded by `1.24.0` | Adopted in the 2026-08-28 alignment. |
+| `pdf-inspector` `1.24.0` registry package (`lopdf` 0.45.0) | Adopted | Bounded object streams cut an object-stream bomb from about 1.1 GiB to 19 MiB peak RSS; golden output differs by one line. Per-page OCR reasons, layout, CMap gaps, and validated creation and modification dates are reported additively. See [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md). |
+| Unbounded page-content reads remaining in `pdf-inspector` 1.24.0 | Contained locally | A page-content bomb still peaks at 2.1 GiB in-process, so every PDF tool now runs in the bounded worker (1 GiB address-space ceiling on Linux, 25-second deadline, four slots) and returns `resource_limit`. |
+| `pdf-inspector` current-main changes beyond the published package | Not adopted | Release CI only after `v1.24.0`. |
 | AnyDoc v0.2.4 typed NeedsOcr behavior and scanned-PDF fixtures | Resolved for parser convergence; bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP and strict EPUB worker paths adopted; CSV is handled by a separate local adapter | The local contract, versioned worker, offline default, sanitizer, public fixtures, OOXML/ODF/EPUB preflight, exact-variant gates, and declared-part completeness checks are implemented; RTF and broader format completeness remain deferred. |
 | AnyDoc `main` documentation-only commits after `v0.2.4` | Not adopted | No production code or dependency change identified. |
+| AnyDoc open pull requests (#147–#177), reviewed 2026-09-24 | Mirrored locally where they expose a pinned-parser defect; not merged | Symbol and form checkboxes (#177) and number-format amplification (#148) fail closed; destination handling (#171) is covered by the sanitizer; allocation-failure signals (#169) and bare ampersands (#158) were already fail-closed; legacy, email, PDF, and OCR changes do not reach the enabled lanes. Dispositions per pull request are in the 2026-09-24 audit. |
+| AnyDoc 0.2.4 `to_utf8` transcoding and `package::path::resolve` | Mirrored locally | The preflight decodes every XML part and resolves every package reference exactly as the pinned parser does, so a UTF-16 part or a decoy under a differently resolved name cannot hide content from the checks. Five hardening fixtures reproduce the divergences. |
 | Local strict PPTX policy | Intentionally local | AnyDoc skips unreadable slides with log-only diagnostics, so this repository enables only exact visible, non-macro `.pptx` packages after declared-slide, shape-tree, external-relationship, and active-content preflight. |
 | Local strict XLSX policy | Intentionally local | AnyDoc exposes a broad Excel parser, but this repository enables only exact `.xlsx` with visible content, cached formula values, no external links, and no active/binary/legacy content. |
 | Local strict ODT policy | Intentionally local | AnyDoc ODF text conversion can omit unsupported or unavailable parts without a typed completeness result; this repository enables only exact visible text packages after XML, manifest, hidden/tracked, external, active, encryption, internal-asset, and known unsupported-note preflight. |

@@ -35,13 +35,50 @@ worker returns a positive response, stays below the existing 8 MiB public
 output envelope, and completes before the existing 15-second worker deadline.
 The opt-in metadata is omitted from normal worker responses.
 
+### Linux observations, 2026-09-24
+
+The same evaluator on Linux x86-64 (release build, commit `37f8e46`) with the
+1 GiB address-space ceiling and seccomp network denial active:
+
+| Lane | Fixture | Peak RSS (bytes) | Response bytes | Wall time (ms) |
+|---|---|---:|---:|---:|
+| DOCX | `docx/public-fixture.docx` | 6,742,016 | 171 | 2 |
+| PPTX | `pptx/public-walkthrough.pptx` | 6,795,264 | 274 | 2 |
+| XLSX | `xlsx/public-workpaper.xlsx` | 6,881,280 | 320 | 2 |
+| ODS | `ods/public-workpaper.ods` | 6,946,816 | 496 | 2 |
+| ODT | `odt/minimal.odt` | 6,664,192 | 103 | 2 |
+| ODP | `odp/public-presentation.odp` | 7,372,800 | 374 | 3 |
+| EPUB | `epub/public-spine-order.epub` | 6,615,040 | 565 | 2 |
+
+## PDF worker observations, 2026-09-24
+
+PDF tools run in the same worker since this refresh (25-second deadline, four
+in-flight slots, the same Linux ceiling and network filter). Measurements from
+the release build on Linux x86-64:
+
+| Input | Route | Result | Peak RSS |
+|---|---|---|---:|
+| 1 MB object-stream bomb inflating to 1 GiB | in-process, `pdf-inspector` 1.17.0 | converted | about 1,100 MiB |
+| Same | in-process, `pdf-inspector` 1.24.0 | converted | about 19 MiB |
+| Page-content bomb | in-process, `pdf-inspector` 1.24.0 (classify, Markdown, analyze) | converted | about 2,122 MiB |
+| Same | worker | `resource_limit` in 0.6–1.7 s | worst process about 519 MiB |
+
+The worker adds little on ordinary input. Median `classify_pdf` time goes from
+4.3 to 7.7 ms on `source/sample-1.pdf` and from 55.8 to 65.6 ms on
+`source/sample-2.pdf`. `pdf_to_markdown` on sample 2 goes from 408 to 417 ms.
+A `batch_classify` over 24 files of 40 MiB lowers the server's high-water mark
+from 1,015 MiB to 192 MiB, because each call takes a slot before it reads its
+file.
+
 ## Boundary and interpretation
 
-The existing worker still enforces an 8 MiB Markdown cap and a 15-second
-deadline. Linux additionally applies a 1 GiB `RLIMIT_AS` and a seccomp
-network-denial filter; Darwin launches the worker under macOS named
-`no-network` profile. Darwin and other non-Linux hosts do not yet have an
-equivalent production memory ceiling. Therefore this evidence:
+The document lanes enforce an 8 MiB Markdown cap and a 15-second deadline.
+The PDF lane enforces a 128 MiB response cap and a 25-second deadline. Linux
+additionally applies a 1 GiB `RLIMIT_AS` and a seccomp network-denial filter.
+Darwin launches the worker under the macOS named `no-network` profile. Darwin
+and other non-Linux hosts do not yet have an equivalent production memory
+ceiling. On hosts without a worker sandbox, PDF tools parse in-process, as
+they did before this refresh. Therefore this evidence:
 
 - supports the current enabled-lane baseline and can detect gross release
   regressions;
@@ -82,6 +119,11 @@ The run passed 7/7 cases with zero nonzero worker exits, protocol failures,
 raw stderr, or timeout outcomes. These are initial Darwin hostile-resource
 observations, not a universal memory budget or cross-platform proof; repeat the
 evaluator after upstream revision changes and on Linux CI before promotion.
+
+**Repeated:** 2026-09-24 on Linux x86-64 with the release worker from commit
+`37f8e46` against AnyDoc `main` `261fc257`. The result was 7/7 `resource_limit`,
+with peak RSS between 12,873,728 and 13,660,160 bytes and wall times of
+2–9 ms.
 
 Run it with a local mirror and release worker:
 

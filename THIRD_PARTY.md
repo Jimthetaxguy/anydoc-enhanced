@@ -36,28 +36,32 @@ Revert the dependency and lockfile changes, then rerun the locked verification g
 
 ## Full dependency license audit
 
-Generated with `cargo license --json` on 2026-08-28. The 211-package workspace graph
-(209 external packages plus 2 workspace packages) resolves to:
+Generated with `cargo license --json` (cargo-license 0.7.0) on 2026-09-24. The
+206-package workspace graph (204 external packages plus 2 workspace packages)
+resolves to:
 
 | License set | Crate count | Notes |
 |---|---:|---|
-| `Apache-2.0 OR MIT` | 141 | Bulk of the Rust ecosystem |
-| `MIT` | 35 | Includes `anydoc`, `lopdf`, and `pdf-inspector` |
+| `Apache-2.0 OR MIT` | 137 | Bulk of the Rust ecosystem |
+| `MIT` | 33 | Includes `anydoc`, `lopdf`, and `pdf-inspector` |
 | `Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT` | 14 | wasm/wit toolchain crates |
-| `MIT OR Unlicense` | 8 | Permissive dual-license choice |
+| `MIT OR Unlicense` | 6 | Permissive dual-license choice |
 | `Apache-2.0 OR MIT OR Zlib` | 3 | Permissive multi-license choice |
-| `Apache-2.0` | 3 | Includes `rmcp` and `rmcp-macros` |
-| `(Apache-2.0 OR MIT) AND BSD-3-Clause` | 1 | Compatible conjunctive terms |
+| `Apache-2.0` | 3 | `rmcp`, `rmcp-macros`, and `zopfli` |
+| `BSD-3-Clause` | 2 | `alloc-no-stdlib` and `alloc-stdlib`, through `brotli-decompressor` (from `lopdf` 0.45.0) |
+| `Zlib` | 2 | Permissive license |
+| `(Apache-2.0 OR MIT) AND BSD-3-Clause` | 1 | `encoding_rs`; compatible conjunctive terms |
 | `(Apache-2.0 OR MIT) AND Unicode-3.0` | 1 | Compatible conjunctive terms |
 | `0BSD OR Apache-2.0 OR MIT` | 1 | Permissive multi-license choice |
+| `BSD-3-Clause OR MIT` | 1 | `brotli-decompressor`; this project selects MIT |
 | `Apache-2.0 OR BSL-1.0` | 1 | `ryu`; this project selects Apache-2.0 |
 | `Apache-2.0 OR LGPL-2.1-or-later OR MIT` | 1 | `r-efi`; this project selects MIT |
-| `Zlib` | 2 | Permissive license |
 
 **Result:** no resolved package requires GPL, AGPL, LGPL, SSPL, BUSL, or
 proprietary licensing. The graph passes the repository's cargo-deny license
-policy; `r-efi` offers LGPL-or-later or MIT, and this project selects MIT; `ryu`
-offers Apache-2.0 or BSL-1.0, and this project selects Apache-2.0.
+policy, whose allow list includes BSD-3-Clause. `r-efi` offers LGPL-or-later or
+MIT, and this project selects MIT; `ryu` offers Apache-2.0 or BSL-1.0, and this
+project selects Apache-2.0.
 
 To re-run the audit:
 

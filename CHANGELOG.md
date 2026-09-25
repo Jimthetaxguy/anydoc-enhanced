@@ -8,18 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Adopted `pdf-inspector` 1.24.0 and `lopdf` 0.45.0 (from 1.17.0 and 0.42.0).
+  Every PDF tool now runs in the bounded worker used by the document lanes:
+  separate process, 1 GiB address-space ceiling and seccomp network denial on
+  Linux, a 25-second deadline, and four in-flight slots taken before a file is
+  read. Tool names and input schemas are unchanged.
+- Adopted `rmcp` 3.4.1. Every tool declares read-only, non-destructive,
+  idempotent, closed-world annotations.
+- Every dependency now resolves from crates.io, and cargo-deny rejects Git
+  sources.
 - Consolidated the `anyhow`, `serde_json`, `thiserror`, `regex`, and `tokio`
   lockfile updates after a live review of PRs #14-#18; `thiserror` advances to
   2.0.20 because the proposed 2.0.19 update is already superseded.
 - Replaced home-directory PDF discovery in integration tests with a tracked,
   redistributable U.S. Code fixture.
 - Updated repository identity and documentation for `anydoc-enhanced`, and
-  added a dependency-ordered Firecrawl AnyDoc integration plan. AnyDoc remains
-  planned and is not yet a runtime dependency.
+  added a dependency-ordered Firecrawl AnyDoc integration plan. AnyDoc 0.2.4
+  now runs behind the bounded worker for the enabled document lanes.
 - Limited feature-branch CI to the pull-request event so the same jobs are not
   duplicated by both `push` and `pull_request`.
 
 ### Security
+- DOCX conversion refuses content the pinned AnyDoc parser drops silently:
+  symbol-font checkboxes and letters (`w:sym`), legacy form checkbox and
+  drop-down state. Hidden text is converted and disclosed with a
+  `hidden_content_preserved` warning.
+- XLSX conversion refuses number-format codes over 4,096 bytes; one 8 MiB code
+  had amplified to 855 MiB in the worker.
+- Markdown sanitization decodes each link destination before classifying it.
+  It removes external and local-path destinations in every spelling found in
+  review, including `mailto:`, `file:`, `data:`, `tel:`, UNC, and `www.` forms.
+- Package checks now read what AnyDoc reads. XML parts are transcoded as AnyDoc
+  transcodes them (UTF-16 and declared encodings). Package references resolve
+  as AnyDoc resolves them, including fragments, queries, percent-encoding, and
+  `..` clamping. The PPTX presentation part is matched by exact name, and the
+  officeDocument relationship must name the checked part. Each hidden-content
+  or dropped-content decoy found in review converted as complete before this
+  change and now fails closed or is disclosed.
+- A PDF page-content bomb that still peaks at 2.1 GiB in-process under
+  `pdf-inspector` 1.24.0 now returns `resource_limit` from the worker.
+- Replaced the yanked `chacha20` 0.10.0 with 0.10.2.
 - Updated transitive `crossbeam-epoch` to 0.9.20 to resolve
   `RUSTSEC-2026-0204`.
 - Expanded CI policy enforcement to run cargo-deny advisory, license, ban, and
@@ -32,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backward-compatible `batch_classify` path echo explicitly.
 
 ### Added
+- PDF results report per-page OCR reasons. Analysis reports layout (pages with
+  tables or columns) and fonts whose text may be garbled (CMap gaps), and
+  omits both when a mode did not compute them. Creation and modification dates
+  are reported when they match the PDF date grammar. Region extraction reports
+  why a region needs OCR.
+- `parse_irc_sections` reads the Markdown pdf-inspector renders. It returns
+  full provision labels such as `(d)(2)(A)(i)`, flags repealed sections, and
+  keeps editorial and statutory notes apart from the operative text.
+- `scripts/build-anydoc-hardening-corpus.py` and ten synthetic fixtures that
+  reproduce pinned-AnyDoc behaviors the local contract does not inherit.
+- `docs/upstream-drift-audit-2026-09-24.md`: the upstream refresh audit and the
+  disposition of each open AnyDoc pull request.
 - Initial Rust workspace with `pdf-inspector-skillkit` library and `pdf-inspector-mcp` server binary
 - 9 MCP tools: `classify_pdf`, `pdf_to_markdown`, `analyze_layout`, `extract_text_regions`, `extract_table_regions`, `batch_classify`, `identify_tax_form`, `parse_irc_sections`, `split_sec_filing`
 - 4 Sweet tax-review demo tools: `list_tax_packages`, `review_tax_package`, `compare_line_items`, `render_review_memo` — deterministic package review, line-item comparison, and Markdown memo rendering over built-in demo packages (1040, 1120, 1065, 1120-S, K-1, 1099 workflows). Bringing the total to 13 MCP tools.
@@ -48,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Known limitations
-- `parse_irc_sections`: regex captures only the leading section integer, drops decimal/parens (does not handle Treas Reg format) — flagged experimental
+- `parse_irc_sections` reads U.S. Code Title 26 structure; Treasury Regulation
+  numbering (`§ 1.401(k)-1`) is not parsed.
 - `identify_tax_form`: bank-direct 1099-INTs that render as numeric tables only return `Unknown` (no header text in markdown)
-- OCR fallback for scanned PDFs not yet implemented — first scanned PDF returns empty markdown
+- No OCR engine ships. Scanned pages report that they need OCR and why, and
+  return no text for those pages.
+- AnyDoc 0.2.4 drops some DOCX run content that is not yet refused or
+  disclosed, including non-breaking hyphens and ruby base text; see the next
+  slices in `docs/iterative-improvement-roadmap.md`.

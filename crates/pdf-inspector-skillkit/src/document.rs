@@ -1190,8 +1190,9 @@ struct DocxStoryScan {
     /// Content the pinned AnyDoc parser drops without a diagnostic: a symbol
     /// character (`w:sym`, which carries Wingdings checkboxes and Symbol-font
     /// letters) and the state of a legacy form checkbox or drop-down
-    /// (`w:checkBox`, `w:ddList`). Upstream renders symbol checkboxes after
-    /// this release (firecrawl/anydoc#176, #177).
+    /// (`w:checkBox`, `w:ddList`). An open upstream change
+    /// (firecrawl/anydoc#177) renders four Wingdings checkbox codes; every
+    /// other symbol stays dropped there too.
     dropped: bool,
     /// A run formatted hidden directly (`w:r/w:rPr/w:vanish`), which the
     /// pinned parser converts as ordinary text.
@@ -1716,8 +1717,9 @@ fn xlsx_sheet_relationship_ids(workbook: &[u8]) -> HashSet<String> {
 
 /// Longest spreadsheet number-format code converted. AnyDoc 0.2.4 expands
 /// every character of a `formatCode` into several vectors, so one 8 MiB code
-/// in a 10 KB workbook peaked near 855 MiB in the worker; upstream caps codes
-/// at the same 4096 bytes after this release (firecrawl/anydoc#148).
+/// in a 10 KB workbook peaked near 855 MiB in the worker. An open upstream
+/// fix (firecrawl/anydoc#148) caps codes at the same 4096 bytes and renders
+/// longer ones as General; the pinned parser cannot, so they are refused.
 const MAX_NUMBER_FORMAT_BYTES: usize = 4096;
 
 /// Stream a styles part and report whether any `formatCode` attribute value

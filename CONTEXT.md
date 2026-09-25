@@ -3,7 +3,7 @@
 **Role:** public Rust workspace + MCP server for offline document intelligence.
 **Path:** repository root (`<repo-root>`)
 **Remote:** `https://github.com/Jimthetaxguy/anydoc-enhanced.git`
-**Branch:** `agent/codex-align-firecrawl-20260828` (active implementation branch)
+**Branch:** `main`; the 2026-09-24 upstream refresh is on `claude/tender-fermat-dt9szh`
 
 ## Purpose
 
@@ -13,18 +13,20 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 
 | Term | Meaning |
 |------|---------|
-| **classify_pdf** | TextBased / Scanned / Mixed + confidence (~1–10 ms) |
+| **classify_pdf** | TextBased / Scanned / ImageBased / Mixed + confidence, pages needing OCR and why, validated creation/modification dates (~5–10 ms through the worker) |
 | **pdf_to_markdown** | Born-digital PDF → clean Markdown (headings/tables/lists) |
-| **analyze_layout** | Tables, columns, complexity metrics |
+| **analyze_layout** | Pages with tables or columns, and fonts whose text may be garbled (CMap gaps) |
 | **extract_text_regions / extract_table_regions** | Geometry-bounded extraction (`[x1,y1,x2,y2]`) |
 | **batch_classify** | Multi-PDF classify loop |
 | **identify_tax_form** | W-2 / 1099 / K-1 / 1040 / 1065 / 1120 / schedules detector |
-| **parse_irc_sections** | Title 26 IRC section parser (experimental capture format) |
+| **parse_irc_sections** | Title 26 IRC parser over rendered Markdown: sections, full provision labels such as `(d)(2)(A)(i)`, repealed flags, and separated notes |
 | **split_sec_filing** | 10-K / 10-Q Item-number splitter |
 | **Sweet demo package** | Bundled structured tax-review package (list / review / compare / memo tools) |
 | **skillkit** | Library crate with domain modules (`tax`, `irc`, `sec`, `sweet`) |
 | **mcp crate** | `pdf-inspector-mcp` binary exposing tools via rmcp |
 | **AnyDoc worker** | Firecrawl native Rust converter locked at `v0.2.4`; DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, exact `.odp`, and strict EPUB use the bounded AnyDoc path; strict CSV uses a separate local adapter with the same worker boundary on Linux; EPUB and CSV are enabled only on Linux; other variants remain disabled |
+| **PDF worker** | The same bounded worker runs every PDF tool (worker codes 16–20): 25-second deadline, four slots, Linux address-space ceiling and network filter |
+| **hardening corpus** | Synthetic fixtures from `scripts/build-anydoc-hardening-corpus.py` reproducing pinned-AnyDoc behaviors the local contract refuses or discloses |
 | **parser convergence** | One resolved `pdf-inspector` version shared by the skillkit and AnyDoc; required before integration |
 | **document service** | Provider-neutral contract above the PDF facade and bounded AnyDoc worker |
 | **public fixture** | Redistributable, provenance-recorded test input containing no PII or private source material |
@@ -67,9 +69,10 @@ CI: GitHub Actions badge on README.
 - Strict ODT currently accepts only visible, well-formed, exact-mimetype `.odt` packages; hidden/tracked content, external references, encrypted packages, active objects/forms, malformed XML, missing internal assets, and unsupported `text:note` content fail closed
 - Strict CSV is recognized everywhere but the generic route is enabled only when the worker address-space ceiling is enforceable (currently Linux); it requires valid UTF-8, equal-width RFC-4180-style rows, bounded fields/output, and escapes Markdown structure. Strict ODP and strict EPUB follow the same Linux memory gate: ODP requires exact presentation identity, visible complete slides, and local assets; EPUB requires exact EPUB 3 identity, all-spine completeness, navigation agreement, and local resources. Both reject active/external/hidden content.
 - Worker process-group cleanup is implemented on Unix; Linux enforces the address-space ceiling and seccomp network denial, while Darwin uses the named `no-network` profile. Filesystem isolation, non-Linux memory ceilings, and hostile-input promotion remain gated
-- The worker classifies reviewed AnyDoc omission and malformed-recovery warnings into stable incomplete results without exposing raw log text; structural marker oracles cover known public fixtures, while unobserved silent omissions still require additional cases. Strict ODP now has exact identity, visible presentation, local-asset, hidden/external/active, malformed, encryption, archive-limit, and real-worker evidence; strict EPUB now has exact OCF/OPF/spine identity, navigation, local-resource, hostile-content, archive-limit, and real-worker evidence. Initial Darwin/arm64 release-mode resource observations are recorded in `docs/resource-evidence.md`; hostile-resource, filesystem, and cross-host memory gates remain open
+- The worker classifies reviewed AnyDoc omission and malformed-recovery warnings into stable incomplete results without exposing raw log text; structural marker oracles cover known public fixtures, while unobserved silent omissions still require additional cases. Strict ODP now has exact identity, visible presentation, local-asset, hidden/external/active, malformed, encryption, archive-limit, and real-worker evidence; strict EPUB now has exact OCF/OPF/spine identity, navigation, local-resource, hostile-content, archive-limit, and real-worker evidence. Darwin/arm64 and Linux x86-64 release-mode resource observations are recorded in `docs/resource-evidence.md`; hostile-resource, filesystem, and cross-host memory gates remain open
 - Bank-direct 1099-INTs often `Unknown` for form id
-- IRC section-number capture format incomplete
+- IRC parsing covers U.S. Code Title 26; Treasury Regulation numbering is not parsed
+- AnyDoc 0.2.4 still drops some DOCX run content without a diagnostic (non-breaking hyphens, ruby base text); refusing or disclosing it is the next slice
 - Sweet tools are demo/synthetic until real packages wired
 
 ## Non-goals

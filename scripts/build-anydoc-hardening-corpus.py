@@ -5,7 +5,8 @@ Each package reproduces a behavior of AnyDoc 0.2.4 that the local contract
 must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
 
 - symbol-checkbox.docx: Wingdings `w:sym` checkboxes, which the pinned parser
-  drops without a diagnostic (firecrawl/anydoc#176, #177). Expected
+  drops without a diagnostic. The open firecrawl/anydoc#177 renders only the
+  F0FE and F06F Wingdings codes; F0A8 stays dropped. Expected
   `incomplete_conversion`.
 - legacy-form-checkbox.docx: a checked FORMCHECKBOX field, whose state the
   pinned parser drops. Expected `incomplete_conversion`.
@@ -15,7 +16,8 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
   tel, and UNC targets, which the pinned parser writes into Markdown link
   destinations. Expected complete output with every destination removed.
 - oversized-number-format.xlsx: one 64 KiB `formatCode`; the pinned parser
-  expands every character into several vectors (firecrawl/anydoc#148).
+  expands every character into several vectors (capped upstream only in the
+  open firecrawl/anydoc#148).
   Expected `resource_limit` before conversion.
 - utf16-footnote-symbol.docx: a Wingdings checkbox in a UTF-16 footnotes part.
   AnyDoc transcodes UTF-16 parts before parsing, so the checks must read the

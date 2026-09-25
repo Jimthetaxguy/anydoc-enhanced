@@ -1,8 +1,8 @@
 # anydoc-enhanced — public handoff
 
-**Last reconciled:** 2026-08-28
+**Last reconciled:** 2026-09-24
 **Repository:** <https://github.com/Jimthetaxguy/anydoc-enhanced>
-**Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.24.0; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion.
+**Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.24.0, and every PDF tool runs in the bounded worker; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion. The 2026-09-24 upstream refresh is recorded in [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md).
 
 This is the public, repository-relative entry point for future work. Do not add
 home-directory paths, private corpus locations, credentials, internal agent
@@ -13,7 +13,8 @@ configuration, or identifying source-document details.
 The workspace exposes 16 MCP tools over stdio:
 
 - Six generic PDF tools: classify, Markdown, layout, batch, and two region
-  extractors.
+  extractors. All run in the bounded worker (codes 16–20) and report per-page
+  OCR reasons; analysis adds layout and CMap-gap signals.
 - Three generic document tools: capability discovery, classification, and bounded DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB/CSV-to-Markdown conversion (ODP, EPUB, and CSV are enabled only on Linux hosts with the address-space ceiling).
 - Three domain parsers: tax-form identification, IRC section parsing, and SEC
   filing splitting.
@@ -38,13 +39,17 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 
 | Path | Responsibility |
 |---|---|
-| `crates/pdf-inspector-skillkit/src/lib.rs` | PDF facade, document contract, validation, and serialized result types |
+| `crates/pdf-inspector-skillkit/src/lib.rs` | PDF facade, validation, and serialized result types |
+| `crates/pdf-inspector-skillkit/src/pdf_worker.rs` | PDF operations framed for the bounded worker, and the in-process route for hosts without a sandbox |
+| `crates/pdf-inspector-skillkit/src/document.rs` | Document contract, package preflight that reads each package as AnyDoc reads it, worker supervisor and containment, and Markdown sanitizer |
 | `crates/pdf-inspector-skillkit/src/domain/` | Tax, IRC, SEC, and synthetic review logic |
 | `crates/pdf-inspector-mcp/src/main.rs` | MCP schemas, worker mode, tool registration, dispatch, and timeout response handling |
 | `scripts/check-public-hygiene.sh` | Candidate-text obvious-identifier heuristic used locally and in CI |
 | test-corpus/README.md | Public PDF/PPTX/DOCX/XLSX/ODS/ODT/ODP/CSV/EPUB fixture provenance and contributor gate |
 | `docs/dependency-pr-review-2026-08-22.md` | Live review of dependency PRs #14–#18 |
 | `docs/anydoc-integration-plan.md` | Authoritative dependency-ordered AnyDoc plan |
+| `docs/upstream-drift-audit-2026-09-24.md` | Latest upstream audit, open-PR dispositions, and adoption checklist |
+| `scripts/build-anydoc-hardening-corpus.py` | Deterministic fixtures for pinned-AnyDoc behaviors the contract refuses or discloses |
 | `CONTEXT.md` | Stable project vocabulary and boundaries |
 
 ## Verified constraints
@@ -54,8 +59,10 @@ MCP handlers and domain modules must depend on the skillkit boundary.
   partial extraction with page-level OCR diagnostics; no OCR engine is
   currently shipped.
 - Input paths are canonicalized and capped at 50 MiB.
-- PDF MCP handlers return after a 30-second Tokio timeout; the generic DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB path
-  additionally uses a 15-second killable child worker with input/output caps and a
+- MCP handlers return after a 30-second Tokio timeout. PDF tools run in a
+  25-second killable child worker with a 128 MiB response cap and four in-flight
+  slots taken before a file is read; the generic DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB path
+  uses a 15-second killable child worker with input/output caps and a
   two-worker in-flight semaphore; Unix process-group cleanup on timeout, protocol
   error, output overflow, and caller cancellation, Linux address-space
   plus seccomp network denial, and Darwin named `no-network` profile are active.
@@ -129,5 +136,11 @@ exact tool-name set. When parser dependencies change, also assert that
    rollback evidence pass. EPUB has a tracked qualification corpus, navigation
    oracle, real-parser chapter-order/omission evidence, and Linux worker route;
    hostile-resource, filesystem, and cross-platform gates remain.
+
+5. Close the DOCX inline-content gap: AnyDoc 0.2.4 drops non-breaking hyphens
+   ("Form 1040‑SR" becomes "Form 1040SR") and ruby base text without a
+   diagnostic. Decide refuse-or-disclose per element, with fixtures.
+6. Adopt the next AnyDoc release only through the checklist in the
+   2026-09-24 audit, re-checking the ported `to_utf8` and `path::resolve`.
 
 The detailed ordering remains in [`docs/anydoc-integration-plan.md`](anydoc-integration-plan.md). Do not skip parser convergence or expose upstream AnyDoc model types directly through MCP.

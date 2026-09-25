@@ -1,6 +1,6 @@
 # Firecrawl AnyDoc integration plan
 
-**Evidence date:** 2026-08-28
+**Evidence date:** 2026-08-28; refreshed 2026-09-24 (see [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md))
 **Plan status:** parser convergence complete; bounded worker, contract, DOCX happy path, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict CSV, Linux-memory-gated strict ODP, and Linux-memory-gated strict EPUB slices implemented; broader formats remain gated
 **Target:** additive multi-format document support without changing the 13
 existing PDF/domain MCP tools plus additive generic document tools
@@ -14,6 +14,8 @@ the same Rust workspace.
 
 No non-PDF format is enabled merely because `AnyDoc::to_markdown` returns
 `Ok`. The current worker enables DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, exact `.odp`, and strict EPUB through AnyDoc; strict CSV uses a separate local adapter and CSV, ODP, and EPUB are enabled only on Linux where the worker address-space ceiling is enforceable. PPTX requires every declared slide to resolve to a well-formed shape tree and fails closed for hidden slides, external relationships, active content, and incomplete packages. XLSX uses a local cached-value-only policy and fails closed for hidden content, external links, active content, macro-enabled/binary/legacy containers, malformed packages, and uncached formulas. Broader parser paths remain disabled until completeness is observable through a typed signal or the conversion fails closed.
+
+The package preflight reads each package the way the pinned parser does. It decodes every XML part as AnyDoc's `to_utf8` decodes it, and resolves every reference with a port of `package::path::resolve`. It reads the parts AnyDoc reads by their exact names, and requires the officeDocument relationship to name the checked part. A check that saw a different document than the parser would otherwise let unchecked content through as complete output; the 2026-09-24 refresh reproduced five such packages and added them to the hardening corpus.
 
 Do not use the Node CLI, `npx`, Python bindings, WASM wrapper, Docker, or the
 hosted Firecrawl Parse API. The local library path is offline and does not need
