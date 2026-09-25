@@ -2387,7 +2387,9 @@ struct DocxStoryScan {
     /// letters) and the state of a legacy form checkbox or drop-down
     /// (`w:checkBox`, `w:ddList`). An open upstream change
     /// (firecrawl/anydoc#177) renders four Wingdings checkbox codes; every
-    /// other symbol stays dropped there too.
+    /// other symbol stays dropped there too. So is the text of
+    /// `mc:AlternateContent` of which AnyDoc takes no branch while Word
+    /// shows one.
     dropped: bool,
     /// A run formatted hidden directly (`w:r/w:rPr/w:vanish`), which the
     /// pinned parser converts as ordinary text.
@@ -2612,6 +2614,9 @@ struct WordNode {
     paragraphs_before: usize,
     /// For a `w:p`: its mark (`w:pPr`) was read.
     marked: bool,
+    /// For `mc:AlternateContent`: Word shows text in a branch AnyDoc does
+    /// not take.
+    word_text: bool,
 }
 
 impl WordNode {
@@ -2629,6 +2634,7 @@ impl WordNode {
             anydoc_first: false,
             paragraphs_before,
             marked: false,
+            word_text: false,
         }
     }
 
@@ -2942,6 +2948,9 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     }
                     if closed.is(WordVocabulary::MarkupCompatibility, b"AlternateContent") {
                         stand_in_for_word_branch(&mut scan.list_paragraphs, closed);
+                        // AnyDoc takes no branch, and drops the text Word
+                        // shows in its own.
+                        scan.dropped |= closed.word_text && closed.anydoc_branches == 0;
                     }
                 }
                 if closed
@@ -2988,10 +2997,48 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     record_list_paragraph(scan, &stack, DocxListUse::default(), false)?;
                 }
             }
+            quick_xml::events::Event::Text(text) => {
+                if text.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    note_branch_text(&mut stack);
+                }
+            }
+            quick_xml::events::Event::GeneralRef(_) | quick_xml::events::Event::CData(_) => {
+                note_branch_text(&mut stack);
+            }
             quick_xml::events::Event::Eof => return Ok(()),
             _ => {}
         }
         buffer.clear();
+    }
+}
+
+/// Note text of a `w:t` that Word shows in a branch AnyDoc does not take,
+/// on the outermost such branch's alternate content: where AnyDoc takes
+/// another branch, that one holds the text for it; where it takes none,
+/// the text is lost. Text AnyDoc would not reach anyway, deleted or in a
+/// drawing outside its text boxes, is left to the checks of that content.
+fn note_branch_text(stack: &mut [WordNode]) {
+    if !stack
+        .last()
+        .is_some_and(|node| node.is(WordVocabulary::Word, b"t"))
+        || word_content_omitted(stack)
+        || word_drawing_search(stack)
+        || stack.iter().any(|node| {
+            node.word_skips
+                || (node.vocabulary == WordVocabulary::Word
+                    && matches!(node.local.as_slice(), b"del" | b"moveFrom"))
+        })
+    {
+        return;
+    }
+    let Some(branch) = stack
+        .iter()
+        .position(|node| node.is_branch() && node.anydoc_skips)
+    else {
+        return;
+    };
+    if let Some(alternate) = branch.checked_sub(1).map(|parent| &mut stack[parent]) {
+        alternate.word_text = true;
     }
 }
 
@@ -9852,6 +9899,37 @@ mod tests {
             r#"<w:p><w:sdt><w:sdtContent><w:r><w:t>&#x2612; Yes</w:t></w:r></w:sdtContent></w:sdt></w:p>"#,
         );
         assert!(!docx_preflight(&[("word/document.xml", &control)]).unsupported_content);
+
+        // Compatibility content AnyDoc takes no branch of loses the text of
+        // the branch Word shows, as a block or in a run.
+        let alternate = |branches: &str| {
+            format!(
+                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">{branches}</mc:AlternateContent>"#
+            )
+        };
+        let dropped_text = |body: String| {
+            let document = word_part("document", &body);
+            docx_preflight(&[("word/document.xml", &document)]).unsupported_content
+        };
+        let choice =
+            r#"<mc:Choice Requires="w14"><w:p><w:r><w:t>Shown</w:t></w:r></w:p></mc:Choice>"#;
+        assert!(dropped_text(alternate(choice)));
+        assert!(dropped_text(format!(
+            "<w:p><w:r>{}</w:r></w:p>",
+            alternate(r#"<mc:Choice Requires="w14"><w:t>Shown</w:t></mc:Choice>"#)
+        )));
+        // Not where AnyDoc reads a fallback holding it, where the choice
+        // holds no text, or where Word does not understand the choice
+        // either.
+        assert!(!dropped_text(alternate(&format!(
+            r#"{choice}<mc:Fallback><w:p><w:r><w:t>Shown</w:t></w:r></w:p></mc:Fallback>"#
+        ))));
+        assert!(!dropped_text(alternate(
+            r#"<mc:Choice Requires="w14"><w:p><w:r><w:t> </w:t></w:r></w:p></mc:Choice>"#
+        )));
+        assert!(!dropped_text(alternate(
+            r#"<mc:Choice xmlns:zz="urn:zz" Requires="zz"><w:p><w:r><w:t>Unread</w:t></w:r></w:p></mc:Choice>"#
+        )));
     }
 
     #[test]
