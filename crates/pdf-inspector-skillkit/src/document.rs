@@ -4425,8 +4425,16 @@ fn docx_style_numbering(
             return Err(DocumentError::ResourceLimit);
         }
         let local = xml_local_name(event.name().as_ref()).to_vec();
-        let raw = xml_attribute_values(&event, b"val").into_iter().next();
-        let value = || raw.as_ref().map(|value| value.trim().to_string());
+        // The attributes are decoded once: a style id can run to kilobytes.
+        let attributes = xml_attributes(&event);
+        let named = |wanted: &'static [u8]| {
+            attributes
+                .iter()
+                .filter(move |attribute| attribute.local() == wanted)
+                .map(|attribute| attribute.value.as_str())
+        };
+        let raw = named(b"val").next();
+        let value = || raw.map(|value| value.trim().to_string());
         // AnyDoc reads the first `w:basedOn` of a style, and the list of the
         // first `w:numId` of the first `w:numPr` of its first `w:pPr`.
         if let Some(kept) = kept.as_mut() {
@@ -4450,7 +4458,7 @@ fn docx_style_numbering(
                 {
                     kept.lists += 1;
                     if kept.lists == 1 {
-                        kept.style.list = raw.as_ref().and_then(|list| list.parse().ok());
+                        kept.style.list = raw.and_then(|list| list.parse().ok());
                     }
                 }
                 _ => {}
@@ -4458,8 +4466,7 @@ fn docx_style_numbering(
         }
         match local.as_slice() {
             b"style" => {
-                let id = xml_attribute_values(&event, b"styleId")
-                    .into_iter()
+                let id = named(b"styleId")
                     .next()
                     .map(|id| id.trim().to_string())
                     .filter(|id| id.len() <= MAX_STYLE_ID_BYTES);
@@ -4484,14 +4491,8 @@ fn docx_style_numbering(
                         }
                     }
                     // The last paragraph style marked the default one.
-                    let paragraph = xml_attribute_values(&event, b"type")
-                        .iter()
-                        .all(|kind| kind.trim() == "paragraph");
-                    if paragraph
-                        && xml_attribute_values(&event, b"default")
-                            .iter()
-                            .any(|value| xml_true(value))
-                    {
+                    let paragraph = named(b"type").all(|kind| kind.trim() == "paragraph");
+                    if paragraph && named(b"default").any(xml_true) {
                         numbering.default_paragraph = Some(id.clone());
                     }
                 }
