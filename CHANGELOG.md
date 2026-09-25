@@ -263,6 +263,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
 - Review round seven checked the round-six fixes again:
+  - EPUB: a reader sets more boxes apart than the chapter walk knew, and
+    AnyDoc ran their text together with no warning. Each flex or grid
+    item, table cell set by style, and SVG `text` now stands apart, as
+    does a floated or positioned box holding digits:
+    `<p><span style="float:left">10</span>250 units</p>` had converted as
+    "10250 units". So do a block image, a line feed a `::before` box keeps
+    (`content: "\A"; white-space: pre`), a line break alone in a link,
+    which AnyDoc drops, and a display formula in a link, which AnyDoc
+    flattens into the text around it. Text a `::before` or `::after` box
+    shows, from letters, digits, a counter, or `attr()`, is refused as
+    text AnyDoc drops, and so is a sign beside the digits of an amount
+    ("−1,250.00" converted as "1,250.00"); a hyphen bullet is not. The
+    other way, rules that may not apply, such as sibling selectors, now
+    count only where digits meet, which the Markdown reads as one number.
+    Drop caps set by such rules, a drop cap after an opening quote, an
+    InDesign drop cap of three letters going on in lower case, and floated
+    images with alt text no longer refuse the chapter, and neither does a
+    `::before` or `::after` box without `content`. A large book whose
+    stylesheet carries rules for many other sections had run out of match
+    budget since round six read `float` rules; rules whose ancestor
+    classes, ids, and element names a chapter lacks are now set aside by
+    lookup, as browsers filter them.
   - PDF: the evidence round six required for the table and repeat warnings
     missed real cases and still passed some by-design layouts. A table cell
     holding two amounts is now judged by where the page sets them. Separate
@@ -441,10 +463,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `figure` and its caption, are walked inline by AnyDoc and convert as one
   paragraph, their text joined with spaces. This is not flagged; text that
   would run together is refused. The reader model reads `display`, `float`,
-  and `::before`/`::after` `display` from style rules; a positioned box, a
-  pseudo-element with no `content`, and a `table-*` display are read as
-  blocks, and a floated box ends a line unless it holds two letters or
-  fewer.
+  `position`, and flex and grid layout from style rules, and the `display`,
+  `content`, `position`, and `white-space` of `::before` and `::after`
+  boxes. A floated or positioned box keeps the line before it and ends the
+  line after it, unless it holds a drop cap: one or two characters, or
+  three going on in lower case, and no digits. The walk reads a chapter
+  once, so a rule it cannot settle, with a sibling selector (`h2 + p`),
+  `:has()`, `:last-child`, or `:lang()`, counts only where digits meet:
+  "Balance due" and "1,250.00" run together under such a rule are not
+  refused. Alt text meeting other text counts the same way. Generated
+  counters refuse a book even where they match AnyDoc's own list
+  numbers.
 - ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
   converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
 - EPUB `noscript` content is treated as shown, as readers without scripting

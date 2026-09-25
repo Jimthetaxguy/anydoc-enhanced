@@ -279,6 +279,7 @@ came back clean. The evidence and dispositions are in
 | 14 | DOCX list labels as Word writes them | Missing number text, composite labels across instances, style chains past 32, and padded numbering numbers disclosed; 15 review fixtures now match LibreOffice, and no randomized or public document changed |
 | Review 6 | Bypass and false-refusal review of loops 12-13 and the round-five fixes, against LibreOffice and AnyDoc's raw output | 4 missed losses and 7 false positives fixed: links holding blocks spliced as AnyDoc splices them, boxes laid out as a reader lays them out, DOCX lists numbered per Word story, PDF repeats confirmed in the Markdown, table warnings only with evidence, a quadratic ODF scan made linear; DOCX list numbers now agree with LibreOffice on all 320 randomized documents |
 | 15 | PDF word gaps pdf-inspector judges against the wrong space width (open upstream #532) | `word_gaps_misread` warning by page; the upstream real-estate fixture ("CBDOffice", "pricingisliketheweather") and three #532 replicas are named, and every page the fix changes among 900 randomized fonts and layouts, with none named in error |
+| Review 7 | Bypass and false-refusal review of loops 14-15 and the round-six fixes, against LibreOffice, Chromium, and AnyDoc's raw output | EPUB boxes a reader sets apart (flex and grid items, table cells, SVG text, floats holding digits, line breaks and formulas in links) and generated signs are refused, while drop caps and rules a single pass cannot settle no longer refuse a chapter: 24 review books now refused and 22 now complete, no public book changed; PDF table and repeat warnings judged by where the page sets the text; DOCX lists through notes and style levels disclosed; a large stylesheet's rules filtered by ancestor, as browsers do |
 
 ## Next slices
 
@@ -311,6 +312,13 @@ came back clean. The evidence and dispositions are in
 6. **Non-Linux containment.** PDF and document parsing still lack a memory
    ceiling on macOS and fall back to in-process parsing where no sandbox
    exists; filesystem isolation remains open on every platform.
+7. **EPUB selectors a single pass cannot settle.** Sibling selectors
+   (`h2 + p`, `h1 ~ p`), `:first-of-type`, `:last-child`, and `:has()` are
+   read as rules that may apply, which count only where digits meet.
+   Keeping each open element's earlier children would settle `+`, `~`, and
+   the `-of-type` counts, and the pass that finds block children could
+   settle `:last-child`. Of 800 randomized chapters with one sibling rule,
+   58 run words together that this leaves unreported.
 
 ## Decisions for the owners
 
@@ -343,6 +351,10 @@ Each of these is a policy choice the checks make one way today:
   in the spine need not list itself, but pandoc's hides its landmarks list,
   which AnyDoc then converts, so such books are refused as hidden content.
 - **External hyperlinks** outside DOCX, as in the next slices.
+- **EPUB rules that may not apply.** A `display` or `float` rule the walk
+  cannot settle counts only where digits meet, so a drop cap set by a
+  sibling selector converts, and so does "Balance due1,250.00" under such
+  a rule. Counting every such join would refuse those books instead.
 
 ## Go/no-go rules
 

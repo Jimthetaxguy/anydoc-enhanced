@@ -42,7 +42,7 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 | `crates/pdf-inspector-skillkit/src/lib.rs` | PDF facade, validation, and serialized result types |
 | `crates/pdf-inspector-skillkit/src/pdf_worker.rs` | PDF operations framed for the bounded worker, and the in-process route for hosts without a sandbox |
 | `crates/pdf-inspector-skillkit/src/document.rs` | Document contract, package preflight that reads each package as AnyDoc reads it, worker supervisor and containment, and Markdown sanitizer |
-| `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters seen by a reading system (CSS, cascade, user-agent rules) and by AnyDoc's walker and stylesheet subset |
+| `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters seen by a reading system (CSS, cascade, user-agent rules, how boxes flow, generated content) and by AnyDoc's walker and stylesheet subset |
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content walked as AnyDoc's walkers walk it, including spreadsheet cells and drawings |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats read with AnyDoc's grammar, against each cell's value |
 | `crates/pdf-inspector-skillkit/src/text_paints.rs` | What PDF pages paint that pdf-inspector 1.24.0 misreads: an invisible OCR layer over a scan, text painted twice over itself, and word gaps (through `word_gaps.rs`) |

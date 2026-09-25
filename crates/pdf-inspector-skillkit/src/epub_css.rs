@@ -19,9 +19,16 @@
 //!
 //! A chapter is also flagged when AnyDoc runs together text a reader shows
 //! on separate lines. For that the reader model reads how boxes flow:
-//! `display` (inline-level or block-level), `float`, and block `::before`
-//! and `::after` boxes. The chapter walk mirrors AnyDoc's inline runs,
-//! including the way it flattens a link's blocks into the text around it.
+//! `display` (inline-level, block-level, or laying children out as flex or
+//! grid items), `float` and `position`, and `::before` and `::after` boxes
+//! that are blocks or keep a line feed. The chapter walk mirrors AnyDoc's
+//! inline runs, including the way it flattens a link's blocks into the text
+//! around it. A break only a rule the walk cannot settle gives counts where
+//! digits meet, which the Markdown reads as one number.
+//!
+//! Text a `::before` or `::after` box shows is text AnyDoc drops: flagged
+//! when it holds letters or digits, and for a sign an amount reads by
+//! ("−", "(", "%") when it meets digits.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -36,11 +43,13 @@ const MAX_COMPOUNDS: usize = 32;
 const MAX_SELECTOR_NESTING: usize = 8;
 /// `@import` statements one stylesheet may carry.
 pub(super) const MAX_IMPORTS_PER_SHEET: usize = 256;
-/// Style rules that set `display`, `visibility`, `content-visibility`, or
-/// `float`, across a package's stylesheets. Real books carry a few dozen.
+/// Style rules that set `display`, `visibility`, `content-visibility`,
+/// `float`, or `position`, or style `::before` and `::after` boxes, across a
+/// package's stylesheets. Real books carry a few dozen.
 pub(super) const MAX_STYLE_RULES: usize = 16_384;
 /// Compound-selector evaluations across a package: one element tested
-/// against one rule costs one per compound it reaches.
+/// against one rule costs one per compound it reaches, and one when the
+/// ancestor filter sets the rule aside.
 pub(super) const MAX_MATCH_WORK: u64 = 50_000_000;
 /// Nesting depth of a chapter's elements, as AnyDoc's parser allows.
 const MAX_CHAPTER_DEPTH: usize = 256;
@@ -579,6 +588,32 @@ enum Property {
     Visibility,
     ContentVisibility,
     Float,
+    /// What a `::before` or `::after` box shows.
+    Content,
+    /// Whether a box is out of the line's flow (`absolute`, `fixed`).
+    Position,
+    /// Whether a `::before` or `::after` box keeps the line feeds it shows.
+    WhiteSpace,
+}
+
+/// What a `content` declaration makes a `::before` or `::after` box show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Generated {
+    /// No box (`none`, `normal`).
+    Nothing,
+    /// A box without text that carries meaning: empty, white space, quote
+    /// marks, dashes, bullets, and other ornaments, or an image.
+    Plain,
+    /// Such a box holding a line feed (`"\A"`), which breaks the line where
+    /// the box keeps white space (`white-space: pre`).
+    LineFeed,
+    /// A sign an amount reads by ("−", "(", "%"), which a reader shows
+    /// beside the digits after or before it, and otherwise an ornament,
+    /// such as a hyphen for a bullet.
+    Sign,
+    /// Text a reader shows: letters or digits, a counter, or an attribute's
+    /// value.
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -597,10 +632,86 @@ struct Declaration {
     effect: Effect,
     important: bool,
     /// How the box flows: for `display`, whether it is inline-level; for
-    /// `float`, whether it floats. `Maybe` for a value not known until run
-    /// time; `None` for a declaration a reader ignores.
+    /// `float`, whether it floats; for `position`, whether it leaves the
+    /// flow. `Maybe` for a value not known until run time; `None` for a
+    /// declaration a reader ignores.
     flow: Option<Tri>,
+    /// For `display`, whether the box lays its children out as flex or
+    /// grid items, each a block of its own.
+    items: Option<Tri>,
+    /// For `content`, what the box shows; `None` when not known until run
+    /// time.
+    generated: Option<Generated>,
 }
+
+/// `display` keywords that lay a box's children out as flex or grid items.
+const ITEM_DISPLAY_KEYWORDS: [&str; 14] = [
+    "flex",
+    "grid",
+    "inline-flex",
+    "inline-grid",
+    "-webkit-box",
+    "-webkit-inline-box",
+    "-webkit-flex",
+    "-webkit-inline-flex",
+    "-moz-box",
+    "-moz-inline-box",
+    "-ms-flexbox",
+    "-ms-inline-flexbox",
+    "-ms-grid",
+    "-ms-inline-grid",
+];
+
+/// Signs an amount reads by, which generated content may add to it.
+fn amount_sign(character: char) -> bool {
+    matches!(
+        character,
+        '\u{2212}' | '-' | '+' | '(' | ')' | '%' | '$' | '\u{20ac}' | '\u{a3}' | '\u{a5}'
+    )
+}
+
+/// What a `content` value shows, from its tokens.
+fn generated_content(value: &[Token]) -> Option<Generated> {
+    let mut generated = Generated::Plain;
+    for token in value {
+        match token {
+            Token::Ident(word) => match word.to_ascii_lowercase().as_str() {
+                "none" | "normal" => return Some(Generated::Nothing),
+                "initial" | "unset" | "revert" => return Some(Generated::Nothing),
+                _ => {}
+            },
+            Token::Str(text) => {
+                if text.chars().any(char::is_alphanumeric) {
+                    generated = Generated::Text;
+                } else if text.chars().any(amount_sign) {
+                    generated = generated.max(Generated::Sign);
+                } else if text.contains('\n') {
+                    generated = generated.max(Generated::LineFeed);
+                }
+            }
+            Token::Function(function) => match function.to_ascii_lowercase().as_str() {
+                "counter" | "counters" | "attr" => generated = Generated::Text,
+                "var" | "env" | "if" => return None,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Some(generated)
+}
+
+/// `white-space` and `white-space-collapse` keywords that keep line feeds.
+const LINE_FEED_KEYWORDS: [&str; 6] = [
+    "pre",
+    "pre-wrap",
+    "pre-line",
+    "break-spaces",
+    "preserve",
+    "preserve-breaks",
+];
+
+/// Keywords that collapse line feeds to spaces.
+const COLLAPSING_KEYWORDS: [&str; 5] = ["normal", "nowrap", "collapse", "wrap", "initial"];
 
 /// `display` keywords that make a box inline-level: it sits in the line
 /// around it. `initial` and `unset` give `inline`.
@@ -624,9 +735,9 @@ const INLINE_DISPLAY_KEYWORDS: [&str; 17] = [
     "initial",
 ];
 
-/// `display` keywords that make a box block-level: a reader starts a new
-/// line for it.
-const BLOCK_DISPLAY_KEYWORDS: [&str; 12] = [
+/// `display` keywords that make a box block-level, a reader starting a new
+/// line for it, or a part of a table, a box of its own beside the others.
+const BLOCK_DISPLAY_KEYWORDS: [&str; 20] = [
     "block",
     "flow",
     "flow-root",
@@ -634,6 +745,14 @@ const BLOCK_DISPLAY_KEYWORDS: [&str; 12] = [
     "flex",
     "grid",
     "list-item",
+    "table-row-group",
+    "table-header-group",
+    "table-footer-group",
+    "table-row",
+    "table-cell",
+    "table-column-group",
+    "table-column",
+    "table-caption",
     "-webkit-box",
     "-webkit-flex",
     "-moz-box",
@@ -701,6 +820,9 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         "visibility" => Property::Visibility,
         "content-visibility" => Property::ContentVisibility,
         "float" => Property::Float,
+        "content" => Property::Content,
+        "position" => Property::Position,
+        "white-space" | "white-space-collapse" => Property::WhiteSpace,
         _ => return None,
     };
     let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
@@ -719,11 +841,17 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
     let mut keywords = Vec::new();
     let mut computed = false;
     let mut other = false;
+    // `content` has always read an attribute's value (`attr()`), which it
+    // shows as text.
+    let run_time: &[&str] = match property {
+        Property::Content => &["var", "env", "if"],
+        _ => &["var", "env", "attr", "if"],
+    };
     for token in value {
         match token {
             Token::Ident(word) => keywords.push(word.to_ascii_lowercase()),
             Token::Function(function)
-                if ["var", "env", "attr", "if"]
+                if run_time
                     .iter()
                     .any(|name| function.eq_ignore_ascii_case(name)) =>
             {
@@ -769,13 +897,48 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         Property::Float if has(&["left", "right", "inline-start", "inline-end"]) => Some(Tri::Yes),
         Property::Float if has(&["none", "initial", "unset"]) => Some(Tri::No),
         Property::Float => Some(Tri::Maybe),
-        Property::Visibility | Property::ContentVisibility => None,
+        Property::Position if keywords.len() > 1 => None,
+        Property::Position if has(&["absolute", "fixed"]) => Some(Tri::Yes),
+        Property::Position if has(&["static", "relative", "sticky", "initial", "unset"]) => {
+            Some(Tri::No)
+        }
+        Property::Position => None,
+        Property::WhiteSpace if has(&LINE_FEED_KEYWORDS) => Some(Tri::Yes),
+        Property::WhiteSpace
+            if keywords
+                .iter()
+                .all(|word| COLLAPSING_KEYWORDS.contains(&word.as_str())) =>
+        {
+            Some(Tri::No)
+        }
+        // `inherit`, `unset`, and `revert` take the element's value.
+        Property::WhiteSpace => Some(Tri::Maybe),
+        Property::Visibility | Property::ContentVisibility | Property::Content => None,
     };
+    let items = match property {
+        Property::Display if computed => Some(Tri::Maybe),
+        Property::Display if effect == Effect::Show => Some(if has(&ITEM_DISPLAY_KEYWORDS) {
+            Tri::Yes
+        } else {
+            Tri::No
+        }),
+        _ => None,
+    };
+    let generated = match property {
+        Property::Content if computed => None,
+        Property::Content => generated_content(value),
+        _ => None,
+    };
+    if property == Property::Content && generated.is_none() && !computed {
+        return None;
+    }
     Some(Declaration {
         property,
         effect,
         important,
         flow,
+        items,
+        generated,
     })
 }
 
@@ -791,8 +954,9 @@ fn inline_declarations(style: &str) -> Result<Vec<Declaration>, DocumentError> {
 // ---------------------------------------------------------------------------
 // Selectors
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum Tri {
+    #[default]
     No,
     Maybe,
     Yes,
@@ -1574,6 +1738,95 @@ fn match_complex(selector: &ComplexSelector, stack: &[Element], work: &mut u64) 
 struct StyleRule {
     selector: ComplexSelector,
     declarations: Rc<[Declaration]>,
+    /// The classes, ids, and element names its ancestor compounds require
+    /// (see [`AncestorKeys`]).
+    ancestor_keys: Box<[u64]>,
+}
+
+/// A class, id, or element name, hashed without regard to ASCII case. Two
+/// names that collide only let more rules through to the full match.
+fn selector_key(kind: u8, name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    for byte in name.bytes() {
+        byte.to_ascii_lowercase().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+const KEY_TYPE: u8 = 0;
+const KEY_ID: u8 = 1;
+const KEY_CLASS: u8 = 2;
+
+/// The keys a selector's ancestor compounds require: those joined to the
+/// compound on their right by a descendant or child combinator, whose
+/// element names, ids, and classes some ancestor must carry. A compound
+/// before a sibling combinator matches a sibling, and requires nothing of
+/// the ancestors.
+fn ancestor_keys(selector: &ComplexSelector) -> Box<[u64]> {
+    let mut keys: Vec<u64> = Vec::new();
+    for (compound, combinator) in selector.compounds.iter().zip(&selector.combinators) {
+        if *combinator == Combinator::Sibling {
+            continue;
+        }
+        for part in &compound.parts {
+            let key = match part {
+                Simple::Type {
+                    name: Some(name), ..
+                } => selector_key(KEY_TYPE, name),
+                Simple::Id(id) => selector_key(KEY_ID, id),
+                Simple::Class(class) => selector_key(KEY_CLASS, class),
+                _ => continue,
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.into_boxed_slice()
+}
+
+/// The element names, ids, and classes of the open elements, counted, so
+/// that a rule for another part of a book is set aside with a lookup per
+/// key, as browsers filter rules by their ancestors.
+#[derive(Default)]
+pub(super) struct AncestorKeys {
+    counts: HashMap<u64, u32>,
+}
+
+impl AncestorKeys {
+    fn keys(element: &Element) -> impl Iterator<Item = u64> + '_ {
+        std::iter::once(selector_key(KEY_TYPE, &element.lower))
+            .chain(element.values("id").map(|(_, id)| selector_key(KEY_ID, id)))
+            .chain(element.values("class").flat_map(|(_, classes)| {
+                classes
+                    .split_ascii_whitespace()
+                    .map(|class| selector_key(KEY_CLASS, class))
+            }))
+    }
+
+    fn push(&mut self, element: &Element) {
+        for key in Self::keys(element) {
+            *self.counts.entry(key).or_default() += 1;
+        }
+    }
+
+    fn pop(&mut self, element: &Element) {
+        for key in Self::keys(element) {
+            if let Some(count) = self.counts.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.counts.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Whether some open element carries each key.
+    fn hold(&self, keys: &[u64]) -> bool {
+        keys.iter().all(|key| self.counts.contains_key(key))
+    }
 }
 
 /// A stylesheet reduced to what the check reads: its rules that set
@@ -1773,21 +2026,34 @@ fn parse_style_block(
     }
     if media && !declarations.is_empty() {
         let declarations: Rc<[Declaration]> = declarations.into();
-        // A `::before` or `::after` box matters only for where a reader
-        // breaks lines, which its `display` decides.
-        let lays_out = declarations
-            .iter()
-            .any(|declaration| declaration.property == Property::Display);
+        // A `::before` or `::after` box matters for where a reader breaks
+        // lines, which its `display`, `content`, `position`, and
+        // `white-space` decide, and for the text it shows. An element's own
+        // `content` and `white-space` are not read.
+        let lays_out = declarations.iter().any(|declaration| {
+            matches!(
+                declaration.property,
+                Property::Display | Property::Content | Property::Position | Property::WhiteSpace
+            )
+        });
+        let styles_element = declarations.iter().any(|declaration| {
+            !matches!(
+                declaration.property,
+                Property::Content | Property::WhiteSpace
+            )
+        });
         for selector in parse_selector_list(selectors, 0) {
             let kept = match selector.pseudo_element {
-                PseudoElement::None => true,
+                PseudoElement::None => styles_element,
                 PseudoElement::Before | PseudoElement::After => lays_out,
                 PseudoElement::Other => false,
             };
             if kept {
+                let ancestor_keys = ancestor_keys(&selector);
                 sheet.rules.push(Rc::new(StyleRule {
                     selector,
                     declarations: declarations.clone(),
+                    ancestor_keys,
                 }));
             }
         }
@@ -1868,23 +2134,72 @@ pub(super) struct ReaderStyle {
     content_visibility: Resolved,
     /// Whether the box is inline-level.
     inline: Tri,
-    /// Whether it floats.
+    /// Whether it floats, or is positioned out of the flow (`absolute`,
+    /// `fixed`), apart from the lines around it.
     floats: Tri,
-    /// A `::before` or `::after` box that may be a block, breaking the line
-    /// before or after the element's content.
-    breaks_before: bool,
-    breaks_after: bool,
+    /// Whether it lays its children out as flex or grid items.
+    items: Tri,
+    /// A `::before` or `::after` box that is a block in the flow, breaking
+    /// the line before or after the element's content.
+    breaks_before: Tri,
+    breaks_after: Tri,
+    /// A `::before` or `::after` box certainly shows text that carries
+    /// meaning, which AnyDoc does not convert.
+    generates_text: bool,
+    /// A `::before` or `::after` box certainly shows a sign an amount reads
+    /// by, which matters beside a digit.
+    sign_before: bool,
+    sign_after: bool,
+}
+
+/// How a reader lays an element out beside the text around it, as far as
+/// its style can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    /// In the line.
+    Inline,
+    /// A block of its own, starting a new line.
+    Block,
+    /// Floated beside the lines after it.
+    Float,
+    /// A block, or floated, only if a rule that may apply does.
+    MaybeApart,
 }
 
 impl ReaderStyle {
-    /// A reader certainly lays the element out in the line around it.
-    fn inline(&self) -> bool {
-        self.inline == Tri::Yes && self.floats == Tri::No
+    fn flow(&self) -> Flow {
+        match (self.inline, self.floats) {
+            (_, Tri::Yes) => Flow::Float,
+            (Tri::No, Tri::No) => Flow::Block,
+            (Tri::Yes, Tri::No) => Flow::Inline,
+            _ => Flow::MaybeApart,
+        }
     }
+}
 
-    /// A reader certainly floats the element beside the lines that follow.
-    fn floats(&self) -> bool {
-        self.floats == Tri::Yes
+/// The value of the certain declaration that wins the cascade, or `default`
+/// when none does, and whether one that may apply above it says otherwise.
+fn resolve_value<T: Copy + PartialEq>(applied: &[(Precedence, Tri, T)], default: T) -> (T, bool) {
+    let best = applied
+        .iter()
+        .filter(|(_, certainty, _)| *certainty == Tri::Yes)
+        .max_by_key(|(precedence, _, _)| *precedence);
+    let value = best.map_or(default, |best| best.2);
+    let contested = applied.iter().any(|(precedence, certainty, other)| {
+        *certainty != Tri::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
+    });
+    (value, contested)
+}
+
+/// Whether all of three may hold: `Yes` if each certainly does, `No` if one
+/// certainly does not.
+fn all_three(first: Tri, second: Tri, third: Tri) -> Tri {
+    if [first, second, third].contains(&Tri::No) {
+        Tri::No
+    } else if [first, second, third].iter().all(|tri| *tri == Tri::Yes) {
+        Tri::Yes
+    } else {
+        Tri::Maybe
     }
 }
 
@@ -2006,7 +2321,12 @@ impl Cascade {
     /// The cascade for the element at the top of `stack`: author rules,
     /// its inline style, SVG presentation attributes, and the user-agent
     /// rules that hide content.
-    fn evaluate(&self, stack: &[Element], work: &mut u64) -> Result<ReaderStyle, DocumentError> {
+    fn evaluate(
+        &self,
+        stack: &[Element],
+        ancestors: &AncestorKeys,
+        work: &mut u64,
+    ) -> Result<ReaderStyle, DocumentError> {
         let element = stack.last().expect("an element to style");
         let mut candidates: Vec<usize> = Vec::new();
         for (_, id) in element.values("id") {
@@ -2028,21 +2348,32 @@ impl Cascade {
         candidates.dedup();
 
         let mut applied: [Vec<Applied>; 3] = Default::default();
-        let mut flows: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        // Whether the box is inline-level, floats, lays its children out as
+        // items, and is positioned out of the flow.
+        let mut flows: [Vec<(Precedence, Tri, Tri)>; 4] = Default::default();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
             let slot = match declaration.property {
                 Property::Display => 0,
                 Property::Visibility => 1,
                 Property::ContentVisibility => 2,
-                Property::Float => {
+                Property::Float | Property::Position => {
+                    let flow_slot = match declaration.property {
+                        Property::Float => 1,
+                        _ => 3,
+                    };
                     if let Some(flow) = declaration.flow {
-                        flows[1].push((precedence, certainty, flow));
+                        flows[flow_slot].push((precedence, certainty, flow));
                     }
                     return;
                 }
+                // What only `::before` and `::after` boxes read.
+                Property::Content | Property::WhiteSpace => return,
             };
             if let (Property::Display, Some(flow)) = (declaration.property, declaration.flow) {
                 flows[0].push((precedence, certainty, flow));
+            }
+            if let (Property::Display, Some(items)) = (declaration.property, declaration.items) {
+                flows[2].push((precedence, certainty, items));
             }
             applied[slot].push(Applied {
                 precedence,
@@ -2050,10 +2381,20 @@ impl Cascade {
                 effect: declaration.effect,
             });
         };
-        // Whether each of `::before` and `::after` is a block box.
+        // For each of `::before` and `::after`: whether it is a block box,
+        // whether `display: none` removes it, what it shows, whether it
+        // leaves the flow, and whether it keeps line feeds.
         let mut pseudo_blocks: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_none: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_content: [Vec<(Precedence, Tri, Option<Generated>)>; 2] = Default::default();
+        let mut pseudo_out: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_line_feeds: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         for index in candidates {
             let (rule, order) = &self.rules[index];
+            if !ancestors.hold(&rule.ancestor_keys) {
+                *work += 1;
+                continue;
+            }
             let certainty = match_complex(&rule.selector, stack, work);
             if certainty == Tri::No {
                 continue;
@@ -2066,13 +2407,6 @@ impl Cascade {
             };
             if let Some(slot) = pseudo {
                 for declaration in rule.declarations.iter() {
-                    let block = match (declaration.property, declaration.flow) {
-                        (Property::Display, Some(Tri::No)) => Tri::Yes,
-                        (Property::Display, Some(Tri::Yes)) => Tri::No,
-                        (Property::Display, Some(Tri::Maybe)) => Tri::Maybe,
-                        (Property::Display, None) if declaration.effect == Effect::Hide => Tri::No,
-                        _ => continue,
-                    };
                     let tier = if declaration.important {
                         TIER_AUTHOR_IMPORTANT
                     } else {
@@ -2082,6 +2416,42 @@ impl Cascade {
                         tier,
                         specificity: rule.selector.specificity,
                         order: *order,
+                    };
+                    match (declaration.property, declaration.flow) {
+                        (Property::Content, _) => {
+                            pseudo_content[slot].push((
+                                precedence,
+                                certainty,
+                                declaration.generated,
+                            ));
+                            continue;
+                        }
+                        (Property::Position, Some(out)) => {
+                            pseudo_out[slot].push((precedence, certainty, out));
+                            continue;
+                        }
+                        (Property::WhiteSpace, Some(kept)) => {
+                            pseudo_line_feeds[slot].push((precedence, certainty, kept));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let none = match (declaration.property, declaration.effect, declaration.flow) {
+                        (Property::Display, Effect::Hide, None) => Some(Tri::Yes),
+                        // A value computed at run time.
+                        (Property::Display, Effect::Hide, Some(_)) => Some(Tri::Maybe),
+                        (Property::Display, Effect::Show, _) => Some(Tri::No),
+                        _ => None,
+                    };
+                    if let Some(none) = none {
+                        pseudo_none[slot].push((precedence, certainty, none));
+                    }
+                    let block = match (declaration.property, declaration.flow) {
+                        (Property::Display, Some(Tri::No)) => Tri::Yes,
+                        (Property::Display, Some(Tri::Yes)) => Tri::No,
+                        (Property::Display, Some(Tri::Maybe)) => Tri::Maybe,
+                        (Property::Display, None) if declaration.effect == Effect::Hide => Tri::No,
+                        _ => continue,
                     };
                     pseudo_blocks[slot].push((precedence, certainty, block));
                 }
@@ -2148,6 +2518,8 @@ impl Cascade {
                     effect,
                     important: false,
                     flow: None,
+                    items: None,
+                    generated: None,
                 },
                 presentation,
                 certainty,
@@ -2167,6 +2539,8 @@ impl Cascade {
                     effect,
                     important: false,
                     flow: None,
+                    items: None,
+                    generated: None,
                 },
                 presentation,
                 certainty,
@@ -2207,19 +2581,66 @@ impl Cascade {
                     effect: Effect::Hide,
                     important: false,
                     flow: None,
+                    items: None,
+                    generated: None,
                 },
                 user_agent,
                 Tri::Yes,
             );
         }
+        // A box exists where `content` gives one and `display` does not take
+        // it away: what it shows, and whether it breaks the line, as a block
+        // in the flow or with a line feed it keeps. Without a `white-space`
+        // of its own, it keeps line feeds as the element does, which is not
+        // read.
+        let pseudo = |slot: usize| {
+            let (content, contested) =
+                resolve_value(&pseudo_content[slot], Some(Generated::Nothing));
+            let given = match content {
+                Some(Generated::Nothing) if !contested => Tri::No,
+                Some(_) if !contested => Tri::Yes,
+                _ => Tri::Maybe,
+            };
+            let exists = all_three(
+                given,
+                resolve_flow(&pseudo_none[slot], false).not(),
+                Tri::Yes,
+            );
+            let shown = |generated: Generated| {
+                content == Some(generated) && !contested && exists == Tri::Yes
+            };
+            let (text, sign) = (shown(Generated::Text), shown(Generated::Sign));
+            let line_feed = match content {
+                Some(Generated::LineFeed) if !contested => {
+                    match resolve_value(&pseudo_line_feeds[slot], Tri::Maybe) {
+                        (_, true) => Tri::Maybe,
+                        (kept, false) => kept,
+                    }
+                }
+                _ => Tri::No,
+            };
+            let breaks = all_three(
+                exists,
+                resolve_flow(&pseudo_blocks[slot], false).max(line_feed),
+                resolve_flow(&pseudo_out[slot], false).not(),
+            );
+            (breaks, text, sign)
+        };
+        let (breaks_before, before_text, sign_before) = pseudo(0);
+        let (breaks_after, after_text, sign_after) = pseudo(1);
         Ok(ReaderStyle {
             display: resolve(&applied[0]),
             visibility: resolve(&applied[1]),
             content_visibility: resolve(&applied[2]),
             inline: resolve_flow(&flows[0], !reader_block_by_default(&element.lower)),
-            floats: resolve_flow(&flows[1], false),
-            breaks_before: resolve_flow(&pseudo_blocks[0], false) != Tri::No,
-            breaks_after: resolve_flow(&pseudo_blocks[1], false) != Tri::No,
+            // A box positioned out of the flow sits apart like a float.
+            floats: resolve_flow(&flows[1], false).max(resolve_flow(&flows[3], false)),
+            items: resolve_flow(&flows[2], false),
+            breaks_before,
+            breaks_after,
+            generates_text: before_text || after_text,
+            sign_before,
+            sign_after,
         })
     }
 }
@@ -2438,6 +2859,8 @@ struct Open {
     /// Children are fallback content a reader replaces.
     fallback: bool,
     in_svg: bool,
+    /// Children are laid out as flex or grid items.
+    items: Tri,
     exempt: Exempt,
     /// What the element does to AnyDoc's inline run as it ends.
     effects: Effects,
@@ -2450,15 +2873,19 @@ struct Effects {
     opens_run: bool,
     /// AnyDoc starts a new paragraph after it.
     flush_after: bool,
-    /// A reader starts a new line after it and AnyDoc does not.
-    boundary_after: bool,
+    /// A reader starts a new line after it and AnyDoc does not: `Maybe`
+    /// where only a rule that may apply says so.
+    boundary_after: Tri,
     /// It opened a [`Splice`].
     closes_splice: bool,
     /// It is a block inside a link (see [`Run::edge`]).
     edge_after: bool,
-    /// A reader floats it: the letters taken in before it, to tell a drop
-    /// cap, beside which the lines after it start.
-    letters_at: Option<u64>,
+    /// A reader floats it: the glyphs and digits taken in before it, to
+    /// tell a drop cap, beside which the text after it continues.
+    glyphs_at: Option<(u64, u64)>,
+    /// Its `::after` box shows a sign, lost where the text before it ends
+    /// in a digit.
+    sign_after: bool,
 }
 
 /// One inline run of AnyDoc's walker (a `Builder`): the text it last
@@ -2469,6 +2896,10 @@ struct Effects {
 struct Run {
     last: Option<char>,
     boundary: bool,
+    /// A reader starts a new line here only if a rule that may apply says
+    /// so, or a float sits here: it counts where digits meet, which the
+    /// Markdown then reads as one number.
+    maybe_boundary: bool,
     /// The links, and the lists, tables, and quotes inside them, whose
     /// content the run is taking in, innermost last.
     splices: Vec<Splice>,
@@ -2476,7 +2907,20 @@ struct Run {
     /// other text follows it.
     alt: Option<String>,
     /// A floated drop cap ended, and the next text starts beside it.
-    beside_float: bool,
+    beside_float: Option<DropCap>,
+    /// A `::before` box showing a sign sits before the next text.
+    sign_before: bool,
+    /// A generated sign met a digit, which AnyDoc then shows without it.
+    lost_sign: bool,
+}
+
+/// A floated drop cap, beside which the next text continues its word: any
+/// text after one or two characters, and after three, as an InDesign drop
+/// cap of a word's first letters, only text going on in lower case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropCap {
+    Any,
+    Lowercase,
 }
 
 /// A link's content, which AnyDoc flattens into the run around the link
@@ -2499,8 +2943,21 @@ struct Splice {
     /// White space or a line break waiting in the current part, kept only
     /// if content follows before the part ends.
     pending: Option<char>,
-    /// `pre` text, which AnyDoc keeps whole (`elem.text()`).
-    verbatim: bool,
+    /// Text AnyDoc keeps whole below a `pre` or `math` element.
+    whole: Whole,
+}
+
+/// How a part of a link's content takes in the text below a `pre` or
+/// `math` element, which AnyDoc keeps whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whole {
+    /// None of it: only walked text joins the run.
+    No,
+    /// `pre` text as it stands (`elem.text()`).
+    Pre,
+    /// A display formula's TeX (`mathml_to_tex`), which leaves out the
+    /// white space between its tokens.
+    Tex,
 }
 
 impl Run {
@@ -2517,12 +2974,12 @@ impl Run {
         }
     }
 
-    /// Start taking in a link's content, or a list, table, quote, or `pre`
-    /// inside one.
-    fn open_splice(&mut self, separator: char, verbatim: bool) {
+    /// Start taking in a link's content, or a list, table, quote, `pre`, or
+    /// display formula inside one.
+    fn open_splice(&mut self, separator: char, whole: Whole) {
         let trim = match separator {
             '\n' => self.at_space(),
-            _ => !verbatim,
+            _ => whole != Whole::Pre,
         };
         self.splices.push(Splice {
             separator,
@@ -2530,7 +2987,7 @@ impl Run {
             kept: false,
             trim,
             pending: None,
-            verbatim,
+            whole,
         });
     }
 
@@ -2584,8 +3041,33 @@ impl Run {
         }
     }
 
+    /// Note where a reader may start a new line.
+    fn mark(&mut self, boundary: Tri) {
+        match boundary {
+            Tri::Yes => self.boundary = true,
+            Tri::Maybe => self.maybe_boundary = true,
+            Tri::No => {}
+        }
+    }
+
     /// Add text to the run; whether it runs into the text before it.
     fn add(&mut self, text: &str) -> bool {
+        self.take(text, false)
+    }
+
+    /// Take in a packaged image's alt text.
+    fn add_alt(&mut self, alt: &str) -> bool {
+        let fused = self.take(alt, true);
+        self.alt = Some(alt.to_string()).filter(|alt| !alt.is_empty());
+        fused
+    }
+
+    /// Add text, or alt text, to the run; whether it runs into the text
+    /// before it where a reader starts a new line. Alt text is not text a
+    /// reader shows: where it meets other text, as pandoc 2 figures run an
+    /// image's caption into it ("ChartChart"), only digits on both sides,
+    /// which read as one number, count as joined.
+    fn take(&mut self, text: &str, alt: bool) -> bool {
         let kept = || text.chars().filter(|character| anydoc_keeps(*character));
         let (Some(first), Some(last)) = (kept().next(), kept().next_back()) else {
             return false;
@@ -2598,47 +3080,31 @@ impl Run {
             true => kept().find(|character| !character.is_whitespace()),
             false => Some(first),
         };
+        if std::mem::take(&mut self.sign_before)
+            && kept()
+                .find(|character| !character.is_whitespace())
+                .is_some_and(char::is_numeric)
+        {
+            self.lost_sign = true;
+        }
         self.content();
-        let fused = self.boundary
-            && !self.beside_float
-            && self.last.is_some_and(|previous| !previous.is_whitespace())
-            && first.is_some_and(|first| !first.is_whitespace())
-            && !self.repeats_alt(text);
+        let joined = self.last.is_some_and(|previous| !previous.is_whitespace())
+            && first.is_some_and(|first| !first.is_whitespace());
+        let digits = self.last.is_some_and(char::is_numeric) && first.is_some_and(char::is_numeric);
+        let beside = match self.beside_float {
+            Some(DropCap::Any) => true,
+            Some(DropCap::Lowercase) => first.is_some_and(char::is_lowercase),
+            None => false,
+        };
+        let alt_side = (alt || self.alt.is_some()) && !digits;
+        let fused =
+            joined && (self.boundary || (self.maybe_boundary && digits)) && !beside && !alt_side;
         self.last = Some(last);
         self.boundary = false;
-        self.beside_float = false;
+        self.maybe_boundary = false;
+        self.beside_float = None;
         self.alt = None;
         fused
-    }
-
-    /// Take in a packaged image's alt text.
-    fn add_alt(&mut self, alt: &str) -> bool {
-        let fused = self.add(alt);
-        self.alt = Some(alt.to_string()).filter(|alt| !alt.is_empty());
-        fused
-    }
-
-    /// Whether text that runs into a packaged image's alt text only repeats
-    /// it: pandoc 2 gives an implicit figure's image its caption as alt
-    /// text, and the caption runs into it ("ChartChart"), which repeats the
-    /// words without joining two of a reader's values. Digits on both sides
-    /// could be read as one number, so they count as joined.
-    fn repeats_alt(&self, text: &str) -> bool {
-        let Some(alt) = &self.alt else {
-            return false;
-        };
-        let words = |text: &str| {
-            text.chars()
-                .filter(|character| anydoc_keeps(*character))
-                .collect::<String>()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let (alt, text) = (words(alt), words(text));
-        let digits = alt.ends_with(|character: char| character.is_numeric())
-            && text.starts_with(|character: char| character.is_numeric());
-        !text.is_empty() && (alt.starts_with(&text) || text.starts_with(&alt)) && !digits
     }
 }
 
@@ -2648,6 +3114,12 @@ impl Run {
 fn anydoc_keeps(character: char) -> bool {
     !matches!(character, '\u{ad}' | '\u{200b}' | '\u{feff}')
         && (!character.is_control() || matches!(character, '\t' | '\n' | '\r'))
+}
+
+/// Whether AnyDoc converts a `math` element as a display formula, a block
+/// of its own (`mathml_is_display`).
+fn anydoc_display_math(element: &Element) -> bool {
+    element.first("display") == Some("block")
 }
 
 /// Whether an image source is an absolute URI (`is_absolute_uri`): a scheme,
@@ -2793,15 +3265,43 @@ fn walked_reach(element: &Element, anydoc: &AnyDocCascade) -> Reach {
     }
 }
 
-/// Letters a floated box may hold and still be a drop cap, beside which the
-/// text after it continues the word ("O" and "nce upon a time").
+/// Characters a floated box may hold and still be a drop cap, beside which
+/// the text after it continues the word ("O" and "nce upon a time"), and
+/// the most when the word goes on in lower case ("Onc" and "e the office").
 const MAX_DROP_CAP_LETTERS: u64 = 2;
+const MAX_DROP_CAP_WORD_LETTERS: u64 = 3;
 
-/// The characters of text AnyDoc keeps that are not white space.
-fn letter_count(text: &str) -> u64 {
+/// The characters of text AnyDoc keeps that are not white space, and the
+/// digits among them.
+fn glyph_count(text: &str) -> (u64, u64) {
     text.chars()
         .filter(|character| anydoc_keeps(*character) && !character.is_whitespace())
-        .count() as u64
+        .fold((0, 0), |(glyphs, digits), character| {
+            (glyphs + 1, digits + u64::from(character.is_numeric()))
+        })
+}
+
+/// Add the glyphs of `text` to the count so far.
+fn count_glyphs(glyphs: &mut (u64, u64), text: &str) {
+    let (characters, digits) = glyph_count(text);
+    glyphs.0 += characters;
+    glyphs.1 += digits;
+}
+
+/// The drop cap a floated box that took in the glyphs between `start` and
+/// `end` makes: never with a digit, which reads as a number beside the
+/// next.
+fn drop_cap(start: (u64, u64), end: (u64, u64)) -> Option<DropCap> {
+    let (characters, digits) = (end.0 - start.0, end.1 - start.1);
+    if digits > 0 {
+        None
+    } else if characters <= MAX_DROP_CAP_LETTERS {
+        Some(DropCap::Any)
+    } else if characters <= MAX_DROP_CAP_WORD_LETTERS {
+        Some(DropCap::Lowercase)
+    } else {
+        None
+    }
 }
 
 /// Take in an image AnyDoc converts: a packaged image as its alt text,
@@ -2809,7 +3309,7 @@ fn letter_count(text: &str) -> u64 {
 /// which keeps the text on either side apart, except inside a list, table,
 /// or quote in a link, which AnyDoc reduces to plain text, alt text and all.
 /// Whether the alt text runs into the text before it.
-fn take_image(run: &mut Run, element: &Element, letters: &mut u64) -> bool {
+fn take_image(run: &mut Run, element: &Element, glyphs: &mut (u64, u64)) -> bool {
     let source = element
         .first("src")
         .or_else(|| element.first("href"))
@@ -2827,7 +3327,7 @@ fn take_image(run: &mut Run, element: &Element, letters: &mut u64) -> bool {
         run.alt = None;
         false
     } else {
-        *letters += letter_count(alt);
+        count_glyphs(glyphs, alt);
         run.add_alt(alt)
     }
 }
@@ -2843,6 +3343,10 @@ struct Meeting<'a> {
     anydoc_hidden: bool,
     /// The reader's style, where it was read.
     style: Option<&'a ReaderStyle>,
+    /// The parent lays its children out as flex or grid items.
+    parent_items: Tri,
+    /// The element is inside an SVG image.
+    in_svg: bool,
 }
 
 /// How an element meets the run it sits in as it starts, and what it will
@@ -2850,7 +3354,7 @@ struct Meeting<'a> {
 fn meet_run(
     run: &mut Run,
     meeting: &Meeting,
-    letters: &mut u64,
+    glyphs: &mut (u64, u64),
     found: &mut ChapterText,
 ) -> Effects {
     let mut effects = Effects::default();
@@ -2861,31 +3365,55 @@ fn meet_run(
         has_blocks,
         anydoc_hidden,
         style,
+        parent_items,
+        in_svg,
     } = *meeting;
     let local = element.local.as_str();
     let spliced = !run.splices.is_empty();
-    // Where AnyDoc keeps the element in the run: a reader starts a new line
-    // for it unless it certainly lays it out inline, and floats it beside
-    // the lines after it when it certainly floats. An element whose style
-    // was not read holds no text; the reader's defaults decide.
-    let (inline, floats) = match style {
-        Some(style) => (style.inline(), style.floats()),
-        None => (!reader_block_by_default(local), false),
+    // How a reader lays the element out beside the text around it. A flex
+    // or grid item is a block of its own, as is each text of an SVG image
+    // and each span of one set at a place of its own; otherwise its style
+    // decides, or, where it was not read (the element holds no text), the
+    // reader's defaults.
+    let own = match style {
+        Some(style) => style.flow(),
+        None if reader_block_by_default(local) => Flow::Block,
+        None => Flow::Inline,
     };
-    let (breaks_before, breaks_after) = style.map_or((false, false), |style| {
+    let placed = |name: &str| element.first(name).is_some();
+    let flow = match (parent_items, own) {
+        (Tri::Yes, _) | (_, Flow::Block) => Flow::Block,
+        _ if in_svg && (local == "text" || (local == "tspan" && (placed("x") || placed("y")))) => {
+            Flow::Block
+        }
+        // Moved off the line only by a shift that may be a superscript's.
+        _ if in_svg && local == "tspan" && placed("dy") => Flow::MaybeApart,
+        (Tri::Maybe, _) => Flow::MaybeApart,
+        _ => own,
+    };
+    let (breaks_before, breaks_after) = style.map_or((Tri::No, Tri::No), |style| {
         (style.breaks_before, style.breaks_after)
     });
-    let keep_in_run = |run: &mut Run, effects: &mut Effects| {
-        if inline {
-            // A block `::before` or `::after` box still breaks the line.
-            run.boundary |= breaks_before;
+    let keep_in_run = |run: &mut Run, effects: &mut Effects, glyphs: (u64, u64)| match flow {
+        // A block `::before` or `::after` box still breaks the line.
+        Flow::Inline => {
+            run.mark(breaks_before);
             effects.boundary_after = breaks_after;
-            return;
         }
-        run.boundary = true;
-        effects.boundary_after = true;
-        if floats {
-            effects.letters_at = Some(*letters);
+        Flow::Block => {
+            run.boundary = true;
+            effects.boundary_after = Tri::Yes;
+        }
+        // A float starts no line of its own before it; a number beside it
+        // stays apart from one in it.
+        Flow::Float => {
+            run.maybe_boundary = true;
+            effects.boundary_after = Tri::Yes;
+            effects.glyphs_at = Some(glyphs);
+        }
+        Flow::MaybeApart => {
+            run.maybe_boundary = true;
+            effects.boundary_after = Tri::Maybe;
         }
     };
     match (parent, reach) {
@@ -2900,15 +3428,17 @@ fn meet_run(
             // there, while a reader may show it: a line break, a rule, or a
             // block, even an empty one, starts a new line.
             let shown = style.is_some_and(|style| style.display != Resolved::Hidden);
-            if shown && (matches!(local, "br" | "hr") || anydoc_block(local) || !inline) {
+            if shown && (matches!(local, "br" | "hr") || anydoc_block(local)) {
                 run.boundary = true;
-                effects.boundary_after = true;
+                effects.boundary_after = Tri::Yes;
+            } else if shown {
+                keep_in_run(run, &mut effects, *glyphs);
             }
         }
         (Reach::Walk, _) => match (local, reach) {
             ("a", Reach::Walk) => {
-                keep_in_run(run, &mut effects);
-                run.open_splice('\n', false);
+                keep_in_run(run, &mut effects, *glyphs);
+                run.open_splice('\n', Whole::No);
                 effects.closes_splice = true;
             }
             ("p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6", Reach::Walk) if spliced => {
@@ -2917,17 +3447,26 @@ fn meet_run(
             }
             ("blockquote", Reach::Walk) | (_, Reach::List | Reach::Table) if spliced => {
                 run.edge();
-                run.open_splice(' ', false);
+                run.open_splice(' ', Whole::No);
                 effects.closes_splice = true;
                 effects.edge_after = true;
             }
             ("pre", Reach::Whole) if spliced => {
                 run.edge();
-                run.open_splice(' ', true);
+                run.open_splice(' ', Whole::Pre);
                 effects.closes_splice = true;
                 effects.edge_after = true;
             }
-            // `math` converts as TeX, kept apart from the text around it.
+            // A display formula is one of the link's blocks, its TeX joined
+            // to the text on either side.
+            ("math", Reach::Whole) if spliced && anydoc_display_math(element) => {
+                run.edge();
+                run.open_splice(' ', Whole::Tex);
+                effects.closes_splice = true;
+                effects.edge_after = true;
+            }
+            // An inline formula converts as TeX between dollar signs, apart
+            // from the text around it.
             (_, Reach::Whole) if spliced => {
                 run.content();
                 run.last = Some(' ');
@@ -2946,9 +3485,18 @@ fn meet_run(
                 run.flush();
                 effects.flush_after = true;
             }
-            ("br", Reach::Dropped) => run.space('\n'),
+            // A reader breaks the line even where AnyDoc drops the break: a
+            // link holding nothing else loses it with its empty paragraph.
+            ("br", Reach::Dropped) => {
+                run.space('\n');
+                if style.is_none_or(|style| style.display != Resolved::Hidden) {
+                    run.boundary = true;
+                }
+            }
             ("img" | "image", Reach::Dropped) => {
-                found.fuses_blocks |= take_image(run, element, letters);
+                keep_in_run(run, &mut effects, *glyphs);
+                found.fuses_blocks |= take_image(run, element, glyphs);
+                found.drops_shown |= std::mem::take(&mut run.lost_sign);
             }
             (container, Reach::Walk) if anydoc_container(container) && has_blocks => {
                 if spliced {
@@ -2960,7 +3508,7 @@ fn meet_run(
                 }
             }
             // Walked inline.
-            (_, Reach::Walk) => keep_in_run(run, &mut effects),
+            (_, Reach::Walk) => keep_in_run(run, &mut effects, *glyphs),
             _ => {}
         },
         _ => {}
@@ -2968,13 +3516,19 @@ fn meet_run(
     effects
 }
 
-/// Apply what an element does to AnyDoc's inline run as it ends.
-fn end_element(effects: &Effects, runs: &mut Vec<Run>, letters: u64) {
+/// Apply what an element does to AnyDoc's inline run as it ends, with the
+/// glyphs taken in so far; whether a sign its `::after` box shows meets a
+/// digit, which AnyDoc then shows without it.
+fn end_element(effects: &Effects, runs: &mut Vec<Run>, glyphs: (u64, u64)) -> bool {
+    let lost_sign = effects.sign_after
+        && runs
+            .last()
+            .is_some_and(|run| run.last.is_some_and(char::is_numeric));
     if effects.opens_run {
         runs.pop();
     }
     let Some(run) = runs.last_mut() else {
-        return;
+        return lost_sign;
     };
     if effects.closes_splice {
         run.splices.pop();
@@ -2985,10 +3539,11 @@ fn end_element(effects: &Effects, runs: &mut Vec<Run>, letters: u64) {
     if effects.flush_after {
         run.flush();
     }
-    match effects.letters_at {
-        Some(start) if letters - start <= MAX_DROP_CAP_LETTERS => run.beside_float = true,
-        _ => run.boundary |= effects.boundary_after,
+    match effects.glyphs_at.and_then(|start| drop_cap(start, glyphs)) {
+        Some(cap) => run.beside_float = Some(cap),
+        None => run.mark(effects.boundary_after),
     }
+    lost_sign
 }
 
 /// How a chapter's text fares between a reading system and AnyDoc.
@@ -3016,6 +3571,7 @@ pub(super) fn chapter_text(
     xml.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     let mut elements: Vec<Element> = Vec::new();
+    let mut ancestors = AncestorKeys::default();
     let mut open: Vec<Open> = Vec::new();
     let mut top_level = 0usize;
     let mut root_taken = false;
@@ -3024,8 +3580,9 @@ pub(super) fn chapter_text(
     let blocks = block_children(chapter)?;
     let mut element_index = 0usize;
     let mut runs: Vec<Run> = Vec::new();
-    // Characters taken into runs so far, to tell a floated drop cap.
-    let mut letters = 0u64;
+    // Glyphs, and digits among them, taken into runs so far, to tell a
+    // floated drop cap.
+    let mut glyphs = (0u64, 0u64);
     loop {
         let event = xml
             .read_event_into(&mut buffer)
@@ -3034,9 +3591,11 @@ pub(super) fn chapter_text(
             quick_xml::events::Event::Start(start) => (Some((start, true)), None),
             quick_xml::events::Event::Empty(start) => (Some((start, false)), None),
             quick_xml::events::Event::End(_) => {
-                elements.pop();
+                if let Some(closed) = elements.pop() {
+                    ancestors.pop(&closed);
+                }
                 if let Some(closed) = open.pop() {
-                    end_element(&closed.effects, &mut runs, letters);
+                    found.drops_shown |= end_element(&closed.effects, &mut runs, glyphs);
                 }
                 buffer.clear();
                 continue;
@@ -3063,11 +3622,18 @@ pub(super) fn chapter_text(
         };
         if let Some(text) = text {
             if let (Some(state), Some(run)) = (open.last(), runs.last_mut()) {
-                // `pre` text inside a link joins the run around it.
-                let verbatim = run.splices.last().is_some_and(|splice| splice.verbatim);
-                if state.reach == Reach::Walk || (state.reach == Reach::Whole && verbatim) {
-                    letters += letter_count(&text);
-                    found.fuses_blocks |= run.add(&text);
+                // `pre` text, or a display formula's, inside a link joins the
+                // run around it.
+                let whole = run.splices.last().map_or(Whole::No, |splice| splice.whole);
+                let taken = match (state.reach, whole) {
+                    (Reach::Walk, _) | (Reach::Whole, Whole::Pre) => Some(text.as_str()),
+                    (Reach::Whole, Whole::Tex) => Some(text.trim()),
+                    _ => None,
+                };
+                if let Some(taken) = taken {
+                    count_glyphs(&mut glyphs, taken);
+                    found.fuses_blocks |= run.add(taken);
+                    found.drops_shown |= std::mem::take(&mut run.lost_sign);
                 }
             }
             let state = open
@@ -3196,18 +3762,21 @@ pub(super) fn chapter_text(
         let anydoc_hidden = parent_reach == Some(Reach::Walk)
             && matches!(reach, Reach::Omitted | Reach::Dropped)
             && anydoc.hides(&element);
+        ancestors.push(&element);
         elements.push(element);
         let element = elements.last().expect("the element just pushed");
-        // The reader's style: for the text below the element, and for
-        // whether a reader shows an element AnyDoc skips. Nothing below a
-        // dropped or empty element converts or shows.
+        // The reader's style: for the text below the element, for whether a
+        // reader shows an element AnyDoc skips, a line break, or an image,
+        // and how it lays them out, and for the `::before` and `::after`
+        // boxes of an empty element. Nothing below a dropped or empty
+        // element converts or shows.
         let style = if (has_children && reach != Reach::Dropped)
             || (anydoc_hidden && (reach == Reach::Omitted || matches!(local.as_str(), "br" | "hr")))
-            || (reach == Reach::Walk
-                && parent_reach == Some(Reach::Walk)
-                && reader.styles_pseudo_boxes())
+            || (parent_reach == Some(Reach::Walk)
+                && matches!(local.as_str(), "br" | "img" | "image"))
+            || (reach != Reach::Dropped && reader.styles_pseudo_boxes())
         {
-            Some(reader.evaluate(&elements, work)?)
+            Some(reader.evaluate(&elements, &ancestors, work)?)
         } else {
             None
         };
@@ -3219,6 +3788,8 @@ pub(super) fn chapter_text(
         // for anything its style makes a block. A link's content joins the
         // run around it (see [`Splice`]).
         let spliced = runs.last().is_some_and(|run| !run.splices.is_empty());
+        let parent_items = open.last().map_or(Tri::No, |parent| parent.items);
+        let parent_in_svg = open.last().is_some_and(|parent| parent.in_svg);
         let mut effects = match (parent_reach, reach, runs.last_mut()) {
             (Some(Reach::Root), Reach::Walk, _) => Effects {
                 opens_run: true,
@@ -3239,27 +3810,18 @@ pub(super) fn chapter_text(
                     has_blocks,
                     anydoc_hidden,
                     style: style.as_ref(),
+                    parent_items,
+                    in_svg: parent_in_svg,
                 },
-                &mut letters,
+                &mut glyphs,
                 &mut found,
             ),
             _ => Effects::default(),
         };
-        // An empty element holds no text to check.
-        if !has_children {
-            elements.pop();
-            effects.opens_run = false;
-            end_element(&effects, &mut runs, letters);
-            buffer.clear();
-            continue;
-        }
-        if effects.opens_run {
-            runs.push(Run::default());
-        }
         let parent = open.last();
         let element = elements.last().expect("the element just pushed");
-        let in_svg = parent.is_some_and(|parent| parent.in_svg) || element.lower == "svg";
-        let state = match style {
+        let in_svg = parent_in_svg || element.lower == "svg";
+        let mut state = match &style {
             // Nothing below converts or shows, so its style does not matter.
             None => Open {
                 children: 0,
@@ -3270,6 +3832,7 @@ pub(super) fn chapter_text(
                 contents_hidden: false,
                 fallback: false,
                 in_svg,
+                items: Tri::No,
                 exempt: Exempt::None,
                 effects,
             },
@@ -3300,14 +3863,66 @@ pub(super) fn chapter_text(
                     contents_hidden: style.content_visibility == Resolved::Hidden,
                     fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
                     in_svg,
+                    items: style.items,
                     exempt,
                     effects,
                 }
             }
         };
+        // What a shown `::before` or `::after` box adds, which AnyDoc never
+        // converts: text, such as a label, and a sign beside digits.
+        let hidden = state.undisplayed || state.invisible || state.contents_hidden;
+        let generated = style
+            .as_ref()
+            .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
+        found.drops_shown |= generated.is_some_and(|style| style.generates_text);
+        let sign_before = generated.is_some_and(|style| style.sign_before);
+        effects.sign_after = generated.is_some_and(|style| style.sign_after);
+        state.effects.sign_after = effects.sign_after;
+        let mark_sign = |runs: &mut Vec<Run>| {
+            if let Some(run) = runs.last_mut().filter(|_| sign_before) {
+                run.sign_before = true;
+            }
+        };
+        // An empty element holds no text to check.
+        if !has_children {
+            if let Some(closed) = elements.pop() {
+                ancestors.pop(&closed);
+            }
+            effects.opens_run = false;
+            mark_sign(&mut runs);
+            found.drops_shown |= end_element(&effects, &mut runs, glyphs);
+            buffer.clear();
+            continue;
+        }
+        if effects.opens_run {
+            runs.push(Run::default());
+        }
+        mark_sign(&mut runs);
         open.push(state);
         buffer.clear();
     }
+}
+
+/// Elements a reader replaces with other content, which shows no `::before`
+/// or `::after` box.
+fn replaced(local: &str) -> bool {
+    matches!(
+        local,
+        "input"
+            | "select"
+            | "textarea"
+            | "iframe"
+            | "object"
+            | "embed"
+            | "video"
+            | "audio"
+            | "canvas"
+            | "img"
+            | "image"
+            | "br"
+            | "hr"
+    )
 }
 
 #[cfg(test)]
@@ -3652,9 +4267,10 @@ mod tests {
             "<section>One</section>Two",
             "A<div/>B",
             "<ul><li><div>Item</div><div>Note</div></li></ul>",
-            // A packaged image converts as its alt text.
-            r#"<figure><img src="chart.png" alt="chart"/><figcaption>Figure 2</figcaption></figure>"#,
-            r#"<div><img src="total.png" alt="Total"/></div><div>1,250.00</div>"#,
+            // A packaged image converts as its alt text, which runs into
+            // other text where digits meet.
+            r#"<figure><img src="chart.png" alt="Figure 2"/><figcaption>2023 revenue</figcaption></figure>"#,
+            r#"<div><img src="total.png" alt="Total 12"/></div><div>50.00</div>"#,
         ] {
             assert!(fuses(body), "{body}");
         }
@@ -3797,8 +4413,13 @@ mod tests {
             &["br { display: none }"],
             "<p>Balance due<br/>1,250.00</p>"
         ));
-        // A rule that may not apply keeps a container a block.
+        // A rule that may not apply counts where digits meet, which the
+        // Markdown reads as one number.
         assert!(fuses(
+            &[".x { display: inline } p + .x { display: block }"],
+            r#"<p>A</p><div class="x">Units 12</div><div class="x">50 shipped</div>"#
+        ));
+        assert!(!fuses(
             &[".x { display: inline } p + .x { display: block }"],
             r#"<p>A</p><div class="x">Balance due</div><div class="x">1,250.00</div>"#
         ));
@@ -3826,19 +4447,257 @@ mod tests {
     }
 
     #[test]
-    fn a_caption_repeating_its_image_alt_text_is_not_a_join() {
+    fn items_floats_links_and_svg_text_keep_their_own_lines() {
+        let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
+        let math = r#"xmlns="http://www.w3.org/1998/Math/MathML""#;
+        let svg = r#"xmlns="http://www.w3.org/2000/svg""#;
+        for (sheets, body) in [
+            // Each flex or grid item is a block, text straight inside too.
+            (
+                &[".s { display: flex; flex-direction: column }"][..],
+                r#"<div class="s"><span>Balance due</span><span>1,250.00</span></div>"#.to_string(),
+            ),
+            (
+                &[".s { display: grid }"],
+                r#"<div class="s"><span>Item</span><span>1,250.00</span></div>"#.into(),
+            ),
+            (
+                &[],
+                r#"<div style="display:flex">Balance due<span>1,250.00</span></div>"#.into(),
+            ),
+            // A floated or positioned box holding digits is no drop cap.
+            (
+                &[".f { float: left }"],
+                r#"<p><span class="f">10</span>250 units received</p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="float:right">12</span>Widgets</p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute;left:300px">12</span>50 units</p>"#.into(),
+            ),
+            // AnyDoc drops a link holding only a line break, and flattens
+            // a display formula in a link into the text around it.
+            (&[], "<p>Balance due<a><br/></a>1,250.00</p>".into()),
+            (
+                &[],
+                format!(r#"<p><a><math {math} display="block"><mn>12</mn></math></a>50 units</p>"#),
+            ),
+            (
+                &[],
+                format!(
+                    r#"<p>Total<a> <math {math} display="block">
+                    <mn>12</mn> </math> </a>50 units</p>"#
+                ),
+            ),
+            // A block image, and each placed text of an SVG image.
+            (
+                &[],
+                r#"<p>Balance due<img src="rule.png" alt="" style="display:block"/>1,250.00</p>"#
+                    .into(),
+            ),
+            (
+                &[],
+                format!(
+                    r#"<svg {svg}><text x="10" y="20">Balance due</text><text x="10" y="45">1,250.00</text></svg>"#
+                ),
+            ),
+            (
+                &[],
+                format!(
+                    r#"<svg {svg}><text><tspan x="10" dy="1.2em">Balance due</tspan><tspan x="10" dy="1.2em">1,250.00</tspan></text></svg>"#
+                ),
+            ),
+            // A line feed a `::before` box keeps.
+            (
+                &[r#".amt::before { content: "\A"; white-space: pre }"#],
+                r#"<p>Balance due<span class="amt">1,250.00</span></p>"#.into(),
+            ),
+            // Cells of a table laid out by style.
+            (
+                &[".row { display: table } .cell { display: table-cell }"],
+                r#"<p class="row"><span class="cell">Intake</span><span class="cell">7</span></p>"#
+                    .into(),
+            ),
+        ] {
+            assert!(fuses(sheets, &body), "{body}");
+        }
+        for (sheets, body) in [
+            // AnyDoc keeps white space between items, a line break beside
+            // other text in a link, and an inline formula's delimiters.
+            (
+                &[".s { display: flex }"][..],
+                r#"<div class="s"><span>Balance due</span> <span>1,250.00</span></div>"#
+                    .to_string(),
+            ),
+            (&[], "<p>Balance due<span><br/></span>1,250.00</p>".into()),
+            (&[], "<p>x<a>Balance due<br/></a>1,250.00</p>".into()),
+            (
+                &[],
+                format!(r#"<p>due<a><math {math}><mn>12</mn></math></a>50 units</p>"#),
+            ),
+            // A drop cap of a word's first letters, going on in lower case.
+            (
+                &[],
+                r#"<p><span style="float:left">Onc</span>e the office opened</p>"#.into(),
+            ),
+            // A line feed collapsed to a space, or in a box that is not there.
+            (
+                &[r#".amt::before { content: "\A" }"#],
+                r#"<p>Balance due<span class="amt">1,250.00</span></p>"#.into(),
+            ),
+            (
+                &[r#".amt::before { content: "\A"; white-space: pre; display: none }"#],
+                r#"<p>Balance due<span class="amt">1,250.00</span></p>"#.into(),
+            ),
+            // A shift that may be a superscript's, where no digits meet.
+            (
+                &[],
+                format!(r#"<svg {svg}><text>Area<tspan dy="-4">2</tspan></text></svg>"#),
+            ),
+        ] {
+            assert!(!fuses(sheets, &body), "{body}");
+        }
+        // The one uncertain break that counts: digits meeting.
+        assert!(fuses(
+            &[r#".amt::before { content: "\A" }"#],
+            r#"<p>Units 12<span class="amt">50</span></p>"#
+        ));
+    }
+
+    #[test]
+    fn text_generated_content_adds_is_shown_and_not_converted() {
+        for (sheets, body) in [
+            (
+                r#".n::before { content: "\2212" }"#,
+                r#"<p>Net change <span class="n">1,250.00</span></p>"#,
+            ),
+            (
+                r#".n::after { content: " (restated)" }"#,
+                r#"<p><span class="n">1,250.00</span></p>"#,
+            ),
+            (
+                r#".c::before { content: counter(item) ". " }"#,
+                r#"<p class="c">First</p>"#,
+            ),
+            (
+                r#".e::before { content: "Total" }"#,
+                r#"<p>Due <span class="e"/></p>"#,
+            ),
+            (
+                r#".tip::after { content: attr(title); display: block; position: absolute }"#,
+                r#"<p>See <abbr class="tip" title="adjusted gross income">AGI</abbr>.</p>"#,
+            ),
+            // Signs beside the digits of an amount.
+            (
+                r#".neg::before { content: "(" } .neg::after { content: ")" }"#,
+                r#"<p>Loss <span class="neg"><b>1,250.00</b></span></p>"#,
+            ),
+            (
+                r#".pct::after { content: "%" }"#,
+                r#"<p>Rate <span class="pct">5</span></p>"#,
+            ),
+            (
+                r#".n::before { content: "-" }"#,
+                r#"<p><span class="n"/> 1,250.00</p>"#,
+            ),
+        ] {
+            assert!(drops_shown(&[sheets], body), "{sheets} {body}");
+        }
+        for (sheets, body) in [
+            // Ornaments: quote marks, dashes, bullets, and line feeds.
+            (r#"q::before { content: "\201C" }"#, "<p><q>Quoted</q></p>"),
+            (
+                r#".d::before { content: "\2014 " }"#,
+                r#"<p class="d">Aside</p>"#,
+            ),
+            (
+                r#".b::before { content: "\2022" }"#,
+                r#"<p class="b">Point</p>"#,
+            ),
+            // A box `display: none` takes away, or on an element hidden.
+            (
+                r#".n::before { content: "\2212"; display: none }"#,
+                r#"<p><span class="n">1,250.00</span></p>"#,
+            ),
+            (
+                r#".n { display: none } .n::before { content: "\2212" }"#,
+                r#"<p><span class="n"/></p>"#,
+            ),
+            // Content a rule may not give.
+            (
+                r#"p + .n::before { content: "\2212" }"#,
+                r#"<p>A</p><p class="n">1</p>"#,
+            ),
+            // A sign beside words: a bullet, or parentheses around a note.
+            (
+                r#"li.dash::before { content: "- " }"#,
+                r#"<ul><li class="dash">Item</li></ul>"#,
+            ),
+            (
+                r#".note::before { content: "(" } .note::after { content: ")" }"#,
+                r#"<p>Total <span class="note">see page</span> due</p>"#,
+            ),
+        ] {
+            assert!(!drops_shown(&[sheets], body), "{sheets}");
+        }
+    }
+
+    #[test]
+    fn rules_for_ancestors_a_chapter_lacks_cost_a_lookup() {
+        // Rules for sections the chapter does not have, as a large book's
+        // stylesheet carries: each is set aside without walking up.
+        let sheet: String = (0..200)
+            .map(|i| format!("body div.v{i} div p span {{ float: none }}\n"))
+            .collect();
+        let (reader, anydoc) = cascade_for(&[&sheet]);
+        let body = "<p><span>Line</span> text</p>".repeat(50);
+        let mut work = 0;
+        chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
+        assert!(work <= 50 * 200, "{work}");
+        // A rule whose ancestors are there is still matched in full.
+        let (reader, anydoc) = cascade_for(&[".v1 p span { display: block }"]);
+        let mut work = 0;
+        let found = chapter_text(
+            &chapter(
+                r#"<div class="V1"><p><span>Balance due</span><span>1,250.00</span></p></div>"#,
+            ),
+            &reader,
+            &anydoc,
+            &mut work,
+        )
+        .expect("chapter walk");
+        assert!(!found.fuses_blocks, "a class in another case may not match");
+        let found = chapter_text(
+            &chapter(
+                r#"<div class="v1"><p><span>Balance due</span><span>1,250.00</span></p></div>"#,
+            ),
+            &reader,
+            &anydoc,
+            &mut work,
+        )
+        .expect("chapter walk");
+        assert!(found.fuses_blocks);
+    }
+
+    #[test]
+    fn alt_text_runs_into_other_text_only_where_digits_meet() {
         let fuses = |body: &str| walk(&[], body).fuses_blocks;
-        // pandoc 2 gives an implicit figure's image its caption as alt text.
+        // A reader shows the image, not its alt text: pandoc 2 gives an
+        // implicit figure's image its caption as alt text, and other books
+        // give it a word of its own.
         assert!(!fuses(
             r#"<figure><img src="chart.png" alt="Revenue by quarter"/><figcaption>Revenue by quarter</figcaption></figure>"#
         ));
         assert!(!fuses(
             r#"<figure><img src="chart.png" alt="Revenue by quarter"/><figcaption>Revenue <em>by quarter</em></figcaption></figure>"#
         ));
-        // Other text, or digits on both sides, still runs together.
-        assert!(fuses(
+        assert!(!fuses(
             r#"<figure><img src="chart.png" alt="Chart"/><figcaption>Revenue by quarter</figcaption></figure>"#
         ));
+        // Digits on both sides read as one number.
         assert!(fuses(
             r#"<figure><img src="chart.png" alt="2023"/><figcaption>2023</figcaption></figure>"#
         ));
