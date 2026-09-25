@@ -852,8 +852,9 @@ impl Noted {
     /// `MIN_HIDDEN_CHARS` characters or more as it is, and as its line
     /// reads from its first character to its last, as glyphs shown out of
     /// order are read; and a shorter one, such as a "not" or a digit
-    /// slipped into a line, with the text beside it on its line (see
-    /// `line_contexts`), where the scan read the line.
+    /// slipped into a line, with the text before it, and apart with the
+    /// text after it, as pdf-inspector reads the page's lines (see
+    /// `line_contexts`), where the scan read them.
     fn looked_for(self, edges: &[EdgeRun]) -> PageTexts {
         let characters = |note: &Note| crate::repeated_lines::bare(&note.text).chars().count();
         let short = |note: &Note| characters(note) < crate::MIN_HIDDEN_CHARS;
@@ -870,18 +871,14 @@ impl Noted {
         let mut on_page = false;
         let mut texts = Vec::new();
         for note in notes {
-            let line = note.edges.and_then(|_| read.next().flatten());
+            let lines = note.edges.and_then(|_| read.next()).unwrap_or_default();
             let found = texts.len();
             if !short(&note) {
-                if line
-                    .as_ref()
-                    .is_some_and(|line| *line != crate::repeated_lines::bare(&note.text))
-                {
-                    texts.extend(line);
-                }
+                let bare = crate::repeated_lines::bare(&note.text);
+                texts.extend(lines.into_iter().filter(|line| *line != bare));
                 texts.push(note.text);
             } else {
-                texts.extend(line);
+                texts.extend(lines);
             }
             on_page |= texts.len() > found && note.on_page;
         }
@@ -1290,6 +1287,7 @@ impl PageText {
         edges.push(EdgeRun {
             y: at[1] as f32,
             x: at[0] as f32,
+            direction: [matrix[0] as f32, matrix[1] as f32],
             size: size as f32,
             text,
         });
@@ -2981,11 +2979,13 @@ pub(crate) mod tests {
         let run = |x: f32, y: f32, text: &str| EdgeRun {
             x,
             y,
+            direction: [1.0, 0.0],
             size: 12.0,
             text: Some(text.to_owned()),
         };
         // A digit slipped in before an amount, a word into a sentence, a
-        // mark standing alone on its line, and a run long enough alone.
+        // mark standing alone on its line, read with the lines before and
+        // after, and a run long enough alone.
         let edges = [
             run(72.0, 700.0, "Amount due "),
             run(140.04, 700.0, "1,250.00"),
@@ -3006,14 +3006,18 @@ pub(crate) mod tests {
             noted.interrupt();
             noted.note(text, true, None, Some(index), true);
         }
-        assert_eq!(
-            noted.looked_for(&edges).texts,
-            [
-                "mountdue91,250.00",
-                "Thefeeisnotrefundab",
-                "Ignore the balance above"
-            ]
-        );
+        let texts = noted.looked_for(&edges).texts;
+        for text in [
+            "mountdue9",
+            "91,250.00",
+            "Thefeeisnot",
+            "notrefundab",
+            "undable.x",
+            "xIgnoreth",
+            "Ignore the balance above",
+        ] {
+            assert!(texts.iter().any(|looked| looked == text), "{text}");
+        }
     }
 
     #[test]

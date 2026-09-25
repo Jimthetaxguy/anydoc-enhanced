@@ -523,12 +523,21 @@ fn masked(text: &str, page: u32) -> (String, bool) {
     (masked, counts_only && !text.is_empty())
 }
 
-/// A text with its white space, table pipes, emphasis and escape marks,
-/// heading marks, and underline and break tags left out, as it is looked
-/// for in the Markdown; and, by byte, whether anything was left out just
-/// before it.
+/// Bytes of a link's target in the Markdown read past, at most, after its
+/// text (`[text](target)`).
+const MAX_LINK_TARGET: usize = 2_048;
+
+/// A text with its white space, table pipes, emphasis, escape, and link
+/// marks, heading marks, underline, strike, script, and break tags, and
+/// links' targets left out, as it is looked for in the Markdown; its
+/// superscript and subscript digits read as digits, set apart from what
+/// stands before them, its ligatures as their letters, and the bullets
+/// pdf-inspector writes as a list's "-" as that; and, by byte, whether
+/// anything was left out just before it.
 fn bare_marked(text: &str) -> (String, Vec<bool>) {
-    const TAGS: [&str; 4] = ["<u>", "</u>", "<br>", "<br/>"];
+    const TAGS: [&str; 10] = [
+        "<u>", "</u>", "<br>", "<br/>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
+    ];
     let mut bare = String::with_capacity(text.len());
     let mut breaks = Vec::with_capacity(text.len());
     let mut broken = false;
@@ -541,17 +550,62 @@ fn bare_marked(text: &str) -> (String, Vec<bool>) {
                 continue;
             }
         }
+        // A link's target, after its text.
+        if rest.starts_with("](") {
+            let target = &rest[2..rest.len().min(2 + MAX_LINK_TARGET)];
+            if let Some(end) = target.find(')') {
+                rest = &rest[2 + end + 1..];
+                broken = true;
+                continue;
+            }
+        }
         rest = &rest[character.len_utf8()..];
-        if character.is_whitespace() || matches!(character, '|' | '*' | '_' | '`' | '\\' | '#') {
+        if character.is_whitespace()
+            || matches!(character, '|' | '*' | '_' | '`' | '\\' | '#' | '[' | ']')
+        {
             broken = true;
             continue;
         }
-        bare.push(character);
-        breaks.push(broken);
-        breaks.extend(std::iter::repeat_n(false, character.len_utf8() - 1));
+        let (read, count, apart) = folded(character);
+        for (index, character) in read[..count].iter().enumerate() {
+            bare.push(*character);
+            breaks.push(index == 0 && (broken || apart));
+            breaks.extend(std::iter::repeat_n(false, character.len_utf8() - 1));
+        }
         broken = false;
     }
     (bare, breaks)
+}
+
+/// A character as it is looked for (see `bare_marked`): the characters it
+/// reads as, how many, and whether it is set apart from what stands before
+/// it.
+fn folded(character: char) -> ([char; 3], usize, bool) {
+    let digit = |value: u32| char::from_digit(value, 10).unwrap_or('0');
+    let script = |value: u32| ([digit(value), ' ', ' '], 1, true);
+    let letters = |text: &str| {
+        let mut read = [' '; 3];
+        let mut count = 0;
+        for (slot, letter) in read.iter_mut().zip(text.chars()) {
+            *slot = letter;
+            count += 1;
+        }
+        (read, count, false)
+    };
+    match character {
+        '\u{00B9}' => script(1),
+        '\u{00B2}' | '\u{00B3}' => script(u32::from(character) - 0xB0),
+        '\u{2070}' | '\u{2074}'..='\u{2079}' => script(u32::from(character) - 0x2070),
+        '\u{2080}'..='\u{2089}' => script(u32::from(character) - 0x2080),
+        '\u{FB00}' => letters("ff"),
+        '\u{FB01}' => letters("fi"),
+        '\u{FB02}' => letters("fl"),
+        '\u{FB03}' => letters("ffi"),
+        '\u{FB04}' => letters("ffl"),
+        '\u{FB05}' | '\u{FB06}' => letters("st"),
+        '\u{2022}' | '\u{25CB}' | '\u{25CF}' | '\u{25E6}' => (['-', ' ', ' '], 1, false),
+        other => ([other, ' ', ' '], 1, false),
+    }
 }
 
 /// A text as it is looked for in the Markdown (see `bare_marked`).
@@ -652,11 +706,13 @@ pub(crate) const SCAN_EDGE_HEIGHTS: usize = 12;
 const GATE_EDGE_LINES: usize = 8;
 
 /// A run of text a page shows, as the page scan reads it: where it starts,
-/// its size, and its text, where its font can be read.
+/// the way its baseline runs on the page, its size, and its text, where its
+/// font can be read.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EdgeRun {
     pub(crate) y: f32,
     pub(crate) x: f32,
+    pub(crate) direction: [f32; 2],
     pub(crate) size: f32,
     pub(crate) text: Option<String>,
 }
@@ -693,76 +749,205 @@ fn lines_of(runs: &[EdgeRun]) -> Vec<Vec<usize>> {
     lines
 }
 
-/// Characters of a line taken on either side of a short run of text read
-/// in it, to look for the run where it stands.
+/// How pdf-inspector turns a page whose runs mostly read up or down it so
+/// that they read along x, as a point on the page is turned: where two
+/// thirds or more of the runs set within 20 degrees of an axis are set
+/// along the page's height, the way more of them read (see
+/// `correct_rotated_page`, which counts shows where this counts runs).
+fn page_turn(runs: &[EdgeRun]) -> fn([f32; 2]) -> [f32; 2] {
+    const TAN_20_DEG: f32 = 0.364;
+    let (mut across, mut up, mut down) = (0usize, 0usize, 0usize);
+    for run in runs {
+        let [a, b] = run.direction;
+        if b.abs() <= a.abs() * TAN_20_DEG {
+            across += 1;
+        } else if a.abs() <= b.abs() * TAN_20_DEG {
+            if b > 0.0 {
+                up += 1;
+            } else {
+                down += 1;
+            }
+        }
+    }
+    let turned = up + down;
+    if across + turned < 2 || turned * 3 < (across + turned) * 2 || up == down {
+        |[x, y]| [x, y]
+    } else if up > down {
+        |[x, y]| [y, -x]
+    } else {
+        |[x, y]| [-y, x]
+    }
+}
+
+/// Whether pdf-inspector takes the order runs are shown in as too jumbled
+/// to read lines in, going by where they sit: five runs or more, among
+/// whose moves of more than 50 points from one to the next there are three
+/// or more, more than four in ten of them up the page
+/// (`should_use_y_sorting`).
+fn jumbled(at: &[[f32; 2]]) -> bool {
+    if at.len() < 5 {
+        return false;
+    }
+    let (mut up, mut down) = (0usize, 0usize);
+    for pair in at.windows(2) {
+        let moved = pair[1][1] - pair[0][1];
+        if moved > 50.0 {
+            up += 1;
+        } else if moved < -50.0 {
+            down += 1;
+        }
+    }
+    up + down >= 3 && up as f32 / (up + down) as f32 > 0.4
+}
+
+/// The lines pdf-inspector makes of a page's runs, in the order it reads
+/// them, as the indexes of their runs (`group_single_column`): the page
+/// turned where its runs mostly read up or down it (see `page_turn`), the
+/// runs taken in the order shown, or from the top and then the left where
+/// that order is jumbled (see `jumbled`) or `from_the_top`, a run going on
+/// the line before when it sits less than 3 points from that line's first
+/// run, unless, set more than half a point apart from it, it starts where
+/// that run starts or well left of the line's last run; each line then
+/// read left to right, or right to left where its runs are upside down,
+/// runs starting together in the order shown.
+fn reading_lines(runs: &[EdgeRun], from_the_top: bool) -> Vec<Vec<usize>> {
+    let turn = page_turn(runs);
+    let at: Vec<[f32; 2]> = runs.iter().map(|run| turn([run.x, run.y])).collect();
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    if from_the_top || jumbled(&at) {
+        order.sort_by(|&one, &other| {
+            at[other][1]
+                .total_cmp(&at[one][1])
+                .then(at[one][0].total_cmp(&at[other][0]))
+        });
+    }
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    for index in order {
+        let [x, y] = at[index];
+        let joins = lines.last().is_some_and(|line| {
+            let [first_x, first_y] = at[line[0]];
+            let last_x = at[line[line.len() - 1]][0];
+            let apart = (first_y - y).abs();
+            apart < 3.0 && !(apart > 0.5 && ((x - first_x).abs() < 5.0 || x < last_x - 10.0))
+        });
+        match lines.last_mut().filter(|_| joins) {
+            Some(line) => line.push(index),
+            None => lines.push(vec![index]),
+        }
+    }
+    for line in &mut lines {
+        let upside_down = line.iter().all(|&index| {
+            let [a, b] = turn(runs[index].direction);
+            a < 0.0 && b.abs() < a.abs()
+        });
+        line.sort_by(|&one, &other| {
+            let (one, other) = (at[one][0], at[other][0]);
+            if upside_down {
+                other.total_cmp(&one)
+            } else {
+                one.total_cmp(&other)
+            }
+        });
+    }
+    lines
+}
+
+/// Characters taken on either side of a short run of text, to look for
+/// the run where it stands.
 const CONTEXT_CHARS: usize = 8;
+/// Characters that must stand on a side of a short run for it to be looked
+/// for with them.
+const MIN_CONTEXT_CHARS: usize = 2;
 /// Runs a span may reach over, at most.
 const MAX_SPAN_RUNS: usize = 64;
 
-/// The text of each of `spans` of `runs`, a text read from the first run
-/// of the span to the last, bare, as pdf-inspector reads it on the first
-/// one's line (see `lines_of`), its runs left to right, whatever order they
-/// were shown in: from the span's leftmost character to its rightmost,
-/// and, where the span is to be read `beside` what stands with it, from
-/// `CONTEXT_CHARS` characters before that to as many after. None where a
-/// run of that line cannot be read, or, beside, nothing stands with it.
-pub(crate) fn line_contexts(
-    runs: &[EdgeRun],
-    spans: &[(usize, usize, bool)],
-) -> Vec<Option<String>> {
+/// The texts to look for of each of `spans` of `runs`, bare, as
+/// pdf-inspector reads the page's lines, one after another (see
+/// `reading_lines`), in the order shown and from the top, as it may yet
+/// set a line read in the order shown beside another at its height: a
+/// span read from its first run to its last, from its leftmost character
+/// on its lines to its rightmost; and, where the span is to be read
+/// `beside` what stands with it, that text with the `CONTEXT_CHARS`
+/// characters before it, and, apart, with as many after it, from the lines
+/// before and after where its own ends, but not past a run whose text
+/// cannot be read. None for a span a run of which cannot be read, or,
+/// beside, with nothing on either side.
+pub(crate) fn line_contexts(runs: &[EdgeRun], spans: &[(usize, usize, bool)]) -> Vec<Vec<String>> {
+    let mut contexts: Vec<Vec<String>> = vec![Vec::new(); spans.len()];
     if spans.is_empty() {
-        return Vec::new();
+        return contexts;
     }
-    let lines = lines_of(runs);
-    let mut line_of = vec![usize::MAX; runs.len()];
-    for (number, line) in lines.iter().enumerate() {
-        for &index in line {
-            line_of[index] = number;
+    for from_the_top in [false, true] {
+        let read = read_in_order(runs, &reading_lines(runs, from_the_top), spans);
+        for (texts, more) in contexts.iter_mut().zip(read) {
+            for text in more {
+                if !texts.contains(&text) {
+                    texts.push(text);
+                }
+            }
         }
     }
-    // Each line read so far: its bare text, and where each run's text
-    // starts and ends in it, in characters; None where a run of it cannot
-    // be read.
-    type Read = Option<(Vec<char>, HashMap<usize, (usize, usize)>)>;
-    let mut read: HashMap<usize, Read> = HashMap::new();
+    contexts
+}
+
+/// The texts to look for of each of `spans` of `runs`, as the page reads in
+/// `lines` (see `line_contexts`).
+fn read_in_order(
+    runs: &[EdgeRun],
+    lines: &[Vec<usize>],
+    spans: &[(usize, usize, bool)],
+) -> Vec<Vec<String>> {
+    // The page's text as read, bare, a gap where a run cannot be read, and
+    // where each run's text starts and ends in it, in characters.
+    let mut text: Vec<Option<char>> = Vec::new();
+    let mut places: Vec<Option<(usize, usize)>> = vec![None; runs.len()];
+    for &index in lines.iter().flatten() {
+        let start = text.len();
+        match runs[index].text.as_deref() {
+            Some(read) => text.extend(bare(read).chars().map(Some)),
+            None => text.push(None),
+        }
+        places[index] = Some((start, text.len()));
+    }
+    let read =
+        |range: std::ops::Range<usize>| -> Option<String> { text[range].iter().copied().collect() };
     spans
         .iter()
         .map(|&(first, last, beside)| {
-            let number = *line_of.get(first)?;
-            if number == usize::MAX || last < first || last - first > MAX_SPAN_RUNS {
-                return None;
+            if last < first || last - first > MAX_SPAN_RUNS || last >= runs.len() {
+                return Vec::new();
             }
-            let (text, places) = read
-                .entry(number)
-                .or_insert_with(|| {
-                    let mut order = lines[number].clone();
-                    order.sort_by(|&one, &other| runs[one].x.total_cmp(&runs[other].x));
-                    let mut text = Vec::new();
-                    let mut places = HashMap::new();
-                    for index in order {
-                        let start = text.len();
-                        text.extend(bare(runs[index].text.as_deref()?).chars());
-                        places.insert(index, (start, text.len()));
-                    }
-                    Some((text, places))
-                })
-                .as_ref()?;
-            let (from, to) = (first..=last)
-                .filter_map(|index| places.get(&index))
+            let (from, to) = places[first..=last]
+                .iter()
+                .flatten()
                 .fold((usize::MAX, 0), |(from, to), &(start, end)| {
                     (from.min(start), to.max(end))
                 });
-            if from >= to {
-                return None;
-            }
+            let Some(span) = (from < to).then(|| read(from..to)).flatten() else {
+                return Vec::new();
+            };
             if !beside {
-                return Some(text[from..to].iter().collect());
+                return vec![span];
             }
-            let (start, end) = (
-                from.saturating_sub(CONTEXT_CHARS),
-                (to + CONTEXT_CHARS).min(text.len()),
-            );
-            (start < from || end > to).then(|| text[start..end].iter().collect())
+            let before = text[..from]
+                .iter()
+                .rev()
+                .take(CONTEXT_CHARS)
+                .take_while(|character| character.is_some())
+                .count();
+            let after = text[to..]
+                .iter()
+                .take(CONTEXT_CHARS)
+                .take_while(|character| character.is_some())
+                .count();
+            [
+                (before >= MIN_CONTEXT_CHARS).then(|| read(from - before..to)),
+                (after >= MIN_CONTEXT_CHARS).then(|| read(from..to + after)),
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect()
         })
         .collect()
 }
@@ -1479,6 +1664,7 @@ mod tests {
             .map(|(index, text)| EdgeRun {
                 y: 740.0 - 16.0 * index as f32,
                 x: 72.0,
+                direction: [1.0, 0.0],
                 size: 10.0,
                 text: Some(text.to_string()),
             })
@@ -1486,6 +1672,7 @@ mod tests {
         runs.extend(beside.iter().map(|(index, text)| EdgeRun {
             y: 740.0 - 16.0 * *index as f32,
             x: 400.0,
+            direction: [1.0, 0.0],
             size: 10.0,
             text: Some(text.to_string()),
         }));
@@ -1577,6 +1764,7 @@ mod tests {
                 .map(|(index, glyph)| EdgeRun {
                     y: 740.0,
                     x: 72.0 + 6.0 * index as f32,
+                    direction: [1.0, 0.0],
                     size: 10.0,
                     text: Some(glyph.to_string()),
                 })
@@ -1602,6 +1790,7 @@ mod tests {
         let run = |x: f32, y: f32| EdgeRun {
             y,
             x,
+            direction: [1.0, 0.0],
             size: 10.0,
             text: Some(String::new()),
         };
@@ -1632,5 +1821,93 @@ mod tests {
         assert!(!found.contains("Account1234") && found.contains("Name"));
         assert!(found.contains("5678"));
         assert_eq!(bare("| a <u>b</u> |<br>c"), "abc");
+    }
+
+    #[test]
+    fn markdown_decoration_is_left_out_as_text_is_looked_for() {
+        assert_eq!(bare("Price <s>$1,500</s> now"), "Price$1,500now");
+        assert_eq!(bare("x<sup>2</sup> H<sub>2</sub>O"), "x2H2O");
+        assert_eq!(
+            bare("Do not pay at [https://pay.example](https://pay.example) now"),
+            "Donotpayathttps://pay.examplenow"
+        );
+        assert_eq!(bare("The fee\u{B9} is \u{FB01}nal"), "Thefee1isfinal");
+        assert_eq!(bare("\u{2022} Fees"), bare("- Fees"));
+        // A superscript digit is set apart from a number before it.
+        let found = found_in(&["1,250.00"], "Total 1,250.00\u{B9}");
+        assert!(found.contains("1,250.00"));
+    }
+
+    fn line_run(x: f32, y: f32, text: Option<&str>) -> EdgeRun {
+        EdgeRun {
+            y,
+            x,
+            direction: [1.0, 0.0],
+            size: 12.0,
+            text: text.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn short_runs_are_read_beside_their_lines_as_pdf_inspector_reads_them() {
+        let holds = |runs: &[EdgeRun], span: usize, texts: &[&str]| {
+            let read = line_contexts(runs, &[(span, span, true)]);
+            texts
+                .iter()
+                .all(|text| read[0].iter().any(|read| read == text))
+        };
+        // Raised or lowered off the line a point or so, in the order shown,
+        // as pdf-inspector keeps it on the line; a tie on x in that order.
+        for lift in [1.0, 1.5, 2.5, -1.5] {
+            let runs = [
+                line_run(72.0, 640.0, Some("The fee is ")),
+                line_run(128.0, 640.0 + lift, Some("not ")),
+                line_run(128.0, 640.0, Some("refundable within")),
+            ];
+            assert!(holds(&runs, 1, &["Thefeeisnot", "notrefundab"]), "{lift}");
+        }
+        // Drawn last, where pdf-inspector sets it beside the line at its
+        // height.
+        let runs = [
+            line_run(72.0, 640.0, Some("The fee is ")),
+            line_run(128.0, 640.0, Some("refundable.")),
+            line_run(72.0, 600.0, Some("Please keep this.")),
+            line_run(128.0, 640.0, Some("not ")),
+        ];
+        assert!(holds(&runs, 3, &["undable.not"]));
+        // A run that cannot be read ends the text beside, not the line.
+        let runs = [
+            line_run(72.0, 640.0, Some("The customer")),
+            line_run(140.0, 640.0, None),
+            line_run(146.0, 640.0, Some("s fee is ")),
+            line_run(200.0, 640.0, Some("not ")),
+            line_run(225.0, 640.0, Some("refundable")),
+        ];
+        assert!(holds(&runs, 3, &["sfeeisnot", "notrefundab"]));
+        assert_eq!(
+            line_contexts(&runs, &[(1, 1, true)]),
+            [Vec::<String>::new()]
+        );
+        // A run alone on its line is read with the lines before and after.
+        let runs = [
+            line_run(72.0, 660.0, Some("Balance due")),
+            line_run(72.0, 640.0, Some("$0.00")),
+            line_run(72.0, 620.0, Some("Thank you")),
+        ];
+        assert!(holds(&runs, 1, &["lancedue$0.00", "$0.00Thankyou"]));
+        // A page whose lines read up it is turned first, as pdf-inspector
+        // turns it: the run shown a point along the line from the text
+        // after it stays in the line.
+        let up = |x: f32, y: f32, text: &str| EdgeRun {
+            direction: [0.0, 1.0],
+            ..line_run(x, y, Some(text))
+        };
+        let runs = [
+            up(560.0, 72.0, "Statement of account"),
+            up(480.0, 72.0, "The fee is "),
+            up(480.0, 126.0, "not "),
+            up(480.0, 127.0, "refundable within"),
+        ];
+        assert!(holds(&runs, 2, &["Thefeeisnot", "notrefundab"]));
     }
 }
