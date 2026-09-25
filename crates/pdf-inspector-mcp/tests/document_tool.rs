@@ -1473,6 +1473,114 @@ fn docx_list_numbers_word_continues_are_reported_as_partial() {
         .any(|warning| warning["code"] == "list_numbering_differs"));
 }
 
+/// Write a package of these parts to `path`.
+fn write_package(path: &Path, entries: &[(&str, String)]) {
+    let file = std::fs::File::create(path).expect("create package");
+    let mut archive = zip::ZipWriter::new(file);
+    for (name, contents) in entries {
+        archive
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .expect("package part");
+        archive
+            .write_all(contents.as_bytes())
+            .expect("package part bytes");
+    }
+    archive.finish().expect("finish package");
+}
+
+const WORD_NAMESPACE: &str =
+    r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+/// A Word package whose main part names these relationships, holding these
+/// further parts.
+fn docx_parts(body: &str, relationships: &str, parts: &[(&str, String)]) -> Vec<(String, String)> {
+    let mut entries = vec![
+        (
+            "[Content_Types].xml".to_string(),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_string(),
+        ),
+        (
+            "_rels/.rels".to_string(),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_string(),
+        ),
+        (
+            "word/document.xml".to_string(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><w:document {WORD_NAMESPACE}><w:body>{body}</w:body></w:document>"#),
+        ),
+        (
+            "word/_rels/document.xml.rels".to_string(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{relationships}</Relationships>"#),
+        ),
+    ];
+    entries.extend(
+        parts
+            .iter()
+            .map(|(name, contents)| (name.to_string(), contents.clone())),
+    );
+    entries
+}
+
+#[test]
+fn docx_notes_from_another_part_than_words_are_refused() {
+    let temporary = tempfile::tempdir().expect("temporary DOCX directory");
+    let note = |text: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:footnotes {WORD_NAMESPACE}><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+        )
+    };
+    let footnotes = |id: &str, target: &str| {
+        format!(
+            r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="{target}"/>"#
+        )
+    };
+    let body =
+        r#"<w:p><w:r><w:t>NOTE-CLAUSE</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+    let parts = [
+        ("word/footnotes.xml", note("SHOWN-NOTE pays 100 USD")),
+        ("word/other.xml", note("OTHER-NOTE pays 900 USD")),
+    ];
+    let convert = |name: &str, relationships: String| {
+        let path = temporary.path().join(name);
+        let entries = docx_parts(body, &relationships, &parts);
+        let entries: Vec<(&str, String)> = entries
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.clone()))
+            .collect();
+        write_package(&path, &entries);
+        run_document_tool(path.to_string_lossy().into_owned(), "docx-notes-parts-test")
+    };
+    // Word, as LibreOffice shows it, reads the first footnotes relationship
+    // and AnyDoc the lowest id, which names a part holding other text.
+    let substituted = convert(
+        "substituted.docx",
+        [
+            footnotes("rId8", "footnotes.xml"),
+            footnotes("rId0", "other.xml"),
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        substituted["code"], "incomplete_conversion",
+        "{substituted}"
+    );
+    // With the lowest id first, both read the note Word shows.
+    let same = convert(
+        "same.docx",
+        [
+            footnotes("rId0", "footnotes.xml"),
+            footnotes("rId8", "other.xml"),
+        ]
+        .concat(),
+    );
+    assert_eq!(same["completeness"], "complete", "{same}");
+    let markdown = same["markdown"].as_str().expect("markdown");
+    assert!(
+        markdown.contains("NOTE-CLAUSE") && markdown.contains("SHOWN-NOTE pays 100 USD"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("OTHER-NOTE"), "{markdown}");
+}
+
 #[test]
 fn docx_dropped_hyphens_are_reported_as_partial() {
     let fixture = format!(

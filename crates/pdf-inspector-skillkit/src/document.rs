@@ -3226,6 +3226,216 @@ fn docx_note(
     })
 }
 
+/// What a footnotes or endnotes part shows, note by note, for comparing the
+/// part Word reads with the one AnyDoc reads where the two differ: each
+/// note but the separators, by kind (`true` for an endnote) and id, as the
+/// text references notes.
+#[derive(Default)]
+struct DocxNotesShown {
+    notes: HashMap<(bool, String), DocxNoteShown>,
+}
+
+/// One note as it shows. `text` holds each paragraph, the text of its `t`
+/// elements from run to run, and every other element a run holds (a tab, a
+/// break, a field, deleted text) by name; `marks` the numbering each
+/// paragraph's mark asks for (`w:pStyle`, `w:numPr`), which changes only
+/// its list label. Each item is framed by its kind and length, so no text
+/// can pass for another item, and a note defined twice holds both.
+#[derive(Default, PartialEq, Eq)]
+struct DocxNoteShown {
+    text: Vec<u8>,
+    marks: Vec<u8>,
+}
+
+impl DocxNoteShown {
+    const NOTE: u8 = 1;
+    const PARAGRAPH: u8 = 2;
+    const TEXT: u8 = 3;
+    const RUN: u8 = 4;
+    const MARK: u8 = 5;
+
+    fn item(stream: &mut Vec<u8>, kind: u8, bytes: &[u8]) {
+        stream.push(kind);
+        stream.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        stream.extend_from_slice(bytes);
+    }
+
+    /// End the text read since the last item: runs split differently still
+    /// show the same text.
+    fn flush(&mut self, text: &mut String) {
+        if !text.is_empty() {
+            Self::item(&mut self.text, Self::TEXT, text.as_bytes());
+            text.clear();
+        }
+    }
+}
+
+/// Read what a notes part shows (see [`DocxNotesShown`]): the notes are the
+/// WordprocessingML `w:footnote` and `w:endnote` children of a
+/// `w:footnotes` or `w:endnotes` root. Parse errors fail closed as
+/// malformed.
+fn docx_notes_shown(bytes: &[u8]) -> Result<DocxNotesShown, DocumentError> {
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<(WordVocabulary, Vec<u8>)> = Vec::new();
+    // The note being read: how deep it opened, its kind and id, and what it
+    // shows so far.
+    let mut note: Option<(usize, (bool, String), DocxNoteShown)> = None;
+    let mut shown = DocxNotesShown::default();
+    let mut text = String::new();
+    let in_t =
+        |stack: &[(WordVocabulary, Vec<u8>)]| stack.last().is_some_and(|(_, local)| local == b"t");
+    let keep = |shown: &mut DocxNotesShown, key: (bool, String), read: DocxNoteShown| {
+        let kept = shown.notes.entry(key).or_default();
+        kept.text.extend_from_slice(&read.text);
+        kept.marks.extend_from_slice(&read.marks);
+    };
+    loop {
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        let vocabulary = WordVocabulary::of(&namespace);
+        let (element, opens) = match event {
+            quick_xml::events::Event::Start(element) => (element, true),
+            quick_xml::events::Event::Empty(element) => (element, false),
+            quick_xml::events::Event::End(_) => {
+                let closed = stack.pop();
+                if let Some((_, _, read)) = note.as_mut() {
+                    if closed.is_some_and(|(vocabulary, local)| {
+                        vocabulary == WordVocabulary::Word && local == b"p"
+                    }) {
+                        read.flush(&mut text);
+                    }
+                }
+                if note
+                    .as_ref()
+                    .is_some_and(|(depth, _, _)| stack.len() <= *depth)
+                {
+                    if let Some((_, key, mut read)) = note.take() {
+                        read.flush(&mut text);
+                        keep(&mut shown, key, read);
+                    }
+                }
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::Text(content) if note.is_some() && in_t(&stack) => {
+                text.push_str(&String::from_utf8_lossy(content.as_ref()));
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::CData(content) if note.is_some() && in_t(&stack) => {
+                text.push_str(&String::from_utf8_lossy(content.as_ref()));
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::GeneralRef(reference) if note.is_some() && in_t(&stack) => {
+                text.push_str(&anydoc_entity_text(&String::from_utf8_lossy(
+                    reference.as_ref(),
+                )));
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::Eof => {
+                if let Some((_, key, mut read)) = note.take() {
+                    read.flush(&mut text);
+                    keep(&mut shown, key, read);
+                }
+                return Ok(shown);
+            }
+            _ => {
+                buffer.clear();
+                continue;
+            }
+        };
+        if opens && stack.len() >= MAX_XML_DEPTH {
+            return Err(DocumentError::ResourceLimit);
+        }
+        let local = xml_local_name(element.name().as_ref()).to_vec();
+        let word = vocabulary == WordVocabulary::Word;
+        match note.as_mut() {
+            None => {
+                let root_holds_notes = stack.len() == 1
+                    && stack[0].0 == WordVocabulary::Word
+                    && matches!(stack[0].1.as_slice(), b"footnotes" | b"endnotes");
+                let separator = xml_attribute_values(&element, b"type").iter().any(|kind| {
+                    matches!(
+                        kind.trim(),
+                        "separator" | "continuationSeparator" | "continuationNotice"
+                    )
+                });
+                let id = xml_attribute_value(&element, b"id");
+                if let Some(id) = id.filter(|_| {
+                    root_holds_notes
+                        && word
+                        && matches!(local.as_slice(), b"footnote" | b"endnote")
+                        && !separator
+                }) {
+                    if shown.notes.len() >= MAX_DOCX_NOTES || id.len() > MAX_STYLE_ID_BYTES {
+                        return Err(DocumentError::ResourceLimit);
+                    }
+                    let key = (local == b"endnote", id.trim().to_string());
+                    let mut read = DocxNoteShown::default();
+                    DocxNoteShown::item(&mut read.text, DocxNoteShown::NOTE, b"");
+                    if opens {
+                        note = Some((stack.len(), key, read));
+                    } else {
+                        keep(&mut shown, key, read);
+                    }
+                }
+            }
+            Some((_, _, read)) if word && local == b"p" => {
+                read.flush(&mut text);
+                DocxNoteShown::item(&mut read.text, DocxNoteShown::PARAGRAPH, b"");
+                DocxNoteShown::item(&mut read.marks, DocxNoteShown::PARAGRAPH, b"");
+            }
+            Some((_, _, read))
+                if stack.last().is_some_and(|(parent, name)| {
+                    *parent == WordVocabulary::Word && name == b"r"
+                }) && !matches!(local.as_slice(), b"t" | b"rPr") =>
+            {
+                read.flush(&mut text);
+                DocxNoteShown::item(&mut read.text, DocxNoteShown::RUN, &local);
+            }
+            Some((_, _, read))
+                if word
+                    && matches!(local.as_slice(), b"pStyle" | b"numPr" | b"numId" | b"ilvl") =>
+            {
+                let mut mark = local.clone();
+                for attribute in xml_attributes(&element) {
+                    mark.push(0);
+                    mark.extend_from_slice(&attribute.key);
+                    mark.push(0);
+                    mark.extend_from_slice(attribute.value.as_bytes());
+                }
+                DocxNoteShown::item(&mut read.marks, DocxNoteShown::MARK, &mark);
+            }
+            Some(_) => {}
+        }
+        if opens {
+            stack.push((vocabulary, local));
+        }
+        buffer.clear();
+    }
+}
+
+/// What the notes part `part` shows (see [`DocxNotesShown`]); none where a
+/// side reads no part, or the part is missing.
+fn docx_notes_part_shown(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    part: Option<&str>,
+) -> Result<DocxNotesShown, DocumentError> {
+    match part {
+        Some(part) => match read_optional_xml_part(archive, part)? {
+            Some(bytes) => docx_notes_shown(&bytes),
+            None => Ok(DocxNotesShown::default()),
+        },
+        None => Ok(DocxNotesShown::default()),
+    }
+}
+
 fn scan_docx_element(
     resolver: &quick_xml::name::NamespaceResolver,
     event: &quick_xml::events::BytesStart<'_>,
@@ -5642,6 +5852,10 @@ const STYLES_RELATIONSHIP: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
 const NUMBERING_RELATIONSHIP: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
+const FOOTNOTES_RELATIONSHIP: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
+const ENDNOTES_RELATIONSHIP: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes";
 
 /// A Strict (ISO/IEC 29500) namespace or relationship type in the
 /// Transitional form AnyDoc 0.2.4 maps it onto (`normalize_ooxml_uri`);
@@ -5876,6 +6090,8 @@ struct OoxmlLayout {
     /// The DOCX styles and numbering parts each side of the list replay
     /// reads.
     list_parts: DocxListParts,
+    /// The DOCX footnotes and endnotes parts each side reads.
+    note_parts: DocxNoteParts,
 }
 
 /// The styles and numbering parts Word and AnyDoc each read for a Word
@@ -5889,6 +6105,18 @@ struct DocxListParts {
     anydoc_styles: String,
     word_numbering: Option<String>,
     anydoc_numbering: String,
+}
+
+/// The footnotes and endnotes parts Word and AnyDoc each read, found as the
+/// list parts are: of several relationships of a type Word, as LibreOffice
+/// shows it, takes the first and AnyDoc the lowest id, and AnyDoc alone
+/// reads a conventional part no relationship names.
+#[derive(Default)]
+struct DocxNoteParts {
+    word_footnotes: Option<String>,
+    anydoc_footnotes: String,
+    word_endnotes: Option<String>,
+    anydoc_endnotes: String,
 }
 
 fn ooxml_layout(
@@ -5954,6 +6182,22 @@ fn ooxml_layout(
                     main,
                     NUMBERING_RELATIONSHIP,
                     "numbering.xml",
+                ),
+            };
+            layout.note_parts = DocxNoteParts {
+                word_footnotes: word_typed_part(&read, main, FOOTNOTES_RELATIONSHIP),
+                anydoc_footnotes: anydoc_typed_part(
+                    &read,
+                    main,
+                    FOOTNOTES_RELATIONSHIP,
+                    "footnotes.xml",
+                ),
+                word_endnotes: word_typed_part(&read, main, ENDNOTES_RELATIONSHIP),
+                anydoc_endnotes: anydoc_typed_part(
+                    &read,
+                    main,
+                    ENDNOTES_RELATIONSHIP,
+                    "endnotes.xml",
                 ),
             };
         }
@@ -7964,6 +8208,44 @@ fn preflight_package(
         let anydoc = docx_list_numbering(&mut archive, Some(&parts.anydoc_numbering), false)?;
         result.list_numbering_differs |=
             DocxNumberings { word, anydoc }.numbers_differ(&docx_scan, &style_numbering);
+        // Where Word and AnyDoc read different notes parts, a note the text
+        // references converts as Word shows it only if both parts hold it
+        // with the same text; a list mark apart changes only its label. A
+        // note no text references, which Word does not show, is disclosed
+        // as hidden below. Both parts were scanned above as story parts.
+        let notes = &layout.note_parts;
+        for (endnotes, word_part, anydoc_part) in [
+            (
+                false,
+                notes.word_footnotes.as_deref(),
+                notes.anydoc_footnotes.as_str(),
+            ),
+            (
+                true,
+                notes.word_endnotes.as_deref(),
+                notes.anydoc_endnotes.as_str(),
+            ),
+        ] {
+            if word_part == Some(anydoc_part) {
+                continue;
+            }
+            let word = docx_notes_part_shown(&mut archive, word_part)?;
+            let anydoc = docx_notes_part_shown(&mut archive, Some(anydoc_part))?;
+            for note in docx_scan
+                .notes_referenced
+                .iter()
+                .filter(|(endnote, _)| *endnote == endnotes)
+            {
+                match (word.notes.get(note), anydoc.notes.get(note)) {
+                    (Some(word), Some(anydoc)) => {
+                        result.unsupported_content |= word.text != anydoc.text;
+                        result.list_numbering_differs |= word.marks != anydoc.marks;
+                    }
+                    (None, None) => {}
+                    _ => result.unsupported_content = true,
+                }
+            }
+        }
         result.hidden_content |= hidden_labels
             || label_styles
                 .iter()
@@ -12760,6 +13042,207 @@ mod tests {
             ("word/charts/_rels/chart1.xml.rels", &embedded),
         ]);
         assert!(result.active_content);
+    }
+
+    #[test]
+    fn docx_notes_each_side_reads_must_show_the_same_text() {
+        let rels = |inner: &[(&str, &str, &str)]| {
+            let inner: String = inner
+                .iter()
+                .map(|(id, kind, target)| {
+                    format!(r#"<Relationship Id="{id}" Type="{REL_NS}/{kind}" Target="{target}"/>"#)
+                })
+                .collect();
+            format!(r#"<Relationships xmlns="{PACKAGE_RELS_NS}">{inner}</Relationships>"#)
+        };
+        let numbering = format!(
+            r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        );
+        for kind in ["footnote", "endnote"] {
+            let body = word_part(
+                "document",
+                &format!(
+                    r#"<w:p><w:r><w:t>Clause with a note</w:t></w:r><w:r><w:{kind}Reference w:id="1"/></w:r></w:p>"#
+                ),
+            );
+            let notes = |paragraphs: &str| {
+                format!(
+                    r#"<w:{kind}s {WORD_NS}><w:{kind} w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:{kind}><w:{kind} w:id="1">{paragraphs}</w:{kind}></w:{kind}s>"#
+                )
+            };
+            let paragraph = |text: &str| {
+                format!(r#"<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>"#)
+            };
+            let conventional = format!("word/{kind}s.xml");
+            let preflight = |rels: String, parts: &[(&str, String)]| {
+                let mut entries: Vec<(&str, &[u8])> = vec![
+                    ("word/document.xml", &body),
+                    ("word/_rels/document.xml.rels", rels.as_bytes()),
+                    ("word/numbering.xml", numbering.as_bytes()),
+                ];
+                entries.extend(parts.iter().map(|(name, bytes)| (*name, bytes.as_bytes())));
+                docx_preflight(&entries)
+            };
+            let relationship = format!("{kind}s");
+            let first_conventional = rels(&[
+                ("rId1", "numbering", "numbering.xml"),
+                ("rId8", &relationship, &format!("{kind}s.xml")),
+                ("rId0", &relationship, "other.xml"),
+            ]);
+            // Word, as LibreOffice shows it, reads the first relationship and
+            // AnyDoc the lowest id: AnyDoc would convert other note text than
+            // Word shows.
+            let alpha = notes(&paragraph("Alpha note says pay 100 USD"));
+            let omega = notes(&paragraph("Omega note says pay 900 USD"));
+            let substituted = preflight(
+                first_conventional.clone(),
+                &[
+                    (&conventional, alpha.clone()),
+                    ("word/other.xml", omega.clone()),
+                ],
+            );
+            assert!(substituted.unsupported_content, "{kind}");
+            assert!(matches!(
+                preflight_rejection(DocumentKind::Docx, &substituted),
+                Some(DocumentError::IncompleteConversion)
+            ));
+            // With the lowest id first, both read the same part.
+            let lowest_first = rels(&[
+                ("rId1", "numbering", "numbering.xml"),
+                ("rId0", &relationship, &format!("{kind}s.xml")),
+                ("rId8", &relationship, "other.xml"),
+            ]);
+            let same_part = preflight(
+                lowest_first,
+                &[
+                    (&conventional, alpha.clone()),
+                    ("word/other.xml", omega.clone()),
+                ],
+            );
+            assert!(!same_part.unsupported_content, "{kind}");
+            // Parts that show the same text are one, however their runs are
+            // split and whatever else their markup says; a digit spaced apart
+            // is other text.
+            let split = notes(
+                r#"<w:p w:rsidR="00AB12CD"><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Alpha note says </w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:t>pay 100 USD</w:t></w:r></w:p>"#,
+            );
+            let same_text = preflight(
+                first_conventional.clone(),
+                &[(&conventional, alpha.clone()), ("word/other.xml", split)],
+            );
+            assert!(!same_text.unsupported_content, "{kind}");
+            assert!(!same_text.list_numbering_differs, "{kind}");
+            let spaced = notes(&paragraph("Alpha note says pay 1 00 USD"));
+            assert!(
+                preflight(
+                    first_conventional.clone(),
+                    &[(&conventional, alpha.clone()), ("word/other.xml", spaced)],
+                )
+                .unsupported_content,
+                "{kind}"
+            );
+            // A tracked deletion Word shows struck through is not the text
+            // AnyDoc's part holds as current.
+            let deleted = notes(
+                r#"<w:p><w:del w:id="9" w:author="Reviewer"><w:r><w:delText xml:space="preserve">Alpha note says pay 100 USD</w:delText></w:r></w:del></w:p>"#,
+            );
+            assert!(
+                preflight(
+                    first_conventional.clone(),
+                    &[(&conventional, deleted), ("word/other.xml", alpha.clone())],
+                )
+                .unsupported_content,
+                "{kind}"
+            );
+            // A note no text references, which Word does not show, is
+            // disclosed, as it is from one part.
+            let extra = notes(&paragraph("Alpha note says pay 100 USD")).replace(
+                &format!("</w:{kind}s>"),
+                &format!(
+                    r#"<w:{kind} w:id="2">{}</w:{kind}></w:{kind}s>"#,
+                    paragraph("Unreferenced note")
+                ),
+            );
+            let unreferenced = preflight(
+                first_conventional.clone(),
+                &[(&conventional, alpha.clone()), ("word/other.xml", extra)],
+            );
+            assert!(!unreferenced.unsupported_content, "{kind}");
+            assert!(unreferenced.hidden_content, "{kind}");
+            // The same text numbered on one side only changes a label.
+            let numbered = notes(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">Alpha note says pay 100 USD</w:t></w:r></w:p>"#,
+            );
+            let relabelled = preflight(
+                first_conventional.clone(),
+                &[(&conventional, numbered), ("word/other.xml", alpha.clone())],
+            );
+            assert!(!relabelled.unsupported_content, "{kind}");
+            assert!(relabelled.list_numbering_differs, "{kind}");
+            // Without a relationship Word reads no notes, where AnyDoc reads
+            // the conventional part; with one, both read the part it names,
+            // whatever the conventional part holds.
+            let unnamed = preflight(
+                rels(&[("rId1", "numbering", "numbering.xml")]),
+                &[(&conventional, alpha.clone())],
+            );
+            assert!(unnamed.unsupported_content, "{kind}");
+            let unreferenced = word_part("document", "<w:p><w:r><w:t>No note</w:t></w:r></w:p>");
+            let rels_without_notes = rels(&[("rId1", "numbering", "numbering.xml")]);
+            let hidden = docx_preflight(&[
+                ("word/document.xml", &unreferenced),
+                (
+                    "word/_rels/document.xml.rels",
+                    rels_without_notes.as_bytes(),
+                ),
+                ("word/numbering.xml", numbering.as_bytes()),
+                (&conventional, alpha.as_bytes()),
+            ]);
+            assert!(!hidden.unsupported_content, "{kind}");
+            assert!(hidden.hidden_content, "{kind}");
+            let named = preflight(
+                rels(&[
+                    ("rId1", "numbering", "numbering.xml"),
+                    ("rId8", &relationship, "other.xml"),
+                ]),
+                &[
+                    (&conventional, omega.clone()),
+                    ("word/other.xml", alpha.clone()),
+                ],
+            );
+            assert!(!named.unsupported_content, "{kind}");
+            // A first relationship naming a missing part shows no notes.
+            let missing = preflight(
+                rels(&[
+                    ("rId1", "numbering", "numbering.xml"),
+                    ("rId8", &relationship, "missing.xml"),
+                    ("rId0", &relationship, &format!("{kind}s.xml")),
+                ]),
+                &[(&conventional, alpha.clone())],
+            );
+            assert!(missing.unsupported_content, "{kind}");
+            // Separators alone show no text on either side.
+            let separators_only =
+                notes("").replace(&format!(r#"<w:{kind} w:id="1"></w:{kind}>"#), "");
+            assert!(
+                !preflight(
+                    rels(&[("rId1", "numbering", "numbering.xml")]),
+                    &[(&conventional, separators_only)],
+                )
+                .unsupported_content,
+                "{kind}"
+            );
+        }
+        // Each item of a note is framed, so text cannot pass for a note.
+        let one = format!(
+            r#"<w:footnotes {WORD_NS}><w:footnote w:id="1"><w:p><w:r><w:t>ab</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+        );
+        let two = format!(
+            r#"<w:footnotes {WORD_NS}><w:footnote w:id="1"><w:p><w:r><w:t>a</w:t></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>b</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+        );
+        let shown = |part: &str| docx_notes_shown(part.as_bytes()).expect("notes part").notes;
+        assert!(shown(&one) != shown(&two));
+        assert!(shown(&one) == shown(&one.replace("<w:t>ab", r#"<w:t xmlns:x="urn:x">ab"#)));
     }
 
     #[test]
