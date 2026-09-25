@@ -194,6 +194,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Text set in a layer a reader hides by default, which pdf-inspector
+  1.24.0 reads anyway, is reported. A PDF can set content in optional
+  layers and hide some of them by default: a superseded figure kept beside
+  the current one, a draft note, text meant only for print. A reader shows
+  the page as the document's default configuration sets its layers;
+  pdf-inspector reads no layer settings, so a statement's Markdown held
+  "Ending balance 1,000.00 superseded" beside the "Ending balance 2,000.00"
+  a reader sees, with no sign. The page scan now reads the default
+  configuration (its base state, the layers it turns on or off, a
+  membership dictionary's policy or visibility expression, and layers meant
+  for design only, which do not affect viewing), and a page whose text in a
+  hidden layer, in a marked-content span or a form the layer holds, the
+  Markdown shows carries the new `hidden_layer_text_read` warning; the
+  Markdown is not changed. An annotation a hidden layer holds is no longer
+  read as text the page shows.
 - Files a PDF embeds, which pdf-inspector 1.24.0 never reads, are reported.
   A portfolio bundles documents, such as a year's tax forms, as embedded
   files behind a cover page, and converted as that cover alone; attachments
@@ -256,9 +271,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Markdown is not changed. Headers repeated as they are, such as a bank's
   name, and those numbering their pages are dropped by design and not
   reported. No PDF among 551 corpus, fixture, replica, and review files and
-  3,970 fuzz and review files is named. The reading costs about a third
-  more CPU on documents of three pages or more; it covers up to 2,000 pages
-  and stops, reporting nothing, after 4 seconds.
+  3,970 fuzz and review files is named. The pages are read again only where
+  the page scan finds a line repeated at the edges of enough pages that
+  differs from the first page's (see review round ten), up to 2,000 pages,
+  and only while the call is expected to end within 20 seconds; the warning
+  names the last page checked when it stops short.
 - Amounts pdf-inspector 1.24.0 pushes out of a table's rows are reported
   (open upstream #424). The table grid can drop a column: a 1099-B's sparse
   wash-sale adjustments, or the Amount column of a long card statement,
@@ -394,6 +411,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round ten checked loops 20 to 23 and 25:
+  - PDF running headers (#483): the check re-read every page of every
+    multi-page PDF, 20 to 30% more CPU, under a 4 s budget of its own, so
+    heavy statements near the limit timed out, a warning came and went
+    between runs, and past 2,000 pages or 8,192 texts it stopped without a
+    word. The page scan now keeps the runs at each page's edges, and pages
+    are read again only where a text repeated at the edges of enough pages
+    sits beside one the first page showing it does not show; a document
+    with no such line pays nothing, a 2,000-page control 7.04 s against
+    7.09 s before loop 20. The reading runs a part at a time while the call
+    is expected to end within 20 s, and the warning names the last page
+    checked where it stops short. Lines are ranked without the images,
+    links, and table rows pdf-inspector sets aside first, so a logo, a
+    link, or a tall header over a table no longer hides a dropped account
+    number, and pages listed for OCR are read as pdf-inspector reads them.
+    Numbers count the pages only after a page word, between dashes, in
+    "3 of 7" or "3/7", or as a folio a set distance from the page's own
+    number, roman numerals too, and a clock time's parts say nothing:
+    sequential invoice and check numbers, and one date a page, are
+    reported, while a bundle whose documents number their pages afresh is
+    not. Each line of a band is looked for on its own, and a text ending in
+    a digit is not found where another digit runs on from it.
+  - PDF annotations: a stamp's appearance was inflated without a limit and
+    parsed whole for every annotation, so 60 stamps sharing a 1.8 KB
+    compressed appearance timed out. Each appearance is now read once, to
+    1 MiB decoded and 16 MiB a document, and scanned token by token for an
+    operator that shows a string, through the forms it draws, as Acrobat
+    draws a stamp. A captioned line counts as a text box does, one set off
+    its page does not, and a text box is read from the rich text a viewer
+    draws it from, its character references read.
+  - PDF form values: values pdf-inspector leaves out are found where a
+    group's widgets each hold "Off" of their own, and where a value is
+    given by reference, as a text stream, only as rich text, inherited from
+    a field above, or on a field whose kids are none; a field whose name
+    pdf-inspector garbles is named; and a hidden widget, a widget on no
+    page, and a control character PDFDocEncoding drops no longer are.
+  - PDF XFA and attachments: a dynamic XFA form now also needs XFA in its
+    form and a Markdown of no more than a notice a page, and both checks
+    run in any full run, so a blank placeholder page or a portfolio's blank
+    cover is reported. The embedded-file walk read each name-tree node
+    again for every reference to it, so 20,000 references to one leaf timed
+    out; each node is read once, a file counts once however it is reached,
+    null or dangling entries count none, and an e-invoice's XML, which the
+    document declares another form of its pages, is not counted.
+  Over 4,412 corpus, fixture, review, and fuzz PDFs, no warning of these
+  loops changed but on their reproducers, and none timed out.
+- Review round nine checked loops 17 to 19 and the round-eight fixes:
+  - PDF words split in glyph-by-glyph text (#531): Chrome's Skia keeps a
+    glyph in its open string when its hinted advance equals its declared
+    width, so a word going on in a string of several glyphs was dropped;
+    each glyph is now placed by the font's widths, and on 400 pages written
+    with Skia's grouping the warning names 206 of the 273 whose Markdown
+    splits such a word (126 before) and none of the others. A ligature
+    extends its word; a label and its value set apart by layout no longer
+    read as one word; a split after a hyphen is reported; pages past the 64
+    read again are named, widest gap first; a running header split on
+    every page names its first page only; and a font that never paints a
+    space no longer fills the word cap.
+  - PDF tables and forms: a dense 1099-B whose cost-basis and wash-sale
+    columns pdf-inspector merges is reported again, its header read as the
+    page sets it, while an amount beside its percentage under one heading
+    is not; a dropped column is read wherever pdf-inspector sets it after
+    the table, with a work budget of its own. Text drawn through a form
+    pdf-inspector never reaches is reported where a page inherits its
+    resources or a form's resources are null, dangling, or lack a category
+    pdfium takes from the page; a form's text is compared with the reading
+    pdf-inspector makes without a font. A run painted twice by a `TJ`
+    rewind is found on any page of a long statement.
 - Review round eight checked loops 14 to 17 and the round-seven fixes:
   - PDF: a statement whose rows repeat a cell of two amounts, such as
     "0.00 0.00" quarter- and year-to-date, made the merged-cell check time
@@ -628,7 +713,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No OCR engine ships. Scanned pages report that they need OCR and why, and
   return no text for those pages.
 - Other pdf-inspector 1.24.0 defects from its open pull requests are not
-  detected: amounts pushed out of their rows after a table (#424); a receipt
+  detected: a receipt
   with few text operators and a logo read as a scan (#445); forms with
   indirect resources (#407), reported only through the garbled-text reason
   where it applies; rotated column headers scattered
@@ -662,6 +747,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   word whole. A word set in small capitals, its first letter a glyph of
   its own and the rest one string, is not read, so the public Title 26
   chapter 6 sample keeps "(A) L imitations" with no warning.
+- The PDF warnings added since loop 18 disclose what their checks can read,
+  and no more. A doubled run past the first 10,000 doubled occurrences of a
+  document is not found; page text in a font bound only by resources a page
+  inherits as a direct dictionary, which pdf-inspector reads byte by byte,
+  is not reported, as only forms are checked; and a label and its value in
+  one text object, with no space glyph and a gap under half an em, still
+  read as one word. A stamp or text box whose text is only in its
+  appearance, with no `/Contents` or rich text, a redaction's overlay text,
+  and text a shape's appearance draws are not read. A form value flattened
+  into the page among other text may be named, and an XFA placeholder page
+  without the needs-rendering flag, or a static XFA form whose values are
+  only in its datasets, is not. A running header's text the Markdown shows
+  elsewhere, as in a transfer line, counts as shown; a count after a page
+  word no higher than the page's number reads as a page number begun
+  afresh; and where the page scan cannot read a run's text, or runs out of
+  its budget, every page is read again for the running-header rule, within
+  the call's time.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen
