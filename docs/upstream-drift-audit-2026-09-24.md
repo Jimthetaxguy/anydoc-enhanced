@@ -164,12 +164,19 @@ this audit named some by their latest commit, and listed #160, closed on
 | #164 | feat(eml): read RFC 5322 email messages | Email lanes are not enabled. |
 | #163 | feat(sheet): preserve spreadsheet provenance | Sheet names and cell origins only; no cell text is lost. |
 | #161 | feat: OCR scanned PDFs with a vision model via LiteLLM | Out of scope: the MCP boundary stays offline. |
-| #158 | fix(xml): keep a part whose text carries a bare ampersand | Already fail-closed: a bare `&` in the DOCX body is `malformed`, and in a footnote the recovery diagnostic yields `incomplete_conversion`. |
+| #158 | fix(xml): keep a part whose text carries a bare ampersand | Already fail-closed: a bare `&` in the DOCX body is `malformed`, and in a footnote the recovery diagnostic yields `incomplete_conversion`. An EPUB chapter holding a bare `&` or `<`, which AnyDoc drops whole (issue #127 reports a title page lost so), is refused as `incomplete_conversion`, checked on 2026-09-25. |
 | #154 | api: mark Format as `#[non_exhaustive]` | The next AnyDoc bump needs wildcard arms on `Format`; unknown formats must map to unrecognized or disabled, never to an enabled lane. |
 | #151 | fix(xlsx): retain embedded worksheet images | 0.2.4 never follows a worksheet's drawings, so text boxes over a sheet were lost too. XLSX text boxes and shapes with text, and ODS drawings over the grid, are now refused; pictures and charts are a documented limitation. |
 | #147, #149 | feat: add standalone HTML support; feat: add MHTML support | New formats, not enabled. Both change the HTML walker EPUB uses: 0.2.4 reads only `li` children of a list, so text or a paragraph placed directly in a list was lost from EPUB chapters. EPUB now refuses text a reader shows and AnyDoc drops. |
 | #148 | fix: bound parser paths reachable from a crafted document | The number-format part is reproduced locally: an 8 MiB `formatCode` in a 10.6 KB workbook peaked at 855 MiB. The XLSX preflight refuses codes over 4,096 bytes with `resource_limit`. The legacy DOC, PPT, and RTF parts do not apply because those lanes are disabled. |
 | #150, #152 | Documentation | No production change. |
+
+### Open issues
+
+| Issue | Report | Local disposition |
+|---|---|---|
+| #127 | An EPUB's title page is missing from the Markdown | Its cause is the bare `&` or `<` of #158 above; such a chapter is refused. |
+| #81 | "1. 1. first item" where a list item's text repeats its number | AnyDoc 0.2.4 shows what Word shows, the label and the text both, so nothing is reported. Pull request #80 would strip the text's own number; if a release adopts it, the DOCX list comparison must model the stripping, or it would disclose a difference Word does not show as none. |
 
 ### Older open pull requests
 
