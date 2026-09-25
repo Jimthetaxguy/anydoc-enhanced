@@ -1220,10 +1220,32 @@ fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
         "<< /FT /Tx /T (amount) /V (1,250.00) {} >>",
         widget("150 636 400 652")
     );
+    // The group's widgets each hold "Off" of their own, which pdf-inspector
+    // reads and skips; a value given by reference; and a garbled value on
+    // a hidden widget, which no viewer shows.
+    let off_single = format!(
+        "<< /Parent 6 0 R /AS /Off /V /Off {} >>",
+        widget("72 680 84 692")
+    );
+    let off_joint = format!(
+        "<< /Parent 6 0 R /AS /MFJ /V /Off {} >>",
+        widget("172 680 184 692")
+    );
+    let referred = format!(
+        "<< /FT /Tx /T (payee_city) /V 7 0 R {} >>",
+        widget("150 696 400 712")
+    );
+    let hidden = format!(
+        "<< /FT /Tx /T (city) /V <53E36F205061756C6F> /F 2 {} >>",
+        widget("150 666 400 682")
+    );
     let documents = [
         filled_form_pdf(&[(6, &name), (7, &city)], &[6, 7]),
         filled_form_pdf(&[(6, &status), (7, &single), (8, &joint)], &[7, 8]),
         filled_form_pdf(&[(6, &amount)], &[6]),
+        filled_form_pdf(&[(6, &status), (7, &off_single), (8, &off_joint)], &[7, 8]),
+        filled_form_pdf(&[(6, &referred), (7, "(Springfield)")], &[6]),
+        filled_form_pdf(&[(6, &hidden)], &[6]),
     ];
     let mut calls = Vec::new();
     for (index, pdf) in documents.iter().enumerate() {
@@ -1257,6 +1279,15 @@ fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
     let markdown = results[2]["markdown"].as_str().unwrap_or_default();
     assert!(markdown.contains("amount: 1,250.00"), "{markdown}");
     assert_eq!(reported(&results[2]), None, "{}", results[2]);
+    for result in &results[3..5] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(
+            !markdown.contains("MFJ") && !markdown.contains("Springfield"),
+            "{markdown:?}"
+        );
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+    }
+    assert_eq!(reported(&results[5]), None, "{}", results[5]);
 }
 
 /// A statement page a reviewer marked up: a text box typed onto it and a
@@ -1286,6 +1317,55 @@ fn annotated_statement_pdf(flattened: bool) -> Vec<u8> {
             b"BT /F1 12 Tf 4 16 Td (RECEIVED APR 15 2025) Tj ET",
         ),
     ])
+}
+
+/// A statement page stamped "PAID" as Acrobat draws a stamp, through a
+/// form its appearance draws, with a text box set off the page; and, when
+/// `stamps` is given, as many stamps sharing the Flate `appearance`, which
+/// the check reads once and within its bounds.
+fn stamped_statement_pdf(stamps: usize, appearance: &[u8]) -> Vec<u8> {
+    let first_stamp = 10;
+    let mut annotations = vec!["6 0 R".to_string(), "7 0 R".to_string()];
+    annotations.extend((0..stamps).map(|stamp| format!("{} 0 R", first_stamp + stamp)));
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [{}] >>",
+            annotations.join(" ")
+        )
+        .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", b"BT /F1 12 Tf 72 740 Td (Invoice 2025-0412 total due 1,250.00) Tj ET"),
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 700 560 740] /Contents (PAID 04/15/2025) /AP << /N 8 0 R >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [700 100 900 140] /Contents (Off the page) >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 160 40] /Resources << /XObject << /FRM 9 0 R >> >>",
+            b"q /FRM Do Q",
+        ),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 160 40] /Resources << /Font << /F1 4 0 R >> >>",
+            b"BT /F1 18 Tf 4 12 Td (PAID) Tj ET",
+        ),
+    ];
+    if stamps > 0 {
+        let shared = first_stamp + stamps;
+        for _ in 0..stamps {
+            objects.push(
+                format!("<< /Type /Annot /Subtype /Stamp /Rect [72 72 232 112] /Contents (Batch stamp) /AP << /N {shared} 0 R >> >>")
+                    .into_bytes(),
+            );
+        }
+        let mut bomb = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 160 40] /Filter /FlateDecode /Length {} >>\nstream\n",
+            appearance.len()
+        )
+        .into_bytes();
+        bomb.extend_from_slice(appearance);
+        bomb.extend_from_slice(b"\nendstream");
+        objects.push(bomb);
+    }
+    pdf_file(&objects)
 }
 
 #[test]
@@ -1324,22 +1404,73 @@ fn annotation_text_pdf_inspector_never_reads_is_reported() {
     assert_eq!(reported(&results[1]), None, "{}", results[1]);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn stamps_are_read_through_their_forms_within_bounds() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    // 400 stamps share one appearance inflating to 64 MiB of spaces, past
+    // what the check decodes of an appearance.
+    for (stamps, mib) in [(0, 0), (400, 64)] {
+        let appearance = if stamps > 0 {
+            zlib_spaces(mib)
+        } else {
+            Vec::new()
+        };
+        let path = temporary.path().join(format!("stamped-{stamps}.pdf"));
+        std::fs::write(&path, stamped_statement_pdf(stamps, &appearance)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let started = std::time::Instant::now();
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "annotation_text_unread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // The stamp drawn through a form is read; the text box off the page,
+    // and the stamps whose appearance cannot be read within bounds, are not
+    // what the page shows.
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("Invoice 2025-0412"), "{result}");
+        assert!(!markdown.contains("PAID"), "{markdown}");
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(60));
+}
+
 /// A filled tax form made in XFA, whose page holds only the notice a
 /// viewer without XFA shows; `dynamic` marks it as needing rendering.
 fn xfa_form_pdf(dynamic: bool) -> Vec<u8> {
+    xfa_form_pdf_with(dynamic, true, true)
+}
+
+/// As `xfa_form_pdf`, the form holding XFA when `xfa`, and its page showing
+/// the notice when `notice`, else nothing.
+fn xfa_form_pdf_with(dynamic: bool, xfa: bool, notice: bool) -> Vec<u8> {
     let needs = if dynamic { " /NeedsRendering true" } else { "" };
+    let xfa = if xfa {
+        " /XFA [(template) 6 0 R (datasets) 7 0 R]"
+    } else {
+        ""
+    };
+    let notice: &[u8] = if notice {
+        b"BT /F1 10 Tf 36 740 Td (Please wait... If this message is not eventually replaced by the proper contents of the document, your PDF viewer may not be able to display this type of document.) Tj ET"
+    } else {
+        b""
+    };
     pdf_file(&[
-        format!(
-            "<< /Type /Catalog /Pages 2 0 R{needs} /AcroForm << /Fields [] /XFA [(template) 6 0 R (datasets) 7 0 R] >> >>"
-        )
-        .into_bytes(),
+        format!("<< /Type /Catalog /Pages 2 0 R{needs} /AcroForm << /Fields []{xfa} >> >>")
+            .into_bytes(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
-        stream(
-            "",
-            b"BT /F1 10 Tf 36 740 Td (Please wait... If this message is not eventually replaced by the proper contents of the document, your PDF viewer may not be able to display this type of document.) Tj ET",
-        ),
+        stream("", notice),
         stream(
             "",
             b"<template xmlns=\"http://www.xfa.org/schema/xfa-template/3.3/\"><subform name=\"form1\"><field name=\"Wages\"/></subform></template>",
@@ -1355,9 +1486,17 @@ fn xfa_form_pdf(dynamic: bool) -> Vec<u8> {
 fn dynamic_xfa_forms_pdf_inspector_cannot_read_are_reported() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");
     let mut calls = Vec::new();
-    for dynamic in [true, false] {
-        let path = temporary.path().join(format!("xfa-{dynamic}.pdf"));
-        std::fs::write(&path, xfa_form_pdf(dynamic)).expect("write PDF");
+    let forms = [
+        xfa_form_pdf(true),
+        xfa_form_pdf(false),
+        // A blank page before XFA is rendered, and a form that says it
+        // needs rendering but holds no XFA.
+        xfa_form_pdf_with(true, true, false),
+        xfa_form_pdf_with(true, false, true),
+    ];
+    for (index, form) in forms.iter().enumerate() {
+        let path = temporary.path().join(format!("xfa-{index}.pdf"));
+        std::fs::write(&path, form).expect("write PDF");
         let path = path.to_str().expect("UTF-8 path").to_string();
         calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
     }
@@ -1378,6 +1517,8 @@ fn dynamic_xfa_forms_pdf_inspector_cannot_read_are_reported() {
     assert!(reported(&results[0]), "{}", results[0]);
     // A form that does not need rendering draws its own pages.
     assert!(!reported(&results[1]), "{}", results[1]);
+    assert!(reported(&results[2]), "{}", results[2]);
+    assert!(!reported(&results[3]), "{}", results[3]);
 }
 
 /// A cover page bundling two embedded tax forms, as a portfolio when
@@ -1390,7 +1531,7 @@ fn bundled_forms_pdf(portfolio: bool) -> Vec<u8> {
     };
     pdf_file(&[
         format!(
-            "<< /Type /Catalog /Pages 2 0 R{collection} /Names << /EmbeddedFiles << /Names [(1099-DIV.pdf) 6 0 R (1099-INT.pdf) 8 0 R] >> >> >>"
+            "<< /Type /Catalog /Pages 2 0 R{collection} /Names << /EmbeddedFiles << /Names [(1099-DIV.pdf) 6 0 R (1099-DIV copy.pdf) 6 0 R (1099-INT.pdf) 8 0 R (factur-x.xml) 10 0 R (stale.pdf) null] >> >> >>"
         )
         .into_bytes(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
@@ -1404,6 +1545,10 @@ fn bundled_forms_pdf(portfolio: bool) -> Vec<u8> {
         stream("/Type /EmbeddedFile", b"%PDF-1.4 dividends 1,250.00"),
         b"<< /Type /Filespec /F (1099-INT.pdf) /EF << /F 9 0 R >> >>".to_vec(),
         stream("/Type /EmbeddedFile", b"%PDF-1.4 interest 310.00"),
+        // An e-invoice's XML, which restates what the pages show.
+        b"<< /Type /Filespec /F (factur-x.xml) /AFRelationship /Alternative /EF << /F 11 0 R >> >>"
+            .to_vec(),
+        stream("/Type /EmbeddedFile /Subtype /text#2Fxml", b"<rsm:CrossIndustryInvoice/>"),
     ])
 }
 

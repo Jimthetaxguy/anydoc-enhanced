@@ -98,6 +98,10 @@ pub const PDF_WARNING_FORM_VALUES_MISREAD: &str = "form_values_misread";
 pub const PDF_WARNING_ANNOTATION_TEXT_UNREAD: &str = "annotation_text_unread";
 /// A dynamic XFA form's content is not in the Markdown.
 pub const PDF_WARNING_XFA_FORM_UNREAD: &str = "xfa_form_unread";
+/// Words a page, on average, in the Markdown of a dynamic XFA form whose
+/// pages hold only a viewer's notice, such as Adobe's "Please wait..." of
+/// about a hundred words; past them, its pages hold its content as well.
+const MAX_NOTICE_WORDS: usize = 150;
 /// The files a PDF embeds, such as a portfolio's documents, are not in the
 /// Markdown.
 pub const PDF_WARNING_EMBEDDED_FILES_UNREAD: &str = "embedded_files_unread";
@@ -657,10 +661,20 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_FORM_VALUES_MISREAD,
-                "On these pages pdf-inspector 1.24.0 garbles or leaves out values filled into the form: it reads accented or UTF-16 text byte by byte, as in \"S\u{FFFD}o Paulo\", and never writes the value of a field whose widgets are its kids, such as a group of radio buttons; read the form's values another way.",
+                "On these pages pdf-inspector 1.24.0 garbles or leaves out values filled into the form: it reads accented or UTF-16 names and values byte by byte, as in \"S\u{FFFD}o Paulo\", and never writes the value of a field whose widgets are its kids, such as a group of radio buttons; read the form's values another way.",
                 pages,
             ));
         }
+    }
+
+    /// Whether the Markdown holds no more than a notice a page: at most
+    /// `MAX_NOTICE_WORDS` words a page, on average.
+    fn shows_only_a_notice(&self) -> bool {
+        let words = self
+            .markdown
+            .as_deref()
+            .map_or(0, |markdown| markdown.split_whitespace().count());
+        words <= MAX_NOTICE_WORDS * self.page_count.max(1) as usize
     }
 
     /// Scan what the pages paint and report what the scan finds but a
@@ -683,20 +697,23 @@ impl PdfInfo {
                 .as_deref()
                 .is_some_and(|markdown| !markdown.trim().is_empty()))
         .then(|| self.pages_needing_ocr.iter().copied().collect());
-        if layer_skip.len() as u64 >= u64::from(self.page_count) && twice_skip.is_none() {
+        // What a document holds beside its pages is read in any full run,
+        // its Markdown empty or not.
+        let whole = matches!(mode, ProcessMode::Full);
+        if layer_skip.len() as u64 >= u64::from(self.page_count) && twice_skip.is_none() && !whole {
             return text_paints::Findings::default();
         }
         // The scan only adds signals: if it fails, the result stands as
         // pdf-inspector gave it.
         let mut found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            text_paints::scan(buffer, &layer_skip, twice_skip.as_ref(), only)
+            text_paints::scan_document(buffer, &layer_skip, twice_skip.as_ref(), only, whole)
         }))
         .unwrap_or_default();
         let values = std::mem::take(&mut found.form_values);
         self.check_form_values(&values, only);
         let annotations = std::mem::take(&mut found.annotation_texts);
         self.check_annotation_texts(&annotations);
-        if found.xfa_dynamic {
+        if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
                 "This is a dynamic XFA form: its content and filled values are kept in XFA, which a viewer lays out and pdf-inspector 1.24.0 does not read, so the Markdown shows only what its pages hold without XFA, such as a \"Please wait...\" notice; read the form another way.",

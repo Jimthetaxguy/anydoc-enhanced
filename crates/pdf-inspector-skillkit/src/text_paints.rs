@@ -938,11 +938,10 @@ pub(crate) struct Findings {
     /// are read for repeats (see `annotations`).
     pub(crate) annotation_texts: Vec<crate::annotations::AnnotationText>,
     /// Whether the document is a dynamic XFA form, whose content
-    /// pdf-inspector never reads, when the pages are read for repeats.
+    /// pdf-inspector never reads, when the whole document is read.
     pub(crate) xfa_dynamic: bool,
     /// The files the document embeds, which pdf-inspector never reads, and
-    /// whether it is a portfolio of them, when the pages are read for
-    /// repeats.
+    /// whether it is a portfolio of them, when the whole document is read.
     pub(crate) embedded_files: (usize, bool),
 }
 
@@ -951,11 +950,25 @@ pub(crate) struct Findings {
 /// `twice_skip` is given, and not those in it. Pages outside `only`, when
 /// it is given, are not scanned. A document that does not load reports
 /// none.
+#[cfg(test)]
 pub(crate) fn scan(
     buffer: &[u8],
     layer_skip: &HashSet<u32>,
     twice_skip: Option<&HashSet<u32>>,
     only: Option<&HashSet<u32>>,
+) -> Findings {
+    scan_document(buffer, layer_skip, twice_skip, only, twice_skip.is_some())
+}
+
+/// As `scan`, and, when `whole` is set, reading what the document holds
+/// beside its pages that pdf-inspector never reads: dynamic XFA, and the
+/// files it embeds.
+pub(crate) fn scan_document(
+    buffer: &[u8],
+    layer_skip: &HashSet<u32>,
+    twice_skip: Option<&HashSet<u32>>,
+    only: Option<&HashSet<u32>>,
+    whole: bool,
 ) -> Findings {
     let options = lopdf::LoadOptions {
         max_decompressed_size: Some(MAX_OBJECT_STREAM_BYTES),
@@ -973,7 +986,9 @@ pub(crate) fn scan(
     if twice_skip.is_some() {
         found.form_values = crate::form_fields::misread(&document);
         found.annotation_texts = crate::annotations::unread(&document, only);
-        found.xfa_dynamic = crate::form_fields::needs_rendering(&document);
+    }
+    if whole {
+        found.xfa_dynamic = crate::form_fields::dynamic_xfa(&document);
         found.embedded_files = crate::form_fields::embedded_files(&document);
     }
     // Words shown glyph by glyph, kept while their fonts may yet be seen

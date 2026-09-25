@@ -5,42 +5,62 @@
 //! reads a field's name and text as UTF-8, while a PDF writes them in
 //! PDFDocEncoding or UTF-16, so an accented letter reads as "�" and a UTF-16
 //! value as "��\0J\0o\0s…" (upstream issue #504). And it reads a value only
-//! from a field that is its own widget: a field whose widgets are its kids,
-//! as every group of radio buttons is, and any field shown in more than one
-//! place, keeps its value on itself, where pdf-inspector never looks, so the
-//! value is not written at all.
+//! as a string, strings, or a name given on the field's own widget: a value
+//! kept on a field whose widgets are its kids, as every group of radio
+//! buttons keeps its choice, inherited from a field above, given by
+//! reference, as a text stream, or only as rich text, is not written at
+//! all, though a viewer shows it.
 //!
 //! The walk follows pdf-inspector's through the field tree, within its
 //! bounds, and gives each value it misreads or passes over, as it would
-//! write it if it read it right, with the pages its widgets sit on. The
-//! Markdown decides: a value it shows was not lost, as when the page itself
-//! draws the value.
+//! write it if it read it right, with the pages a viewer shows it on: those
+//! whose annotations hold a widget of the field not hidden. The Markdown
+//! decides: a value it shows was not lost, as when the page itself draws
+//! the value.
 //!
-//! A dynamic XFA form, which its catalog marks as needing rendering, keeps
-//! its whole content in XFA, which a viewer lays out; its pages hold only
-//! the notice a viewer without XFA shows, "Please wait...". pdf-inspector
-//! reads no XFA, so such a form converts to that notice alone. Nor does it
-//! read the files a PDF embeds: a portfolio, which bundles documents such
-//! as a year's tax forms behind a cover page, converts to its cover.
+//! A dynamic XFA form, whose catalog marks it as needing rendering and whose
+//! form holds XFA, keeps its content in XFA, which a viewer lays out; its
+//! pages hold only the notice a viewer without XFA shows, "Please wait...".
+//! pdf-inspector reads no XFA, so such a form converts to that notice alone.
+//! Nor does it read the files a PDF embeds: a portfolio, which bundles
+//! documents such as a year's tax forms behind a cover page, converts to its
+//! cover.
 
 use std::collections::{HashMap, HashSet};
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 /// Field tree nodes pdf-inspector visits, and how deep it goes.
 const MAX_FIELD_NODES: usize = 100_000;
 const MAX_FIELD_DEPTH: usize = 100;
-/// Values reported, at most.
-const MAX_VALUES: usize = 4_096;
+/// Bytes of a text stream read as a field's value.
+const MAX_VALUE_BYTES: usize = 64 << 10;
+/// References followed to reach an object.
+const MAX_REFERENCE_HOPS: usize = 8;
+/// Annotation flags that keep a widget from view: hidden, and not viewed.
+const HIDDEN: i64 = 2;
+const NO_VIEW: i64 = 32;
 
 /// A field value pdf-inspector misreads or never writes, and the pages it
 /// belongs to. A text or choice is the value read right; a button's, whose
 /// value is a word the page's own labels may show, is the field as
-/// pdf-inspector would write it, "filing_status: Married".
+/// pdf-inspector would write it, "filing_status: Married", as is a value
+/// whose field's name pdf-inspector garbles.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FormValue {
     pub(crate) text: String,
     pub(crate) pages: Vec<u32>,
+}
+
+/// An object, its references followed.
+fn resolved<'a>(document: &'a Document, mut object: &'a Object) -> Option<&'a Object> {
+    for _ in 0..MAX_REFERENCE_HOPS {
+        match object {
+            Object::Reference(id) => object = document.get_object(*id).ok()?,
+            object => return Some(object),
+        }
+    }
+    None
 }
 
 /// A text string as pdf-inspector reads it, and as the PDF means it.
@@ -54,12 +74,9 @@ fn readings(object: &Object) -> Option<(String, String)> {
 }
 
 /// Whether pdf-inspector's reading of a text shows what the PDF does not
-/// mean: a replacement mark or a control character.
+/// mean: a replacement mark, where its bytes are not UTF-8.
 fn garbled(read: &str, meant: &str) -> bool {
-    read != meant
-        && read
-            .chars()
-            .any(|character| character == '\u{FFFD}' || character.is_control())
+    read != meant && read.contains('\u{FFFD}')
 }
 
 /// How pdf-inspector writes a field: its name, a colon, and its value; or
@@ -69,6 +86,16 @@ fn written(name: &str, value: &str) -> String {
         value.to_string()
     } else {
         format!("{name}: {value}")
+    }
+}
+
+/// How pdf-inspector writes a button's choice.
+fn button(name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name).to_string();
+    if name == "Yes" || name == "1" {
+        "Yes".to_string()
+    } else {
+        name
     }
 }
 
@@ -82,12 +109,12 @@ struct Walk<'a> {
     values: Vec<FormValue>,
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
     fn exhausted(&self) -> bool {
         self.visited.len() >= MAX_FIELD_NODES || self.examined >= MAX_FIELD_NODES
     }
 
-    fn dictionary<'b>(&'b self, object: &'b Object) -> Option<&'b Dictionary> {
+    fn dictionary(&self, object: &'a Object) -> Option<&'a Dictionary> {
         match object {
             Object::Reference(id) => self.document.get_dictionary(*id).ok(),
             Object::Dictionary(dictionary) => Some(dictionary),
@@ -95,7 +122,7 @@ impl Walk<'_> {
         }
     }
 
-    fn array<'b>(&'b self, object: &'b Object) -> Option<&'b [Object]> {
+    fn array(&self, object: &'a Object) -> Option<&'a [Object]> {
         match object {
             Object::Reference(id) => self
                 .document
@@ -108,16 +135,25 @@ impl Walk<'_> {
         }
     }
 
-    /// The page a widget sits on, as pdf-inspector places it: its `/P`, the
-    /// page whose annotations hold it, or the first.
-    fn page(&self, id: ObjectId, dictionary: &Dictionary) -> u32 {
-        dictionary
-            .get(b"P")
+    /// The page a viewer shows a widget on: the page whose annotations hold
+    /// it, or its `/P`; `None` where it is hidden or on no page.
+    fn page(&self, id: ObjectId, widget: &Dictionary) -> Option<u32> {
+        let flags = widget
+            .get(b"F")
             .ok()
-            .and_then(|page| page.as_reference().ok())
-            .and_then(|page| self.pages.get(&page).copied())
-            .or_else(|| self.annotation_pages.get(&id).copied())
-            .unwrap_or(1)
+            .and_then(|flags| resolved(self.document, flags))
+            .and_then(|flags| flags.as_i64().ok())
+            .unwrap_or(0);
+        if flags & (HIDDEN | NO_VIEW) != 0 {
+            return None;
+        }
+        self.annotation_pages.get(&id).copied().or_else(|| {
+            widget
+                .get(b"P")
+                .ok()
+                .and_then(|page| page.as_reference().ok())
+                .and_then(|page| self.pages.get(&page).copied())
+        })
     }
 
     /// A value as pdf-inspector reads it and as the PDF means it, for a
@@ -142,34 +178,101 @@ impl Walk<'_> {
                 if name == b"Off" {
                     return None;
                 }
-                let name = String::from_utf8_lossy(name).to_string();
-                let shown = if name == "Yes" || name == "1" {
-                    "Yes".to_string()
-                } else {
-                    name
-                };
+                let shown = button(name);
                 Some((shown.clone(), shown))
             }
             _ => None,
         }
     }
 
-    /// Walk a field and its kids as pdf-inspector does, with the type and
-    /// the name each inherits, as it reads them and as the PDF means them.
+    /// A value as a viewer shows it, for a field of type `kind`: given by
+    /// reference or not, as text, a text stream, or a choice; `None` where
+    /// it shows none.
+    fn shown(&self, kind: &[u8], value: &'a Object) -> Option<String> {
+        let document = self.document;
+        let text = |object: &'a Object| -> Option<String> {
+            match resolved(document, object)? {
+                Object::Stream(stream) => {
+                    let bytes = stream.get_plain_content_with_limit(MAX_VALUE_BYTES).ok()?;
+                    readings(&Object::String(bytes, StringFormat::Literal)).map(|(_, meant)| meant)
+                }
+                object => readings(object).map(|(_, meant)| meant),
+            }
+        };
+        let shown = match (kind, resolved(document, value)?) {
+            (b"Tx" | b"Ch", Object::Array(parts)) => {
+                let parts: Vec<String> = parts.iter().filter_map(text).collect();
+                (!parts.is_empty()).then(|| parts.join(", "))
+            }
+            (b"Tx" | b"Ch", value) => text(value),
+            (b"Btn", value) => value
+                .as_name()
+                .ok()
+                .filter(|name| *name != b"Off")
+                .map(button),
+            _ => None,
+        }?;
+        (!shown.trim().is_empty()).then_some(shown)
+    }
+
+    /// The plain text of a text field's rich value, which a viewer shows
+    /// where it has no value as plain text.
+    fn rich(&self, kind: &[u8], field: &'a Dictionary) -> Option<String> {
+        if kind != b"Tx" {
+            return None;
+        }
+        let rich = self.shown(kind, field.get(b"RV").ok()?)?;
+        let plain = crate::annotations::plain(&rich);
+        (!plain.trim().is_empty()).then_some(plain)
+    }
+
+    /// Note a value pdf-inspector leaves out, on `pages`: the value shown,
+    /// `value` or else the field's rich value, as a field of type `kind`
+    /// named `name` holds it.
+    fn left_out(
+        &mut self,
+        kind: &[u8],
+        name: &str,
+        value: Option<&'a Object>,
+        field: &'a Dictionary,
+        pages: Vec<u32>,
+    ) {
+        if pages.is_empty() {
+            return;
+        }
+        let Some(shown) = value
+            .and_then(|value| self.shown(kind, value))
+            .or_else(|| self.rich(kind, field))
+        else {
+            return;
+        };
+        let text = if kind == b"Btn" {
+            written(name, &shown)
+        } else {
+            shown
+        };
+        self.values.push(FormValue { text, pages });
+    }
+
+    /// Walk a field and its kids as pdf-inspector does, with the type, the
+    /// name, and the value each inherits, the name as it reads it and as the
+    /// PDF means it.
     fn field(
         &mut self,
         id: ObjectId,
-        parent_kind: Option<&[u8]>,
+        parent_kind: Option<&'a [u8]>,
         parent_names: (&str, &str),
+        inherited: Option<&'a Object>,
         depth: usize,
     ) {
-        if depth > MAX_FIELD_DEPTH || self.exhausted() || self.values.len() >= MAX_VALUES {
+        if depth > MAX_FIELD_DEPTH || self.exhausted() {
             return;
         }
         if !self.visited.insert(id) {
             return;
         }
-        let Ok(dictionary) = self.document.get_dictionary(id) else {
+        let document = self.document;
+        let Ok(dictionary) = document.get_dictionary(id) else {
             return;
         };
         let (local_read, local_meant) = dictionary
@@ -188,13 +291,13 @@ impl Walk<'_> {
         };
         let name_read = join(parent_names.0, &local_read);
         let name_meant = join(parent_names.1, &local_meant);
-        let kind: Option<Vec<u8>> = dictionary
+        let kind: Option<&'a [u8]> = dictionary
             .get(b"FT")
             .ok()
             .and_then(|kind| kind.as_name().ok())
-            .or(parent_kind)
-            .map(<[u8]>::to_vec);
+            .or(parent_kind);
         let own = dictionary.get(b"V").ok();
+        let value = own.or(inherited);
 
         if let Some(kids) = dictionary
             .get(b"Kids")
@@ -205,32 +308,36 @@ impl Walk<'_> {
                 .iter()
                 .filter_map(|kid| kid.as_reference().ok())
                 .collect();
-            // A value on a field whose kids are its widgets is written by
-            // none of them unless one holds a value of its own.
-            if let (Some(kind), Some(own)) = (kind.as_deref(), own) {
-                let widgets: Vec<(ObjectId, &Dictionary)> = kids
-                    .iter()
-                    .filter_map(|&kid| {
-                        let kid_dictionary = self.document.get_dictionary(kid).ok()?;
-                        (!kid_dictionary.has(b"T")).then_some((kid, kid_dictionary))
-                    })
-                    .collect();
-                let written_by_kid = widgets.iter().any(|(_, kid)| kid.has(b"V"));
-                if kind != b"Sig" && !widgets.is_empty() && !written_by_kid {
-                    if let Some((_, meant)) = self.value(kind, own) {
-                        let mut pages: Vec<u32> = widgets
-                            .iter()
-                            .map(|(kid, kid_dictionary)| self.page(*kid, kid_dictionary))
-                            .collect();
-                        pages.sort_unstable();
-                        pages.dedup();
-                        let text = if kind == b"Btn" {
-                            written(&name_meant, &meant)
-                        } else {
-                            meant
-                        };
-                        self.values.push(FormValue { text, pages });
-                    }
+            // A field whose kids are its widgets shows its value in each;
+            // pdf-inspector writes only a value a widget holds of its own. A
+            // field with no kids at all is its own widget, and writes none.
+            if let Some(kind) = kind.filter(|kind| *kind != b"Sig") {
+                let widgets: Vec<(ObjectId, &'a Dictionary)> = if kids.is_empty() {
+                    vec![(id, dictionary)]
+                } else {
+                    kids.iter()
+                        .filter_map(|&kid| {
+                            let widget = document.get_dictionary(kid).ok()?;
+                            (!widget.has(b"T") && !widget.has(b"Kids")).then_some((kid, widget))
+                        })
+                        .collect()
+                };
+                let written_by_widget = !kids.is_empty()
+                    && widgets.iter().any(|(_, widget)| {
+                        widget
+                            .get(b"V")
+                            .ok()
+                            .and_then(|value| self.value(kind, value))
+                            .is_some()
+                    });
+                if !written_by_widget {
+                    let mut pages: Vec<u32> = widgets
+                        .iter()
+                        .filter_map(|(widget, dictionary)| self.page(*widget, dictionary))
+                        .collect();
+                    pages.sort_unstable();
+                    pages.dedup();
+                    self.left_out(kind, &name_meant, value, dictionary, pages);
                 }
             }
             for kid in kids {
@@ -238,136 +345,222 @@ impl Walk<'_> {
                     break;
                 }
                 self.examined += 1;
-                self.field(kid, kind.as_deref(), (&name_read, &name_meant), depth + 1);
+                self.field(kid, kind, (&name_read, &name_meant), value, depth + 1);
             }
             return;
         }
 
-        let (Some(kind), Some(own)) = (kind.as_deref(), own) else {
+        let Some(kind) = kind.filter(|kind| *kind != b"Sig") else {
             return;
         };
-        if kind == b"Sig" {
-            return;
-        }
-        let Some((read, meant)) = self.value(kind, own) else {
+        let Some(page) = self.page(id, dictionary) else {
             return;
         };
-        if garbled(&read, &meant) {
-            let page = self.page(id, dictionary);
-            self.values.push(FormValue {
-                text: meant,
-                pages: vec![page],
-            });
+        match own.and_then(|own| self.value(kind, own)) {
+            Some((read, meant)) => {
+                let name_garbled = garbled(&name_read, &name_meant);
+                if name_garbled || garbled(&read, &meant) {
+                    let text = if kind == b"Btn" || name_garbled {
+                        written(&name_meant, &meant)
+                    } else {
+                        meant
+                    };
+                    self.values.push(FormValue {
+                        text,
+                        pages: vec![page],
+                    });
+                }
+            }
+            // A field that is its own widget shows the value it holds or
+            // inherits; a widget of a field above shows that field's, which
+            // the field notes.
+            None if dictionary.has(b"T") || depth == 0 => {
+                self.left_out(kind, &name_meant, value, dictionary, vec![page]);
+            }
+            None => {}
         }
     }
 }
 
-/// Files embedded in a document: in its catalog's name tree, and in file
-/// attachment annotations, counted to `MAX_FIELD_NODES`; and whether the
-/// catalog makes it a portfolio (a collection), whose pages hold only a
-/// cover while its documents are the files.
-pub(crate) fn embedded_files(document: &Document) -> (usize, bool) {
-    let resolve = |object: &Object| -> Option<Object> {
-        match object {
-            Object::Reference(id) => document.get_object(*id).ok().cloned(),
-            object => Some(object.clone()),
-        }
+/// The stream holding the file a file specification embeds, unless the
+/// document says the file restates what its pages show: an alternative
+/// form of its content, or the XML data behind it, as an e-invoice
+/// (ZUGFeRD, Factur-X) carries its invoice.
+fn embedded_stream(document: &Document, specification: &Object) -> Option<ObjectId> {
+    let specification = resolved(document, specification)?.as_dict().ok()?;
+    let files = resolved(document, specification.get(b"EF").ok()?)?
+        .as_dict()
+        .ok()?;
+    let stream = [&b"UF"[..], b"F", b"DOS", b"Mac", b"Unix"]
+        .iter()
+        .find_map(|key| files.get(key).ok()?.as_reference().ok())?;
+    let content = document.get_object(stream).ok()?.as_stream().ok()?;
+    let xml = || {
+        let named_xml = [&b"UF"[..], b"F"].iter().any(|key| {
+            specification
+                .get(key)
+                .ok()
+                .and_then(|name| resolved(document, name))
+                .and_then(|name| lopdf::decode_text_string(name).ok())
+                .is_some_and(|name| name.to_ascii_lowercase().ends_with(".xml"))
+        });
+        let typed_xml = content
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|subtype| subtype.as_name().ok())
+            .is_some_and(|subtype| matches!(subtype, b"text/xml" | b"application/xml"));
+        named_xml || typed_xml
     };
+    let relationship = specification
+        .get(b"AFRelationship")
+        .ok()
+        .and_then(|relationship| resolved(document, relationship))
+        .and_then(|relationship| relationship.as_name().ok());
+    match relationship {
+        Some(b"Alternative") => None,
+        Some(b"Data") if xml() => None,
+        _ => Some(stream),
+    }
+}
+
+/// Files embedded in a document, each counted once: in its catalog's name
+/// tree, and in file attachment annotations, within `MAX_FIELD_NODES` steps;
+/// and whether the catalog makes it a portfolio (a collection), whose pages
+/// hold only a cover while its documents are the files.
+pub(crate) fn embedded_files(document: &Document) -> (usize, bool) {
     let Some(root) = document
         .trailer
         .get(b"Root")
         .ok()
-        .and_then(resolve)
-        .and_then(|root| root.as_dict().ok().cloned())
+        .and_then(|root| resolved(document, root))
+        .and_then(|root| root.as_dict().ok())
     else {
         return (0, false);
     };
     let portfolio = root.has(b"Collection");
-    // The name tree: `/Names` pairs in its leaves, `/Kids` above them.
-    let mut files = 0;
-    let mut stack: Vec<(Object, usize)> = root
+    let mut files: HashSet<ObjectId> = HashSet::new();
+    let mut steps = 0;
+    // The name tree: `/Names` pairs in its leaves, `/Kids` above them, each
+    // node read once.
+    let mut nodes: HashSet<ObjectId> = HashSet::new();
+    let mut stack: Vec<(&Object, usize)> = root
         .get(b"Names")
         .ok()
-        .and_then(resolve)
-        .and_then(|names| {
-            names
-                .as_dict()
-                .ok()
-                .and_then(|names| names.get(b"EmbeddedFiles").ok().cloned())
-        })
+        .and_then(|names| resolved(document, names))
+        .and_then(|names| names.as_dict().ok())
+        .and_then(|names| names.get(b"EmbeddedFiles").ok())
         .map(|tree| vec![(tree, 0)])
         .unwrap_or_default();
-    let mut visited = 0;
     while let Some((node, depth)) = stack.pop() {
-        visited += 1;
-        if visited > MAX_FIELD_NODES || depth > MAX_FIELD_DEPTH || files >= MAX_FIELD_NODES {
+        steps += 1;
+        if steps > MAX_FIELD_NODES {
             break;
         }
-        let Some(node) = resolve(&node).and_then(|node| node.as_dict().ok().cloned()) else {
+        if depth > MAX_FIELD_DEPTH {
             continue;
-        };
-        if let Some(names) = node.get(b"Names").ok().and_then(resolve) {
-            if let Ok(names) = names.as_array() {
-                files += names.len() / 2;
+        }
+        if let Object::Reference(id) = node {
+            if !nodes.insert(*id) {
+                continue;
             }
         }
-        if let Some(kids) = node.get(b"Kids").ok().and_then(resolve) {
-            if let Ok(kids) = kids.as_array() {
-                stack.extend(kids.iter().map(|kid| (kid.clone(), depth + 1)));
+        let Some(node) = resolved(document, node).and_then(|node| node.as_dict().ok()) else {
+            continue;
+        };
+        if let Some(names) = node
+            .get(b"Names")
+            .ok()
+            .and_then(|names| resolved(document, names))
+            .and_then(|names| names.as_array().ok())
+        {
+            for value in names.iter().skip(1).step_by(2) {
+                steps += 1;
+                if steps > MAX_FIELD_NODES {
+                    break;
+                }
+                files.extend(embedded_stream(document, value));
+            }
+        }
+        if let Some(kids) = node
+            .get(b"Kids")
+            .ok()
+            .and_then(|kids| resolved(document, kids))
+            .and_then(|kids| kids.as_array().ok())
+        {
+            for kid in kids {
+                steps += 1;
+                if steps > MAX_FIELD_NODES {
+                    break;
+                }
+                stack.push((kid, depth + 1));
             }
         }
     }
-    for (_, page) in document.get_pages() {
+    'pages: for (_, page) in document.get_pages() {
         let Some(annotations) = document
             .get_dictionary(page)
             .ok()
             .and_then(|page| page.get(b"Annots").ok())
-            .and_then(resolve)
+            .and_then(|annotations| resolved(document, annotations))
+            .and_then(|annotations| annotations.as_array().ok())
         else {
             continue;
         };
-        let Ok(annotations) = annotations.as_array() else {
-            continue;
-        };
-        files += annotations
-            .iter()
-            .filter_map(resolve)
-            .filter(|annotation| {
-                annotation.as_dict().is_ok_and(|annotation| {
-                    annotation
-                        .get(b"Subtype")
-                        .ok()
-                        .and_then(|subtype| subtype.as_name().ok())
-                        .is_some_and(|subtype| subtype == b"FileAttachment")
-                })
-            })
-            .count();
-        if files >= MAX_FIELD_NODES {
-            break;
+        for annotation in annotations {
+            steps += 1;
+            if steps > MAX_FIELD_NODES {
+                break 'pages;
+            }
+            let Some(annotation) =
+                resolved(document, annotation).and_then(|annotation| annotation.as_dict().ok())
+            else {
+                continue;
+            };
+            let attached = annotation
+                .get(b"Subtype")
+                .ok()
+                .and_then(|subtype| subtype.as_name().ok())
+                == Some(b"FileAttachment");
+            if attached {
+                if let Ok(specification) = annotation.get(b"FS") {
+                    files.extend(embedded_stream(document, specification));
+                }
+            }
         }
     }
-    (files, portfolio)
+    (files.len(), portfolio)
 }
 
 /// Whether `document` is a dynamic XFA form: its catalog says it needs
-/// rendering.
-pub(crate) fn needs_rendering(document: &Document) -> bool {
-    document
+/// rendering, and its form holds XFA.
+pub(crate) fn dynamic_xfa(document: &Document) -> bool {
+    let Some(root) = document
         .trailer
         .get(b"Root")
         .ok()
-        .and_then(|root| match root {
-            Object::Reference(id) => document.get_dictionary(*id).ok(),
-            Object::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        })
-        .and_then(|root| root.get(b"NeedsRendering").ok())
-        .and_then(|needs| match needs {
-            Object::Reference(id) => document.get_object(*id).ok(),
-            needs => Some(needs),
-        })
+        .and_then(|root| resolved(document, root))
+        .and_then(|root| root.as_dict().ok())
+    else {
+        return false;
+    };
+    let needs_rendering = root
+        .get(b"NeedsRendering")
+        .ok()
+        .and_then(|needs| resolved(document, needs))
         .and_then(|needs| needs.as_bool().ok())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let holds_xfa = root
+        .get(b"AcroForm")
+        .ok()
+        .and_then(|form| resolved(document, form))
+        .and_then(|form| form.as_dict().ok())
+        .and_then(|form| form.get(b"XFA").ok())
+        .and_then(|xfa| resolved(document, xfa))
+        .is_some_and(|xfa| {
+            matches!(xfa, Object::Array(parts) if !parts.is_empty()) || xfa.as_stream().is_ok()
+        });
+    needs_rendering && holds_xfa
 }
 
 /// The field values pdf-inspector misreads or passes over in the form of
@@ -439,7 +632,7 @@ pub(crate) fn misread(document: &Document) -> Vec<FormValue> {
             break;
         }
         walk.examined += 1;
-        walk.field(field, None, ("", ""), 0);
+        walk.field(field, None, ("", ""), None, 0);
     }
     walk.values
 }
@@ -579,32 +772,181 @@ mod tests {
     }
 
     #[test]
+    fn values_pdf_inspector_cannot_reach_are_found() {
+        let document = form(|document, page| {
+            // A group whose widgets each hold "Off" of their own.
+            let yes = document.add_object(dictionary! { "Subtype" => "Widget", "V" => "Off" });
+            let no = document.add_object(dictionary! { "Subtype" => "Widget", "V" => "Off" });
+            let status = document.add_object(dictionary! {
+                "FT" => "Btn", "T" => Object::string_literal("filing_status"),
+                "V" => "Married", "Kids" => vec![yes.into(), no.into()],
+            });
+            // Values given by reference, as a text stream, or as rich text.
+            let city_value = document.add_object(Object::string_literal("Springfield"));
+            let city = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("city"), "V" => city_value,
+            });
+            let memo_value =
+                document.add_object(lopdf::Stream::new(dictionary! {}, b"Paid in full".to_vec()));
+            let memo = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("memo"), "V" => memo_value,
+            });
+            let note = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("note"),
+                "RV" => Object::string_literal("<body><p>Basis 12,500.00</p></body>"),
+            });
+            // A value on a field above, which named fields below inherit.
+            let spouse =
+                document.add_object(dictionary! { "T" => Object::string_literal("spouse") });
+            let joint = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("joint"),
+                "V" => Object::string_literal("Alex Sample"), "Kids" => vec![spouse.into()],
+            });
+            // A field listing no kids is its own widget.
+            let empty = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("ssn_last4"),
+                "V" => Object::string_literal("6789"), "Kids" => Vec::<Object>::new(),
+            });
+            // A name pdf-inspector garbles, with its value read right.
+            let named = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => utf16("Número"), "V" => Object::string_literal("42"),
+            });
+            // Hidden, on no page, or holding a NUL pdf-inspector keeps: not
+            // lost.
+            let hidden_widget =
+                document.add_object(dictionary! { "Subtype" => "Widget", "F" => 2 });
+            let hidden = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("hidden"),
+                "V" => Object::string_literal("Secret"), "Kids" => vec![hidden_widget.into()],
+            });
+            let nowhere = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("nowhere"),
+                "V" => Object::String(b"S\xE3o".to_vec(), StringFormat::Literal),
+            });
+            let nul = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("nul"),
+                "V" => Object::String(b"Jane\0Sample".to_vec(), StringFormat::Literal),
+                "P" => page,
+            });
+            (
+                vec![
+                    status, city, memo, note, joint, empty, named, hidden, nowhere, nul,
+                ],
+                vec![
+                    yes,
+                    no,
+                    city,
+                    memo,
+                    note,
+                    spouse,
+                    empty,
+                    named,
+                    hidden_widget,
+                    nul,
+                ],
+            )
+        });
+        let texts: Vec<(String, Vec<u32>)> = misread(&document)
+            .into_iter()
+            .map(|value| (value.text, value.pages))
+            .collect();
+        let expected = [
+            "filing_status: Married",
+            "Springfield",
+            "Paid in full",
+            "  Basis 12,500.00  ",
+            "Alex Sample",
+            "6789",
+            "Número: 42",
+        ];
+        assert_eq!(
+            texts,
+            expected
+                .iter()
+                .map(|text| (text.to_string(), vec![1]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn a_document_without_a_form_has_no_values() {
         let mut document = Document::with_version("1.7");
         let catalog = document.add_object(dictionary! { "Type" => "Catalog" });
         document.trailer.set("Root", catalog);
         assert!(misread(&document).is_empty());
-        assert!(!needs_rendering(&document));
-        let mut dynamic = Document::with_version("1.7");
-        let catalog =
-            dynamic.add_object(dictionary! { "Type" => "Catalog", "NeedsRendering" => true });
-        dynamic.trailer.set("Root", catalog);
-        assert!(needs_rendering(&dynamic));
+        assert!(!dynamic_xfa(&document));
         assert_eq!(embedded_files(&document), (0, false));
+        // Needing rendering makes a dynamic XFA form only with XFA to render.
+        for (xfa, dynamic) in [(true, true), (false, false)] {
+            let mut form = Document::with_version("1.7");
+            let template = form.add_object(lopdf::Stream::new(dictionary! {}, b"<xdp/>".to_vec()));
+            let acroform = if xfa {
+                dictionary! { "Fields" => Vec::<Object>::new(), "XFA" => vec![Object::string_literal("template"), template.into()] }
+            } else {
+                dictionary! { "Fields" => Vec::<Object>::new() }
+            };
+            let catalog = form.add_object(dictionary! {
+                "Type" => "Catalog", "NeedsRendering" => true, "AcroForm" => acroform,
+            });
+            form.trailer.set("Root", catalog);
+            assert_eq!(dynamic_xfa(&form), dynamic);
+        }
+    }
+
+    #[test]
+    fn embedded_files_are_counted_once_each() {
         let mut portfolio = Document::with_version("1.7");
-        let file = portfolio.add_object(dictionary! { "Type" => "Filespec" });
+        let specification = |document: &mut Document, name: &str, relationship: Option<&str>| {
+            let stream =
+                document.add_object(lopdf::Stream::new(dictionary! {}, b"%PDF-1.7".to_vec()));
+            let mut specification = dictionary! {
+                "Type" => "Filespec", "F" => Object::string_literal(name),
+                "EF" => dictionary! { "F" => stream },
+            };
+            if let Some(relationship) = relationship {
+                specification.set(
+                    "AFRelationship",
+                    Object::Name(relationship.as_bytes().to_vec()),
+                );
+            }
+            document.add_object(specification)
+        };
+        let dividends = specification(&mut portfolio, "1099-DIV.pdf", None);
+        let interest = specification(&mut portfolio, "1099-INT.pdf", Some("Unspecified"));
+        // An e-invoice's XML restates the invoice its pages show.
+        let invoice = specification(&mut portfolio, "factur-x.xml", Some("Alternative"));
+        let data = specification(&mut portfolio, "zugferd-invoice.xml", Some("Data"));
+        let dangling: Object = (9_999, 0).into();
         let leaf = portfolio.add_object(dictionary! {
-            "Names" => vec![Object::string_literal("1099-DIV.pdf"), file.into(), Object::string_literal("1099-INT.pdf"), file.into()],
+            "Names" => vec![
+                Object::string_literal("1099-DIV.pdf"), dividends.into(),
+                Object::string_literal("again.pdf"), dividends.into(),
+                Object::string_literal("1099-INT.pdf"), interest.into(),
+                Object::string_literal("factur-x.xml"), invoice.into(),
+                Object::string_literal("zugferd-invoice.xml"), data.into(),
+                Object::string_literal("null"), Object::Null,
+                Object::string_literal("dangling"), dangling,
+                Object::string_literal("unembedded"), dictionary! { "Type" => "Filespec" }.into(),
+            ],
         });
+        // A tree that lists its leaf twice, and a node that lists itself.
+        let looping = portfolio.new_object_id();
+        portfolio.objects.insert(
+            looping,
+            Object::Dictionary(dictionary! { "Kids" => vec![looping.into(), leaf.into()] }),
+        );
         let catalog = portfolio.add_object(dictionary! {
             "Type" => "Catalog",
             "Collection" => dictionary! { "Type" => "Collection" },
-            "Names" => dictionary! { "EmbeddedFiles" => dictionary! { "Kids" => vec![leaf.into()] } },
+            "Names" => dictionary! {
+                "EmbeddedFiles" => dictionary! { "Kids" => vec![leaf.into(), leaf.into(), looping.into()] },
+            },
         });
         portfolio.trailer.set("Root", catalog);
         assert_eq!(embedded_files(&portfolio), (2, true));
         assert!(garbled("S\u{FFFD}o", "São"));
         assert!(!garbled("José", "Jos\u{e9}"));
+        assert!(!garbled("Jane\0Sample", "JaneSample"));
         assert_eq!(written("", "x"), "x");
     }
 }
