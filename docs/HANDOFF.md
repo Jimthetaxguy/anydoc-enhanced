@@ -47,6 +47,7 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats read with AnyDoc's grammar, against each cell's value |
 | `crates/pdf-inspector-skillkit/src/text_paints.rs` | What PDF pages paint that pdf-inspector 1.24.0 misreads: an invisible OCR layer over a scan, and text painted twice over itself |
 | `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF tables pdf-inspector 1.24.0 may have misread: a first row repeated above its table, amounts merged into one cell |
+| `crates/pdf-inspector-skillkit/src/doubled_text.rs` | Text the PDF Markdown shows twice, confirming the pages the repeat scan names |
 | `crates/pdf-inspector-skillkit/src/domain/` | Tax, IRC, SEC, and synthetic review logic |
 | `crates/pdf-inspector-mcp/src/main.rs` | MCP schemas, worker mode, tool registration, dispatch, and timeout response handling |
 | `scripts/check-public-hygiene.sh` | Candidate-text obvious-identifier heuristic used locally and in CI |
@@ -66,7 +67,8 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 - PDF Markdown is pdf-inspector's own. Where 1.24.0 is known to repeat or
   merge text (a run painted twice, a table's first row left above it, two
   amounts in one cell), the result carries a `warnings` entry instead of a
-  repair.
+  repair. A repeated run is named only when the Markdown shows it doubled,
+  since pdf-inspector strips some repeats itself as page furniture.
 - Input paths are canonicalized and capped at 50 MiB.
 - MCP handlers return after a 30-second Tokio timeout. PDF tools run in a
   25-second killable child worker with a 128 MiB response cap and four in-flight

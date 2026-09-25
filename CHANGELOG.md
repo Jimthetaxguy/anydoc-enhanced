@@ -235,6 +235,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round six found four missed losses and seven false positives in
+  loops 12 and 13 and the round-five fixes; all are fixed:
+  - EPUB: AnyDoc flattens a link's content into the text around it, so
+    `<div>Note:<a id="c1"><h2>Total 1,250.00</h2></a></div>` converted as
+    "Note:Total 1,250.00" with no warning. The chapter walk now splices a
+    link's blocks as AnyDoc does, with the white space and line breaks it
+    drops. The reader model now reads `display`, `float`, and block
+    `::before`/`::after` boxes: a floated drop cap ("O" beside "nce") and an
+    inline `div` no longer refuse a book, while a `span` styled as a block,
+    an `address`, and a line break, rule, or empty paragraph that only
+    AnyDoc's selector quirks hide now count as the reader's line breaks. An
+    image whose alt text its caption repeats, as pandoc 2 writes figures, no
+    longer refuses the book.
+  - DOCX: Word numbers the body, the text boxes, the footnotes, and the
+    endnotes as separate stories, which AnyDoc counts through as one. A
+    footnote list continuing the body's numbers converted as 4, 5 where Word
+    shows 1, 2, without a warning, and a text box written both as a shape
+    and as its VML fallback was counted twice, flagging lists that match.
+    The replay also counts a level a deeper paragraph skips as used ("1.1.1."
+    then "2."), restarts an instance once, at its first overridden level,
+    and starts a level without `w:start` at 0, as Word does. On 320
+    randomized list documents it now agrees with LibreOffice on every one;
+    38 differences had been missed.
+  - PDF: a run painted twice through two font objects was missed; runs are
+    now matched by their bytes alone. `text_painted_twice` no longer names
+    pages whose repeat pdf-inspector drops before its Markdown (a doubled
+    header or footer stripped as furniture, a white copy in a form, a copy
+    its clip hides): the text at each repeat must appear doubled in the
+    Markdown, and a header kept on the first page only names that page.
+    `table_values_merged` needs an empty neighbouring cell or a single
+    amount elsewhere in the column, and `table_row_repeated` no longer
+    fires on a sentence that restates the first row.
+  - ODT and ODP: the embedded-object reference check compared every
+    reference with every archive entry. A 28 MB document held a worker
+    thread for 225 s after its 30 s timeout; the check is now linear.
+  - XLSX and ODS: a negative fraction in a colour-only format (`# ?/?;[Red]#
+    ?/?`) shows as "1/4" however small, and its lost sign is refused.
 - EPUB chapters whose blocks AnyDoc runs together are refused, found from its
   older EPUB pull request (#4). AnyDoc walks a `div`, `section`, `figure`,
   `figcaption`, `dd`, or other container without block children inline, so
@@ -314,7 +351,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and blank pages that turn the sparse-extraction rule on for every page
   (#339). The table checks read the Markdown and name no page; the repeat
   check reads runs whose position is set, and stops after 4 million
-  operations per document.
+  operations per document. A repeat is confirmed in the Markdown on up to
+  64 pages; later pages are named unconfirmed.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen
@@ -334,7 +372,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EPUB block containers without block children, such as indented `div`s or a
   `figure` and its caption, are walked inline by AnyDoc and convert as one
   paragraph, their text joined with spaces. This is not flagged; text that
-  would run together is refused.
+  would run together is refused. The reader model reads `display`, `float`,
+  and `::before`/`::after` `display` from style rules; a positioned box, a
+  pseudo-element with no `content`, and a `table-*` display are read as
+  blocks, and a floated box ends a line unless it holds two letters or
+  fewer.
 - ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
   converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
 - EPUB `noscript` content is treated as shown, as readers without scripting
@@ -351,3 +393,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Where Word supports
   a block-level `mc:Choice` that AnyDoc does not, AnyDoc converts the
   `mc:Fallback`; the check assumes the two branches hold the same text.
+  Word also reads numbering values padded with white space, and style
+  chains deeper than AnyDoc follows, and shows no number for a level
+  without `w:lvlText`; none of these is flagged yet. A level with
+  `w:lvlRestart="0"` is taken never to restart, as Word does, although
+  LibreOffice restarts it.

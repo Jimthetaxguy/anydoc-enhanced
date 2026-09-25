@@ -272,7 +272,7 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 236 tests pass (183 skillkit unit, 13
+- `cargo test --workspace --locked`: 242 tests pass (189 skillkit unit, 13
   skillkit integration, 29 document-tool and 8 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
@@ -291,6 +291,17 @@ Run on Linux x86-64 with Rust 1.94.1:
   clip-only PDF text), and 2 older false refusals (ODS charts refused as
   active content, empty-string formulas as uncached). All are fixed; none of
   the 303 documents below changed outcome.
+- A sixth round, against the same references, found 4 missed losses (EPUB
+  blocks inside links, a PDF run repainted through a second font object,
+  DOCX lists continued into footnotes, a negative fraction's sign) and 7
+  false positives (DOCX text boxes counted twice, table and repeat warnings
+  on text pdf-inspector reads right or strips, a floated drop cap), and a
+  quadratic ODF reference scan. All are fixed. The DOCX list replay now
+  agrees with LibreOffice on all 320 randomized list documents from the
+  fifth-round review, 38 of which it had missed. Among 206 review EPUBs,
+  exactly the 20 reproductions changed to refused and the 2 false refusals
+  to complete; among 71 review PDFs, each of the 21 changed warnings is a
+  reviewer finding; none of the 303 documents changed outcome.
 - Across 303 documents (the public corpus, 39 LibreOffice conversions, the
   round-four regression corpus, AnyDoc's 34 upstream fixtures, and the
   pull-request reproductions), every outcome change was traced to a check
@@ -301,9 +312,11 @@ Run on Linux x86-64 with Rust 1.94.1:
   a reader shows in the Markdown, apart from web addresses the sanitizer
   removes by design
 - `bash scripts/check-public-hygiene.sh` and `cargo deny check`
-- Golden comparison of every tool over the public corpus against the previous
-  build: 143 calls, identical tool list; the one changed output is the new
-  `table_row_repeated` warning on the Title 26 sample, whose rate table
+- Golden comparison of every tool over the public corpus against the
+  round-five build: 143 calls, identical tool list; the one changed output
+  is a `sanitized_output` warning that the anchor-keeping sanitizer no
+  longer raises on the public spine-order EPUB. Against the build before
+  loop 13, the Title 26 sample gained `table_row_repeated`, whose rate table
   pdf-inspector repeats
 - The page scan, which in a full run also reads every text page for repeated
   runs, adds 12-130 ms (20-30%) to `pdf_to_markdown` on the public text PDFs,
@@ -341,6 +354,9 @@ When pdf-inspector publishes a release after 1.24.0:
    `text_painted_twice`, `table_row_repeated`, or `table_values_merged`
    warning only for a defect the release reads right, and update the
    `sample-2.pdf` expectation in the PDF integration test.
+4. Re-run the sixth-round furniture, white-copy, and clip fixtures: the
+   repeat warning is confirmed against the Markdown, so a release that
+   strips or hides differently changes which pages it names.
 
 ## Sources
 

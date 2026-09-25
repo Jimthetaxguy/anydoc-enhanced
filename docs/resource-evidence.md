@@ -83,6 +83,7 @@ build on Linux x86-64:
 | 200,000 imports fanned out 400 times | 7.09 s | 0.17 s, `resource_limit` |
 | 16,000 selectors matched against 16,000 elements | 3.54 s | 0.27 s |
 | 1.39 million selectors in one sheet | 182 MiB | 61 MiB, `resource_limit` at the token cap |
+| ODT with 40,000 embedded-object references and 40,000 entries (3.8 MB) | 4.25 s per call; a 28 MB variant held a worker thread 225 s past its timeout | 0.43 s |
 
 The EPUB model caps tokens (500,000 per sheet), rules, imports, import depth,
 sheet applications, and matching work (50 million steps). The ODF walker stops

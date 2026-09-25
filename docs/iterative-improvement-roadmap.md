@@ -276,37 +276,44 @@ came back clean. The evidence and dispositions are in
 | 13 | PDF text pdf-inspector repeats or merges, from its open pull requests (#317, #377, #406, #424, #443, #531) | `text_painted_twice`, `table_row_repeated`, and `table_values_merged` warnings; confidence 0 for a text PDF with no Markdown; the public Title 26 sample repeats a rate table's first row |
 | Review 5 | Bypass and false-refusal review of loops 8-11, against LibreOffice and AnyDoc's raw output | 4 missed losses and 12 false refusals fixed: list numbers replayed paragraph by paragraph, colour-only negatives told from labels and currency codes, compatibility fallbacks and chart objects read as the applications show them |
 | Sanitizer | Keep what the Markdown sanitizer removed wrongly | Cell line breaks (`<br>`) kept, which had fused "52,000" and "1,250" into "52,0001,250" in six lanes; escaped `\<Client name>` placeholders and code kept |
+| Review 6 | Bypass and false-refusal review of loops 12-13 and the round-five fixes, against LibreOffice and AnyDoc's raw output | 4 missed losses and 7 false positives fixed: links holding blocks spliced as AnyDoc splices them, boxes laid out as a reader lays them out, DOCX lists numbered per Word story, PDF repeats confirmed in the Markdown, table warnings only with evidence, a quadratic ODF scan made linear; DOCX list numbers now agree with LibreOffice on all 320 randomized documents |
 
 ## Next slices
 
-1. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
+1. **DOCX list labels as Word writes them.** Checked against LibreOffice,
+   the replay still misses a level without `w:lvlText` (Word shows no
+   number, AnyDoc one), a composite label whose shallower number differs
+   across list instances (`%1.%2`), style chains deeper than AnyDoc follows,
+   and numbering values padded with white space, which Word reads as XML
+   Schema numbers. Each is a disclosure the replay can make.
+2. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
    chunks, non-breaking hyphens, and page-number and date blocks in the body
    (`w:pgNum`, `w:dayShort` and related elements) are handled. `w:contentPart`
    ink holds no text; it drops like a picture. Master-document `w:subDoc`
    links reference files outside the package and are reported as external
    relationships.
-2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
+3. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
    non-exhaustive `Format` arms, the four Wingdings codes from #177, a
    re-check of the ported `to_utf8` and `path::resolve`, and the walker,
    numbering, and format models, which mirror 0.2.4's behavior.
-3. **Next pdf-inspector release.** If #479 or #501 lands, compare its
+4. **Next pdf-inspector release.** If #479 or #501 lands, compare its
    invisible-layer handling with the local scan before removing either; if
    #317, #377, #406, #424, or #443 lands, retire the matching warning once a
    fixture shows the release reads it right; if #578 lands, PDF Markdown
    gains link destinations and must pass through the sanitizer.
-4. **PDF defects not yet detected.** From the open pull requests: amounts
+5. **PDF defects not yet detected.** From the open pull requests: amounts
    pushed out of their rows (#424), receipts read as scans (#445), forms with
    indirect or missing resources (#407, #312), rotated headers (#298), space
    widths from the wrong code (#532), browser-printed words (#531), and blank
    pages (#339). Each has a generated fixture and a proposed local check in
    the drift audit. A leaner content tokenizer would also cut the repeat
    check's 20-30% share of `pdf_to_markdown`.
-5. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
+6. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
    external relationship, including an ordinary hyperlink, while DOCX converts
    and removes the destination with a warning. Hyperlink relationships could
    follow the DOCX policy, since the sanitizer already removes their
    destinations. This is a policy change for the owners to decide.
-6. **Non-Linux containment.** PDF and document parsing still lack a memory
+7. **Non-Linux containment.** PDF and document parsing still lack a memory
    ceiling on macOS and fall back to in-process parsing where no sandbox
    exists; filesystem isolation remains open on every platform.
 
