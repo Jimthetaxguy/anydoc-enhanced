@@ -104,6 +104,10 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
   `incomplete_conversion`.
 - ods/cell-anchored-text-box.ods: a text box anchored to a cell, which
   AnyDoc never reads. Expected `incomplete_conversion`.
+- docx/shared-list-definition.docx: two list instances of one numbering
+  definition; Word continues the count into the second, and AnyDoc restarts
+  it. Expected `partial` completeness with the `list_numbering_differs`
+  warning.
 
 All content is synthetic and contains no personal data.
 """
@@ -837,6 +841,31 @@ def main():
     styled_workpaper("format-hidden-value.xlsx", 164, ";;;", 25000)
     styled_workpaper("locale-date-format.xlsx", 31, None, 45762)
     write_drawing_text_box()
+    numbered = lambda list_id, text: (
+        f'<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{list_id}"/></w:numPr>'
+        f'</w:pPr><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+    )
+    write_docx(
+        "shared-list-definition.docx",
+        numbered(1, "Enter wages.")
+        + numbered(1, "Enter interest.")
+        + paragraph("Attach the statement.")
+        + numbered(2, "LIST-CONTINUES: enter dividends.")
+        + numbered(2, "Add lines 1 through 3."),
+        typed_rels("numbering", "numbering.xml"),
+        [
+            (
+                "word/numbering.xml",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f"<w:numbering {WORD_NS}>"
+                '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/>'
+                '<w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>'
+                '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
+                '<w:num w:numId="2"><w:abstractNumId w:val="0"/></w:num>'
+                "</w:numbering>",
+            )
+        ],
+    )
     ods = "application/vnd.oasis.opendocument.spreadsheet"
     write_odf(
         "ods",

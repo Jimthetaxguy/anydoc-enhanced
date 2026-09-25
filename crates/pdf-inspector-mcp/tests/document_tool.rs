@@ -1424,6 +1424,24 @@ fn xlsx_parenthesized_negatives_keep_their_sign() {
 }
 
 #[test]
+fn docx_list_numbers_word_continues_are_reported_as_partial() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/shared-list-definition.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-numbering-integration-test");
+    assert_eq!(document["completeness"], "partial", "{document}");
+    assert!(document["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("LIST-CONTINUES")));
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "list_numbering_differs"));
+}
+
+#[test]
 fn docx_dropped_hyphens_are_reported_as_partial() {
     let fixture = format!(
         "{}/../../test-corpus/docx/non-breaking-hyphen.docx",

@@ -333,7 +333,8 @@ pub enum Completeness {
     Complete,
     /// Conversion produced output but an audited completeness check found a
     /// recoverable omission, named by a warning. Emitted for DOCX when the
-    /// pinned parser drops non-breaking hyphens (`characters_omitted`).
+    /// pinned parser drops non-breaking hyphens (`characters_omitted`) or
+    /// numbers lists differently from Word (`list_numbering_differs`).
     Partial,
 }
 
@@ -518,6 +519,9 @@ struct PackagePreflight {
     /// Characters the pinned parser drops while the text around them
     /// converts, so the result is usable but partial.
     omitted_characters: bool,
+    /// List numbers the pinned parser renders differently from Word, while
+    /// the list text converts.
+    list_numbering_differs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2242,6 +2246,22 @@ struct DocxStoryScan {
     /// and those the converted text references.
     notes_defined: HashSet<(bool, String)>,
     notes_referenced: HashSet<(bool, String)>,
+    /// The numbering each paragraph asks for, directly or through its
+    /// style, in the order of first use, with how many paragraphs ask.
+    list_first_uses: Vec<DocxListUse>,
+    list_uses: HashMap<DocxListUse, usize>,
+    /// Numbering asked for by a paragraph whose mark is a tracked deletion
+    /// or move source: AnyDoc still numbers it, so every later number is one
+    /// too high.
+    deleted_list_uses: HashSet<DocxListUse>,
+}
+
+/// The numbering a paragraph asks for: a list instance and level given
+/// directly, or its paragraph style's, with a level given directly.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DocxListUse {
+    Direct(u64, usize),
+    Style(String, Option<usize>),
 }
 
 /// Notes a document may define or reference. Real documents have a few
@@ -2281,7 +2301,19 @@ struct DocxParagraphMark {
     hidden: bool,
     style_separator: bool,
     styles: Vec<String>,
+    /// The list instance (`w:numId`) and level (`w:ilvl`) numbering it
+    /// directly; a `w:numId` of 0 removes a style's numbering.
+    list: Option<u64>,
+    direct_list: bool,
+    level: Option<usize>,
+    /// The paragraph style, which may number the paragraph.
+    style: Option<String>,
+    /// The mark is a tracked deletion or move source.
+    deleted: bool,
 }
+
+/// Levels a Word list has; AnyDoc clamps deeper ones to the last.
+const DOCX_LIST_LEVELS: usize = 9;
 
 fn xml_true(value: &str) -> bool {
     matches!(
@@ -2501,6 +2533,28 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     && word_path_ends_with(&stack, &[b"p"])
                 {
                     let mark = std::mem::take(&mut scan.mark);
+                    let used = match (mark.list, mark.direct_list, &mark.style) {
+                        (Some(list), _, _) => {
+                            Some(DocxListUse::Direct(list, mark.level.unwrap_or(0)))
+                        }
+                        (None, false, Some(style)) => {
+                            Some(DocxListUse::Style(style.clone(), mark.level))
+                        }
+                        _ => None,
+                    };
+                    if let Some(used) = used {
+                        if mark.deleted {
+                            scan.deleted_list_uses.insert(used.clone());
+                        }
+                        let count = scan.list_uses.entry(used.clone()).or_insert(0);
+                        if *count == 0 {
+                            if scan.list_first_uses.len() >= MAX_DOCX_STYLES {
+                                return Err(DocumentError::ResourceLimit);
+                            }
+                            scan.list_first_uses.push(used);
+                        }
+                        *count += 1;
+                    }
                     if mark.numbered && !mark.style_separator {
                         scan.hidden_run |= mark.hidden;
                         for style in mark.styles {
@@ -2599,9 +2653,27 @@ fn scan_docx_element(
             scan.mark = DocxParagraphMark::default();
         }
         b"numId" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
-            scan.mark.numbered |= xml_attribute_values(event, b"val")
+            let values = xml_attribute_values(event, b"val");
+            scan.mark.numbered |= values.iter().any(|value| value.trim() != "0");
+            scan.mark.direct_list = true;
+            if let Some(list) = values
                 .iter()
-                .any(|value| value.trim() != "0");
+                .find_map(|value| value.trim().parse::<u64>().ok())
+                .filter(|&list| list != 0)
+            {
+                scan.mark.list = Some(list);
+            }
+        }
+        b"ilvl" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
+            if let Some(level) = xml_attribute_values(event, b"val")
+                .iter()
+                .find_map(|value| value.trim().parse::<usize>().ok())
+            {
+                scan.mark.level = Some(level.min(DOCX_LIST_LEVELS - 1));
+            }
+        }
+        b"del" | b"moveFrom" if word_path_ends_with(stack, &[b"p", b"pPr", b"rPr"]) => {
+            scan.mark.deleted = true;
         }
         b"vanish" if word_path_ends_with(stack, &[b"p", b"pPr", b"rPr"]) => {
             scan.mark.hidden |= !xml_toggle_off(event);
@@ -2617,7 +2689,16 @@ fn scan_docx_element(
                 scan.mark.styles.push(style);
             }
         }
-        b"pStyle" if word_path_ends_with(stack, &[b"p", b"pPr"]) => record_style(event, scan)?,
+        b"pStyle" if word_path_ends_with(stack, &[b"p", b"pPr"]) => {
+            if scan.mark.style.is_none() {
+                scan.mark.style = xml_attribute_values(event, b"val")
+                    .into_iter()
+                    .next()
+                    .map(|style| style.trim().to_string())
+                    .filter(|style| style.len() <= MAX_STYLE_ID_BYTES);
+            }
+            record_style(event, scan)?;
+        }
         b"tblStyle" if word_path_ends_with(stack, &[b"tbl", b"tblPr"]) => {
             record_style(event, scan)?;
         }
@@ -2719,6 +2800,385 @@ fn docx_numbering_labels(
                 }
                 _ => {}
             }
+        }
+        if start {
+            stack.push(local);
+        }
+        buffer.clear();
+    }
+}
+
+/// A numbering part's list definitions, as far as the numbers Word and
+/// AnyDoc show differ.
+#[derive(Default)]
+struct DocxNumbering {
+    /// Each list instance (`w:num`): the definition it shares counters
+    /// through, the levels it overrides, and override level formats.
+    lists: HashMap<u64, DocxList>,
+    /// Each definition's level formats: `None` for a level defined without
+    /// a `w:numFmt`.
+    formats: HashMap<(String, usize), Option<String>>,
+    /// Definitions linked through a list style (`w:numStyleLink`,
+    /// `w:styleLink`), which share counters with the style's definition.
+    links: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct DocxList {
+    definition: String,
+    overridden: HashSet<usize>,
+    formats: HashMap<usize, Option<String>>,
+}
+
+impl DocxNumbering {
+    /// The counter group a definition belongs to.
+    fn group(&self, definition: &str) -> String {
+        match self.links.get(definition) {
+            Some(style) => format!("style:{style}"),
+            None => format!("definition:{definition}"),
+        }
+    }
+
+    /// Whether AnyDoc's list numbers differ from Word's for the numbering a
+    /// document asks for, in order of first use, with paragraph styles'
+    /// numbering resolved.
+    fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
+        let mut first_uses: Vec<(u64, usize)> = Vec::new();
+        let mut uses: HashMap<(u64, usize), usize> = HashMap::new();
+        for used in &scan.list_first_uses {
+            let Some(resolved) = styles.resolve(used) else {
+                continue;
+            };
+            if scan.deleted_list_uses.contains(used) {
+                return true;
+            }
+            let count = scan.list_uses.get(used).copied().unwrap_or(0);
+            let total = uses.entry(resolved).or_insert(0);
+            if *total == 0 {
+                first_uses.push(resolved);
+            }
+            *total += count;
+        }
+        self.counters_differ(&first_uses, &uses)
+    }
+
+    fn counters_differ(
+        &self,
+        first_uses: &[(u64, usize)],
+        uses: &HashMap<(u64, usize), usize>,
+    ) -> bool {
+        let formats: HashMap<(String, usize), &Option<String>> = self
+            .formats
+            .iter()
+            .map(|((definition, level), format)| ((self.group(definition), *level), format))
+            .collect();
+        let mut users: HashMap<(String, usize), HashSet<u64>> = HashMap::new();
+        for &(list, level) in first_uses {
+            let Some(instance) = self.lists.get(&list) else {
+                continue;
+            };
+            let group = self.group(&instance.definition);
+            // Word keeps one counter per definition; AnyDoc one per list
+            // instance, so a second instance restarts where Word continues,
+            // unless it overrides the level.
+            let sharing = users.entry((group.clone(), level)).or_default();
+            if !sharing.is_empty()
+                && !sharing.contains(&list)
+                && !instance.overridden.contains(&level)
+            {
+                return true;
+            }
+            sharing.insert(list);
+            let format = instance
+                .formats
+                .get(&level)
+                .or_else(|| formats.get(&(group, level)).copied());
+            match format {
+                // AnyDoc renders a level without a format as bullets; Word
+                // numbers it.
+                Some(None) => return true,
+                Some(Some(format)) => match format.as_str() {
+                    "decimal" | "bullet" | "none" | "lowerRoman" | "upperRoman" => {}
+                    // Past `z` Word doubles the letter (`aa`, `bb`), and
+                    // AnyDoc counts on (`aa`, `ab`).
+                    "lowerLetter" | "upperLetter" => {
+                        if uses.get(&(list, level)).is_some_and(|&count| count > 26) {
+                            return true;
+                        }
+                    }
+                    // Ordinals, words, zero-padded numbers, and the rest
+                    // render as plain decimals.
+                    _ => return true,
+                },
+                None => {}
+            }
+        }
+        false
+    }
+}
+
+/// Paragraph styles' numbering (`w:pPr/w:numPr`), with the styles they are
+/// based on, from every styles part.
+#[derive(Default)]
+struct DocxStyleNumbering {
+    styles: HashMap<String, DocxStyleList>,
+}
+
+#[derive(Default)]
+struct DocxStyleList {
+    based_on: Option<String>,
+    list: Option<u64>,
+    level: Option<usize>,
+}
+
+impl DocxStyleNumbering {
+    /// The list instance and level a paragraph's numbering resolves to, if
+    /// any: its own, or the first its style chain gives, up to a bounded
+    /// depth. A list instance of 0 removes numbering.
+    fn resolve(&self, used: &DocxListUse) -> Option<(u64, usize)> {
+        let (style, direct_level) = match used {
+            DocxListUse::Direct(list, level) => return Some((*list, *level)),
+            DocxListUse::Style(style, level) => (style, *level),
+        };
+        let (mut list, mut level) = (None, direct_level);
+        let mut current = Some(style.as_str());
+        for _ in 0..32 {
+            let Some(definition) = current.and_then(|style| self.styles.get(style)) else {
+                break;
+            };
+            level = level.or(definition.level);
+            if list.is_none() {
+                list = definition.list;
+            }
+            if list.is_some() && level.is_some() {
+                break;
+            }
+            current = definition.based_on.as_deref();
+        }
+        list.filter(|&list| list != 0)
+            .map(|list| (list, level.unwrap_or(0)))
+    }
+}
+
+/// Read paragraph styles' numbering from a styles part, streamed under
+/// AnyDoc's depth and node bounds.
+fn docx_style_numbering(
+    reader: impl std::io::BufRead,
+    numbering: &mut DocxStyleNumbering,
+) -> Result<(), DocumentError> {
+    let mut reader = quick_xml::Reader::from_reader(reader);
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut nodes = 0usize;
+    let mut open: Option<String> = None;
+    loop {
+        let (event, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => (event, true),
+            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
+            Ok(quick_xml::events::Event::End(_)) => {
+                if stack.pop().as_deref() == Some(b"style".as_slice()) {
+                    open = None;
+                }
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) => return Ok(()),
+            Ok(_) => {
+                nodes += 1;
+                if nodes > MAX_XML_NODES {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                buffer.clear();
+                continue;
+            }
+            Err(_) => return Err(DocumentError::Malformed),
+        };
+        nodes += 1;
+        if nodes > MAX_XML_NODES || (start && stack.len() >= MAX_XML_DEPTH) {
+            return Err(DocumentError::ResourceLimit);
+        }
+        let local = xml_local_name(event.name().as_ref()).to_vec();
+        let value = || {
+            xml_attribute_values(&event, b"val")
+                .into_iter()
+                .next()
+                .map(|value| value.trim().to_string())
+        };
+        match local.as_slice() {
+            b"style" if start => {
+                open = xml_attribute_values(&event, b"styleId")
+                    .into_iter()
+                    .next()
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| id.len() <= MAX_STYLE_ID_BYTES);
+                if let Some(id) = &open {
+                    if numbering.styles.len() >= MAX_DOCX_STYLES
+                        && !numbering.styles.contains_key(id)
+                    {
+                        return Err(DocumentError::ResourceLimit);
+                    }
+                    numbering.styles.entry(id.clone()).or_default();
+                }
+            }
+            b"basedOn" if xml_path_ends_with(&stack, &[b"style"]) => {
+                if let (Some(id), Some(base)) = (&open, value()) {
+                    numbering.styles.entry(id.clone()).or_default().based_on = Some(base);
+                }
+            }
+            b"numId" if xml_path_ends_with(&stack, &[b"style", b"pPr", b"numPr"]) => {
+                if let (Some(id), Some(list)) = (&open, value().and_then(|list| list.parse().ok()))
+                {
+                    numbering.styles.entry(id.clone()).or_default().list = Some(list);
+                }
+            }
+            b"ilvl" if xml_path_ends_with(&stack, &[b"style", b"pPr", b"numPr"]) => {
+                if let (Some(id), Some(level)) =
+                    (&open, value().and_then(|level| level.parse::<usize>().ok()))
+                {
+                    numbering.styles.entry(id.clone()).or_default().level =
+                        Some(level.min(DOCX_LIST_LEVELS - 1));
+                }
+            }
+            _ => {}
+        }
+        if start {
+            stack.push(local);
+        }
+        buffer.clear();
+    }
+}
+
+/// Read a numbering part's list definitions, streamed under AnyDoc's depth
+/// and node bounds.
+fn docx_numbering_definitions(
+    reader: impl std::io::BufRead,
+) -> Result<DocxNumbering, DocumentError> {
+    let mut reader = quick_xml::Reader::from_reader(reader);
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut nodes = 0usize;
+    let mut numbering = DocxNumbering::default();
+    // The open definition or list instance, and the open level in it.
+    let mut definition: Option<String> = None;
+    let mut list: Option<u64> = None;
+    let mut level: Option<usize> = None;
+    let level_of = |event: &quick_xml::events::BytesStart<'_>| {
+        xml_attribute_values(event, b"ilvl")
+            .iter()
+            .find_map(|value| value.trim().parse::<usize>().ok())
+            .map(|level| level.min(DOCX_LIST_LEVELS - 1))
+    };
+    loop {
+        let (event, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => (event, true),
+            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
+            Ok(quick_xml::events::Event::End(_)) => {
+                match stack.pop().as_deref() {
+                    Some(b"abstractNum") => definition = None,
+                    Some(b"num") => list = None,
+                    Some(b"lvl") | Some(b"lvlOverride") => level = None,
+                    _ => {}
+                }
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) => return Ok(numbering),
+            Ok(_) => {
+                nodes += 1;
+                if nodes > MAX_XML_NODES {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                buffer.clear();
+                continue;
+            }
+            Err(_) => return Err(DocumentError::Malformed),
+        };
+        nodes += 1;
+        if nodes > MAX_XML_NODES || (start && stack.len() >= MAX_XML_DEPTH) {
+            return Err(DocumentError::ResourceLimit);
+        }
+        let local = xml_local_name(event.name().as_ref()).to_vec();
+        let value = |name: &[u8]| {
+            xml_attribute_values(&event, name)
+                .into_iter()
+                .next()
+                .map(|value| value.trim().to_string())
+        };
+        match local.as_slice() {
+            b"abstractNum" if stack.len() == 1 => definition = value(b"abstractNumId"),
+            b"num" if stack.len() == 1 => {
+                list = value(b"numId").and_then(|id| id.parse().ok());
+                if let Some(id) = list {
+                    numbering.lists.entry(id).or_default();
+                }
+            }
+            b"abstractNumId" if list.is_some() && xml_path_ends_with(&stack, &[b"num"]) => {
+                if let (Some(id), Some(definition)) = (list, value(b"val")) {
+                    numbering.lists.entry(id).or_default().definition = definition;
+                }
+            }
+            b"numStyleLink" | b"styleLink" if definition.is_some() => {
+                if let (Some(definition), Some(style)) = (definition.clone(), value(b"val")) {
+                    numbering.links.insert(definition, style);
+                }
+            }
+            b"lvlOverride" if list.is_some() => {
+                level = level_of(&event);
+                if let (Some(id), Some(level)) = (list, level) {
+                    // An override restarts the level's count.
+                    numbering
+                        .lists
+                        .entry(id)
+                        .or_default()
+                        .overridden
+                        .insert(level);
+                }
+            }
+            b"lvl" => {
+                if definition.is_some() {
+                    level = level_of(&event);
+                }
+                let key = match (&definition, list, level) {
+                    (Some(definition), _, Some(level)) => Some((definition.clone(), level)),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    numbering.formats.entry(key).or_insert(None);
+                } else if let (Some(id), Some(level)) = (list, level) {
+                    numbering
+                        .lists
+                        .entry(id)
+                        .or_default()
+                        .formats
+                        .entry(level)
+                        .or_insert(None);
+                }
+            }
+            b"numFmt" if xml_path_ends_with(&stack, &[b"lvl"]) => {
+                if let Some(format) = value(b"val") {
+                    match (&definition, list, level) {
+                        (Some(definition), _, Some(level)) => {
+                            numbering
+                                .formats
+                                .insert((definition.clone(), level), Some(format));
+                        }
+                        (None, Some(id), Some(level)) => {
+                            numbering
+                                .lists
+                                .entry(id)
+                                .or_default()
+                                .formats
+                                .insert(level, Some(format));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
         if start {
             stack.push(local);
@@ -5018,6 +5478,7 @@ fn preflight_package(
     if matches!(kind, DocumentKind::Docx) {
         let mut hidden_styles = HashSet::new();
         let mut defaults_hidden = false;
+        let mut style_numbering = DocxStyleNumbering::default();
         for part in &layout.styles_parts {
             let Ok(entry) = archive.by_name(part) else {
                 continue;
@@ -5026,6 +5487,13 @@ fn preflight_package(
                 docx_hidden_styles(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
             hidden_styles.extend(styles);
             defaults_hidden |= defaults;
+            let Ok(entry) = archive.by_name(part) else {
+                continue;
+            };
+            docx_style_numbering(
+                open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?,
+                &mut style_numbering,
+            )?;
         }
         let mut hidden_labels = false;
         let mut label_styles = HashSet::new();
@@ -5037,6 +5505,12 @@ fn preflight_package(
                 docx_numbering_labels(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
             hidden_labels |= hidden;
             label_styles.extend(styles);
+            let Ok(entry) = archive.by_name(part) else {
+                continue;
+            };
+            let numbering =
+                docx_numbering_definitions(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
+            result.list_numbering_differs |= numbering.numbers_differ(&docx_scan, &style_numbering);
         }
         result.hidden_content |= hidden_labels
             || label_styles
@@ -5224,6 +5698,14 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
         warnings.push(DocumentWarning {
             code: "characters_omitted".into(),
             message: "The document uses non-breaking hyphens, which the converter drops; hyphenated terms such as form numbers may appear joined."
+                .into(),
+        });
+    }
+    if kind == DocumentKind::Docx && preflight.list_numbering_differs {
+        completeness = Completeness::Partial;
+        warnings.push(DocumentWarning {
+            code: "list_numbering_differs".into(),
+            message: "Some list numbers differ from what Word shows: a list continuing another, a numbered paragraph deleted with tracked changes, or a format such as ordinals or words. The list text is converted."
                 .into(),
         });
     }
@@ -8156,6 +8638,124 @@ mod tests {
             pptx_slide_relationship_ids(presentation.as_bytes()),
             Err(DocumentError::Malformed)
         ));
+    }
+
+    #[test]
+    fn docx_list_numbers_word_shows_differently_are_disclosed() {
+        let item = |list: u32, level: u32, extra: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{list}"/></w:numPr>{extra}</w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#
+            )
+        };
+        let definition = |id: u32, format: &str| {
+            format!(
+                r#"<w:abstractNum w:abstractNumId="{id}"><w:lvl w:ilvl="0"><w:start w:val="1"/>{format}<w:lvlText w:val="%1."/></w:lvl></w:abstractNum>"#
+            )
+        };
+        let decimal = r#"<w:numFmt w:val="decimal"/>"#;
+        let differs = |body: String, numbering: String, styles: &str| {
+            let document = word_part("document", &body);
+            let numbering = format!("<w:numbering {WORD_NS}>{numbering}</w:numbering>");
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let two_lists = |second: &str| {
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/>{second}</w:num>"#,
+                definition(0, decimal)
+            )
+        };
+        let items = format!("{}{}", item(1, 0, ""), item(2, 0, ""));
+        // A second list instance of one definition continues Word's count;
+        // AnyDoc restarts it, unless the instance restarts the level.
+        assert!(differs(items.clone(), two_lists(""), ""));
+        assert!(!differs(
+            items.clone(),
+            two_lists(r#"<w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride>"#),
+            ""
+        ));
+        assert!(!differs(
+            format!("{}{}", item(1, 0, ""), item(1, 0, "")),
+            two_lists(""),
+            ""
+        ));
+        // Numbering through a paragraph style counts too.
+        let heading = r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:basedOn w:val="Heading1"/></w:style>"#;
+        let styled = |style: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>Head</w:t></w:r></w:p>"#
+            )
+        };
+        assert!(differs(
+            format!("{}{}", styled("Heading2"), item(2, 0, "")),
+            two_lists(""),
+            heading
+        ));
+        assert!(!differs(
+            format!("{}{}", styled("Heading2"), styled("Heading1")),
+            two_lists(""),
+            heading
+        ));
+        // A deleted numbered paragraph still takes a number in AnyDoc.
+        let one_list = format!(
+            r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+            definition(0, decimal)
+        );
+        for revision in ["del", "moveFrom"] {
+            let deleted = item(
+                1,
+                0,
+                &format!(r#"<w:rPr><w:{revision} w:id="1" w:author="A"/></w:rPr>"#),
+            );
+            assert!(
+                differs(format!("{}{deleted}", item(1, 0, "")), one_list.clone(), ""),
+                "{revision}"
+            );
+        }
+        assert!(!differs(item(1, 0, ""), one_list.clone(), ""));
+        // Formats AnyDoc renders as plain decimals, or as bullets.
+        let formatted = |format: &str| {
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+                definition(0, format)
+            )
+        };
+        for format in ["ordinal", "cardinalText", "decimalZero"] {
+            assert!(
+                differs(
+                    item(1, 0, ""),
+                    formatted(&format!(r#"<w:numFmt w:val="{format}"/>"#)),
+                    ""
+                ),
+                "{format}"
+            );
+        }
+        assert!(differs(item(1, 0, ""), formatted(""), ""));
+        for format in ["decimal", "bullet", "lowerRoman", "upperLetter", "none"] {
+            assert!(
+                !differs(
+                    item(1, 0, ""),
+                    formatted(&format!(r#"<w:numFmt w:val="{format}"/>"#)),
+                    ""
+                ),
+                "{format}"
+            );
+        }
+        // Letters past `z` count differently.
+        let letters = formatted(r#"<w:numFmt w:val="lowerLetter"/>"#);
+        assert!(!differs(item(1, 0, "").repeat(26), letters.clone(), ""));
+        assert!(differs(item(1, 0, "").repeat(27), letters, ""));
+        // A list style's definitions share counters through the style.
+        let linked = format!(
+            r#"{}<w:abstractNum w:abstractNumId="1"><w:numStyleLink w:val="Outline"/></w:abstractNum><w:abstractNum w:abstractNumId="2"><w:styleLink w:val="Outline"/><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="2"/></w:num>"#,
+            definition(0, decimal)
+        );
+        assert!(differs(items, linked, ""));
     }
 
     #[test]
