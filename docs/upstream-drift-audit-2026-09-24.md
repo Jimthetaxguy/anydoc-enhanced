@@ -97,7 +97,7 @@ reach this repository:
 | #583 | Explicit invisible-text inclusion in positioned extraction | Not exposed; the region tools keep upstream's default. |
 | #584 | A fork's fixes: CIDs a ToUnicode CMap never names, filled per code from the embedded font's cmap; Hebrew right-to-left order and number separators | From the 1.24.0 source: a code without an entry is read from the codes around it where they spell it out and is otherwise U+FFFD, both counted per font in `cmap_gaps`, which the PDF tools return, and U+FFFD also sets `has_encoding_issues`. The fork's recovery from the embedded font is not adopted, so such a letter stays visible as lost. The right-to-left fixes concern Hebrew text order, outside this repository's corpus. |
 | #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
-| #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. #532 is reported as `word_gaps_misread` on each page with a gap 1.24.0 judges otherwise than the fix would; checked against pdf-inspector patched with the fix, it names every changed page it checks and no other. #531's split words are not detected; its #406 half is reported as `table_row_repeated`. |
+| #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. #532 is reported as `word_gaps_misread` on each page with a gap 1.24.0 judges otherwise than the fix would; checked against pdf-inspector patched with the fix, it names every changed page it checks and no other. #531's split words are reported the same way where a font paints its word spaces as glyphs: each page whose own text splits a word it shows glyph by glyph (203 of 270 randomized browser-printed pages whose Markdown splits one, none in error; the 67 missed mostly leave spaces as gaps). Its #406 half is reported as `table_row_repeated`. Small capitals set as one string after a first letter are split too ("(A) L imitations" in the public Title 26 chapter 6 sample) and are not reported. |
 
 Thirteen open pull requests that reach the PDF tools were checked against
 1.24.0 with generated fixtures run through the server. Twelve defects are
@@ -273,8 +273,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 258 tests pass (204 skillkit unit, 13
-  skillkit integration, 29 document-tool and 9 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 262 tests pass (207 skillkit unit, 13
+  skillkit integration, 29 document-tool and 10 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI
@@ -319,7 +319,12 @@ Run on Linux x86-64 with Rust 1.94.1:
   oracle over Chromium's layout of the same 800 chapters finds every one
   of the 417 in which AnyDoc runs words together refused and none of the
   383 others, and among the 3,053 review and public EPUBs only one more
-  review false refusal changed, to complete.
+  review false refusal changed, to complete. Loop 17 reports words
+  pdf-inspector splits in browser-printed text (#531): against the
+  pdf-inspector commit that fixes it, over 400 randomized pages, it names
+  203 of the 270 whose Markdown splits a word shown glyph by glyph and none
+  of the 130 others; among the 256 PDFs, only the three #531 replicas
+  changed.
 - Across 303 documents (the public corpus, 39 LibreOffice conversions, the
   round-four regression corpus, AnyDoc's 34 upstream fixtures, and the
   pull-request reproductions), every outcome change was traced to a check

@@ -281,6 +281,7 @@ came back clean. The evidence and dispositions are in
 | 15 | PDF word gaps pdf-inspector judges against the wrong space width (open upstream #532) | `word_gaps_misread` warning by page; the upstream real-estate fixture ("CBDOffice", "pricingisliketheweather") and three #532 replicas are named, and every page the fix changes among 900 randomized fonts and layouts, with none named in error |
 | Review 7 | Bypass and false-refusal review of the round-six fixes, against LibreOffice, Chromium, and AnyDoc's raw output | EPUB boxes a reader sets apart (flex and grid items, table cells, SVG text, floats holding digits, line breaks and formulas in links) and generated signs are refused, while drop caps and rules a single pass cannot settle no longer refuse a chapter: 24 review books now refused and 22 now complete, no public book changed; PDF table and repeat warnings judged by where the page sets the text; DOCX lists through notes and style levels disclosed; a large stylesheet's rules filtered by ancestor, as browsers do |
 | 16 | EPUB sibling selectors matched exactly (`h2 + p`, `h1 ~ p`, `:first-of-type`, `:last-child`), from a pass that counts siblings and the earlier siblings the walk keeps | Against Chromium's layout of 800 randomized chapters, every one of the 417 in which AnyDoc runs words together is refused and none of the 383 others; round seven missed 13 and refused 1 in error |
+| 17 | PDF words pdf-inspector splits in text a browser printed glyph by glyph (open upstream #531) | `word_gaps_misread` names the page; on 400 randomized browser-printed pages, 203 of the 270 whose Markdown splits a word are named and none of the 130 others; among 256 corpus and fixture PDFs only the three #531 replicas change |
 
 ## Next slices
 
@@ -296,14 +297,17 @@ came back clean. The evidence and dispositions are in
    numbering, and format models, which mirror 0.2.4's behavior.
 3. **Next pdf-inspector release.** If #479 or #501 lands, compare its
    invisible-layer handling with the local scan before removing either; if
-   #317, #377, #406, #424, #443, or #532 lands, retire the matching warning
-   once a fixture shows the release reads it right; if #578 lands, PDF
-   Markdown gains link destinations and must pass through the sanitizer.
+   #317, #377, #406, #424, #443, #531, or #532 lands, retire the matching
+   warning once a fixture shows the release reads it right; if #578 lands,
+   PDF Markdown gains link destinations and must pass through the
+   sanitizer.
 4. **PDF defects not yet detected.** From the open pull requests: amounts
    pushed out of their rows (#424), receipts read as scans (#445), forms with
-   indirect or missing resources (#407, #312), rotated headers (#298),
-   browser-printed words (#531), and blank pages (#339). Each has a generated fixture and a proposed local check in
-   the drift audit. A leaner content tokenizer would also cut the repeat
+   indirect or missing resources (#407, #312), rotated headers (#298), and
+   blank pages (#339). Each has a generated fixture and a proposed local
+   check in the drift audit. Browser-printed words whose spaces are gaps
+   rather than glyphs, and small capitals set as one string after a first
+   letter, are still missed by the #531 check. A leaner content tokenizer would also cut the repeat
    check's 20-30% share of `pdf_to_markdown`.
 5. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
    external relationship, including an ordinary hyperlink, while DOCX converts

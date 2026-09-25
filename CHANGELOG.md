@@ -187,6 +187,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Words pdf-inspector 1.24.0 splits in text a browser printed glyph by glyph
+  (open upstream #531) are reported. Chromium's print to PDF shows each
+  glyph as a string of its own, placed at the whole-pixel advance hinting
+  gave it, while the font's widths keep the unhinted advance; a glyph set
+  wider than its width crosses pdf-inspector's word-gap threshold, so the
+  upstream fixture read "LIAB ILITIES" and a statement "B ALANCE DUE". Where
+  a font paints its word spaces as glyphs, which say where its words end,
+  the page scan collects the words it shows glyph by glyph. When the
+  Markdown shows one split by a space or a cell edge, the pages showing it
+  are read again as pdf-inspector places their text, and each page whose
+  own text splits it carries the `word_gaps_misread` warning; the Markdown
+  is not changed. On 400 randomized browser-printed pages, it names 203 of
+  the 270 whose Markdown splits such a word and none of the 130 others; 61
+  of the 67 it misses leave their word spaces as gaps. Among 256 corpus,
+  upstream-fixture, and replica PDFs, only the three #531 replicas are
+  reported, and the public samples, which the check reads again, convert
+  about 50-60 ms slower.
 - EPUB selectors that rely on siblings are matched as a reader matches
   them. Round seven counted a rule with `h2 + p`, `h1 ~ p`,
   `:first-of-type`, or `:last-child` only where digits met, because one
@@ -446,9 +463,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with few text operators and a logo read as a scan (#445); forms with
   indirect or missing resources (#407, #312), reported only through the
   garbled-text reason where it applies; rotated column headers scattered
-  into cells (#298); browser-printed words split into letters (#531);
-  and blank pages that turn the sparse-extraction rule on for every page
-  (#339). The table checks read the Markdown and name no page; the repeat
+  into cells (#298); and blank pages that turn the sparse-extraction rule
+  on for every page (#339). The table checks read the Markdown and name no page; the repeat
   check reads runs whose position is set, and stops after 4 million
   operations per document. A repeat is confirmed in the Markdown on up to
   64 pages; a later page is named while doubled text is left in the
@@ -459,7 +475,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows hold one amount. The word-gap check runs on
   the same pages; a page listed as needing OCR is not checked, and a
   dependent sign's placement and return count as two gaps, where
-  pdf-inspector nets them into one.
+  pdf-inspector nets them into one. Words printed glyph by glyph are read
+  only in a font that paints a word space as a glyph after a word on the
+  page, so a page whose words stand alone on their lines, or whose spaces
+  are gaps, is not checked. A split word's pages are read again up to 64
+  pages; past them, a page is named only when the Markdown never shows the
+  word whole. A word set in small capitals, its first letter a glyph of
+  its own and the rest one string, is not read, so the public Title 26
+  chapter 6 sample keeps "(A) L imitations" with no warning.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen

@@ -17,6 +17,7 @@ anydoc = { workspace = true }
 pdf-inspector = { workspace = true }
 lopdf = { workspace = true }
 regex = "1"
+aho-corasick = "1"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }

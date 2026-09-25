@@ -5,7 +5,7 @@
 //! the upstream API surface changes.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // Re-export upstream types that callers need
@@ -271,12 +271,56 @@ impl PdfInfo {
             .as_deref()
             .map(markdown_tables::check)
             .unwrap_or_default();
+        // Words shown glyph by glyph that the Markdown splits; the text of
+        // the pages showing them tells which pages split them.
+        let misread = self
+            .markdown
+            .as_deref()
+            .map(|markdown| glyph_words::misread(markdown, &found.glyph_words))
+            .unwrap_or_default();
+        let shared = glyph_words::pages_to_read(&misread, &found.glyph_words);
         let items = self.positions(
             buffer,
             &found.painted_twice,
             !tables.merged.is_empty(),
+            &shared,
             only,
         );
+        // Each page's text as pdf-inspector reads it, its lines ended, where
+        // a word may wrap, and the items of a line apart without a space: a
+        // gap misjudged as a word space is a space inside an item.
+        let mut page_text: HashMap<u32, String> = HashMap::new();
+        let mut line: Option<(u32, f32)> = None;
+        for item in items.iter().flatten() {
+            if shared.binary_search(&item.page).is_err() {
+                continue;
+            }
+            let text = page_text.entry(item.page).or_default();
+            match line {
+                Some((page, y)) if page != item.page || (y - item.y).abs() > 1.0 => {
+                    text.push('\n');
+                }
+                Some(_) => text.push(glyph_words::ITEM_EDGE),
+                None => {}
+            }
+            text.push_str(&item.text);
+            line = Some((item.page, item.y));
+        }
+        let mut gaps_misread = found.gaps_misread.clone();
+        gaps_misread.extend(glyph_words::split_pages(
+            &misread,
+            &found.glyph_words,
+            &page_text,
+        ));
+        gaps_misread.sort_unstable();
+        gaps_misread.dedup();
+        if !gaps_misread.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_WORD_GAPS_MISREAD,
+                "On these pages pdf-inspector 1.24.0 misjudges word gaps, so some words or amounts run together or split apart: against the wrong space width, as in \"CBDOffice\" or \"8 5,000 .00\", or at the advances of text a browser printed glyph by glyph, as in \"LIAB ILITIES\"; check amounts against the PDF.",
+                gaps_misread,
+            ));
+        }
         let painted_twice =
             self.confirm_painted_twice(found.painted_twice, &found.repeats, items.as_deref());
         if !painted_twice.is_empty() {
@@ -325,14 +369,16 @@ impl PdfInfo {
     }
 
     /// The positioned text of the pages the checks read again: the first
-    /// `MAX_CONFIRMED_PAGES` pages painting text twice, and, when a table
-    /// cell holds two amounts, as many of the pages converted. `None` when
-    /// it cannot be read.
+    /// `MAX_CONFIRMED_PAGES` pages painting text twice, as many of the pages
+    /// sharing a word shown glyph by glyph that the Markdown splits, and,
+    /// when a table cell holds two amounts, as many of the pages converted.
+    /// `None` when it cannot be read.
     fn positions(
         &self,
         buffer: &[u8],
         painted_twice: &[u32],
         tables: bool,
+        glyph_words: &[u32],
         only: Option<&HashSet<u32>>,
     ) -> Option<Vec<pdf_inspector::TextItem>> {
         let mut wanted: HashSet<u32> = painted_twice
@@ -340,6 +386,7 @@ impl PdfInfo {
             .take(MAX_CONFIRMED_PAGES)
             .copied()
             .collect();
+        wanted.extend(glyph_words.iter().take(MAX_CONFIRMED_PAGES));
         if tables {
             wanted.extend(
                 (1..=self.page_count)
@@ -390,13 +437,6 @@ impl PdfInfo {
             text_paints::scan(buffer, &layer_skip, twice_skip.as_ref(), only)
         }))
         .unwrap_or_default();
-        if !found.gaps_misread.is_empty() {
-            self.warnings.push(PdfWarning::new(
-                PDF_WARNING_WORD_GAPS_MISREAD,
-                "On these pages pdf-inspector 1.24.0 measures word gaps against the wrong space width, so some words or amounts run together or split apart, as in \"CBDOffice\" or \"8 5,000 .00\"; check amounts against the PDF.",
-                found.gaps_misread.clone(),
-            ));
-        }
         if found.hidden_layer.is_empty() {
             return found;
         }
@@ -496,6 +536,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 pub mod document;
 pub mod domain;
 mod doubled_text;
+mod glyph_words;
 mod markdown_tables;
 pub mod pdf_worker;
 mod text_paints;

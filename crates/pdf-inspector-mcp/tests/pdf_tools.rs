@@ -429,6 +429,132 @@ fn word_gaps_judged_against_the_wrong_space_are_reported() {
     );
 }
 
+/// The bold serif glyphs of `glyph_by_glyph_pdf`: each glyph's width in
+/// thousandths of an em, and the whole-pixel advance a browser hints it to
+/// at 8 px.
+const HINTED_GLYPHS: &[(char, u32, u32)] = &[
+    (' ', 250, 2),
+    ('A', 722, 6),
+    ('B', 667, 6),
+    ('C', 722, 6),
+    ('D', 722, 6),
+    ('E', 667, 5),
+    ('F', 611, 5),
+    ('I', 389, 3),
+    ('L', 667, 5),
+    ('M', 944, 8),
+    ('N', 722, 6),
+    ('P', 611, 5),
+    ('R', 722, 6),
+    ('S', 556, 4),
+    ('T', 667, 5),
+    ('U', 722, 6),
+    ('Y', 722, 6),
+];
+
+/// A page a browser printed glyph by glyph, one string per glyph and each
+/// word space painted as a space glyph, at advances hinted to whole pixels,
+/// or, when `hinted` is false, at the glyphs' own widths (pdf-inspector
+/// #531).
+fn glyph_by_glyph_pdf(hinted: bool) -> Vec<u8> {
+    let glyph = |character: char| {
+        HINTED_GLYPHS
+            .iter()
+            .find(|(known, ..)| *known == character)
+            .expect("a glyph of the font")
+    };
+    let mut content = String::from("1 0 0 -1 0 792 cm 0.75 0 0 0.75 0 0 cm\n");
+    for (y, text) in [
+        (60, "LIABILITIES"),
+        (80, "BALANCE DUE AFTER PAYMENTS AND CREDITS"),
+    ] {
+        content.push_str(&format!("BT /F1 8 Tf 1 0 0 -1 0 0 Tm 40 -{y} Td"));
+        for (index, character) in text.chars().enumerate() {
+            if index > 0 {
+                let (_, width, advance) = glyph(text.chars().nth(index - 1).expect("glyph"));
+                let travel = if hinted {
+                    f64::from(*advance)
+                } else {
+                    f64::from(*width) * 8.0 / 1000.0
+                };
+                content.push_str(&format!(" {travel} 0 Td"));
+            }
+            content.push_str(&format!(" <{:02x}> Tj", u32::from(character)));
+        }
+        content.push_str(" ET\n");
+    }
+    let widths: Vec<String> = (32..=90u8)
+        .map(|code| {
+            HINTED_GLYPHS
+                .iter()
+                .find(|(known, ..)| *known == char::from(code))
+                .map_or(0, |(_, width, _)| *width)
+                .to_string()
+        })
+        .collect();
+    let font = format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /SyntheticSerif-Bold /FirstChar 32 \
+         /LastChar 90 /Widths [{}] /Encoding /WinAnsiEncoding >>",
+        widths.join(" ")
+    );
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        font.into_bytes(),
+        stream("", content.as_bytes()),
+    ])
+}
+
+#[test]
+fn words_split_at_hinted_glyph_advances_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let hinted = temporary.path().join("hinted.pdf");
+    std::fs::write(&hinted, glyph_by_glyph_pdf(true)).expect("write PDF");
+    let exact = temporary.path().join("exact.pdf");
+    std::fs::write(&exact, glyph_by_glyph_pdf(false)).expect("write PDF");
+    let results = call_tools(
+        &[
+            (
+                "pdf_to_markdown",
+                serde_json::json!({ "path": hinted.to_str().expect("UTF-8 path") }),
+            ),
+            (
+                "pdf_to_markdown",
+                serde_json::json!({ "path": exact.to_str().expect("UTF-8 path") }),
+            ),
+        ],
+        None,
+    );
+    let reported = |result: &serde_json::Value| {
+        result["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning["code"] == "word_gaps_misread" && warning["pages"] == serde_json::json!([1])
+            })
+        })
+    };
+    assert!(reported(&results[0]), "{}", results[0]);
+    // pdf-inspector 1.24.0 splits a word at a hinted advance narrower than
+    // the glyph; when a release fixes #531, this expectation goes.
+    assert!(
+        results[0]["markdown"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("LIAB ILITIES")),
+        "{}",
+        results[0]
+    );
+    // Glyphs advanced by their own widths are read whole, and nothing is
+    // reported.
+    assert!(!reported(&results[1]), "{}", results[1]);
+    assert!(
+        results[1]["markdown"].as_str().is_some_and(
+            |markdown| markdown.contains("LIABILITIES") && markdown.contains("BALANCE DUE")
+        ),
+        "{}",
+        results[1]
+    );
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

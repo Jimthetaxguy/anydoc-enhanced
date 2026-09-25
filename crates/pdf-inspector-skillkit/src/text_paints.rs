@@ -33,6 +33,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
 
+use crate::glyph_words::{Glyph, GlyphFonts, GlyphWords};
 use crate::word_gaps::{leading_travel, shows_glyphs, Candidate, GapFont, GapFonts, Shown};
 
 /// Bytes any one content stream may decode to.
@@ -123,6 +124,9 @@ struct State {
     /// The font, when pdf-inspector and its fix take different word-gap
     /// thresholds from it and the page is checked for them.
     gaps: Option<GapFont>,
+    /// The font, when its glyph codes can be read and the page is checked
+    /// for words shown glyph by glyph.
+    glyph_font: Option<usize>,
     size: f64,
     char_spacing: f64,
     word_spacing: f64,
@@ -138,6 +142,7 @@ impl State {
         render_mode: 0,
         font: false,
         gaps: None,
+        glyph_font: None,
         size: 0.0,
         char_spacing: 0.0,
         word_spacing: 0.0,
@@ -317,6 +322,10 @@ struct PageText {
     /// its fix would, and the fonts read for that so far in the document.
     gaps_misread: bool,
     gap_fonts: GapFonts,
+    /// The words shown glyph by glyph, when the page is read for them, and
+    /// the fonts read for that so far in the document.
+    glyph_words: Option<GlyphWords>,
+    glyph_fonts: GlyphFonts,
 }
 
 impl PageText {
@@ -370,6 +379,38 @@ impl PageText {
     fn ended(&mut self) {
         self.text_object_ended();
         self.restore_to(0);
+    }
+
+    /// Note a string for the words shown glyph by glyph: one glyph placed
+    /// where the text matrix says, as pdf-inspector reads it, or anything
+    /// else, which ends the word being shown.
+    fn note_glyph(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], placed: bool) {
+        let Some(words) = self.glyph_words.as_mut() else {
+            return;
+        };
+        let matrix = multiply(text_matrix, state.ctm);
+        let at = [
+            matrix[2] * state.rise + matrix[4],
+            matrix[3] * state.rise + matrix[5],
+        ];
+        let em = [matrix[0] * state.size, matrix[1] * state.size];
+        let known = placed && at.iter().chain(&em).all(|value| value.is_finite());
+        let font = state
+            .glyph_font
+            .filter(|_| state.font && state.render_mode != 3);
+        match (font, known) {
+            (Some(font), true) => match self.glyph_fonts.one_glyph(font, bytes) {
+                Some(reading) => words.glyph(Glyph {
+                    font,
+                    reading,
+                    at,
+                    em,
+                }),
+                None => words.interrupt(Some(at), self.glyph_fonts.first_glyph(font, bytes)),
+            },
+            (None, true) => words.interrupt(Some(at), None),
+            (_, false) => words.interrupt(None, None),
+        }
     }
 
     /// Note a visible run whose start the text matrix says.
@@ -448,7 +489,14 @@ pub(crate) struct Findings {
     /// Where the visible runs placed on the pages read for repeats start,
     /// up to `MAX_PLACED_RUNS`.
     pub(crate) placed: Vec<Placed>,
+    /// Words shown glyph by glyph in fonts that paint their spaces, on the
+    /// pages read for repeats, with the page and how often, up to
+    /// `MAX_GLYPH_WORDS`.
+    pub(crate) glyph_words: Vec<(u32, String, u32)>,
 }
+
+/// Words shown glyph by glyph kept across a document.
+const MAX_GLYPH_WORDS: usize = 65_536;
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
 /// invisible layer; pages are checked for text painted twice only when
@@ -472,6 +520,7 @@ pub(crate) fn scan(
     let mut repeat_budget = Budget::new(MAX_REPEAT_CONTENT_BYTES, MAX_REPEAT_OPERATIONS);
     let mut repeats = twice_skip.is_some();
     let mut gap_fonts = GapFonts::default();
+    let mut glyph_fonts = GlyphFonts::default();
     let mut found = Findings::default();
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
@@ -486,6 +535,7 @@ pub(crate) fn scan(
             layer: &mut layer_budget,
             repeat: &mut repeat_budget,
             gap_fonts: &mut gap_fonts,
+            glyph_fonts: &mut glyph_fonts,
         };
         match scan_page(&document, page_id, check_layer, check_twice, budgets) {
             Ok(page) => {
@@ -495,6 +545,13 @@ pub(crate) fn scan(
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
                 }
+                let room = MAX_GLYPH_WORDS.saturating_sub(found.glyph_words.len());
+                found.glyph_words.extend(
+                    page.glyph_words
+                        .into_iter()
+                        .take(room)
+                        .map(|(text, count)| (number, text, count)),
+                );
                 let room = MAX_PLACED_RUNS.saturating_sub(found.placed.len());
                 found.placed.extend(
                     page.placed
@@ -528,6 +585,7 @@ struct Budgets<'a> {
     layer: &'a mut Budget,
     repeat: &'a mut Budget,
     gap_fonts: &'a mut GapFonts,
+    glyph_fonts: &'a mut GlyphFonts,
 }
 
 /// What the scan found on one page.
@@ -540,6 +598,8 @@ struct PageFindings {
     /// Where placed runs start, measured from the visible box, and whether
     /// they are plain.
     placed: Vec<([f64; 2], bool)>,
+    /// Words shown glyph by glyph in fonts that paint their spaces.
+    glyph_words: Vec<(String, u32)>,
 }
 
 fn scan_page(
@@ -567,6 +627,7 @@ fn scan_page(
         layer,
         repeat,
         gap_fonts,
+        glyph_fonts,
     } = budgets;
     let budget = if check_layer { layer } else { repeat };
     let mut content = Vec::new();
@@ -585,6 +646,8 @@ fn scan_page(
     let mut page = PageText {
         runs: check_twice.then(Runs::default),
         gap_fonts: std::mem::take(gap_fonts),
+        glyph_words: check_twice.then(GlyphWords::default),
+        glyph_fonts: std::mem::take(glyph_fonts),
         ..PageText::default()
     };
     page.save();
@@ -600,6 +663,7 @@ fn scan_page(
         budget,
     );
     *gap_fonts = std::mem::take(&mut page.gap_fonts);
+    *glyph_fonts = std::mem::take(&mut page.glyph_fonts);
     executed?;
     page.ended();
     let placed = page
@@ -612,10 +676,16 @@ fn scan_page(
                 .collect()
         })
         .unwrap_or_default();
+    let glyph_words = page
+        .glyph_words
+        .take()
+        .map(GlyphWords::finish)
+        .unwrap_or_default();
     Ok(PageFindings {
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
         placed,
+        glyph_words,
         repeats: page
             .runs
             .map(|runs| {
@@ -711,6 +781,12 @@ fn execute<'a>(
                         .filter(|_| page.runs.is_some())
                         .and_then(|name| font(document, resources, name))
                         .and_then(|font| page.gap_fonts.font(document, font));
+                    state.glyph_font = name
+                        .as_name()
+                        .ok()
+                        .filter(|_| page.glyph_words.is_some())
+                        .and_then(|name| font(document, resources, name))
+                        .and_then(|font| page.glyph_fonts.font(document, font));
                     if let Some(size) = number(document, size) {
                         state.size = size;
                     }
@@ -793,6 +869,7 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
+                page.note_glyph(state, text_matrix, &bytes, placed && in_text);
                 if let Some(text) = text.filter(|_| in_text && !page.gaps_misread) {
                     // A run that shows glyphs decides for the string before.
                     if shows_glyphs(text) {
@@ -843,6 +920,9 @@ fn execute<'a>(
             "Do" => {
                 // What a form or an image paints continues no string.
                 pending = None;
+                if let Some(words) = page.glyph_words.as_mut() {
+                    words.interrupt(None, None);
+                }
                 let Some(name) = operands.first().and_then(|name| name.as_name().ok()) else {
                     continue;
                 };
