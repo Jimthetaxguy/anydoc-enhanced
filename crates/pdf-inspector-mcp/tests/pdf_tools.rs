@@ -455,10 +455,14 @@ const HINTED_GLYPHS: &[(char, u32, u32)] = &[
 /// A page a browser printed glyph by glyph, one string per glyph and each
 /// word space painted as a space glyph, at advances hinted to whole pixels,
 /// or, when `hinted` is false, at the glyphs' own widths (pdf-inspector
-/// #531).
-fn glyph_by_glyph_pdf(hinted: bool) -> Vec<u8> {
+/// #531). When `grouped`, the strings are as Skia writes them: a glyph whose
+/// advance is its width stays in the string before it, so a space, 2 pixels
+/// at 8, opens the string of the glyph after it, and the font never shows a
+/// space alone.
+fn glyph_by_glyph_pdf(hinted: bool, grouped: bool) -> Vec<u8> {
     glyph_by_glyph_pages(
         hinted,
+        grouped,
         &[&[
             (60, "LIABILITIES"),
             (80, "BALANCE DUE AFTER PAYMENTS AND CREDITS"),
@@ -467,7 +471,7 @@ fn glyph_by_glyph_pdf(hinted: bool) -> Vec<u8> {
 }
 
 /// Pages of `glyph_by_glyph_pdf`, each the lines given, by their height.
-fn glyph_by_glyph_pages(hinted: bool, pages: &[&[(u32, &str)]]) -> Vec<u8> {
+fn glyph_by_glyph_pages(hinted: bool, grouped: bool, pages: &[&[(u32, &str)]]) -> Vec<u8> {
     let glyph = |character: char| {
         HINTED_GLYPHS
             .iter()
@@ -505,19 +509,28 @@ fn glyph_by_glyph_pages(hinted: bool, pages: &[&[(u32, &str)]]) -> Vec<u8> {
         let mut content = String::from("1 0 0 -1 0 792 cm 0.75 0 0 0.75 0 0 cm\n");
         for (y, text) in lines.iter() {
             content.push_str(&format!("BT /F1 8 Tf 1 0 0 -1 0 0 Tm 40 -{y} Td"));
-            for (position, character) in text.chars().enumerate() {
-                if position > 0 {
-                    let (_, width, advance) = glyph(text.chars().nth(position - 1).expect("glyph"));
+            // The open string's glyphs, and the pen's travel since it began.
+            let (mut string, mut since) = (String::new(), 0.0);
+            let mut previous: Option<char> = None;
+            for character in text.chars() {
+                if let Some(previous) = previous {
+                    let (_, width, advance) = glyph(previous);
+                    let declared = f64::from(*width) * 8.0 / 1000.0;
                     let travel = if hinted {
                         f64::from(*advance)
                     } else {
-                        f64::from(*width) * 8.0 / 1000.0
+                        declared
                     };
-                    content.push_str(&format!(" {travel} 0 Td"));
+                    since += travel;
+                    if !grouped || (travel - declared).abs() > 1e-9 {
+                        content.push_str(&format!(" <{string}> Tj {since} 0 Td"));
+                        (string, since) = (String::new(), 0.0);
+                    }
                 }
-                content.push_str(&format!(" <{:02x}> Tj", u32::from(character)));
+                string.push_str(&format!("{:02x}", u32::from(character)));
+                previous = Some(character);
             }
-            content.push_str(" ET\n");
+            content.push_str(&format!(" <{string}> Tj ET\n"));
         }
         objects.push(
             format!(
@@ -536,9 +549,11 @@ fn glyph_by_glyph_pages(hinted: bool, pages: &[&[(u32, &str)]]) -> Vec<u8> {
 fn words_split_at_hinted_glyph_advances_are_reported() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");
     let hinted = temporary.path().join("hinted.pdf");
-    std::fs::write(&hinted, glyph_by_glyph_pdf(true)).expect("write PDF");
+    std::fs::write(&hinted, glyph_by_glyph_pdf(true, false)).expect("write PDF");
     let exact = temporary.path().join("exact.pdf");
-    std::fs::write(&exact, glyph_by_glyph_pdf(false)).expect("write PDF");
+    std::fs::write(&exact, glyph_by_glyph_pdf(false, false)).expect("write PDF");
+    let grouped = temporary.path().join("grouped.pdf");
+    std::fs::write(&grouped, glyph_by_glyph_pdf(true, true)).expect("write PDF");
     let results = call_tools(
         &[
             (
@@ -548,6 +563,10 @@ fn words_split_at_hinted_glyph_advances_are_reported() {
             (
                 "pdf_to_markdown",
                 serde_json::json!({ "path": exact.to_str().expect("UTF-8 path") }),
+            ),
+            (
+                "pdf_to_markdown",
+                serde_json::json!({ "path": grouped.to_str().expect("UTF-8 path") }),
             ),
         ],
         None,
@@ -572,6 +591,16 @@ fn words_split_at_hinted_glyph_advances_are_reported() {
     // Glyphs advanced by their own widths are read whole, and nothing is
     // reported.
     assert!(!reported(&results[1]), "{}", results[1]);
+    // Strings as Skia writes them, each space in the string of the glyph
+    // after it, are read glyph by glyph too.
+    assert!(reported(&results[2]), "{}", results[2]);
+    assert!(
+        results[2]["markdown"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("LIAB ILITIES")),
+        "{}",
+        results[2]
+    );
     // A page whose words stand alone on their lines is read in a font seen
     // painting its spaces on another page.
     let alone = temporary.path().join("alone.pdf");
@@ -579,6 +608,7 @@ fn words_split_at_hinted_glyph_advances_are_reported() {
         &alone,
         glyph_by_glyph_pages(
             true,
+            false,
             &[
                 &[
                     (60, "BALANCE DUE AFTER PAYMENTS AND CREDITS"),

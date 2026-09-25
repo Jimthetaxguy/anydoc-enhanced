@@ -303,7 +303,8 @@ impl PdfInfo {
             .map(markdown_tables::check)
             .unwrap_or_default();
         // Words shown glyph by glyph that the Markdown splits; the text of
-        // the pages showing them tells which pages split them.
+        // the pages showing them tells which pages split them, those whose
+        // words step widest past their glyphs read first.
         let misread = self
             .markdown
             .as_deref()
@@ -317,6 +318,8 @@ impl PdfInfo {
             &shared,
             only,
         );
+        // Of those pages, the ones read.
+        let shared: HashSet<u32> = shared.into_iter().take(MAX_CONFIRMED_PAGES).collect();
         // The scan's run starts, turned as pdf-inspector turns the text of
         // a page that reads rotated.
         let (items, turns) = match read {
@@ -352,10 +355,13 @@ impl PdfInfo {
         // Each page's text as pdf-inspector reads it, its lines ended, where
         // a word may wrap, and the items of a line apart without a space: a
         // gap misjudged as a word space is a space inside an item.
-        let mut page_text: HashMap<u32, String> = HashMap::new();
+        let mut page_text: HashMap<u32, String> = match items {
+            Some(_) => shared.iter().map(|&page| (page, String::new())).collect(),
+            None => HashMap::new(),
+        };
         let mut line: Option<(u32, f32)> = None;
         for item in items.iter().flatten() {
-            if shared.binary_search(&item.page).is_err() {
+            if !shared.contains(&item.page) {
                 continue;
             }
             let text = page_text.entry(item.page).or_default();
@@ -455,10 +461,10 @@ impl PdfInfo {
 
     /// The positioned text of the pages the checks read again: the first
     /// `MAX_CONFIRMED_PAGES` pages painting text twice, as many of the pages
-    /// sharing a word shown glyph by glyph that the Markdown splits, and,
-    /// when a table cell holds two amounts, as many of the pages converted;
-    /// with the turn of each page whose text reads rotated, which its items
-    /// take. `None` when it cannot be read.
+    /// showing a word glyph by glyph that the Markdown splits, in the order
+    /// given, and, when a table cell holds two amounts, as many of the pages
+    /// converted; with the turn of each page whose text reads rotated, which
+    /// its items take. `None` when it cannot be read.
     fn positions(
         &self,
         buffer: &[u8],

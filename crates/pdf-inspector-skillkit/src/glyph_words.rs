@@ -1,44 +1,73 @@
 //! Words shown glyph by glyph, as browsers print text to PDF (open upstream
 //! #531).
 //!
-//! Chromium's print to PDF shows each glyph of a line as a string of its
-//! own, placed at the whole-pixel advance a hinting rasterizer laid it out
-//! at, while the font's widths keep the unhinted advances; the word spaces
-//! are painted as space glyphs of their own. A hinted glyph runs up to a
-//! fifth of an em past its declared width, over pdf-inspector 1.24.0's
-//! word-gap thresholds, so the Markdown splits words and amounts: "LIAB
-//! ILITIES", "83, 476. 03". The painted spaces say where the words end: the
-//! scan collects each word a font that paints its spaces anywhere in the
-//! document shows glyph by glyph. Where the Markdown holds such a word split
-//! by a space or a cell
-//! edge, each page showing it is read again, as pdf-inspector places its
-//! text, and reported when its own text splits it.
+//! Chromium's print to PDF places each glyph of a line at the whole-pixel
+//! advance a hinting rasterizer laid it out at, while the font's widths keep
+//! the unhinted advances; the word spaces are painted as space glyphs. Its
+//! PDF backend, Skia, starts a string at each glyph that its predecessor's
+//! width does not place, so a line is a run of strings of one glyph or a
+//! few, each placed anew, and a space often opens the string of the glyph
+//! after it. A hinted glyph runs up to a fifth of an em past its declared
+//! width, over pdf-inspector 1.24.0's word-gap thresholds, so the Markdown
+//! splits words and amounts where two strings meet: "LIAB ILITIES", "83,
+//! 476. 03". The painted spaces say where the words end: the scan places
+//! each glyph by the font's widths and collects each word that a font
+//! painting its spaces anywhere in the document shows across two strings or
+//! more, where a string starts far enough past the glyph before it for
+//! pdf-inspector to read a space there. Where the Markdown holds such a word
+//! split by a space or a cell edge, the pages showing it are read again, as
+//! pdf-inspector places their text, and reported when their own text splits
+//! it.
 //!
 //! Glyphs are read by the font's ToUnicode map, then the names its
 //! differences give, then, for a simple font, as printable ASCII. Words are
 //! made of ASCII letters and digits and the marks numbers and dates are
-//! written with; any other character ends a word, and a glyph that cannot be
-//! read drops the word it is in.
+//! written with, and a ligature glyph stands for its letters; any other
+//! character ends a word, as does the end of a text object, since a browser
+//! writes each run of text as one, and a glyph that cannot be read drops
+//! the word it is in.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use aho_corasick::AhoCorasick;
 use lopdf::{Dictionary, Document, Object};
 use pdf_inspector::glyph_names::glyph_name_to_string;
 use pdf_inspector::tounicode::ToUnicodeCMap;
 
+use crate::word_gaps::{code_bound, resolved_array};
+
 /// Bytes a ToUnicode map may decode to.
 const MAX_CMAP_BYTES: usize = 1 << 20;
-/// ToUnicode bytes and differences entries read per document.
+/// ToUnicode bytes, differences entries, and widths read per document.
 const MAX_FONT_STEPS: usize = 16_000_000;
+/// Widths a composite font's `/W` array may give.
+const MAX_CID_WIDTHS: usize = 1 << 16;
 /// How far past the previous glyph's origin, in em along the baseline, the
-/// next glyph of a word starts: the widest glyph's advance and its hinting.
+/// next glyph of a word starts in a font whose widths are not known: the
+/// widest glyph's advance and its hinting.
 const MAX_GLYPH_STEP_EM: f64 = 1.5;
+/// How far past the previous glyph's advance, in em, the next glyph of a
+/// word starts in a font whose widths are known: no further than
+/// pdf-inspector joins two runs into one item, past which its text never
+/// splits a word.
+const MAX_GLYPH_GAP_EM: f64 = 0.5;
 /// How far off the previous glyph's baseline, in em, the next glyph of a
 /// word may sit.
 const MAX_BASELINE_SHIFT_EM: f64 = 0.2;
+/// The least step past a glyph's advance, in em, where two strings meet,
+/// at which pdf-inspector 1.24.0 may read a word space: under its least
+/// threshold, 0.08 em, and the floor it takes from a tracked run's gaps.
+const MIN_WORD_GAP_EM: f64 = 0.04;
 /// Words collected on a page, and bytes in one word.
 const MAX_WORDS_PER_PAGE: usize = 4096;
 const MAX_WORD_BYTES: usize = 64;
+/// Characters a ligature glyph may stand for.
+const MAX_LIGATURE_CHARACTERS: usize = 3;
+/// Words shown glyph by glyph kept across a document, and kept for each
+/// font not yet seen painting its spaces.
+const MAX_GLYPH_WORDS: usize = 65_536;
+const MAX_PENDING_WORDS: usize = 8_192;
 
 /// What stands between two items of a line in a page's text: neither a
 /// space nor a character of a word, so a word ends there without being
@@ -56,6 +85,60 @@ fn word_byte(byte: u8) -> bool {
     word_character(char::from(byte)) && byte.is_ascii()
 }
 
+/// What a glyph reads as, for the words the check reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Reading {
+    /// A space.
+    Space,
+    /// Characters of a word: one, or the two or three a ligature stands
+    /// for, with how many.
+    Word([u8; MAX_LIGATURE_CHARACTERS], u8),
+    /// A character no word holds, which ends a word.
+    Other,
+    /// Nothing the font says, or more than a ligature, which drops the
+    /// word it is in.
+    Unread,
+}
+
+impl Reading {
+    /// What a glyph whose font reads it as `text` is for a word.
+    fn of(text: Option<&str>) -> Reading {
+        let Some(text) = text else {
+            return Reading::Unread;
+        };
+        let mut characters = text.chars();
+        match (characters.next(), characters.next()) {
+            (None, _) => Reading::Unread,
+            (Some(' '), None) => Reading::Space,
+            (Some(character), None) if !word_character(character) => Reading::Other,
+            _ if text.len() <= MAX_LIGATURE_CHARACTERS && text.chars().all(word_character) => {
+                let mut letters = [0u8; MAX_LIGATURE_CHARACTERS];
+                letters[..text.len()].copy_from_slice(text.as_bytes());
+                Reading::Word(letters, text.len() as u8)
+            }
+            _ => Reading::Unread,
+        }
+    }
+}
+
+/// A font's glyph widths as pdf-inspector reads them, in em.
+enum Widths {
+    /// A simple font's, by code; a code its `/Widths` leaves out is none
+    /// wide.
+    Simple(Vec<f64>),
+    /// A composite font's, by code, and the width its `/DW` gives the rest.
+    Composite(HashMap<u16, f64>, f64),
+}
+
+impl Widths {
+    fn of(&self, code: u16) -> f64 {
+        match self {
+            Widths::Simple(widths) => widths.get(usize::from(code)).copied().unwrap_or(0.0),
+            Widths::Composite(widths, default) => widths.get(&code).copied().unwrap_or(*default),
+        }
+    }
+}
+
 /// How the codes of one font read.
 struct Decoder {
     /// Two bytes per code (a Type0 font with an identity encoding).
@@ -63,8 +146,13 @@ struct Decoder {
     cmap: Option<ToUnicodeCMap>,
     /// For a simple font, the name its differences give each code.
     names: HashMap<u8, String>,
+    /// Its glyphs' widths, when it gives them and its glyphs advance along
+    /// the baseline.
+    widths: Option<Widths>,
     /// What the codes read so far read as.
     read: HashMap<u16, Option<String>>,
+    /// The codes shown so far: what each reads as for a word, and its width.
+    glyphs: HashMap<u16, (Reading, Option<f64>)>,
 }
 
 impl Decoder {
@@ -88,15 +176,18 @@ impl Decoder {
         }
     }
 
-    /// What a code reads as: one character, or `None` when the font does
-    /// not say, or says more than one.
-    fn read(&self, code: u16) -> Option<char> {
-        let text = self.text(code)?;
-        let mut characters = text.chars();
-        match (characters.next(), characters.next()) {
-            (Some(character), None) => Some(character),
-            _ => None,
+    /// What a code reads as for a word, and its width, when the font gives
+    /// its widths.
+    fn glyph(&mut self, code: u16) -> (Reading, Option<f64>) {
+        if let Some(glyph) = self.glyphs.get(&code) {
+            return *glyph;
         }
+        let glyph = (
+            Reading::of(self.text(code).as_deref()),
+            self.widths.as_ref().map(|widths| widths.of(code)),
+        );
+        self.glyphs.insert(code, glyph);
+        glyph
     }
 }
 
@@ -128,16 +219,15 @@ impl GlyphFonts {
         found
     }
 
-    /// What a string shown in `font` holds, when it is one glyph: `Some`
-    /// with what the glyph reads as, if it can be read.
-    pub(crate) fn one_glyph(&self, font: usize, bytes: &[u8]) -> Option<Option<char>> {
-        let decoder = &self.decoders[font];
-        let code = match (decoder.two_byte, bytes) {
-            (false, [byte]) => u16::from(*byte),
-            (true, [high, low]) => u16::from_be_bytes([*high, *low]),
-            _ => return None,
-        };
-        Some(decoder.read(code))
+    /// Whether the font's codes are two bytes each.
+    pub(crate) fn two_byte(&self, font: usize) -> bool {
+        self.decoders[font].two_byte
+    }
+
+    /// What a code shown in `font` reads as for a word, and its width in
+    /// em, when the font gives its widths.
+    pub(crate) fn glyph(&mut self, font: usize, code: u16) -> (Reading, Option<f64>) {
+        self.decoders[font].glyph(code)
     }
 
     /// What a string shown in `font` reads as, when every glyph of it can
@@ -163,30 +253,17 @@ impl GlyphFonts {
         }
         Some(text)
     }
-
-    /// What the first glyph of a string shown in `font` reads as.
-    pub(crate) fn first_glyph(&self, font: usize, bytes: &[u8]) -> Option<char> {
-        let decoder = &self.decoders[font];
-        let code = match (decoder.two_byte, bytes) {
-            (false, [byte, ..]) => u16::from(*byte),
-            (true, [high, low, ..]) => u16::from_be_bytes([*high, *low]),
-            _ => return None,
-        };
-        decoder.read(code)
-    }
 }
 
 fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Decoder> {
     let subtype = font.get(b"Subtype").ok()?.as_name().ok()?;
-    let two_byte = match subtype {
-        b"Type0" => {
-            let encoding = font.get(b"Encoding").ok()?.as_name().ok()?;
-            if !matches!(encoding, b"Identity-H" | b"Identity-V") {
-                return None;
-            }
-            true
-        }
-        b"Type1" | b"TrueType" | b"MMType1" | b"Type3" => false,
+    let (two_byte, vertical) = match subtype {
+        b"Type0" => match font.get(b"Encoding").ok()?.as_name().ok()? {
+            b"Identity-H" => (true, false),
+            b"Identity-V" => (true, true),
+            _ => return None,
+        },
+        b"Type1" | b"TrueType" | b"MMType1" | b"Type3" => (false, false),
         _ => return None,
     };
     let cmap = font
@@ -208,11 +285,18 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
     } else {
         differences(document, font, steps)
     };
+    let widths = match (two_byte, vertical) {
+        (false, _) => simple_widths(document, font, steps),
+        (true, false) => composite_widths(document, font, steps),
+        (true, true) => None,
+    };
     Some(Decoder {
         two_byte,
         cmap,
         names,
+        widths,
         read: HashMap::new(),
+        glyphs: HashMap::new(),
     })
 }
 
@@ -249,126 +333,394 @@ fn differences(document: &Document, font: &Dictionary, steps: &mut usize) -> Has
     names
 }
 
-/// A glyph shown as a string of its own.
+/// A width, or a reference to one, whole as pdf-inspector reads it.
+fn width(document: &Document, value: &Object) -> Option<f64> {
+    let value = match value {
+        Object::Reference(id) => document.get_object(*id).ok()?,
+        value => value,
+    };
+    let width = match value {
+        Object::Integer(width) => *width as f64,
+        Object::Real(width) => f64::from(*width),
+        _ => return None,
+    };
+    (width.is_finite() && width >= 0.0).then_some(width.trunc())
+}
+
+/// A simple font's widths, from its `/FirstChar` and `/Widths`, scaled by
+/// its `/FontMatrix`, as pdf-inspector 1.24.0 reads them.
+fn simple_widths(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Widths> {
+    let first = code_bound(document, font.get(b"FirstChar").ok()?)?;
+    let last = code_bound(document, font.get(b"LastChar").ok()?)?;
+    let values = resolved_array(document, font.get(b"Widths").ok()?)?;
+    let scale = match font
+        .get(b"FontMatrix")
+        .ok()
+        .and_then(|matrix| resolved_array(document, matrix))
+        .and_then(<[Object]>::first)
+    {
+        Some(Object::Real(scale)) => f64::from(*scale).abs(),
+        Some(Object::Integer(scale)) => (*scale as f64).abs(),
+        _ => 0.001,
+    };
+    let mut widths = vec![0.0; 256];
+    for (index, value) in values.iter().enumerate() {
+        *steps += 1;
+        let code = usize::from(first) + index;
+        if code > usize::from(last) || code >= widths.len() {
+            break;
+        }
+        if let Some(width) = width(document, value) {
+            widths[code] = width * scale;
+        }
+    }
+    Some(Widths::Simple(widths))
+}
+
+/// A composite font's widths, from its descendant's `/W` and `/DW`, as
+/// pdf-inspector 1.24.0 reads them.
+fn composite_widths(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Widths> {
+    let descendant = match resolved_array(document, font.get(b"DescendantFonts").ok()?)?.first()? {
+        Object::Reference(id) => document.get_dictionary(*id).ok()?,
+        Object::Dictionary(descendant) => descendant,
+        _ => return None,
+    };
+    let default = match descendant.get(b"DW") {
+        Ok(Object::Integer(width)) => *width as f64,
+        Ok(Object::Real(width)) => f64::from(*width),
+        _ => 1000.0,
+    };
+    let code = |value: &Object| match value {
+        Object::Integer(code) => Some(*code as u16),
+        Object::Real(code) => Some(*code as u16),
+        _ => None,
+    };
+    let mut widths = HashMap::new();
+    let entries = descendant
+        .get(b"W")
+        .ok()
+        .and_then(|entries| resolved_array(document, entries))
+        .unwrap_or_default();
+    let mut index = 0;
+    // `c [w1 w2 …]` gives the codes from c on a width each; `c1 c2 w`, the
+    // codes from c1 to c2 one width.
+    while index < entries.len() && widths.len() < MAX_CID_WIDTHS && *steps <= MAX_FONT_STEPS {
+        *steps += 1;
+        let Some(start) = code(&entries[index]) else {
+            index += 1;
+            continue;
+        };
+        let listed = entries
+            .get(index + 1)
+            .and_then(|next| resolved_array(document, next));
+        if let Some(listed) = listed {
+            for (offset, value) in listed.iter().enumerate().take(MAX_CID_WIDTHS) {
+                *steps += 1;
+                if let Some(width) = width(document, value) {
+                    widths.insert(start.wrapping_add(offset as u16), width * 0.001);
+                }
+            }
+            index += 2;
+            continue;
+        }
+        let end = entries.get(index + 1).and_then(code);
+        let value = entries
+            .get(index + 2)
+            .and_then(|value| width(document, value));
+        let (Some(end), Some(value)) = (end, value) else {
+            break;
+        };
+        for code in (start..=end).take(MAX_CID_WIDTHS) {
+            *steps += 1;
+            widths.insert(code, value * 0.001);
+        }
+        index += 3;
+    }
+    Some(Widths::Composite(widths, default * 0.001))
+}
+
+/// A glyph shown in a string.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Glyph {
     /// The font it is shown in (see [`GlyphFonts`]).
     pub(crate) font: usize,
-    /// What it reads as, if it can be read.
-    pub(crate) reading: Option<char>,
+    /// What it reads as.
+    pub(crate) reading: Reading,
     /// Where its origin is, in device space.
     pub(crate) at: [f64; 2],
     /// The baseline's direction, one em long, in device space.
     pub(crate) em: [f64; 2],
+    /// How far it moves the pen along the baseline, in em, when the font's
+    /// widths say.
+    pub(crate) advance: Option<f64>,
+    /// Whether it starts its string.
+    pub(crate) first: bool,
 }
 
 /// The word being shown.
 struct Word {
     text: String,
     font: usize,
+    /// Where its last glyph is, the baseline, and how far that glyph moves
+    /// the pen.
     last: [f64; 2],
     em: [f64; 2],
-    glyphs: usize,
+    advance: Option<f64>,
+    /// How many strings hold its glyphs.
+    strings: u32,
+    /// The widest step past a glyph's advance where two of its strings
+    /// meet, in em: infinite where the advance is not known.
+    gap: f64,
+}
+
+impl Word {
+    fn new(glyph: &Glyph) -> Word {
+        Word {
+            text: String::new(),
+            font: glyph.font,
+            last: glyph.at,
+            em: glyph.em,
+            advance: glyph.advance,
+            strings: 1,
+            gap: f64::NEG_INFINITY,
+        }
+    }
+
+    /// How far past the last glyph's advance, in em, a glyph at `next`
+    /// starts, when it continues the word: on its baseline and ahead of the
+    /// last glyph, no further past it than pdf-inspector joins two runs, or,
+    /// where the advance is not known, than the widest glyph's advance.
+    fn step(&self, next: [f64; 2]) -> Option<f64> {
+        let length = self.em[0].hypot(self.em[1]);
+        if length <= 0.0 || !length.is_finite() {
+            return None;
+        }
+        let step = [next[0] - self.last[0], next[1] - self.last[1]];
+        let along = (step[0] * self.em[0] + step[1] * self.em[1]) / (length * length);
+        let across = (self.em[0] * step[1] - self.em[1] * step[0]) / (length * length);
+        if along <= 0.0 || along.is_nan() || across.abs() > MAX_BASELINE_SHIFT_EM {
+            return None;
+        }
+        match self.advance {
+            Some(advance) => Some(along - advance).filter(|gap| *gap <= MAX_GLYPH_GAP_EM),
+            None => (along <= MAX_GLYPH_STEP_EM).then_some(f64::INFINITY),
+        }
+    }
 }
 
 /// The words a page shows glyph by glyph, as the scan goes.
 #[derive(Default)]
 pub(crate) struct GlyphWords {
     current: Option<Word>,
-    /// Fonts seen painting a space glyph right after a word's glyphs.
+    /// Fonts seen painting a space glyph right after a word's glyphs, the
+    /// space at the start of its string or the word across strings.
     painting_spaces: HashSet<usize>,
-    /// Words of two glyphs or more, by text and font, with how often.
-    words: HashMap<(String, usize), u32>,
+    /// Words across two strings or more that meet a word gap apart, by text
+    /// and font, with the widest gap.
+    words: HashMap<(String, usize), f64>,
 }
 
 impl GlyphWords {
-    /// A glyph shown as a string of its own.
+    /// A glyph shown in a string, in the order the string shows them.
     pub(crate) fn glyph(&mut self, glyph: Glyph) {
-        let follows = self
+        let step = self
             .current
             .as_ref()
-            .is_some_and(|word| word.font == glyph.font && follows(word.last, word.em, glyph.at));
+            .filter(|word| word.font == glyph.font)
+            .and_then(|word| word.step(glyph.at));
         match glyph.reading {
-            Some(' ') => {
-                if follows {
+            Reading::Space => {
+                // A string of a word and its space, as most producers write
+                // text, says nothing of how the words are shown.
+                let painted = step.is_some()
+                    && self
+                        .current
+                        .as_ref()
+                        .is_some_and(|word| glyph.first || word.strings >= 2);
+                if painted {
                     self.painting_spaces.insert(glyph.font);
                 }
                 self.end_word();
             }
-            Some(character) if word_character(character) => {
-                if !follows {
-                    self.end_word();
+            Reading::Word(letters, count) => {
+                match (step, self.current.as_mut()) {
+                    (Some(step), Some(word)) => {
+                        if glyph.first {
+                            word.strings += 1;
+                            word.gap = word.gap.max(step);
+                        }
+                    }
+                    _ => {
+                        self.end_word();
+                        self.current = Some(Word::new(&glyph));
+                    }
                 }
-                let word = self.current.get_or_insert_with(|| Word {
-                    text: String::new(),
-                    font: glyph.font,
-                    last: glyph.at,
-                    em: glyph.em,
-                    glyphs: 0,
-                });
-                word.text.push(character);
+                let Some(word) = self.current.as_mut() else {
+                    return;
+                };
+                word.text
+                    .extend(letters[..usize::from(count)].iter().map(|&b| char::from(b)));
                 word.last = glyph.at;
-                word.glyphs += 1;
+                word.advance = glyph.advance;
                 if word.text.len() > MAX_WORD_BYTES {
                     self.current = None;
                 }
             }
-            Some(_) => self.end_word(),
-            None => self.current = None,
+            Reading::Other => self.end_word(),
+            Reading::Unread => self.current = None,
         }
     }
 
-    /// Text shown otherwise than a glyph at a time: a string of several
-    /// glyphs placed at `at`, whose first reads as `first`, or text or a
-    /// form whose place is not known. A word the string goes on with, as a
-    /// browser prints the small capitals of a word, is not read whole; one
-    /// it does not go on with ends where it stands.
-    pub(crate) fn interrupt(&mut self, at: Option<[f64; 2]>, first: Option<char>) {
-        let ends = match (at, self.current.as_ref()) {
-            (_, None) => return,
-            (Some(at), Some(word)) => !follows(word.last, word.em, at) || first == Some(' '),
-            (None, Some(_)) => false,
-        };
-        if ends {
-            self.end_word();
-        } else {
+    /// Text shown at `at` in a font whose glyphs are not read: a word it
+    /// goes on with is not read whole, and one it does not ends where it
+    /// stands.
+    pub(crate) fn interrupt(&mut self, at: [f64; 2]) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|word| word.step(at).is_some())
+        {
             self.current = None;
+        } else {
+            self.end_word();
         }
     }
 
-    fn end_word(&mut self) {
+    /// Text or a form whose place is not known, where the word being shown
+    /// may go on: it is not read whole.
+    pub(crate) fn lose(&mut self) {
+        self.current = None;
+    }
+
+    /// The word being shown ends here, as at the end of a text object.
+    pub(crate) fn end_word(&mut self) {
         let Some(word) = self.current.take() else {
             return;
         };
-        if word.glyphs >= 2 && self.words.len() < MAX_WORDS_PER_PAGE {
-            *self.words.entry((word.text, word.font)).or_default() += 1;
+        // pdf-inspector reads a word in one string whole, and one whose
+        // strings meet closer than a word gap.
+        if word.strings < 2 || word.gap <= MIN_WORD_GAP_EM {
+            return;
+        }
+        let key = (word.text, word.font);
+        if let Some(gap) = self.words.get_mut(&key) {
+            *gap = gap.max(word.gap);
+        } else if self.words.len() < MAX_WORDS_PER_PAGE {
+            self.words.insert(key, word.gap);
         }
     }
 
-    /// The words shown, each with its font and how often, and the fonts
+    /// The words shown, each with its font and widest gap, and the fonts
     /// seen painting their spaces.
-    pub(crate) fn finish(mut self) -> (Vec<(String, usize, u32)>, HashSet<usize>) {
+    pub(crate) fn finish(mut self) -> (Vec<(String, usize, f64)>, HashSet<usize>) {
         self.end_word();
         let words = self
             .words
             .into_iter()
-            .map(|((text, font), count)| (text, font, count))
+            .map(|((text, font), gap)| (text, font, gap))
             .collect();
         (words, self.painting_spaces)
     }
 }
 
-/// Whether a glyph at `next` continues a word whose last glyph is at `last`:
-/// on its baseline, and less than the widest advance on.
-fn follows(last: [f64; 2], em: [f64; 2], next: [f64; 2]) -> bool {
-    let length = em[0].hypot(em[1]);
-    if length <= 0.0 || !length.is_finite() {
-        return false;
+/// A word a page shows glyph by glyph in a font painting its spaces, with
+/// the widest step past a glyph's advance where its strings meet, in em
+/// (infinite where the font's widths are not known).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ShownWord {
+    pub(crate) page: u32,
+    pub(crate) text: String,
+    pub(crate) gap: f64,
+}
+
+/// Words shown glyph by glyph kept across a document: those of fonts seen
+/// painting their spaces so far, and, up to a bound for each, those of the
+/// other fonts, kept until the font is seen painting its spaces, on any
+/// page.
+pub(crate) struct KeptWords {
+    painting: HashSet<usize>,
+    /// The widest gap of each word, by page and text.
+    kept: HashMap<(u32, String), f64>,
+    pending: HashMap<usize, Vec<(u32, String, f64)>>,
+    pending_total: usize,
+    max_kept: usize,
+    max_pending: usize,
+}
+
+impl Default for KeptWords {
+    fn default() -> Self {
+        KeptWords::bounded(MAX_GLYPH_WORDS, MAX_PENDING_WORDS)
     }
-    let step = [next[0] - last[0], next[1] - last[1]];
-    let along = (step[0] * em[0] + step[1] * em[1]) / (length * length);
-    let across = (em[0] * step[1] - em[1] * step[0]) / (length * length);
-    along > 0.0 && along <= MAX_GLYPH_STEP_EM && across.abs() <= MAX_BASELINE_SHIFT_EM
+}
+
+impl KeptWords {
+    /// Keeping `max_kept` words, and `max_pending` for each font not yet
+    /// seen painting its spaces, as many in all.
+    fn bounded(max_kept: usize, max_pending: usize) -> Self {
+        KeptWords {
+            painting: HashSet::new(),
+            kept: HashMap::new(),
+            pending: HashMap::new(),
+            pending_total: 0,
+            max_kept,
+            max_pending,
+        }
+    }
+
+    /// The words a page shows, with their fonts, and the fonts it shows
+    /// painting their spaces.
+    pub(crate) fn page(
+        &mut self,
+        page: u32,
+        words: Vec<(String, usize, f64)>,
+        painting: HashSet<usize>,
+    ) {
+        for font in painting {
+            if self.painting.insert(font) {
+                let pending = self.pending.remove(&font).unwrap_or_default();
+                self.pending_total -= pending.len();
+                for (page, text, gap) in pending {
+                    self.keep(page, text, gap);
+                }
+            }
+        }
+        for (text, font, gap) in words {
+            if self.painting.contains(&font) {
+                self.keep(page, text, gap);
+                continue;
+            }
+            let pending = self.pending.entry(font).or_default();
+            if pending.len() < self.max_pending && self.pending_total < self.max_kept {
+                pending.push((page, text, gap));
+                self.pending_total += 1;
+            }
+        }
+    }
+
+    fn keep(&mut self, page: u32, text: String, gap: f64) {
+        let room = self.kept.len() < self.max_kept;
+        match self.kept.entry((page, text)) {
+            Entry::Occupied(mut kept) => {
+                let widest = kept.get().max(gap);
+                kept.insert(widest);
+            }
+            Entry::Vacant(slot) if room => {
+                slot.insert(gap);
+            }
+            Entry::Vacant(_) => {}
+        }
+    }
+
+    /// The words kept: those of the fonts seen painting their spaces.
+    pub(crate) fn finish(self) -> Vec<ShownWord> {
+        let mut words: Vec<ShownWord> = self
+            .kept
+            .into_iter()
+            .map(|((page, text), gap)| ShownWord { page, text, gap })
+            .collect();
+        words.sort_by(|one, other| (one.page, &one.text).cmp(&(other.page, &other.text)));
+        words
+    }
 }
 
 /// How often each of `patterns` stands whole in `text`, and how often split
@@ -400,7 +752,7 @@ fn counts(text: &str, patterns: &[&str]) -> (Vec<u32>, Vec<u32>) {
         }
     }
     separated.push(true);
-    let Ok(automaton) = aho_corasick::AhoCorasick::new(patterns) else {
+    let Ok(automaton) = AhoCorasick::new(patterns) else {
         return (whole, split);
     };
     // A word ends at a separator, or where a character no word holds
@@ -432,14 +784,13 @@ fn counts(text: &str, patterns: &[&str]) -> (Vec<u32>, Vec<u32>) {
     (whole, split)
 }
 
-/// The words among `words` (each with a page showing it and how often)
-/// that the Markdown shows split somewhere, each with whether it also shows
-/// it whole: which page splits them, the pages' own text tells (see
-/// [`split_pages`]).
-pub(crate) fn misread(markdown: &str, words: &[(u32, String, u32)]) -> HashMap<String, bool> {
+/// The words among `words` that the Markdown shows split somewhere, each
+/// with whether it also shows it whole: which page splits them, the pages'
+/// own text tells (see [`split_pages`]).
+pub(crate) fn misread(markdown: &str, words: &[ShownWord]) -> HashMap<String, bool> {
     let patterns: Vec<&str> = words
         .iter()
-        .map(|(_, text, _)| text.as_str())
+        .map(|word| word.text.as_str())
         .collect::<HashSet<&str>>()
         .into_iter()
         .collect();
@@ -456,19 +807,17 @@ pub(crate) fn misread(markdown: &str, words: &[(u32, String, u32)]) -> HashMap<S
 }
 
 /// The pages showing a misread word, whose own text tells whether they
-/// split it.
-pub(crate) fn pages_to_read(
-    misread: &HashMap<String, bool>,
-    words: &[(u32, String, u32)],
-) -> Vec<u32> {
-    let mut pages: Vec<u32> = words
-        .iter()
-        .filter(|(_, text, _)| misread.contains_key(text))
-        .map(|(page, _, _)| *page)
-        .collect();
-    pages.sort_unstable();
-    pages.dedup();
-    pages
+/// split it: those whose words step widest past their glyphs' advances
+/// first, then in order.
+pub(crate) fn pages_to_read(misread: &HashMap<String, bool>, words: &[ShownWord]) -> Vec<u32> {
+    let mut widest: HashMap<u32, f64> = HashMap::new();
+    for word in words.iter().filter(|word| misread.contains_key(&word.text)) {
+        let gap = widest.entry(word.page).or_insert(f64::NEG_INFINITY);
+        *gap = gap.max(word.gap);
+    }
+    let mut pages: Vec<(u32, f64)> = widest.into_iter().collect();
+    pages.sort_by(|one, other| other.1.total_cmp(&one.1).then(one.0.cmp(&other.0)));
+    pages.into_iter().map(|(page, _)| page).collect()
 }
 
 /// The pages whose own text, as pdf-inspector places it (`page_text`),
@@ -476,13 +825,13 @@ pub(crate) fn pages_to_read(
 /// those showing a word the Markdown never shows whole.
 pub(crate) fn split_pages(
     misread: &HashMap<String, bool>,
-    words: &[(u32, String, u32)],
+    words: &[ShownWord],
     page_text: &HashMap<u32, String>,
 ) -> Vec<u32> {
     let mut shown: HashMap<u32, Vec<&str>> = HashMap::new();
-    for (page, text, _) in words {
-        if misread.contains_key(text) {
-            shown.entry(*page).or_default().push(text);
+    for word in words {
+        if misread.contains_key(&word.text) {
+            shown.entry(word.page).or_default().push(&word.text);
         }
     }
     let mut named: Vec<u32> = shown
@@ -501,21 +850,30 @@ pub(crate) fn split_pages(
 mod tests {
     use super::*;
 
-    fn words(pairs: &[(u32, &str, u32)]) -> Vec<(u32, String, u32)> {
-        pairs
+    /// Words shown on pages, each with its widest gap.
+    fn words(shown: &[(u32, &str, f64)]) -> Vec<ShownWord> {
+        shown
             .iter()
-            .map(|(page, text, count)| (*page, (*text).to_string(), *count))
+            .map(|(page, text, gap)| ShownWord {
+                page: *page,
+                text: (*text).to_string(),
+                gap: *gap,
+            })
             .collect()
     }
 
-    /// The pages the Markdown names, where each word's pages are its own.
-    fn split_pages(markdown: &str, shown: &[(u32, String, u32)]) -> Vec<u32> {
+    /// The pages the Markdown names, where no page is read again.
+    fn split_pages(markdown: &str, shown: &[ShownWord]) -> Vec<u32> {
         super::split_pages(&misread(markdown, shown), shown, &HashMap::new())
     }
 
     #[test]
     fn words_the_markdown_splits_name_their_pages() {
-        let shown = words(&[(1, "LIABILITIES", 1), (2, "EQUITY", 1), (3, "83,476.03", 1)]);
+        let shown = words(&[
+            (1, "LIABILITIES", 0.1),
+            (2, "EQUITY", 0.1),
+            (3, "83,476.03", 0.1),
+        ]);
         assert_eq!(
             split_pages("|LIAB ILITIES|||\n|EQUITY|1|\n\nTotal 83, 476. 03", &shown),
             vec![1, 3]
@@ -530,9 +888,9 @@ mod tests {
         // without their text, a word the Markdown also shows whole names
         // none.
         let shown = words(&[
-            (2, "Limitations", 1),
-            (7, "Limitations", 1),
-            (18, "Limitations", 1),
+            (2, "Limitations", 0.1),
+            (7, "Limitations", 0.1),
+            (18, "Limitations", 0.1),
         ]);
         let found = misread("Limitations; (Limitations) \"L imitations\"", &shown);
         assert_eq!(pages_to_read(&found, &shown), vec![2, 7, 18]);
@@ -550,7 +908,7 @@ mod tests {
 
     #[test]
     fn whole_words_and_other_text_are_not_split() {
-        let shown = words(&[(1, "LIABILITIES", 2), (1, "OF", 1)]);
+        let shown = words(&[(1, "LIABILITIES", 0.1), (1, "OF", 0.1)]);
         assert!(split_pages("LIABILITIES and **LIABILITIES**", &shown).is_empty());
         // Letters of a word inside other words, or across a word's edge,
         // are not the word split.
@@ -561,12 +919,12 @@ mod tests {
         assert!(split_pages("\"LIABILITIES\" (LIABILITIES) OF", &shown).is_empty());
         assert!(split_pages(
             "LIABILITIES and LIABI-\nLITIES",
-            &words(&[(1, "LIABI-LITIES", 1)])
+            &words(&[(1, "LIABI-LITIES", 0.1)])
         )
         .is_empty());
         assert!(split_pages(
             "self-employment and self- employment",
-            &words(&[(1, "self-employment", 2)])
+            &words(&[(1, "self-employment", 0.1)])
         )
         .is_empty());
         // A split elsewhere in the Markdown names a page only when its own
@@ -584,103 +942,301 @@ mod tests {
         assert!(super::split_pages(&found, &shown, &own).is_empty());
     }
 
-    /// The words a page shows in fonts it sees painting their spaces.
-    fn painted(page: GlyphWords) -> Vec<(String, u32)> {
+    /// Show strings, each at its x on the baseline at 100, one em 8 wide,
+    /// in `font`; each glyph `width` em wide, when the font says.
+    fn show(page: &mut GlyphWords, font: usize, strings: &[(f64, &str)], width: Option<f64>) {
+        let em = [8.0, 0.0];
+        for (x, text) in strings {
+            let mut at = [*x, 100.0];
+            for (index, character) in text.chars().enumerate() {
+                page.glyph(Glyph {
+                    font,
+                    reading: Reading::of(Some(&character.to_string())),
+                    at,
+                    em,
+                    advance: width,
+                    first: index == 0,
+                });
+                at[0] += width.unwrap_or(0.0) * 8.0;
+            }
+        }
+    }
+
+    /// Strings of one glyph each, advancing `step` from one to the next.
+    fn glyph_by_glyph(x: f64, text: &str, step: f64) -> Vec<(f64, String)> {
+        text.chars()
+            .enumerate()
+            .map(|(index, character)| (x + step * index as f64, character.to_string()))
+            .collect()
+    }
+
+    /// The words a page shows in fonts it sees painting their spaces, with
+    /// their widest gaps.
+    fn painted(page: GlyphWords) -> Vec<(String, f64)> {
         let (words, painting) = page.finish();
-        let mut found: Vec<(String, u32)> = words
+        let mut found: Vec<(String, f64)> = words
             .into_iter()
             .filter(|(_, font, _)| painting.contains(font))
-            .map(|(text, _, count)| (text, count))
+            .map(|(text, _, gap)| (text, (gap * 1000.0).round() / 1000.0))
             .collect();
-        found.sort();
+        found.sort_by(|one, other| one.0.cmp(&other.0));
         found
+    }
+
+    fn strings(shown: &[(f64, String)]) -> Vec<(f64, &str)> {
+        shown.iter().map(|(x, text)| (*x, text.as_str())).collect()
     }
 
     #[test]
     fn glyphs_on_one_baseline_make_words_ended_by_painted_spaces() {
-        let em = [8.0, 0.0];
+        // Each glyph half an em wide, hinted to 5 units: a tenth of an em
+        // past its width.
         let mut page = GlyphWords::default();
-        let mut x = 10.0;
-        for character in "LIABILITIES ARE 1,120".chars() {
-            page.glyph(Glyph {
-                font: 0,
-                reading: Some(character),
-                at: [x, 100.0],
-                em,
-            });
-            x += 6.0;
-        }
+        let line = glyph_by_glyph(10.0, "LIABILITIES ARE 1,120", 5.0);
+        show(&mut page, 0, &strings(&line), Some(0.5));
         assert_eq!(
             painted(page),
             vec![
-                ("1,120".to_string(), 1),
-                ("ARE".to_string(), 1),
-                ("LIABILITIES".to_string(), 1)
+                ("1,120".to_string(), 0.125),
+                ("ARE".to_string(), 0.125),
+                ("LIABILITIES".to_string(), 0.125)
             ]
         );
-        // A font that never paints a space gives no words, and a jump off
-        // the baseline or far along it ends one.
+        // A font that never paints a space gives no words, and a font
+        // without widths steps up to one and a half em.
         let mut page = GlyphWords::default();
-        for (index, character) in "TOTAL".chars().enumerate() {
-            page.glyph(Glyph {
-                font: 1,
-                reading: Some(character),
-                at: [10.0 + 6.0 * index as f64, 100.0],
-                em,
-            });
-        }
+        show(
+            &mut page,
+            1,
+            &strings(&glyph_by_glyph(10.0, "TOTAL", 6.0)),
+            None,
+        );
         assert!(painted(page).is_empty());
-        // A word a string of several glyphs goes on with is not read
-        // whole; one a string past it does not reach ends where it stands.
         let mut page = GlyphWords::default();
-        for (x, character) in [(0.0, 'A'), (4.0, 'B'), (8.0, ' ')] {
-            page.glyph(Glyph {
-                font: 0,
-                reading: Some(character),
-                at: [x, 100.0],
-                em,
-            });
-        }
-        for (x, character) in [(10.0, 'E'), (16.0, 'F'), (40.0, ' ')] {
-            if x == 40.0 {
-                page.interrupt(Some([22.0, 100.0]), Some('F'));
-            }
-            page.glyph(Glyph {
-                font: 0,
-                reading: Some(character),
-                at: [x, 100.0],
-                em,
-            });
-        }
-        for (x, character) in [(50.0, 'O'), (56.0, 'F')] {
-            page.glyph(Glyph {
-                font: 0,
-                reading: Some(character),
-                at: [x, 100.0],
-                em,
-            });
-        }
-        page.interrupt(Some([62.0, 100.0]), Some(' '));
-        for (x, character) in [(90.0, 'T'), (96.0, 'O')] {
-            page.glyph(Glyph {
-                font: 0,
-                reading: Some(character),
-                at: [x, 100.0],
-                em,
-            });
-        }
-        page.interrupt(Some([300.0, 100.0]), Some('Z'));
+        show(
+            &mut page,
+            1,
+            &strings(&glyph_by_glyph(10.0, "NET DUE", 6.0)),
+            None,
+        );
         assert_eq!(
             painted(page),
             vec![
-                ("AB".to_string(), 1),
-                ("OF".to_string(), 1),
-                ("TO".to_string(), 1)
+                ("DUE".to_string(), f64::INFINITY),
+                ("NET".to_string(), f64::INFINITY)
             ]
         );
-        assert!(!follows([10.0, 100.0], em, [16.0, 104.0]));
-        assert!(!follows([10.0, 100.0], em, [30.0, 100.0]));
-        assert!(!follows([10.0, 100.0], em, [4.0, 100.0]));
-        assert!(follows([10.0, 100.0], em, [16.0, 100.5]));
+        // A step off the baseline, back, or past the width further than
+        // pdf-inspector joins two runs, ends a word.
+        let word = Word::new(&Glyph {
+            font: 0,
+            reading: Reading::Other,
+            at: [10.0, 100.0],
+            em: [8.0, 0.0],
+            advance: Some(0.5),
+            first: true,
+        });
+        assert_eq!(word.step([14.5, 100.0]), Some(0.0625));
+        assert!(word.step([14.5, 102.0]).is_none());
+        assert!(word.step([9.0, 100.0]).is_none());
+        assert!(word.step([18.5, 100.0]).is_none());
+    }
+
+    #[test]
+    fn words_in_strings_of_several_glyphs_are_placed_by_their_widths() {
+        // As Skia writes a line: a glyph whose hinted advance is its width
+        // stays in the string, so a space opens the string of the glyph
+        // after it and a word goes on in a string of two.
+        let mut page = GlyphWords::default();
+        show(
+            &mut page,
+            0,
+            &[
+                (0.0, "B"),
+                (5.0, "on"),
+                (13.0, "d"),
+                (17.0, " I"),
+                (26.0, "n"),
+            ],
+            Some(0.5),
+        );
+        assert_eq!(
+            painted(page),
+            vec![("Bond".to_string(), 0.125), ("In".to_string(), 0.125)]
+        );
+        // A word in one string, as most producers write text, is read
+        // whole, and its space is no sign of text shown glyph by glyph.
+        let mut page = GlyphWords::default();
+        show(&mut page, 0, &[(0.0, "Bond "), (22.0, "fund")], Some(0.5));
+        assert!(painted(page).is_empty());
+        // A word whose strings meet closer than a word gap is read whole.
+        let mut page = GlyphWords::default();
+        show(
+            &mut page,
+            0,
+            &[(0.0, "B"), (4.1, "ond"), (16.1, " ")],
+            Some(0.5),
+        );
+        assert!(painted(page).is_empty());
+    }
+
+    #[test]
+    fn a_word_ends_where_its_run_does() {
+        // A label and its value, shown as runs of their own without a space
+        // between: the end of the label's text object ends it.
+        let label = glyph_by_glyph(0.0, "Due date:", 5.0);
+        let mut page = GlyphWords::default();
+        show(&mut page, 0, &strings(&label), Some(0.5));
+        page.end_word();
+        show(
+            &mut page,
+            0,
+            &strings(&glyph_by_glyph(46.0, "09", 5.0)),
+            Some(0.5),
+        );
+        page.end_word();
+        let apart = vec![
+            ("09".to_string(), 0.125),
+            ("Due".to_string(), 0.125),
+            ("date:".to_string(), 0.125),
+        ];
+        assert_eq!(painted(page), apart);
+        // In one run, a gap wider than pdf-inspector joins ends it too.
+        let mut page = GlyphWords::default();
+        show(&mut page, 0, &strings(&label), Some(0.5));
+        show(
+            &mut page,
+            0,
+            &strings(&glyph_by_glyph(49.0, "09", 5.0)),
+            Some(0.5),
+        );
+        assert_eq!(painted(page), apart);
+        // A word text in another font goes on with is not read whole; one
+        // a string past it does not reach ends where it stands, and one text
+        // whose place is not known may go on in is not read.
+        let mut page = GlyphWords::default();
+        show(
+            &mut page,
+            0,
+            &[(0.0, "A"), (5.0, "B"), (10.0, " ")],
+            Some(0.5),
+        );
+        show(&mut page, 0, &[(12.0, "E"), (17.0, "F")], Some(0.5));
+        page.interrupt([22.0, 100.0]);
+        show(
+            &mut page,
+            0,
+            &[(40.0, " "), (42.0, "O"), (47.0, "F")],
+            Some(0.5),
+        );
+        page.interrupt([90.0, 100.0]);
+        show(&mut page, 0, &[(100.0, "T"), (105.0, "O")], Some(0.5));
+        page.lose();
+        assert_eq!(
+            painted(page),
+            vec![("AB".to_string(), 0.125), ("OF".to_string(), 0.125)]
+        );
+    }
+
+    #[test]
+    fn a_ligature_stands_for_its_letters() {
+        assert_eq!(Reading::of(Some(" ")), Reading::Space);
+        assert_eq!(Reading::of(Some("(")), Reading::Other);
+        assert_eq!(Reading::of(Some("\u{e9}")), Reading::Other);
+        assert_eq!(Reading::of(Some("fi")), Reading::Word(*b"fi\0", 2));
+        assert_eq!(Reading::of(Some("ffi")), Reading::Word(*b"ffi", 3));
+        for text in [None, Some(""), Some("ffil"), Some("f)")] {
+            assert_eq!(Reading::of(text), Reading::Unread);
+        }
+        let mut page = GlyphWords::default();
+        let em = [8.0, 0.0];
+        let glyphs = ["B", "e", "n", "e", "fi", "t", "s", " "];
+        for (index, text) in glyphs.into_iter().enumerate() {
+            page.glyph(Glyph {
+                font: 0,
+                reading: Reading::of(Some(text)),
+                at: [5.0 * index as f64, 100.0],
+                em,
+                advance: Some(0.5),
+                first: true,
+            });
+        }
+        assert_eq!(painted(page), vec![("Benefits".to_string(), 0.125)]);
+    }
+
+    #[test]
+    fn widths_are_read_as_pdf_inspector_reads_them() {
+        let document = Document::new();
+        let mut steps = 0;
+        let thousandths = |widths: &Widths, codes: &[u16]| -> Vec<f64> {
+            codes
+                .iter()
+                .map(|&code| (widths.of(code) * 1000.0).round())
+                .collect()
+        };
+        // A simple font's widths, scaled by its font matrix; a code without
+        // one is none wide.
+        let mut font = Dictionary::new();
+        font.set("FirstChar", Object::Integer(65));
+        font.set("LastChar", Object::Integer(66));
+        font.set("Widths", vec![Object::Integer(10), Object::Real(20.5)]);
+        font.set(
+            "FontMatrix",
+            [0.01, 0.0, 0.0, 0.01, 0.0, 0.0].map(Object::Real).to_vec(),
+        );
+        let widths = simple_widths(&document, &font, &mut steps).expect("simple widths");
+        assert_eq!(thousandths(&widths, &[65, 66, 67]), vec![100.0, 200.0, 0.0]);
+        font.remove(b"Widths");
+        assert!(simple_widths(&document, &font, &mut steps).is_none());
+        // A composite font's, listed or by range, and its default for the
+        // rest.
+        let mut descendant = Dictionary::new();
+        descendant.set("DW", Object::Integer(500));
+        descendant.set(
+            "W",
+            vec![
+                Object::Integer(3),
+                Object::Array(vec![Object::Integer(250), Object::Integer(333)]),
+                Object::Integer(36),
+                Object::Integer(38),
+                Object::Integer(722),
+            ],
+        );
+        let mut font = Dictionary::new();
+        font.set("DescendantFonts", vec![Object::Dictionary(descendant)]);
+        let widths = composite_widths(&document, &font, &mut steps).expect("composite widths");
+        assert_eq!(
+            thousandths(&widths, &[3, 4, 36, 38, 39]),
+            vec![250.0, 333.0, 722.0, 722.0, 500.0]
+        );
+    }
+
+    #[test]
+    fn fonts_not_seen_painting_spaces_keep_their_words_apart() {
+        let word = |text: &str, font: usize| (text.to_string(), font, 0.1);
+        let mut kept = KeptWords::bounded(4, 2);
+        // A figures font never seen painting a space fills its own share.
+        kept.page(
+            1,
+            vec![word("1,120", 2), word("1,015", 2), word("2,000", 2)],
+            HashSet::new(),
+        );
+        // A font's words before its first painted space are kept for it.
+        kept.page(2, vec![word("ASSETS", 1)], HashSet::new());
+        kept.page(3, vec![word("LIABILITIES", 1)], HashSet::from([1]));
+        kept.page(4, vec![word("EQUITY", 1), word("3,394", 2)], HashSet::new());
+        let found: Vec<(u32, String)> = kept
+            .finish()
+            .into_iter()
+            .map(|word| (word.page, word.text))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (2, "ASSETS".to_string()),
+                (3, "LIABILITIES".to_string()),
+                (4, "EQUITY".to_string())
+            ]
+        );
     }
 }

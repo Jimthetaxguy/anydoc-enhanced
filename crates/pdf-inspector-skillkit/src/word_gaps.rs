@@ -544,7 +544,7 @@ fn readings(
 }
 
 /// `FirstChar` or `LastChar`: an integer, or a reference to one, as a code.
-fn code_bound(document: &Document, value: &Object) -> Option<u16> {
+pub(crate) fn code_bound(document: &Document, value: &Object) -> Option<u16> {
     let value = match value {
         Object::Reference(id) => document.get_object(*id).ok()?,
         value => value,
@@ -556,7 +556,10 @@ fn code_bound(document: &Document, value: &Object) -> Option<u16> {
 }
 
 /// An array, or a reference to one.
-fn resolved_array<'a>(document: &'a Document, value: &'a Object) -> Option<&'a [Object]> {
+pub(crate) fn resolved_array<'a>(
+    document: &'a Document,
+    value: &'a Object,
+) -> Option<&'a [Object]> {
     match value {
         Object::Array(values) => Some(values),
         Object::Reference(id) => match document.get_object(*id) {

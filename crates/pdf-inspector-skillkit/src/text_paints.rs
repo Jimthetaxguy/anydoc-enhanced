@@ -51,7 +51,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
 
-use crate::glyph_words::{Glyph, GlyphFonts, GlyphWords};
+use crate::glyph_words::{Glyph, GlyphFonts, GlyphWords, KeptWords, ShownWord};
 use crate::word_gaps::{leading_travel, shows_glyphs, Candidate, GapFont, GapFonts, Shown};
 
 /// Bytes any one content stream may decode to.
@@ -720,35 +720,107 @@ impl PageText {
         };
     }
 
-    /// Note a string for the words shown glyph by glyph: one glyph placed
-    /// where the text matrix says, as pdf-inspector reads it, or anything
-    /// else, which ends the word being shown.
-    fn note_glyph(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], placed: bool) {
+    /// Note a string for the words shown glyph by glyph: each glyph placed
+    /// where the text matrix and the font's widths say, as pdf-inspector
+    /// reads it; a string in a font whose glyphs are not read, which ends
+    /// the word being shown unless it goes on with it; or one whose place
+    /// is not known.
+    fn note_glyphs(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        text: Option<&Object>,
+        placed: bool,
+    ) {
         let Some(words) = self.glyph_words.as_mut() else {
             return;
         };
         let matrix = multiply(text_matrix, state.ctm);
-        let at = [
+        let mut at = [
             matrix[2] * state.rise + matrix[4],
             matrix[3] * state.rise + matrix[5],
         ];
         let em = [matrix[0] * state.size, matrix[1] * state.size];
-        let known = placed && at.iter().chain(&em).all(|value| value.is_finite());
-        let font = state
+        // One text space unit along the baseline, horizontally scaled.
+        let unit = [
+            matrix[0] * state.horizontal_scale,
+            matrix[1] * state.horizontal_scale,
+        ];
+        if !placed
+            || !at
+                .iter()
+                .chain(&em)
+                .chain(&unit)
+                .all(|value| value.is_finite())
+        {
+            words.lose();
+            return;
+        }
+        let Some(font) = state
             .glyph_font
-            .filter(|_| state.font && state.read_mode != 3);
-        match (font, known) {
-            (Some(font), true) => match self.glyph_fonts.one_glyph(font, bytes) {
-                Some(reading) => words.glyph(Glyph {
+            .filter(|_| state.font && state.read_mode != 3)
+        else {
+            words.interrupt(at);
+            return;
+        };
+        let elements = match text {
+            Some(Object::Array(elements)) => elements.as_slice(),
+            Some(text) => std::slice::from_ref(text),
+            None => &[],
+        };
+        let two_byte = self.glyph_fonts.two_byte(font);
+        // Whether the glyph shown last left the pen where the font's widths
+        // do not say.
+        let (mut first, mut unplaced) = (true, false);
+        for element in elements {
+            let bytes = match element {
+                Object::String(bytes, _) => bytes,
+                Object::Integer(offset) => {
+                    let travel = -(*offset as f64) / 1000.0 * state.size;
+                    at = [at[0] + travel * unit[0], at[1] + travel * unit[1]];
+                    continue;
+                }
+                Object::Real(offset) => {
+                    let travel = -f64::from(*offset) / 1000.0 * state.size;
+                    at = [at[0] + travel * unit[0], at[1] + travel * unit[1]];
+                    continue;
+                }
+                _ => continue,
+            };
+            for code in bytes.chunks_exact(if two_byte { 2 } else { 1 }) {
+                if unplaced {
+                    words.lose();
+                    return;
+                }
+                let code = match code {
+                    [high, low] => u16::from_be_bytes([*high, *low]),
+                    [byte] => u16::from(*byte),
+                    _ => continue,
+                };
+                let (reading, width) = self.glyph_fonts.glyph(font, code);
+                // The pen moves by the width at the font size, the character
+                // spacing, and after code 32 the word spacing.
+                let travel = width.map(|width| {
+                    width * state.size
+                        + state.char_spacing
+                        + if code == 32 { state.word_spacing } else { 0.0 }
+                });
+                words.glyph(Glyph {
                     font,
                     reading,
                     at,
                     em,
-                }),
-                None => words.interrupt(Some(at), self.glyph_fonts.first_glyph(font, bytes)),
-            },
-            (None, true) => words.interrupt(Some(at), None),
-            (_, false) => words.interrupt(None, None),
+                    advance: travel
+                        .filter(|_| state.size != 0.0)
+                        .map(|travel| travel * state.horizontal_scale / state.size),
+                    first,
+                });
+                first = false;
+                match travel {
+                    Some(travel) => at = [at[0] + travel * unit[0], at[1] + travel * unit[1]],
+                    None => unplaced = true,
+                }
+            }
         }
     }
 
@@ -857,9 +929,8 @@ pub(crate) struct Findings {
     /// up to `MAX_PLACED_RUNS`.
     pub(crate) placed: Vec<Placed>,
     /// Words shown glyph by glyph in fonts that paint their spaces anywhere
-    /// in the document, on the pages read for repeats, with the page and
-    /// how often; of the first `MAX_GLYPH_WORDS` the pages show.
-    pub(crate) glyph_words: Vec<(u32, String, u32)>,
+    /// in the document, on the pages read for repeats (see `KeptWords`).
+    pub(crate) glyph_words: Vec<ShownWord>,
     /// Form field values pdf-inspector misreads or never writes, when the
     /// pages are read for repeats (see `form_fields`).
     pub(crate) form_values: Vec<crate::form_fields::FormValue>,
@@ -874,9 +945,6 @@ pub(crate) struct Findings {
     /// repeats.
     pub(crate) embedded_files: (usize, bool),
 }
-
-/// Words shown glyph by glyph kept across a document.
-const MAX_GLYPH_WORDS: usize = 65_536;
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
 /// invisible layer; pages are checked for text painted twice only when
@@ -908,10 +976,9 @@ pub(crate) fn scan(
         found.xfa_dynamic = crate::form_fields::needs_rendering(&document);
         found.embedded_files = crate::form_fields::embedded_files(&document);
     }
-    // Words shown glyph by glyph, by page and font, and the fonts seen
-    // painting their spaces on any page.
-    let mut shown: Vec<(u32, String, usize, u32)> = Vec::new();
-    let mut painting_spaces: HashSet<usize> = HashSet::new();
+    // Words shown glyph by glyph, kept while their fonts may yet be seen
+    // painting their spaces.
+    let mut glyph_words = KeptWords::default();
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
             continue;
@@ -945,14 +1012,7 @@ pub(crate) fn scan(
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
                 }
-                let room = MAX_GLYPH_WORDS.saturating_sub(shown.len());
-                shown.extend(
-                    page.glyph_words
-                        .into_iter()
-                        .take(room)
-                        .map(|(text, font, count)| (number, text, font, count)),
-                );
-                painting_spaces.extend(page.glyph_spaces);
+                glyph_words.page(number, page.glyph_words, page.glyph_spaces);
                 let room = MAX_PLACED_RUNS.saturating_sub(found.placed.len());
                 found.placed.extend(
                     page.placed
@@ -977,16 +1037,7 @@ pub(crate) fn scan(
             Err(Exhausted) => break,
         }
     }
-    let mut words: HashMap<(u32, String), u32> = HashMap::new();
-    for (page, text, font, count) in shown {
-        if painting_spaces.contains(&font) {
-            *words.entry((page, text)).or_default() += count;
-        }
-    }
-    found.glyph_words = words
-        .into_iter()
-        .map(|((page, text), count)| (page, text, count))
-        .collect();
+    found.glyph_words = glyph_words.finish();
     found
 }
 
@@ -1019,9 +1070,9 @@ struct PageFindings {
     /// Where placed runs start, measured from the visible box, and whether
     /// they are plain.
     placed: Vec<([f64; 2], bool)>,
-    /// Words shown glyph by glyph, with their font and how often, and the
+    /// Words shown glyph by glyph, with their font and widest gap, and the
     /// fonts seen painting their spaces.
-    glyph_words: Vec<(String, usize, u32)>,
+    glyph_words: Vec<(String, usize, f64)>,
     glyph_spaces: HashSet<usize>,
 }
 
@@ -1301,6 +1352,11 @@ fn execute<'a>(
                 }
             }
             "BT" => {
+                // A browser writes each run of text as a text object of its
+                // own, which ends the words shown in it.
+                if let Some(words) = page.glyph_words.as_mut() {
+                    words.end_word();
+                }
                 text_matrix = IDENTITY;
                 line_matrix = IDENTITY;
                 placed = true;
@@ -1310,6 +1366,9 @@ fn execute<'a>(
             }
             "ET" => {
                 page.text_object_ended();
+                if let Some(words) = page.glyph_words.as_mut() {
+                    words.end_word();
+                }
                 placed = false;
                 in_text = false;
                 pending = None;
@@ -1359,7 +1418,7 @@ fn execute<'a>(
                 // Inside a span giving the text its glyphs stand for,
                 // pdf-inspector reads that text and not the glyphs.
                 let glyphs_read = !spans.contains(&true);
-                page.note_glyph(state, text_matrix, &bytes, placed && in_text && glyphs_read);
+                page.note_glyphs(state, text_matrix, text, placed && in_text && glyphs_read);
                 let before = travelled;
                 travelled = None;
                 if let Some(text) = text.filter(|_| in_text && glyphs_read && !page.gaps_misread) {
@@ -1416,7 +1475,7 @@ fn execute<'a>(
                 // What a form or an image paints continues no string.
                 pending = None;
                 if let Some(words) = page.glyph_words.as_mut() {
-                    words.interrupt(None, None);
+                    words.lose();
                 }
                 let Some(name) = operands.first().and_then(|name| name.as_name().ok()) else {
                     continue;
@@ -2138,6 +2197,50 @@ pub(crate) mod tests {
         let label =
             "BT /F1 10 Tf 60 700 Td 2 Tc (TOTAL\\032) Tj (DUE) Tj 0 Tc 260 0 Td (1,234.56) Tj ET";
         assert!(gaps(&subset("26 /space", 0, 288), label).is_empty());
+    }
+
+    #[test]
+    fn words_shown_glyph_by_glyph_are_placed_by_their_widths() {
+        // Capitals 600 units wide and a space of 250: at 10 points a glyph
+        // moves the pen 6 units and a space 2.5.
+        let widths: Vec<&str> = (32..=90)
+            .map(|code| if code == 32 { "250" } else { "600" })
+            .collect();
+        let font = format!(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Serif /FirstChar 32 \
+             /LastChar 90 /Widths [{}] /Encoding /WinAnsiEncoding >>",
+            widths.join(" ")
+        );
+        let words = |content: &str| {
+            let pdf = scan_pdf_in(content, "", &font);
+            let mut words: Vec<(String, f64)> =
+                scan(&pdf, &HashSet::new(), Some(&HashSet::new()), None)
+                    .glyph_words
+                    .into_iter()
+                    .map(|word| (word.text, (word.gap * 1000.0).round() / 1000.0))
+                    .collect();
+            words.sort_by(|one, other| one.0.cmp(&other.0));
+            words
+        };
+        // Strings as Skia writes them, each placed a unit past the widths
+        // of the glyphs before: a word goes on in a string of several
+        // glyphs, and a word in one string is read whole.
+        let skia = "BT /F1 10 Tf 40 700 Td (TOT) Tj 19 0 Td (AL ) Tj 14.5 0 Td (DUE) Tj ET";
+        assert_eq!(words(skia), vec![("TOTAL".to_string(), 0.1)]);
+        // A label and its value as runs of their own, a fifth of an em
+        // apart: the end of the label's text object ends it.
+        let runs = "BT /F1 10 Tf 40 680 Td (PA) Tj 13 0 Td (ID) Tj ET \
+                    BT /F1 10 Tf 67 680 Td (I) Tj 7 0 Td (N) Tj ET";
+        // A `TJ` array's offsets move the glyphs after them.
+        let offsets = "BT /F1 10 Tf 40 660 Td [(F) -100 (EE)] TJ 20 0 Td (S) Tj ET";
+        assert_eq!(
+            words(&format!("{skia} {runs} {offsets}")),
+            [("FEES", 0.1), ("IN", 0.1), ("PAID", 0.1), ("TOTAL", 0.1)]
+                .map(|(text, gap)| (text.to_string(), gap))
+                .to_vec()
+        );
+        // Without a painted space, the font's words are not read.
+        assert!(words(&format!("{runs} {offsets}")).is_empty());
     }
 
     #[test]
