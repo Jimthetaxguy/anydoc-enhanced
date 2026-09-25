@@ -24,7 +24,9 @@ use std::collections::{HashMap, HashSet};
 
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-/// Annotations read, at most, across a document.
+/// Annotations of the kinds that can show text of their own read, at most,
+/// across a document; those of other kinds, links above all, are passed
+/// over uncounted.
 const MAX_ANNOTATIONS: usize = 10_000;
 /// Bytes an appearance stream may decode to for its text to be looked for.
 const MAX_APPEARANCE_BYTES: usize = 1 << 20;
@@ -448,13 +450,21 @@ pub(crate) fn unread(
         };
         let mut shown_box: Option<Option<[f32; 4]>> = None;
         for annotation in annotations {
+            let Some(annotation) = dictionary(document, annotation) else {
+                continue;
+            };
+            let subtype = annotation
+                .get(b"Subtype")
+                .ok()
+                .and_then(|subtype| subtype.as_name().ok())
+                .unwrap_or_default();
+            if !matches!(subtype, b"FreeText" | b"Line" | b"Stamp" | b"Watermark") {
+                continue;
+            }
             read += 1;
             if read > MAX_ANNOTATIONS {
                 return texts;
             }
-            let Some(annotation) = dictionary(document, annotation) else {
-                continue;
-            };
             let flags = annotation
                 .get(b"F")
                 .ok()
@@ -467,11 +477,6 @@ pub(crate) fn unread(
             {
                 continue;
             }
-            let subtype = annotation
-                .get(b"Subtype")
-                .ok()
-                .and_then(|subtype| subtype.as_name().ok())
-                .unwrap_or_default();
             let captioned = || {
                 annotation
                     .get(b"Cap")
@@ -692,6 +697,26 @@ mod tests {
                 "Over the edge"
             ]
         );
+    }
+
+    #[test]
+    fn links_do_not_count_against_the_annotations_read() {
+        // A page of links, as a table of contents has, before a text box.
+        let found = document(|_| {
+            let mut annotations: Vec<Dictionary> = (0..MAX_ANNOTATIONS)
+                .map(|_| dictionary! { "Subtype" => "Link" })
+                .collect();
+            annotations.push(dictionary! {
+                "Subtype" => "FreeText",
+                "Contents" => Object::string_literal("Adjusted basis 12,500.00 per preparer"),
+            });
+            annotations
+        });
+        let texts: Vec<String> = unread(&found, None, None)
+            .into_iter()
+            .map(|annotation| annotation.text)
+            .collect();
+        assert_eq!(texts, ["Adjusted basis 12,500.00 per preparer"]);
     }
 
     #[test]
