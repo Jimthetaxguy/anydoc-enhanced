@@ -625,6 +625,37 @@ fn without_controls(text: &str) -> String {
         .collect()
 }
 
+/// A run's text as pdf-inspector writes it: a symbol font's private-use
+/// codes read as the characters they stand for, the control characters it
+/// drops left out (see `without_controls`), ligatures spelled out, soft
+/// hyphens and zero-width marks left out, and typographic spaces as spaces.
+fn written(text: &str) -> String {
+    let mut written = String::with_capacity(text.len());
+    for character in text.chars() {
+        let character = match u32::from(character) {
+            symbol @ 0xF020..=0xF0FF => match symbol - 0xF000 {
+                0xA1 | 0xA7 | 0xB7 => '\u{2022}',
+                0xFC => '\u{2713}',
+                code => char::from(code as u8),
+            },
+            _ => character,
+        };
+        match character {
+            '\u{FB00}' => written.push_str("ff"),
+            '\u{FB01}' => written.push_str("fi"),
+            '\u{FB02}' => written.push_str("fl"),
+            '\u{FB03}' => written.push_str("ffi"),
+            '\u{FB04}' => written.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => written.push_str("st"),
+            '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' => {}
+            '\u{2000}'..='\u{200A}' => written.push(' '),
+            character if character < ' ' && !matches!(character, '\t' | '\n' | '\r') => {}
+            character => written.push(character),
+        }
+    }
+    written
+}
+
 /// What one page's content shows.
 #[derive(Default)]
 struct PageText {
@@ -1103,9 +1134,13 @@ impl PageText {
 
     /// Note text pdf-inspector reads that a reader does not see, in a layer
     /// it hides or, when `invisible`, painted in render mode 3, run by run
-    /// (see `Noted::note`), with the edge run `edge` it is read in: its text
-    /// where its font can be read. Text pdf-inspector reads that a reader
-    /// sees, when `unseen` is not set, ends the run noted last.
+    /// (see `Noted::note`), with the edge run `edge` it is read in: as
+    /// pdf-inspector reads it, the bytes themselves where it finds no font,
+    /// as it reads a font it finds no map for (see `cjk_fonts`), else as the
+    /// font reads them, a space standing in for a code the check cannot
+    /// read; and as pdf-inspector writes it (see `written`). Text
+    /// pdf-inspector reads that a reader sees, when `unseen` is not set,
+    /// ends the run noted last.
     #[allow(clippy::too_many_arguments)]
     fn note_unseen(
         &mut self,
@@ -1130,10 +1165,16 @@ impl PageText {
             noted.interrupt();
             return;
         }
-        let Some(text) = state
-            .glyph_font
-            .and_then(|font| self.glyph_fonts.text(font, bytes))
-        else {
+        let text = if state.raw {
+            Some(read_without_font(bytes))
+        } else if let Some(font) = state.cjk {
+            crate::cjk_fonts::read_as(font, bytes)
+        } else {
+            state
+                .glyph_font
+                .and_then(|font| self.glyph_fonts.text_or(font, bytes, ' '))
+        };
+        let Some(text) = text.map(|text| written(&text)) else {
             return;
         };
         let on_page = starts_on_page(state, text_matrix, page_box);
@@ -3102,6 +3143,74 @@ pub(crate) mod tests {
         assert_eq!(
             hidden_texts(&layered_pdf(written)),
             [(1, vec!["Draft figures".to_string()])]
+        );
+    }
+
+    /// The text the scan notes painted invisibly, by page.
+    fn invisible_texts(pdf: &[u8]) -> Vec<(u32, Vec<String>)> {
+        scan(pdf, &HashSet::new(), Some(&HashSet::new()), None)
+            .invisible_texts
+            .into_iter()
+            .map(|(page, texts)| (page, texts.texts))
+            .collect()
+    }
+
+    #[test]
+    fn unseen_text_is_noted_as_pdf_inspector_reads_it_without_a_font() {
+        // A page inheriting resources written in its page tree node, whose
+        // fonts pdf-inspector does not find: it reads the bytes themselves.
+        let inherited = pdf_of(&[
+            b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] >> >> >>"
+                .to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 \
+              /Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> >> >>"
+                .to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>"
+                .to_vec(),
+            stream(
+                "",
+                b"/OC /MC0 BDC BT /F1 10 Tf 72 680 Td (Solde final remplac\x8e) Tj ET EMC",
+            ),
+            b"<< /Type /OCG /Name (Superseded) >>".to_vec(),
+        ]);
+        assert_eq!(
+            hidden_texts(&inherited),
+            [(1, vec!["Solde final remplac\u{17d}".to_string()])]
+        );
+        // A font the resources do not define, and a form drawing text in the
+        // font it was drawn with, read byte by byte too; pdf-inspector takes
+        // the page's text object before the form to start visible.
+        let undefined = "3 Tr BT /F9 12 Tf 72 680 Td (Ignore the balance above) Tj ET";
+        let drawn = scan_pdf(
+            "BT /F1 12 Tf ET 3 Tr BT ET /Fm1 Do",
+            "BT 72 680 Td (Ignore the balance above) Tj ET",
+        );
+        for pdf in [scan_pdf(undefined, ""), drawn] {
+            assert_eq!(
+                invisible_texts(&pdf),
+                [(1, vec!["Ignore the balance above".to_string()])]
+            );
+        }
+        // A composite font under a predefined Unicode CMap, with no map of
+        // its own, as pdf-inspector reads it (see `cjk_fonts`): as UTF-16.
+        let ucs2 = "<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular \
+                    /Encoding /UniJIS-UCS2-H /DescendantFonts [8 0 R] >>";
+        let descendant = b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPr6N-Regular \
+                           /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> \
+                           /DW 1000 >>"
+            .to_vec();
+        let shown = "3 Tr BT /F1 12 Tf 72 680 Td <00490067006E006F007200650020007400680065002000620061006C0061006E00630065> Tj ET";
+        let pdf = scan_pdf_objects(shown, "", ucs2, "", &[descendant]);
+        assert_eq!(
+            invisible_texts(&pdf),
+            [(1, vec!["Ignore the balance".to_string()])]
+        );
+        // As pdf-inspector writes a run: ligatures spelled out, a symbol
+        // font's private-use codes read, soft hyphens left out.
+        assert_eq!(
+            written("\u{FB01}nal \u{F0B7}\u{F041} con\u{AD}tent\u{1}"),
+            "final \u{2022}A content"
         );
     }
 

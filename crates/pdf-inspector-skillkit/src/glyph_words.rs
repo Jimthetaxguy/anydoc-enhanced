@@ -21,11 +21,13 @@
 //!
 //! Glyphs are read as pdf-inspector 1.24.0 reads them: by the font's
 //! ToUnicode map, then the names its differences give, then, for a simple
-//! font, by its encoding (see `Simple`). Words are made of ASCII letters and
-//! digits and the marks numbers and dates are written with, and a ligature
-//! glyph stands for its letters; any other character ends a word, as does
-//! the end of a text object, since a browser writes each run of text as
-//! one, and a glyph that cannot be read drops the word it is in.
+//! font, by its encoding (see `Simple`); a composite font without a map, by
+//! the code points its codes are where pdf-inspector reads them so. Words
+//! are made of ASCII letters and digits and the marks numbers and dates are
+//! written with, and a ligature glyph stands for its letters; any other
+//! character ends a word, as does the end of a text object, since a browser
+//! writes each run of text as one, and a glyph that cannot be read drops
+//! the word it is in.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -193,6 +195,10 @@ enum Unnamed {
     Ascii,
     /// By a simple font's encoding (see `Simple`).
     Simple(Simple),
+    /// As the code point a composite font's code is: pdf-inspector's last
+    /// reading of a font under `Identity-H` or `Identity-V` with no map,
+    /// whose widths list codes that look like code points.
+    CodePoints,
 }
 
 /// How pdf-inspector reads a simple font's codes that its ToUnicode map and
@@ -307,7 +313,13 @@ impl Decoder {
             return Some(text);
         }
         if self.two_byte {
-            return None;
+            // A control character or a surrogate is no text.
+            return matches!(self.unnamed, Unnamed::CodePoints).then(|| {
+                char::from_u32(u32::from(code))
+                    .filter(|character| !character.is_control() || matches!(character, '\t' | '\n'))
+                    .map(String::from)
+                    .unwrap_or_default()
+            });
         }
         let byte = code as u8;
         if let Some(name) = self.names.get(&byte) {
@@ -379,6 +391,16 @@ impl GlyphFonts {
     /// What a string shown in `font` reads as, when every glyph of it can
     /// be read.
     pub(crate) fn text(&mut self, font: usize, bytes: &[u8]) -> Option<String> {
+        self.read(font, bytes, None)
+    }
+
+    /// What a string shown in `font` reads as, with `unread` for each code
+    /// that cannot be read; `None` where none can.
+    pub(crate) fn text_or(&mut self, font: usize, bytes: &[u8], unread: char) -> Option<String> {
+        self.read(font, bytes, Some(unread))
+    }
+
+    fn read(&mut self, font: usize, bytes: &[u8], unread: Option<char>) -> Option<String> {
         let decoder = &mut self.decoders[font];
         let width = if decoder.two_byte { 2 } else { 1 };
         if !bytes.len().is_multiple_of(width) {
@@ -399,6 +421,8 @@ impl GlyphFonts {
             _ => true,
         };
         let mut text = String::with_capacity(bytes.len());
+        // Whether any code was read, and how many read as nothing.
+        let (mut read, mut nothing) = (false, 0);
         for code in bytes.chunks(width) {
             let code = match code {
                 [byte] => u16::from(*byte),
@@ -410,9 +434,23 @@ impl GlyphFonts {
                 let reading = decoder.text(code, by_code);
                 decoder.read.insert(key, reading);
             }
-            text.push_str(decoder.read[&key].as_deref()?);
+            match (decoder.read[&key].as_deref(), unread) {
+                (Some(reading), _) => {
+                    read = true;
+                    nothing += usize::from(reading.is_empty());
+                    text.push_str(reading);
+                }
+                (None, Some(unread)) => text.push(unread),
+                (None, None) => return None,
+            }
         }
-        Some(text)
+        // A string most of whose codes are no code points pdf-inspector
+        // reads otherwise.
+        let codes = bytes.len() / width;
+        if matches!(decoder.unnamed, Unnamed::CodePoints) && nothing > codes / 2 {
+            return None;
+        }
+        (read || unread.is_none() || bytes.is_empty()).then_some(text)
     }
 }
 
@@ -446,6 +484,8 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
         simple(document, font, cmap.is_some(), steps)
     } else if cmap.is_some() {
         Unnamed::Unknown
+    } else if reads_code_points(document, font) {
+        Unnamed::CodePoints
     } else {
         return None;
     };
@@ -623,6 +663,107 @@ fn lopdf_reading(
         Err(lopdf::Error::Decompress(_)) => Lopdf::Unknown,
         Err(_) => Lopdf::Bytes { symbols },
     }
+}
+
+/// Whether pdf-inspector reads a composite font's codes as the code points
+/// they are, as it does a font under `Identity-H` or `Identity-V`, named in
+/// place, with no ToUnicode map and no other map to read: its descendant,
+/// given by reference, embeds no TrueType or OpenType program and names no
+/// collection whose map is read first (Korea1, which pdf-inspector holds,
+/// and Japan1, GB1, and CNS1, whose fonts `cjk_fonts` reads), and the codes
+/// its widths list have a median of 0x41 or more, as letters' code points
+/// do.
+fn reads_code_points(document: &Document, font: &Dictionary) -> bool {
+    let identity = matches!(font.get(b"Encoding"),
+        Ok(Object::Name(name)) if name == b"Identity-H" || name == b"Identity-V");
+    if !identity || font.has(b"ToUnicode") {
+        return false;
+    }
+    let descendant = match font.get(b"DescendantFonts") {
+        Ok(Object::Array(fonts)) => fonts.first(),
+        Ok(Object::Reference(id)) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|fonts| fonts.as_array().ok())
+            .and_then(|fonts| fonts.first()),
+        _ => None,
+    };
+    let Some(Object::Reference(id)) = descendant else {
+        return false;
+    };
+    let Ok(descendant) = document.get_dictionary(*id) else {
+        return false;
+    };
+    let dictionary = |object| resolved(document, object).and_then(|object| object.as_dict().ok());
+    let program = descendant
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(dictionary)
+        .is_some_and(|descriptor| {
+            [&b"FontFile2"[..], b"FontFile3"]
+                .iter()
+                .any(|key| descriptor.get(key).and_then(Object::as_reference).is_ok())
+        });
+    let collection = descendant
+        .get(b"CIDSystemInfo")
+        .ok()
+        .and_then(dictionary)
+        .and_then(|info| info.get(b"Ordering").ok())
+        .is_some_and(|ordering| {
+            matches!(ordering, Object::String(name, _)
+                if [&b"Korea1"[..], b"Japan1", b"GB1", b"CNS1"].contains(&name.as_slice()))
+        });
+    !program && !collection && median_width_code(descendant).is_some_and(|median| median >= 0x41)
+}
+
+/// The median of the distinct codes a composite font's `/W` array gives
+/// widths, read as pdf-inspector reads them: only an array written in
+/// place, whole numbers, and up to `MAX_CID_WIDTHS` codes.
+fn median_width_code(descendant: &Dictionary) -> Option<u16> {
+    let Ok(Object::Array(entries)) = descendant.get(b"W") else {
+        return None;
+    };
+    let mut seen: HashSet<u16> = HashSet::new();
+    let mut index = 0;
+    while index < entries.len() && seen.len() < MAX_CID_WIDTHS {
+        let Ok(start) = entries[index].as_i64() else {
+            index += 1;
+            continue;
+        };
+        let start = start as u16;
+        match entries.get(index + 1) {
+            // `c [w1 w2 …]` gives the codes from c on, one a width.
+            Some(Object::Array(widths)) => {
+                for offset in 0..widths.len() {
+                    if seen.len() >= MAX_CID_WIDTHS {
+                        break;
+                    }
+                    seen.insert(start.wrapping_add(offset as u16));
+                }
+                index += 2;
+            }
+            // `c1 c2 w` gives the codes from c1 to c2.
+            Some(_) if index + 2 < entries.len() => {
+                if let Ok(end) = entries[index + 1].as_i64() {
+                    for code in start..=end as u16 {
+                        if seen.len() >= MAX_CID_WIDTHS {
+                            break;
+                        }
+                        seen.insert(code);
+                    }
+                }
+                index += 3;
+            }
+            Some(_) => index += 1,
+            None => {
+                seen.insert(start);
+                index += 1;
+            }
+        }
+    }
+    let mut codes: Vec<u16> = seen.into_iter().collect();
+    codes.sort_unstable();
+    codes.get(codes.len() / 2).copied()
 }
 
 /// The name each code last takes in a simple font's `/Differences`.
@@ -1738,6 +1879,90 @@ mod tests {
         let font = fonts.font(&document, &win_ansi).expect("a font");
         assert_eq!(fonts.glyph(font, 0xE9).0, Reading::Other);
         assert_eq!(fonts.glyph(font, 0x01).0, Reading::Unread);
+    }
+
+    #[test]
+    fn composite_fonts_without_a_map_read_as_pdf_inspector_reads_them() {
+        use lopdf::dictionary;
+        let mut document = Document::with_version("1.7");
+        let program = document.add_object(lopdf::Stream::new(dictionary! {}, Vec::new()));
+        // A descendant in `ordering` whose widths list `widths`, embedding a
+        // program when `embedded`.
+        let mut descendant = |ordering: &str, widths: Vec<Object>, embedded: bool| {
+            let mut descriptor = dictionary! { "Type" => "FontDescriptor" };
+            if embedded {
+                descriptor.set("FontFile2", program);
+            }
+            document.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "ArialMT",
+                "CIDSystemInfo" => dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal(ordering), "Supplement" => 0,
+                },
+                "FontDescriptor" => descriptor, "W" => widths,
+            })
+        };
+        // Widths given for the code points of the space and the letters, as
+        // a font whose codes are them has; and for glyph indexes from 3 on.
+        let letters: Vec<Object> = vec![
+            32.into(),
+            vec![Object::from(278)].into(),
+            65.into(),
+            vec![Object::from(667); 26].into(),
+            97.into(),
+            vec![Object::from(556); 26].into(),
+        ];
+        let code_points = descendant("Identity", letters.clone(), false);
+        let glyphs = descendant(
+            "Identity",
+            vec![3.into(), vec![Object::from(278); 40].into()],
+            false,
+        );
+        let embedded = descendant("Identity", letters.clone(), true);
+        let japanese = descendant("Japan1", letters, false);
+        let map = document.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Custom def \
+              1 begincodespacerange <0000> <FFFF> endcodespacerange 1 beginbfchar <0001> <0041> \
+              endbfchar endcmap CMapName currentdict /CMap defineresource pop end end"
+                .to_vec(),
+        ));
+        let font = |descendant: lopdf::ObjectId| {
+            dictionary! {
+                "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "ArialMT",
+                "Encoding" => "Identity-H", "DescendantFonts" => vec![descendant.into()],
+            }
+        };
+        // Codes read as code points, where the widths say they are; a string
+        // most of whose codes are no characters pdf-inspector reads otherwise.
+        assert_eq!(
+            read(&document, &font(code_points), b"\x00I\x00g\x00n"),
+            Some("Ign".into())
+        );
+        assert_eq!(
+            read(&document, &font(code_points), b"\x00\x01\x00\x02\x00A"),
+            None
+        );
+        // Not where they are glyph indexes, or pdf-inspector reads a program
+        // or a collection's map first.
+        for descendant in [glyphs, embedded, japanese] {
+            assert_eq!(read(&document, &font(descendant), b"\x00I"), None);
+        }
+        // A code a font's map does not read stands as the character given
+        // for it, where another code of the string is read.
+        let mut mapped = font(glyphs);
+        mapped.set("ToUnicode", map);
+        let mut fonts = GlyphFonts::default();
+        let mapped = fonts.font(&document, &mapped).expect("a font");
+        let string = b"\x00\x01\x00\x09\x00\x01";
+        assert_eq!(fonts.text(mapped, string), None);
+        assert_eq!(fonts.text_or(mapped, string, ' '), Some("A A".into()));
+        assert_eq!(fonts.text_or(mapped, b"\x00\x09", ' '), None);
+        // Nor a font under a predefined CMap, whatever its widths say, which
+        // pdf-inspector reads by the CMap (see `cjk_fonts`).
+        let mut ucs2 = font(code_points);
+        ucs2.set("Encoding", "UniJIS-UCS2-H");
+        assert_eq!(read(&document, &ucs2, b"\x00I"), None);
     }
 
     #[test]

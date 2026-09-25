@@ -2098,6 +2098,99 @@ fn unseen_text_past_ascii_is_reported() {
     );
 }
 
+#[test]
+fn unseen_text_read_without_a_map_is_reported() {
+    let hidden =
+        b"/OC /MC0 BDC BT /F1 10 Tf 72 680 Td (Ending balance 1,000.00 superseded) Tj ET EMC";
+    let invisible = |font: &str, text: &str| {
+        format!("3 Tr BT /{font} 12 Tf 72 680 Td {text} Tj ET").into_bytes()
+    };
+    // "Ignore the balance above" as the code points of its letters.
+    let code_points: String = "Ignore the balance above"
+        .chars()
+        .map(|letter| format!("{:04X}", u32::from(letter)))
+        .collect();
+    let code_points = format!("<{code_points}>");
+    // A composite font whose widths are given for the code points of the
+    // space and the letters, with no map and no program, as Chromium and
+    // wkhtmltopdf write one; and a Japanese one under a predefined Unicode
+    // CMap.
+    let descendant: &[u8] = b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ArialMT \
+                       /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                       /FontDescriptor 9 0 R /W [32 [278] 65 [667 667 722 722 667 611 778 722 278 \
+                       500 667 556 833 722 778 667 778 722 667 611 722 667 944 667 667 611] 97 [556 \
+                       556 500 556 556 278 556 556 222 222 500 222 833 556 556 556 556 333 500 278 556 \
+                       500 722 500 500 500]] >>";
+    let japanese: &[u8] = b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPr6N-Regular \
+                     /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> \
+                     /FontDescriptor 9 0 R /DW 1000 >>";
+    let descriptor = b"<< /Type /FontDescriptor /FontName /ArialMT /Flags 32 \
+                       /FontBBox [-665 -325 2000 1040] /ItalicAngle 0 /Ascent 905 /Descent -212 \
+                       /CapHeight 716 /StemV 80 >>";
+    let identity: &[u8] =
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ArialMT /Encoding /Identity-H \
+                            /DescendantFonts [8 0 R] >>";
+    let ucs2: &[u8] =
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /UniJIS-UCS2-H \
+                        /DescendantFonts [8 0 R] >>";
+    let composite = |font: &[u8], descendant: &[u8], shown: bool| {
+        let mut content = invisible("F2", &code_points);
+        if shown {
+            content.drain(..5);
+        }
+        unseen_text_pdf(
+            &content,
+            "/Font << /F1 4 0 R /F2 7 0 R >>",
+            &[font, descendant, descriptor],
+            false,
+        )
+    };
+    // A form drawing text in the font it was drawn with.
+    let form = stream(
+        "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << >>",
+        b"BT 72 680 Td (Ignore the balance above) Tj ET",
+    );
+    let results = convert_all(&[
+        // Resources written in the page tree node, whose fonts pdf-inspector
+        // does not find, and a font the resources do not define: it reads
+        // the bytes themselves.
+        unseen_text_pdf(hidden, "", &[], true),
+        unseen_text_pdf(
+            &invisible("F9", "(Ignore the balance above)"),
+            "",
+            &[],
+            false,
+        ),
+        unseen_text_pdf(
+            b"BT /F1 12 Tf ET 3 Tr BT ET /Fm1 Do",
+            "/XObject << /Fm1 7 0 R >>",
+            &[&form],
+            false,
+        ),
+        composite(identity, descendant, false),
+        composite(ucs2, japanese, false),
+        // The composite font's text shown is not reported.
+        composite(identity, descendant, true),
+    ]);
+    // pdf-inspector 1.24.0 reads every layer and this invisible text; when
+    // a release reads neither, these expectations go.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(markdown.contains("1,000.00 superseded"), "{markdown}");
+    for result in &results[1..] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("Ignore the balance above"), "{result}");
+    }
+    assert_eq!(
+        warned_pages(&results[..1], "hidden_layer_text_read"),
+        [Some(serde_json::json!([1]))]
+    );
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results[1..], "invisible_text_read"),
+        [one.clone(), one.clone(), one.clone(), one, None]
+    );
+}
+
 /// A filled one-page form whose fields are `fields`, objects 6 on, each
 /// given its number; `annotations` lists the page's widgets (pdf-inspector
 /// issue #504).
