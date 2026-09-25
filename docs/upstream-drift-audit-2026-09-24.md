@@ -87,7 +87,7 @@ from 1,015 to 192 MiB, because callers take a slot before reading bytes.
 
 ### Open pull requests after 1.24.0
 
-pdf-inspector had 111 open pull requests on 2026-09-25. The recent ones that
+pdf-inspector had 113 open pull requests on 2026-09-25. The recent ones that
 reach this repository:
 
 | PR | Subject | Local disposition |
@@ -98,6 +98,8 @@ reach this repository:
 | #584 | A fork's fixes: CIDs a ToUnicode CMap never names, filled per code from the embedded font's cmap; Hebrew right-to-left order and number separators | From the 1.24.0 source: a code without an entry is read from the codes around it where they spell it out and is otherwise U+FFFD, both counted per font in `cmap_gaps`, which the PDF tools return, and U+FFFD also sets `has_encoding_issues`. The fork's recovery from the embedded font is not adopted, so such a letter stays visible as lost. The right-to-left fixes concern Hebrew text order, outside this repository's corpus. |
 | #586 | Release build of the Node binding with a lower glibc floor, merged after 1.24.0 | Packaging only: the Rust crate the PDF tools use is unchanged, so nothing is adopted. Checked on 2026-09-25 with the round-eight review; no other pull request was opened on either repository since this audit. |
 | #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
+| #589 | Escape literal HTML in rendered text; so far a regression test only | 1.24.0 writes literal text such as `<a test>` or `<u>underline</u>` as is, so it reads as the engine's own markup and an HTML-aware renderer hides it. Not detected; the text stays in the Markdown an agent reads. |
+| #590 | Keep a monospace code listing's indentation; so far a regression test only | 1.24.0 fences the listing but drops each line's leading spaces. Not detected; no characters are lost. |
 | #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. #532 is reported as `word_gaps_misread` on each page with a gap 1.24.0 judges otherwise than the fix would; checked against pdf-inspector patched with the fix, it names every changed page it checks and no other. #531's split words are reported the same way where a font paints its word spaces as glyphs: each page whose own text splits a word it shows glyph by glyph (203 of 270 randomized browser-printed pages whose Markdown splits one, none in error; the 67 missed mostly leave spaces as gaps). Its #406 half is reported as `table_row_repeated`. Small capitals set as one string after a first letter are split too ("(A) L imitations" in the public Title 26 chapter 6 sample) and are not reported. |
 
 Thirteen open pull requests that reach the PDF tools were checked against
@@ -108,7 +110,7 @@ still present; #299 is mostly fixed by 1.24.0's superscript handling.
 |---|---|---|
 | #377, #317 | Text painted twice over itself is kept twice: "TToottaall aammoouunntt", "84.19 84.19", a line three times where the page shows two | Reported: the page scan notes where each placed visible run starts and adds a `text_painted_twice` warning for a page where the same run starts again within a tenth of its size (overprints, glyph-by-glyph replays, fake bold 0.3 pt off). |
 | #406 | A compact table's first row is also left in the paragraph above it, so amounts appear twice (a 14 pt row gap duplicates, 16 pt does not) | Reported from the Markdown as `table_row_repeated` when the paragraph before a table ends with its first or second row and the row holds a digit, where the detector leaves it: on a line of its own, after a label or a line of form fields, or as an emphasized span. The public Title 26 sample (`sample-2.pdf`) has it in a rate table, and the upstream fixtures after an account line. |
-| #424 | Adjacent numeric columns merge: a 1099-B's wash-sale column 28 pt from the basis reads "2,610.25 205.25" in one cell; a ruled table puts both years in one cell | Reported as `table_values_merged` when a body cell's amounts are separate runs on one baseline, one item a second run starts inside, or two lines whose label cell joins both; amounts stacked by design or written as one string are not. Values pushed out of their rows after the table (30 pt pitch) are not detected. |
+| #424 | Adjacent numeric columns merge: a 1099-B's wash-sale column 28 pt from the basis reads "2,610.25 205.25" in one cell; a ruled table puts both years in one cell | Reported as `table_values_merged` when a body cell's amounts are separate runs on one baseline, one item a second run starts inside, or two lines whose label cell joins both; amounts stacked by design or written as one string are not. A column the grid drops, such as the sparse wash-sale column at a 30 pt pitch or a long statement's Amount column, follows the table an amount a line; that is reported as `table_values_detached` (Loop 19) where the page sets most of those amounts on the lines of the table's rows. |
 | #443 | A text PDF whose Markdown is dropped as garbage keeps the detector's confidence 1.0 | Confidence 0 for a full run of a text PDF with no Markdown; `has_encoding_issues` set when a page carries `suspected_garbled_text`. |
 | #407, #312 | A form XObject with indirect `/Resources`, or none, loses its fonts' Unicode maps or the text itself | #312 is reported as `form_text_unread` (Loop 18): a form drawn by a form without resources, which 1.24.0 never reads, and text a form shows in a font it does not set itself, which 1.24.0 reads byte by byte, where the font reads it otherwise. #407's high-code case stays covered by the garbled-text reason, now also an encoding issue. |
 | #445 | A page with a small image and fewer than 10 text operators is read as a scan with no text, though region extraction reads it | Not detected; the page is listed for OCR, so nothing reads as complete. |
@@ -375,9 +377,10 @@ When pdf-inspector publishes a release after 1.24.0:
 2. If #578 is included, route PDF Markdown through the sanitizer before
    adoption, since link destinations will appear in it.
 3. Re-run the thirteen pull-request fixtures. Retire the
-   `text_painted_twice`, `table_row_repeated`, or `table_values_merged`
-   warning only for a defect the release reads right, and update the
-   `sample-2.pdf` expectation in the PDF integration test.
+   `text_painted_twice`, `table_row_repeated`, `table_values_merged`, or
+   `table_values_detached` warning only for a defect the release reads
+   right, and update the `sample-2.pdf` and card-statement expectations in
+   the PDF integration tests.
 4. Re-run the sixth-round furniture, white-copy, and clip fixtures: the
    repeat warning is confirmed against the Markdown, so a release that
    strips or hides differently changes which pages it names.

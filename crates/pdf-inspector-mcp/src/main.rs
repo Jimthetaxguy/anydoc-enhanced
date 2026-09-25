@@ -430,7 +430,7 @@ impl PdfInspectorServer {
 
     /// Convert a PDF to clean Markdown.
     #[tool(
-        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled. Text on pages listed as needing OCR is missing or unreliable; `warnings` name text the Markdown repeats, pages whose word spacing may be misread, and table amounts that may sit in the wrong row or column",
+        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled. Text on pages listed as needing OCR is missing or unreliable; `warnings` name text the Markdown repeats, pages whose word spacing may be misread or whose text drawn through forms is missed, and table amounts that may sit in the wrong row or column or after their table",
         annotations(
             title = "PDF to Markdown",
             read_only_hint = true,

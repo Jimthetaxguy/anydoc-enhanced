@@ -711,6 +711,73 @@ fn text_drawn_through_forms_pdf_inspector_misses_is_reported() {
     );
 }
 
+/// A card statement page listing `rows` purchases under Date, Description
+/// and Amount headings, with the amounts right-aligned at the far edge and
+/// the new balance on a line of its own below them (pdf-inspector #424).
+fn card_statement_pdf(rows: usize) -> Vec<u8> {
+    let text = |font: &str, x: &str, y: usize, text: &str| {
+        format!("BT /{font} 9 Tf 1 0 0 1 {x} {y} Tm ({text}) Tj ET\n")
+    };
+    let mut content = text("F1", "72", 750, "Card statement for March");
+    for (heading, x) in [("Date", "72"), ("Description", "130"), ("Amount", "509.98")] {
+        content.push_str(&text("F2", x, 720, heading));
+    }
+    for row in 0..rows {
+        let y = 704 - 14 * row;
+        content.push_str(&text("F1", "72", y, &format!("03/{:02}", row + 1)));
+        let purchase = format!("Purchase at merchant {}", row + 1);
+        content.push_str(&text("F1", "130", y, &purchase));
+        content.push_str(&text("F1", "514.98", y, &format!("{}.40", 12 + 3 * row)));
+    }
+    content.push_str(&text("F1", "499.97", 690 - 14 * rows, "1,106.00"));
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", content.as_bytes()),
+    ])
+}
+
+#[test]
+fn table_amounts_pushed_out_of_their_rows_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for rows in [20, 12] {
+        let pdf = temporary.path().join(format!("statement-{rows}.pdf"));
+        std::fs::write(&pdf, card_statement_pdf(rows)).expect("write PDF");
+        let path = pdf.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| {
+        result["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "table_values_detached")
+        })
+    };
+    // pdf-inspector 1.24.0 drops the Amount column of the long statement
+    // from its table and lists the amounts after it; when a release fixes
+    // #424, this expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("|03/01|Purchase at merchant 1|\n") && markdown.contains("\n12.40\n"),
+        "{markdown}"
+    );
+    assert!(reported(&results[0]), "{}", results[0]);
+    // The short statement keeps its amounts in their rows, and the balance
+    // after the table stands on a line of its own, as the page sets it.
+    let markdown = results[1]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("|03/01|Purchase at merchant 1|12.40|")
+            && markdown.contains("\n1,106.00"),
+        "{markdown}"
+    );
+    assert!(!reported(&results[1]), "{}", results[1]);
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

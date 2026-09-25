@@ -46,7 +46,7 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content walked as AnyDoc's walkers walk it, including spreadsheet cells and drawings |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats read with AnyDoc's grammar, against each cell's value |
 | `crates/pdf-inspector-skillkit/src/text_paints.rs` | What PDF pages paint that pdf-inspector 1.24.0 misreads: an invisible OCR layer over a scan, text painted twice over itself, word gaps (through `word_gaps.rs` and `glyph_words.rs`), and text drawn through forms it does not reach or reads without a font |
-| `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF tables pdf-inspector 1.24.0 may have misread: a first row repeated above its table, amounts merged into one cell, judged by where the page sets them |
+| `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF tables pdf-inspector 1.24.0 may have misread: a first row repeated above its table, amounts merged into one cell, amounts pushed out of their rows to after the table, judged by where the page sets them |
 | `crates/pdf-inspector-skillkit/src/doubled_text.rs` | Text the PDF Markdown shows twice, confirming the pages the repeat scan names |
 | `crates/pdf-inspector-skillkit/src/word_gaps.rs` | Word gaps pdf-inspector 1.24.0 judges against the wrong space width (#532): its thresholds and its fix's, compared gap by gap as the page scan shows text |
 | `crates/pdf-inspector-skillkit/src/glyph_words.rs` | Words a browser printed glyph by glyph that pdf-inspector 1.24.0 splits (#531): the words fonts that paint their spaces show, found split in the Markdown and confirmed in each page's own text |

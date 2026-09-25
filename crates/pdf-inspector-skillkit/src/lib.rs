@@ -87,6 +87,8 @@ const MAX_CONFIRMED_PAGES: usize = 64;
 pub const PDF_WARNING_TABLE_ROW_REPEATED: &str = "table_row_repeated";
 /// A table cell holds two or more amounts.
 pub const PDF_WARNING_TABLE_VALUES_MERGED: &str = "table_values_merged";
+/// Amounts a table's rows hold appear after the table.
+pub const PDF_WARNING_TABLE_VALUES_DETACHED: &str = "table_values_detached";
 
 impl PdfWarning {
     fn new(code: &str, message: &str, pages: Vec<u32>) -> Self {
@@ -291,7 +293,7 @@ impl PdfInfo {
         let read = self.positions(
             buffer,
             &found.painted_twice,
-            !tables.merged.is_empty(),
+            !tables.merged.is_empty() || !tables.detached.is_empty(),
             &shared,
             only,
         );
@@ -417,6 +419,15 @@ impl PdfInfo {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_TABLE_VALUES_MERGED,
                 "A table cell holds two or more amounts, as when adjacent columns merge; which column each belongs to is uncertain.",
+                Vec::new(),
+            ));
+        }
+        // Amounts after a table are placed only where the page's text is
+        // read; totals on lines of their own stand as the page sets them.
+        if items.is_some() && tables.detached.iter().any(|table| layout.detached(table)) {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TABLE_VALUES_DETACHED,
+                "Amounts the page sets in a table's rows follow the table, an amount a line, as when a column is dropped from the grid; which row each belongs to is lost.",
                 Vec::new(),
             ));
         }

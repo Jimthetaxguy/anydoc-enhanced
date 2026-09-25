@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now runs behind the bounded worker for the enabled document lanes.
 - Limited feature-branch CI to the pull-request event so the same jobs are not
   duplicated by both `push` and `pull_request`.
+- Dependencies build optimized in the dev profile. The integration tests
+  drive the debug server under its 30-second tool timeout, and unoptimized
+  pdf-inspector took 11.6 s of it on the public Title 26 sample, enough to
+  time out on a loaded runner; it now takes 2 s.
 - CI checks the declared minimum Rust (1.88) in a new job. The lockfile pins
   `aes` 0.9.2: 0.9.3 raised its own minimum to 1.89 and fixed nothing.
 - EPUB text a reader hides is refused only when AnyDoc would convert it. Text
@@ -45,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `invisible_text_layer` reason, when its text is mostly an invisible layer
   that pdf-inspector 1.24.0 does not read (see Fixed).
 - PDF results carry a `warnings` list, absent when empty, naming text the
-  Markdown repeats, pages whose word gaps pdf-inspector misjudges, and tables
-  whose amounts may sit in the wrong row or column (see Fixed). A full run that yields no Markdown for a text PDF
+  Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
+  form text it does not read, and tables whose amounts may sit in the wrong
+  row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -187,6 +192,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Amounts pdf-inspector 1.24.0 pushes out of a table's rows are reported
+  (open upstream #424). The table grid can drop a column: a 1099-B's sparse
+  wash-sale adjustments, or the Amount column of a long card statement,
+  follow the table instead, an amount a line, so which lot or purchase each
+  belongs to is lost. When the Markdown shows amounts on lines of their own
+  right after a table, amounts its cells do not hold, the page's text is
+  read as pdf-inspector places it, and where the page sets most of them on
+  the lines of the table's rows, beside a whole date or description cell,
+  the result carries the `table_values_detached` warning; the Markdown is
+  not changed. A total set on a line of its own is not reported. Among 551
+  corpus, upstream-fixture, replica, and review PDFs it names ten, each such
+  a dropout: the three #424 replicas, the upstream `tnagriculture_06_12`
+  fixture, and six generated card statements.
 - Text pdf-inspector 1.24.0 misses or garbles when a form XObject draws it
   is reported (open upstream #312). A form without `/Resources` of its own
   draws with its invoker's, as renderers read the specification, but

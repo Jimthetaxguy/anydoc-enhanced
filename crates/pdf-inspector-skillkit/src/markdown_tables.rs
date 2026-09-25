@@ -12,7 +12,12 @@
 //! so adjacent columns of amounts, such as a 1099-B's wash-sale adjustments
 //! beside the cost basis, can land in one cell (open upstream #424).
 //!
-//! Both are read from the Markdown and reported, never repaired. A repeat
+//! **Amounts pushed out of their rows.** A column the grid drops, such as a
+//! 1099-B's sparse wash-sale adjustments or a long statement's amounts,
+//! follows the table instead, an amount a line, apart from the rows the
+//! page sets them on (open upstream #424).
+//!
+//! All are read from the Markdown and reported, never repaired. A repeat
 //! counts where it stands as the detector leaves it: on a line of its own,
 //! after a label or a line of form fields ("Acct: 5678 Period: April 2025"),
 //! which the detector keeps out of a table, or as a whole emphasized span;
@@ -20,11 +25,14 @@
 //! after the heading words the detector left there too. A sentence that
 //! restates a shorter first row does not. A cell holding two
 //! amounts is a candidate, which the page's positioned text decides (see
-//! `merged_on_one_line`): amounts of separate runs on one baseline were
-//! merged, while amounts stacked one above the other, or written as one
-//! run, stand as the page sets them. Where the text cannot be read there,
-//! a candidate counts beside an empty cell, or in a column whose other rows
-//! hold one amount.
+//! `Layout::placement`): amounts of separate runs on one baseline under a
+//! heading of their own were merged, while amounts stacked one above the
+//! other, or written as one run, stand as the page sets them. Where the
+//! text cannot be read there, a candidate counts beside an empty cell, or
+//! in a column whose other rows hold one amount. Amounts on lines of their
+//! own right after a table, which its cells do not hold, count where the
+//! page sets most of them on the lines of its body rows (see
+//! `Layout::detached`).
 
 /// What the checks found.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -32,7 +40,25 @@ pub(crate) struct TableFindings {
     pub(crate) row_repeated: bool,
     /// Body cells holding two or more amounts.
     pub(crate) merged: Vec<MergedCell>,
+    /// Amounts on lines of their own right after a table.
+    pub(crate) detached: Vec<Detached>,
 }
+
+/// Amounts the Markdown shows on lines of their own right after a table,
+/// and the table's body cells that hold more than amounts, such as its
+/// labels and dates.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Detached {
+    pub(crate) amounts: Vec<String>,
+    pub(crate) labels: Vec<String>,
+}
+
+/// Tables read for amounts after them, and the amounts read after each.
+const MAX_DETACHED_TABLES: usize = 64;
+const MAX_DETACHED_AMOUNTS: usize = 64;
+/// Letters and digits a body cell needs to place a row's line, so that a
+/// stray mark, such as a footnote number, does not.
+const MIN_LABEL_CHARACTERS: usize = 3;
 
 /// A body cell holding two or more amounts.
 #[derive(Debug, PartialEq, Eq)]
@@ -118,10 +144,57 @@ pub(crate) fn check(markdown: &str) -> TableFindings {
                 && repeats_as_detected(&paragraph, &joined);
         }
         merged_cells(&rows, &mut found.merged);
+        if found.detached.len() < MAX_DETACHED_TABLES {
+            // An amount the table holds, such as a total restating a row,
+            // is not one pushed out of it.
+            let held: HashSet<String> = rows
+                .iter()
+                .skip(1)
+                .flatten()
+                .flat_map(|cell| cell.split_whitespace())
+                .map(normalize)
+                .filter(|token| is_amount(token))
+                .collect();
+            let amounts: Vec<String> = amounts_after(lines.clone())
+                .into_iter()
+                .filter(|amount| !held.contains(amount))
+                .collect();
+            if !amounts.is_empty() {
+                let labels = rows
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .filter(|cell| {
+                        amount_count(cell) == 0
+                            && cell.chars().filter(|c| c.is_alphanumeric()).count()
+                                >= MIN_LABEL_CHARACTERS
+                    })
+                    .map(|cell| normalize(cell))
+                    .collect();
+                found.detached.push(Detached { amounts, labels });
+            }
+        }
         paragraph.clear();
         closed = false;
     }
     found
+}
+
+/// The amounts on lines of their own that `lines` opens with, blank lines
+/// aside.
+fn amounts_after<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut amounts = Vec::new();
+    for line in lines {
+        let line = normalize(line);
+        if line.is_empty() {
+            continue;
+        }
+        if line.contains(' ') || !is_amount(&line) || amounts.len() >= MAX_DETACHED_AMOUNTS {
+            break;
+        }
+        amounts.push(line);
+    }
+    amounts
 }
 
 /// Whether the text block ends with `repeat` where the detector leaves a
@@ -459,6 +532,67 @@ impl<'a> Layout<'a> {
         } else {
             Placement::Unread
         }
+    }
+
+    /// Whether the page sets most of the amounts the Markdown shows after a
+    /// table, of those it reads, on the lines of the table's body rows: each
+    /// on a line that, read left to right, holds a whole label cell, such as
+    /// a row's date or description. Amounts that only share a baseline with
+    /// a row by chance, as a column beside the table may, are fewer.
+    pub(crate) fn detached(&self, table: &Detached) -> bool {
+        let labels: HashSet<Vec<&str>> = table.labels.iter().map(|label| words(label)).collect();
+        let mut lengths: Vec<usize> = labels
+            .iter()
+            .map(Vec::len)
+            .filter(|&length| length > 0)
+            .collect();
+        lengths.sort_unstable();
+        lengths.dedup();
+        let mut beside: Vec<usize> = Vec::new();
+        let mut line_words: Vec<&str> = Vec::new();
+        let (mut read, mut on_rows) = (0, 0);
+        for amount in &table.amounts {
+            let runs = self.by_text.get(amount.as_str());
+            read += usize::from(runs.is_some());
+            'runs: for &index in runs.into_iter().flatten() {
+                let run = &self.runs[index];
+                let near = 0.25 * run.size.abs().max(1.0);
+                let Some(line) = self.lines.get(&run.page) else {
+                    continue;
+                };
+                beside.clear();
+                for &other in self.band(line, run.y - near, run.y + near) {
+                    if !self.step() {
+                        return false;
+                    }
+                    if other != index {
+                        beside.push(other);
+                    }
+                }
+                beside.sort_by(|&a, &b| {
+                    self.runs[a]
+                        .x
+                        .partial_cmp(&self.runs[b].x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                line_words.clear();
+                for &other in &beside {
+                    line_words.extend(&self.words[other]);
+                }
+                for &length in &lengths {
+                    for window in line_words.windows(length) {
+                        if !self.step() {
+                            return false;
+                        }
+                        if labels.contains(window) {
+                            on_rows += 1;
+                            break 'runs;
+                        }
+                    }
+                }
+            }
+        }
+        on_rows > 0 && 2 * on_rows > read
     }
 
     /// Whether a line above the line at `y` heads a column over the second
@@ -849,6 +983,95 @@ mod tests {
         assert_eq!(
             merged_on_one_line(&basis, &reversed, &[]),
             Placement::Unread
+        );
+    }
+
+    #[test]
+    fn amounts_pushed_out_of_their_rows_are_found() {
+        let lots = "|Description|Sold|Proceeds|Gain|\n|---|---|---|---|\n|100 sh XYZ CORP|03/02/25|5,210.00|230.00|\n|50 sh ABC INC|03/05/25|2,405.50|0.00|\n\n205.25\n154.60\n\nTotals carry to Form 8949.\n";
+        let found = check(lots);
+        assert_eq!(
+            found.detached,
+            vec![Detached {
+                amounts: vec!["205.25".to_string(), "154.60".to_string()],
+                labels: vec![
+                    "100 sh XYZ CORP".to_string(),
+                    "03/02/25".to_string(),
+                    "50 sh ABC INC".to_string(),
+                    "03/05/25".to_string()
+                ],
+            }]
+        );
+        let run = |text: &'static str, x: f64, y: f64| Run {
+            page: 1,
+            text,
+            x,
+            y,
+            width: 30.0,
+            size: 8.0,
+        };
+        // An amount the page sets on a row's line was pushed out of it; one
+        // it sets on a line of its own, as a total, was not.
+        let table = &found.detached[0];
+        let on_row = [
+            run("50 sh ABC INC", 72.0, 690.0),
+            run("2,405.50", 300.0, 690.0),
+            run("205.25", 380.0, 690.0),
+        ];
+        assert!(Layout::new(&on_row, &[]).detached(table));
+        let below = [
+            run("50 sh ABC INC", 72.0, 690.0),
+            run("205.25", 380.0, 640.0),
+        ];
+        assert!(!Layout::new(&below, &[]).detached(table));
+        // A label the page sets word by word is read along the line; part
+        // of a label is not one.
+        let by_word = [
+            run("50", 72.0, 690.0),
+            run("sh", 84.0, 690.0),
+            run("ABC", 96.0, 690.0),
+            run("INC", 118.0, 690.0),
+            run("205.25", 380.0, 690.0),
+        ];
+        assert!(Layout::new(&by_word, &[]).detached(table));
+        let part = [run("ABC INC", 96.0, 690.0), run("205.25", 380.0, 690.0)];
+        assert!(!Layout::new(&part, &[]).detached(table));
+        // Most of the amounts read must sit on rows' lines: one of three
+        // sharing a row's baseline, as a column beside the table may, does
+        // not.
+        let three = Detached {
+            amounts: vec![
+                "205.25".to_string(),
+                "154.60".to_string(),
+                "105.80".to_string(),
+            ],
+            labels: table.labels.clone(),
+        };
+        let aside = [
+            run("50 sh ABC INC", 72.0, 690.0),
+            run("205.25", 380.0, 690.0),
+            run("154.60", 380.0, 640.0),
+            run("105.80", 380.0, 626.0),
+        ];
+        assert!(!Layout::new(&aside, &[]).detached(&three));
+        // A line after the table holding more than an amount ends them.
+        assert!(check("|a|1.00|\n|---|---|\n|b|2.00|\nTotal 3.00\n4.00\n")
+            .detached
+            .is_empty());
+        // An amount the table holds, as a total restating its one row, is
+        // not pushed out of it; nor does a cell of a mark or two label a
+        // row.
+        assert!(
+            check("|Item|Amount|\n|---|---|\n|Filing fee|12.40|\n\n12.40\n")
+                .detached
+                .is_empty()
+        );
+        assert_eq!(
+            check("|Item|Note|Amount|\n|---|---|---|\n|Filing fee|1|12.40|\n\n9.10\n").detached,
+            vec![Detached {
+                amounts: vec!["9.10".to_string()],
+                labels: vec!["Filing fee".to_string()],
+            }]
         );
     }
 
