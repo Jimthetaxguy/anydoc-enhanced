@@ -102,6 +102,19 @@ fn analysis_reports_layout_for_the_public_fixture() {
 }
 
 #[test]
+fn scanned_fixture_reports_no_analysis_it_did_not_run() {
+    // Upstream skips extraction for scans, so "no tables" would be a guess.
+    let scanned =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-corpus/scanned/sample-1.pdf");
+    for info in [analyze(&scanned), process(&scanned)] {
+        let info = info.expect("scanned fixture");
+        assert_eq!(info.pdf_type, "Scanned");
+        assert!(info.layout.is_none());
+        assert!(info.cmap_gaps.is_none());
+    }
+}
+
+#[test]
 fn scanned_fixture_reports_why_it_needs_ocr() {
     let scanned =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-corpus/scanned/sample-1.pdf");

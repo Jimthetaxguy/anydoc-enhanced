@@ -115,8 +115,14 @@ pub async fn run(
     } else {
         Vec::new()
     };
+    // Take a slot before reading, so a batch of large files waits holding
+    // paths rather than their bytes.
+    let permit = document::pdf_worker_permit().await?;
     if !document::worker_available() {
+        // The blocking parse cannot be cancelled; it keeps its slot until it
+        // finishes, even when the caller has timed out.
         return tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let buffer = crate::read_validated(&canonical)?;
             execute_operation(operation, &buffer, &regions)
         })
@@ -125,7 +131,7 @@ pub async fn run(
     }
 
     let params = if operation.takes_regions() {
-        serde_json::to_vec(&regions).map_err(|_| PdfToolError::Protocol)?
+        serde_json::to_vec(&encode_regions(&regions)).map_err(|_| PdfToolError::Protocol)?
     } else {
         Vec::new()
     };
@@ -158,12 +164,15 @@ pub async fn run(
         .into());
     }
 
-    let response = document::run_pdf_worker_job(WorkerJob {
-        code: operation.code(),
-        payload,
-        timeout: PDF_WORKER_TIMEOUT,
-        max_response_bytes: MAX_PDF_RESPONSE_BYTES,
-    })
+    let response = document::run_pdf_worker_job(
+        WorkerJob {
+            code: operation.code(),
+            payload,
+            timeout: PDF_WORKER_TIMEOUT,
+            max_response_bytes: MAX_PDF_RESPONSE_BYTES,
+        },
+        permit,
+    )
     .await?;
     match (response.json, response.error) {
         (Some(json), None) => Ok(json),
@@ -233,9 +242,43 @@ fn decode_frame(frame: &[u8]) -> Result<(OwnedRegions, &[u8]), DocumentError> {
     let regions = if params.is_empty() {
         Vec::new()
     } else {
-        serde_json::from_slice(params).map_err(|_| DocumentError::WorkerProtocol)?
+        let encoded: EncodedRegions =
+            serde_json::from_slice(params).map_err(|_| DocumentError::WorkerProtocol)?;
+        decode_regions(encoded)
     };
     Ok((regions, buffer))
+}
+
+/// Regions with coordinates as their exact `f32` bit patterns: JSON has no
+/// infinity or NaN, and the worker must receive exactly what the in-process
+/// route would pass to pdf-inspector.
+type EncodedRegions = Vec<(u32, Vec<[u32; 4]>)>;
+
+fn encode_regions(regions: &PageRegions) -> EncodedRegions {
+    regions
+        .iter()
+        .map(|(page, rects)| {
+            (
+                *page,
+                rects.iter().map(|rect| rect.map(f32::to_bits)).collect(),
+            )
+        })
+        .collect()
+}
+
+fn decode_regions(encoded: EncodedRegions) -> OwnedRegions {
+    encoded
+        .into_iter()
+        .map(|(page, rects)| {
+            (
+                page,
+                rects
+                    .into_iter()
+                    .map(|rect| rect.map(f32::from_bits))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// Run one operation in this process and serialize its result exactly as the
@@ -327,13 +370,24 @@ mod tests {
     fn region_parameters_travel_ahead_of_the_document() {
         let buffer = public_fixture();
         let regions: Vec<(u32, Vec<[f32; 4]>)> = vec![(0, vec![[0.0, 0.0, 612.0, 200.0]])];
-        let params = serde_json::to_vec(&regions).unwrap();
+        let params = serde_json::to_vec(&encode_regions(&regions)).unwrap();
         let response = execute(PdfOperation::TextRegions.code(), &frame(&params, &buffer))
             .expect("PDF operation");
         let json = response.json.expect("region result");
         let parsed: serde_json::Value = serde_json::from_str(json.get()).unwrap();
         assert_eq!(parsed[0]["page"], 0);
         assert!(parsed[0]["regions"][0]["text"].is_string());
+    }
+
+    #[test]
+    fn region_encoding_round_trips_every_coordinate() {
+        let regions: Vec<(u32, Vec<[f32; 4]>)> =
+            vec![(3, vec![[f32::INFINITY, -0.0, f32::NAN, f32::MIN_POSITIVE]])];
+        let wire = serde_json::to_vec(&encode_regions(&regions)).unwrap();
+        let decoded = decode_regions(serde_json::from_slice(&wire).unwrap());
+        assert_eq!(decoded[0].0, 3);
+        let bits = |rect: [f32; 4]| rect.map(f32::to_bits);
+        assert_eq!(bits(decoded[0].1[0]), bits(regions[0].1[0]));
     }
 
     #[test]

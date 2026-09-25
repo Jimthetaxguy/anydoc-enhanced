@@ -479,11 +479,7 @@ pub fn capabilities(kind: DocumentKind) -> DocumentCapabilities {
 /// Classify a path using content signatures first and its extension second.
 pub fn classify(path: impl AsRef<Path>) -> Result<DocumentClassification, DocumentError> {
     let canonical = crate::validate_path(path).map_err(map_path_error)?;
-    let metadata = std::fs::metadata(&canonical).map_err(|_| DocumentError::InputUnavailable)?;
-    if metadata.len() > MAX_DOCUMENT_SIZE {
-        return Err(DocumentError::ResourceLimit);
-    }
-    let bytes = std::fs::read(&canonical).map_err(|_| DocumentError::InputUnavailable)?;
+    let bytes = crate::read_validated(&canonical).map_err(map_path_error)?;
     Ok(classify_bytes(&bytes, &canonical))
 }
 
@@ -1090,68 +1086,322 @@ fn xml_has_odt_unsupported_content(bytes: &[u8]) -> bool {
     }
 }
 
-/// Word story parts AnyDoc 0.2.4 renders: the body, footnotes, and endnotes.
-/// Headers, footers, and comments are not converted.
-fn docx_story_part(lower_name: &str) -> bool {
-    matches!(
-        lower_name,
-        "word/document.xml" | "word/footnotes.xml" | "word/endnotes.xml"
-    )
+/// What one Word story part (body, footnotes, or endnotes) carries.
+#[derive(Default)]
+struct DocxStoryScan {
+    /// Content the pinned AnyDoc parser drops without a diagnostic: a symbol
+    /// character (`w:sym`, which carries Wingdings checkboxes and Symbol-font
+    /// letters) and the state of a legacy form checkbox or drop-down
+    /// (`w:checkBox`, `w:ddList`). Upstream renders symbol checkboxes after
+    /// this release (firecrawl/anydoc#176, #177).
+    dropped: bool,
+    /// A run formatted hidden directly (`w:r/w:rPr/w:vanish`), which the
+    /// pinned parser converts as ordinary text.
+    hidden_run: bool,
+    /// Character and paragraph styles the part applies.
+    styles_used: HashSet<String>,
 }
 
-/// Word content the pinned AnyDoc parser drops without a diagnostic: a
-/// symbol character (`w:sym`, which carries Wingdings checkboxes and
-/// Symbol-font letters) and the state of a legacy form checkbox or drop-down
-/// (`w:checkBox`, `w:ddList`). Upstream renders symbol checkboxes after this
-/// release (firecrawl/anydoc#176, #177).
-fn xml_has_docx_dropped_content(bytes: &[u8]) -> bool {
+/// Whether an on/off property element such as `w:vanish` is switched off.
+fn xml_toggle_off(event: &quick_xml::events::BytesStart<'_>) -> bool {
+    xml_attribute_value(event, b"val").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off"
+        )
+    })
+}
+
+/// Scan a Word story part. Parse errors fail closed as malformed; end tags
+/// are not matched against start tags by prefix, as AnyDoc does not.
+fn scan_docx_story(bytes: &[u8]) -> Result<DocxStoryScan, DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut scan = DocxStoryScan::default();
     loop {
         match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(event))
-            | Ok(quick_xml::events::Event::Empty(event)) => {
-                if matches!(
-                    xml_local_name(event.name().as_ref()),
-                    b"sym" | b"checkBox" | b"ddList"
-                ) {
-                    return true;
-                }
-                buffer.clear();
+            Ok(quick_xml::events::Event::Start(event)) => {
+                let local = xml_local_name(event.name().as_ref()).to_vec();
+                scan_docx_element(&event, &local, &stack, &mut scan);
+                stack.push(local);
             }
-            Ok(quick_xml::events::Event::Eof) => return false,
-            Ok(_) => buffer.clear(),
-            Err(_) => return false,
+            Ok(quick_xml::events::Event::Empty(event)) => {
+                let local = xml_local_name(event.name().as_ref()).to_vec();
+                scan_docx_element(&event, &local, &stack, &mut scan);
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(quick_xml::events::Event::Eof) => return Ok(scan),
+            Ok(_) => {}
+            Err(_) => return Err(DocumentError::Malformed),
         }
+        buffer.clear();
     }
 }
 
-/// Whether any Word run is formatted hidden (`w:vanish` not switched off).
-/// The pinned parser converts hidden runs as ordinary text.
-fn xml_has_docx_hidden_text(bytes: &[u8]) -> bool {
+fn scan_docx_element(
+    event: &quick_xml::events::BytesStart<'_>,
+    local: &[u8],
+    stack: &[Vec<u8>],
+    scan: &mut DocxStoryScan,
+) {
+    match local {
+        // Tracked deletions are omitted from the output, symbols included.
+        b"sym" | b"checkBox" | b"ddList" if !stack.iter().any(|name| name == b"del") => {
+            scan.dropped = true;
+        }
+        // Only a run's own properties hide text: the same element under a
+        // paragraph mark (`w:pPr/w:rPr`) or in revision history
+        // (`w:rPrChange/w:rPr`) does not.
+        b"vanish" if stack.ends_with(&[b"r".to_vec(), b"rPr".to_vec()]) => {
+            scan.hidden_run |= !xml_toggle_off(event);
+        }
+        b"rStyle" | b"pStyle" => {
+            if let Some(style) = xml_attribute_value(event, b"val") {
+                scan.styles_used.insert(style);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Style ids whose run properties hide text, following `basedOn`, and whether
+/// the document defaults hide all text.
+fn docx_hidden_styles(bytes: &[u8]) -> Result<(HashSet<String>, bool), DocumentError> {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut explicit: HashMap<String, bool> = HashMap::new();
+    let mut based_on: HashMap<String, String> = HashMap::new();
+    let mut defaults_hidden = false;
+    loop {
+        let (event, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => (event, true),
+            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
+            Ok(quick_xml::events::Event::End(_)) => {
+                if stack.pop().as_deref() == Some(b"style".as_slice()) {
+                    current = None;
+                }
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {
+                buffer.clear();
+                continue;
+            }
+            Err(_) => return Err(DocumentError::Malformed),
+        };
+        let local = xml_local_name(event.name().as_ref()).to_vec();
+        match local.as_slice() {
+            b"style" => current = xml_attribute_value(&event, b"styleId"),
+            b"basedOn" if stack.ends_with(&[b"style".to_vec()]) => {
+                if let (Some(style), Some(base)) =
+                    (current.clone(), xml_attribute_value(&event, b"val"))
+                {
+                    based_on.insert(style, base);
+                }
+            }
+            b"vanish" if stack.ends_with(&[b"style".to_vec(), b"rPr".to_vec()]) => {
+                if let Some(style) = current.clone() {
+                    explicit.insert(style, !xml_toggle_off(&event));
+                }
+            }
+            b"vanish"
+                if stack.ends_with(&[
+                    b"docDefaults".to_vec(),
+                    b"rPrDefault".to_vec(),
+                    b"rPr".to_vec(),
+                ]) =>
+            {
+                defaults_hidden = !xml_toggle_off(&event);
+            }
+            _ => {}
+        }
+        if start {
+            stack.push(local);
+        }
+        buffer.clear();
+    }
+    let mut hidden = HashSet::new();
+    for style in explicit.keys().chain(based_on.keys()) {
+        let mut cursor = style.as_str();
+        // The first explicit setting up the chain decides; cycles and
+        // unreasonably deep chains stop the walk.
+        for _ in 0..32 {
+            if let Some(value) = explicit.get(cursor) {
+                if *value {
+                    hidden.insert(style.clone());
+                }
+                break;
+            }
+            match based_on.get(cursor) {
+                Some(base) => cursor = base,
+                None => break,
+            }
+        }
+    }
+    Ok((hidden, defaults_hidden))
+}
+
+/// One package relationship, read with the XML reader.
+struct OoxmlRelationship {
+    kind: String,
+    target: String,
+    external: bool,
+}
+
+fn ooxml_relationships(bytes: &[u8]) -> Result<Vec<OoxmlRelationship>, DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
+    let mut relationships = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
-            | Ok(quick_xml::events::Event::Empty(event)) => {
-                if xml_local_name(event.name().as_ref()) == b"vanish" {
-                    let off = xml_attribute_value(&event, b"val").is_some_and(|value| {
-                        matches!(value.to_ascii_lowercase().as_str(), "false" | "0" | "off")
-                    });
-                    if !off {
-                        return true;
+            | Ok(quick_xml::events::Event::Empty(event))
+                if xml_local_name(event.name().as_ref()) == b"Relationship" =>
+            {
+                let mut relationship = OoxmlRelationship {
+                    kind: String::new(),
+                    target: String::new(),
+                    external: false,
+                };
+                for attribute in event.attributes().flatten() {
+                    let value = attribute
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .map(|value| value.into_owned())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&attribute.value).into_owned());
+                    match xml_local_name(attribute.key.as_ref()) {
+                        b"Type" => relationship.kind = value,
+                        b"Target" => relationship.target = value,
+                        b"TargetMode" => {
+                            relationship.external = value.trim().eq_ignore_ascii_case("external");
+                        }
+                        _ => {}
                     }
                 }
-                buffer.clear();
+                relationships.push(relationship);
             }
-            Ok(quick_xml::events::Event::Eof) => return false,
-            Ok(_) => buffer.clear(),
-            Err(_) => return false,
+            Ok(quick_xml::events::Event::Eof) => return Ok(relationships),
+            Ok(_) => {}
+            Err(_) => return Err(DocumentError::Malformed),
+        }
+        buffer.clear();
+    }
+}
+
+/// The relationships part for a package part: `word/document.xml` has
+/// `word/_rels/document.xml.rels`.
+fn ooxml_rels_part(part: &str) -> String {
+    match part.rsplit_once('/') {
+        Some((parent, file)) => format!("{parent}/_rels/{file}.rels"),
+        None => format!("_rels/{part}.rels"),
+    }
+}
+
+/// Internal parts named by `type_suffix` relationships in `rels_part`,
+/// resolved against `base_part` as AnyDoc resolves them. A missing rels part
+/// names nothing; an unreadable one is malformed.
+fn ooxml_related_parts(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    rels_part: &str,
+    base_part: &str,
+    type_suffix: &str,
+) -> Result<Vec<String>, DocumentError> {
+    let Ok(entry) = archive.by_name(rels_part) else {
+        return Ok(Vec::new());
+    };
+    if entry.size() > MAX_PREFLIGHT_PART_BYTES {
+        return Err(DocumentError::ResourceLimit);
+    }
+    let mut bytes = Vec::new();
+    entry
+        .take(MAX_PREFLIGHT_PART_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DocumentError::Malformed)?;
+    Ok(ooxml_relationships(&bytes)?
+        .into_iter()
+        .filter(|relationship| !relationship.external && relationship.kind.ends_with(type_suffix))
+        .filter_map(|relationship| resolve_package_target(base_part, &relationship.target))
+        .collect())
+}
+
+/// Parts a conversion reads, located through the package relationships the
+/// way the pinned parser locates them.
+#[derive(Default)]
+struct OoxmlLayout {
+    /// DOCX body, footnotes, and endnotes.
+    story_parts: HashSet<String>,
+    /// DOCX or XLSX styles.
+    styles_parts: HashSet<String>,
+    /// XLSX worksheets.
+    worksheet_parts: HashSet<String>,
+}
+
+fn ooxml_layout(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    kind: DocumentKind,
+) -> Result<OoxmlLayout, DocumentError> {
+    let main = match kind {
+        DocumentKind::Docx => "word/document.xml",
+        DocumentKind::Pptx => "ppt/presentation.xml",
+        DocumentKind::Xlsx => "xl/workbook.xml",
+        _ => return Ok(OoxmlLayout::default()),
+    };
+    // Every check here reads the conventional main part. AnyDoc converts the
+    // part the package's officeDocument relationship names, so a package
+    // naming any other part is refused rather than converted unseen.
+    if let Some(declared) = ooxml_related_parts(archive, "_rels/.rels", "", "/officeDocument")?
+        .into_iter()
+        .next()
+    {
+        if declared != main {
+            return Err(DocumentError::Malformed);
         }
     }
+    let rels = ooxml_rels_part(main);
+    let mut layout = OoxmlLayout::default();
+    // AnyDoc reads the first typed relationship, else the conventional sibling.
+    let mut first_or = |suffix: &str, fallback: &str| -> Result<String, DocumentError> {
+        Ok(ooxml_related_parts(archive, &rels, main, suffix)?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| fallback.to_string()))
+    };
+    match kind {
+        DocumentKind::Docx => {
+            layout.story_parts.insert(main.to_string());
+            layout
+                .story_parts
+                .insert(first_or("/footnotes", "word/footnotes.xml")?);
+            layout
+                .story_parts
+                .insert(first_or("/endnotes", "word/endnotes.xml")?);
+            layout
+                .styles_parts
+                .insert(first_or("/styles", "word/styles.xml")?);
+        }
+        DocumentKind::Xlsx => {
+            // The styles guard is a resource bound: check both candidates.
+            layout.styles_parts.insert("xl/styles.xml".to_string());
+            layout
+                .styles_parts
+                .extend(ooxml_related_parts(archive, &rels, main, "/styles")?);
+            layout
+                .worksheet_parts
+                .extend(ooxml_related_parts(archive, &rels, main, "/worksheet")?);
+        }
+        _ => {}
+    }
+    Ok(layout)
 }
 
 /// Longest spreadsheet number-format code converted. AnyDoc 0.2.4 expands
@@ -1215,38 +1465,6 @@ fn styles_have_oversized_number_format(reader: impl Read) -> Result<bool, Docume
         let consumed = chunk.len();
         std::io::BufRead::consume(&mut reader, consumed);
     }
-}
-
-/// Styles parts AnyDoc may read for a workbook: the target of the workbook's
-/// styles relationship and the conventional `xl/styles.xml` fallback.
-fn xlsx_styles_parts(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Vec<String> {
-    let mut parts = vec!["xl/styles.xml".to_string()];
-    let Ok(entry) = archive.by_name("xl/_rels/workbook.xml.rels") else {
-        return parts;
-    };
-    if entry.size() > MAX_PREFLIGHT_PART_BYTES {
-        return parts;
-    }
-    let mut rels = Vec::new();
-    if entry
-        .take(MAX_PREFLIGHT_PART_BYTES)
-        .read_to_end(&mut rels)
-        .is_err()
-    {
-        return parts;
-    }
-    let rels = String::from_utf8_lossy(&rels);
-    for tag in xml_element_tags(&rels, "Relationship") {
-        let is_styles = xml_attribute(tag, "Type").is_some_and(|kind| kind.ends_with("/styles"));
-        if let Some(target) = xml_attribute(tag, "Target").filter(|_| is_styles) {
-            if let Some(part) = resolve_package_target("xl/workbook.xml", target) {
-                if !parts.contains(&part) {
-                    parts.push(part);
-                }
-            }
-        }
-    }
-    parts
 }
 
 fn xml_has_odt_active_content(bytes: &[u8]) -> bool {
@@ -1455,18 +1673,26 @@ fn xml_has_ooxml_external_relationship(bytes: &[u8]) -> bool {
 }
 
 fn xml_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    for quote in ['"', '\''] {
-        let marker = format!("{name}={quote}");
-        if let Some(start) = tag.find(&marker) {
-            let value_start = start + marker.len();
-            if let Some(end) = tag[value_start..].find(quote) {
-                return Some(&tag[value_start..value_start + end]);
-            }
+    let mut search = 0;
+    while let Some(offset) = tag[search..].find(name) {
+        let start = search + offset;
+        search = start + name.len();
+        // A whole attribute name, optionally spaced around `=` as XML allows.
+        if !tag[..start].ends_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
         }
+        let Some(rest) = tag[search..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            continue;
+        };
+        let value = &rest[1..];
+        return value.find(quote).map(|end| &value[..end]);
     }
     None
 }
-
 fn resolve_package_target(base_part: &str, target: &str) -> Option<String> {
     if target.contains('\\') || target.contains(char::from(0)) {
         return None;
@@ -2167,6 +2393,9 @@ fn preflight_package(
     let mut archive_names = HashSet::new();
     let mut odf_references = Vec::new();
 
+    let layout = ooxml_layout(&mut archive, kind)?;
+    let mut docx_scans = Vec::new();
+    let mut docx_styles = None;
     let mut result = PackagePreflight::default();
     let mut ppt_presentation = None;
     let mut ppt_presentation_rels = None;
@@ -2276,13 +2505,14 @@ fn preflight_package(
                 "content.xml" | "meta-inf/manifest.xml" | "styles.xml"
             ))
             || (matches!(kind, DocumentKind::Xlsx)
-                && lower_name.starts_with("xl/worksheets/")
-                && lower_name.ends_with(".xml"))
+                && ((lower_name.starts_with("xl/worksheets/") && lower_name.ends_with(".xml"))
+                    || layout.worksheet_parts.contains(&name)))
             || (matches!(kind, DocumentKind::Pptx)
                 && (lower_name == "ppt/presentation.xml"
                     || lower_name == "ppt/_rels/presentation.xml.rels"
                     || (lower_name.starts_with("ppt/slides/") && lower_name.ends_with(".xml"))))
-            || (matches!(kind, DocumentKind::Docx) && docx_story_part(&lower_name));
+            || (matches!(kind, DocumentKind::Docx)
+                && (layout.story_parts.contains(&name) || layout.styles_parts.contains(&name)));
         if inspect_xml {
             if declared > MAX_PREFLIGHT_PART_BYTES {
                 return Err(DocumentError::ResourceLimit);
@@ -2302,9 +2532,13 @@ fn preflight_package(
             {
                 return Err(DocumentError::Malformed);
             }
-            if matches!(kind, DocumentKind::Docx) && docx_story_part(&lower_name) {
-                result.unsupported_content |= xml_has_docx_dropped_content(&content);
-                result.hidden_content |= xml_has_docx_hidden_text(&content);
+            if matches!(kind, DocumentKind::Docx) {
+                if layout.story_parts.contains(&name) {
+                    docx_scans.push(scan_docx_story(&content)?);
+                }
+                if layout.styles_parts.contains(&name) {
+                    docx_styles = Some(content.clone());
+                }
             }
             if matches!(
                 kind,
@@ -2368,7 +2602,9 @@ fn preflight_package(
             }
             if matches!(kind, DocumentKind::Xlsx) {
                 result.hidden_content |= xml_has_hidden_content(lower_content.as_bytes());
-                if lower_name.starts_with("xl/worksheets/") {
+                if lower_name.starts_with("xl/worksheets/")
+                    || layout.worksheet_parts.contains(&name)
+                {
                     result.missing_formula_cache |=
                         xml_has_uncached_formula(lower_content.as_bytes());
                 }
@@ -2431,13 +2667,29 @@ fn preflight_package(
         return Err(DocumentError::Malformed);
     }
     if matches!(kind, DocumentKind::Xlsx) {
-        for part in xlsx_styles_parts(&mut archive) {
-            let Ok(entry) = archive.by_name(&part) else {
+        for part in &layout.styles_parts {
+            let Ok(entry) = archive.by_name(part) else {
                 continue;
             };
             if styles_have_oversized_number_format(entry.take(MAX_ARCHIVE_ENTRY_BYTES))? {
                 return Err(DocumentError::ResourceLimit);
             }
+        }
+    }
+    if matches!(kind, DocumentKind::Docx) {
+        let (hidden_styles, defaults_hidden) = docx_styles
+            .as_deref()
+            .map(docx_hidden_styles)
+            .transpose()?
+            .unwrap_or_default();
+        for scan in &docx_scans {
+            result.unsupported_content |= scan.dropped;
+            result.hidden_content |= scan.hidden_run
+                || defaults_hidden
+                || scan
+                    .styles_used
+                    .iter()
+                    .any(|style| hidden_styles.contains(style));
         }
     }
     if !matches!(variant, DocumentVariant::Docx) && matches!(kind, DocumentKind::Docx) {
@@ -2520,7 +2772,12 @@ fn classify_bytes(bytes: &[u8], path: &Path) -> DocumentClassification {
 /// Convert an enabled document through the supervised worker.
 pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, DocumentError> {
     let canonical = crate::validate_path(path).map_err(map_path_error)?;
-    let bytes = tokio::fs::read(&canonical)
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(&canonical)
+        .await
+        .map_err(|_| DocumentError::InputUnavailable)?
+        .take(MAX_DOCUMENT_SIZE + 1)
+        .read_to_end(&mut bytes)
         .await
         .map_err(|_| DocumentError::InputUnavailable)?;
     if bytes.len() as u64 > MAX_DOCUMENT_SIZE {
@@ -2657,17 +2914,25 @@ pub(crate) fn worker_available() -> bool {
     worker_sandbox_available()
 }
 
-/// Run a PDF job in the private worker under the PDF lane's own concurrency
-/// bound, so PDF calls and document conversions cannot starve each other.
-pub(crate) async fn run_pdf_worker_job(job: WorkerJob) -> Result<WorkerResponse, DocumentError> {
+/// Wait for one of the PDF lane's slots, separate from the document lane's so
+/// PDF calls and document conversions cannot starve each other. Callers take
+/// the slot before reading a file, so waiting calls hold no document bytes.
+pub(crate) async fn pdf_worker_permit() -> Result<OwnedSemaphorePermit, DocumentError> {
+    pdf_worker_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| DocumentError::WorkerBusy)
+}
+
+/// Run a PDF job in the private worker under a slot from [`pdf_worker_permit`].
+pub(crate) async fn run_pdf_worker_job(
+    job: WorkerJob,
+    permit: OwnedSemaphorePermit,
+) -> Result<WorkerResponse, DocumentError> {
     if !worker_sandbox_available() {
         return Err(DocumentError::WorkerUnavailable);
     }
     let executable = worker_executable()?;
-    let permit = pdf_worker_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| DocumentError::WorkerBusy)?;
     run_worker_job(job, executable, permit).await
 }
 
@@ -3360,55 +3625,169 @@ fn write_worker_response<W: Write>(
         .map_err(|_| DocumentError::WorkerProtocol)
 }
 
+const EXTERNAL_URL_MARKER: &str = "[external URL removed]";
+const LOCAL_PATH_MARKER: &str = "[local path removed]";
+
 fn sanitize_markdown(markdown: &str) -> (String, bool) {
-    static DESTINATION: OnceLock<Regex> = OnceLock::new();
     static URL: OnceLock<Regex> = OnceLock::new();
     static PATH: OnceLock<Regex> = OnceLock::new();
     static HTML: OnceLock<Regex> = OnceLock::new();
-    // A link or image destination that names a scheme, a host, a drive, or
-    // an absolute or UNC path: `](mailto:…)`, `](//host/…)`, `](\\server\…)`.
-    // Relative and fragment destinations stay; they name parts of the same
-    // package.
-    let destination = DESTINATION.get_or_init(|| {
-        Regex::new(r"\]\(\s*<?((?:[A-Za-z][A-Za-z0-9+.\-]*:|//|\\\\|/)[^)]*)\)")
-            .expect("destination regex")
-    });
-    // Bare URLs with an authority, and the schemes that act without one.
+    // Bare URLs with an authority, `www.` hosts that GFM links on its own,
+    // and the schemes that act without an authority.
     let url = URL.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(?:[a-z][a-z0-9+.\-]*://|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>]+",
+            r"(?i)\b(?:[a-z][a-z0-9+.\-]*://|www\.|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>]+",
         )
         .expect("URL regex")
     });
     // Home directories, temporary and private roots, Windows profiles, and
-    // UNC shares.
+    // UNC shares, starting a token: `Text/home/ch1.xhtml` is a relative link,
+    // not a home directory.
     let path = PATH.get_or_init(|| {
         Regex::new(
-            r"(?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|\b[A-Za-z]:\\(?i:users)\\)[^\s)\]>]+",
+            r#"(^|[\s(\["'=,;])((?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|[A-Za-z]:\\(?i:users)\\)[^\s)\]>]*)"#,
         )
         .expect("path regex")
     });
     let html = HTML.get_or_init(|| Regex::new(r"</?[A-Za-z][^>]*>").expect("HTML regex"));
-    let sanitized = destination.replace_all(markdown, |caps: &regex::Captures<'_>| {
-        let target = &caps[1];
-        let bytes = target.as_bytes();
-        let local = target.starts_with("\\\\")
-            || (target.starts_with('/') && !target.starts_with("//"))
-            || (bytes.len() > 2
-                && bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':'
-                && matches!(bytes[2], b'\\' | b'/'));
-        if local {
-            "]([local path removed])"
-        } else {
-            "]([external URL removed])"
-        }
-    });
-    let sanitized = url.replace_all(&sanitized, "[external URL removed]");
-    let sanitized = path.replace_all(&sanitized, "[local path removed]");
+    let sanitized = neutralize_destinations(markdown);
+    let sanitized = url.replace_all(&sanitized, EXTERNAL_URL_MARKER);
+    let sanitized = path.replace_all(&sanitized, format!("${{1}}{LOCAL_PATH_MARKER}"));
     let sanitized = html.replace_all(&sanitized, "").into_owned();
     let changed = sanitized != markdown;
     (sanitized, changed)
+}
+
+/// Replace link and image destinations that leave the package: a scheme, a
+/// host, a drive, or an absolute or UNC path. Relative and fragment
+/// destinations stay; they name parts of the same package. Destinations are
+/// read as a CommonMark renderer reads them, one line and no unbracketed
+/// whitespace, after backslash escapes and character references are decoded,
+/// so `https&#58;//…` and `https\://…` are recognized.
+fn neutralize_destinations(markdown: &str) -> String {
+    static INLINE: OnceLock<Regex> = OnceLock::new();
+    static REFERENCE: OnceLock<Regex> = OnceLock::new();
+    let inline = INLINE.get_or_init(|| {
+        Regex::new(r"\]\([ \t]*(<[^<>\n]*>|[^\s()<>]+)").expect("inline destination regex")
+    });
+    let reference = REFERENCE.get_or_init(|| {
+        Regex::new(r"(?m)^[ ]{0,3}\[[^\]\n]+\]:[ \t]*(<[^<>\n]*>|\S+)")
+            .expect("reference destination regex")
+    });
+    let rewritten = replace_destinations(markdown, inline, true);
+    replace_destinations(&rewritten, reference, false)
+}
+
+fn replace_destinations(text: &str, pattern: &Regex, skip_escaped_bracket: bool) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    for caps in pattern.captures_iter(text) {
+        let (Some(whole), Some(destination)) = (caps.get(0), caps.get(1)) else {
+            continue;
+        };
+        // `\](…)` is literal text, not a link: count the escaping backslashes.
+        if skip_escaped_bracket {
+            let escapes = text[..whole.start()]
+                .bytes()
+                .rev()
+                .take_while(|byte| *byte == b'\\')
+                .count();
+            if escapes % 2 == 1 {
+                continue;
+            }
+        }
+        if let Some(marker) = destination_marker(destination.as_str()) {
+            output.push_str(&text[copied..destination.start()]);
+            output.push_str(marker);
+            copied = destination.end();
+        }
+    }
+    output.push_str(&text[copied..]);
+    output
+}
+
+/// The marker for a destination that leaves the package, or `None` for a
+/// relative or fragment destination.
+fn destination_marker(raw: &str) -> Option<&'static str> {
+    let inner = raw
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(raw);
+    // An undecodable reference could hide a scheme: fail closed.
+    let Some(decoded) = decode_destination(inner) else {
+        return Some(EXTERNAL_URL_MARKER);
+    };
+    let target = decoded.trim_start();
+    let bytes = target.as_bytes();
+    let drive = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    if target.starts_with('\\') || (target.starts_with('/') && !target.starts_with("//")) || drive {
+        return Some(LOCAL_PATH_MARKER);
+    }
+    if target.starts_with("//") {
+        return Some(EXTERNAL_URL_MARKER);
+    }
+    // A scheme is whatever precedes a colon that comes before any `/`, `?`,
+    // or `#`.
+    let first = target.find([':', '/', '?', '#']);
+    first
+        .is_some_and(|index| index > 0 && bytes[index] == b':')
+        .then_some(EXTERNAL_URL_MARKER)
+}
+
+/// Decode CommonMark backslash escapes and character references in a
+/// destination. Returns `None` for a reference this decoder does not know.
+fn decode_destination(raw: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(ch) = rest.chars().next() {
+        if ch == '\\' {
+            if let Some(next) = rest[1..].chars().next().filter(char::is_ascii_punctuation) {
+                decoded.push(next);
+                rest = &rest[2..];
+                continue;
+            }
+        } else if ch == '&' {
+            if let Some(end) = rest.find(';').filter(|end| (2..=32).contains(end)) {
+                let name = &rest[1..end];
+                if name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'#')
+                {
+                    decoded.push(decode_reference(name)?);
+                    rest = &rest[end + 1..];
+                    continue;
+                }
+            }
+        }
+        decoded.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    Some(decoded)
+}
+
+fn decode_reference(name: &str) -> Option<char> {
+    if let Some(number) = name.strip_prefix('#') {
+        let value = match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse().ok()?,
+        };
+        return char::from_u32(value);
+    }
+    Some(match name {
+        "colon" => ':',
+        "sol" => '/',
+        "bsol" => '\\',
+        "quest" => '?',
+        "num" => '#',
+        "period" => '.',
+        "amp" => '&',
+        "Tab" => '\t',
+        "NewLine" => '\n',
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -3500,6 +3879,51 @@ mod tests {
             assert!(output.contains("[local path removed]"), "{output}");
             assert!(!output.contains("fileserver") && !output.contains("preparer"));
         }
+    }
+
+    #[test]
+    fn sanitizer_never_consumes_text_beyond_one_destination() {
+        // A CSV cell with literal brackets must not swallow the rows below.
+        let escaped = "| \\[memo\\](Note: see line 3 | 100 |\n| Gross receipts | 125000 |\n| Total (all) | 150000 |";
+        assert_eq!(sanitize_markdown(escaped), (escaped.to_string(), false));
+        let unescaped = "[memo](Note: see line 3\nGross receipts 125000\nTotal (all) 150000";
+        let (output, changed) = sanitize_markdown(unescaped);
+        assert!(changed);
+        assert_eq!(
+            output,
+            "[memo]([external URL removed] see line 3\nGross receipts 125000\nTotal (all) 150000"
+        );
+    }
+
+    #[test]
+    fn sanitizer_decodes_destinations_before_classifying_them() {
+        for input in [
+            "[a](https&#58;//evil.example.invalid/x)",
+            "[b](mailto&colon;someone)",
+            "[c](https\\://evil.example.invalid)",
+            "[d](&#x2F;&#x2F;evil.example.invalid)",
+            "[e](java&Tab;script:alert)",
+            "[f](x&unknownentity;y)",
+            "[g](<mailto:someone>)",
+        ] {
+            let (output, changed) = sanitize_markdown(input);
+            assert!(changed, "{input}");
+            assert!(
+                output.ends_with("([external URL removed])"),
+                "{input} -> {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitizer_handles_reference_definitions_and_relative_segments() {
+        let input = "[1]: mailto:someone\n[2]: Text/ch.xhtml\n[doc](Text/home/ch1.xhtml)";
+        let (output, changed) = sanitize_markdown(input);
+        assert!(changed);
+        assert_eq!(
+            output,
+            "[1]: [external URL removed]\n[2]: Text/ch.xhtml\n[doc](Text/home/ch1.xhtml)"
+        );
     }
 
     #[test]
@@ -3804,6 +4228,171 @@ mod tests {
             r#"<w:p><w:r><w:rPr><w:vanish w:val="false"/></w:rPr><w:t>Shown</w:t></w:r></w:p>"#,
         );
         assert!(!docx_preflight(&[("word/document.xml", &switched_off)]).hidden_content);
+    }
+
+    const ROOT_RELS_TO: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="MAIN"/></Relationships>"#;
+
+    fn root_rels(main: &str) -> Vec<u8> {
+        ROOT_RELS_TO.replace("MAIN", main).into_bytes()
+    }
+
+    #[test]
+    fn ooxml_main_part_must_be_the_part_the_checks_read() {
+        let visible = word_part("document", "<w:p><w:r><w:t>Decoy</w:t></w:r></w:p>");
+        let hidden = word_part(
+            "document",
+            r#"<w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>Real</w:t></w:r></w:p>"#,
+        );
+        let redirected = root_rels("word/main.xml");
+        let bytes = zip_entries(&[
+            ("[Content_Types].xml", DOCX_TYPES),
+            ("_rels/.rels", &redirected),
+            ("word/document.xml", &visible),
+            ("word/main.xml", &hidden),
+        ]);
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Docx, DocumentVariant::Docx),
+            Err(DocumentError::Malformed)
+        ));
+
+        let workbook = br#"<workbook><sheets><sheet name="Visible"/></sheets></workbook>"#;
+        let moved = root_rels("alt/book.xml");
+        let bytes = zip_entries(&[
+            ("[Content_Types].xml", XLSX_TYPES),
+            ("_rels/.rels", &moved),
+            ("xl/workbook.xml", workbook),
+            ("alt/book.xml", workbook),
+        ]);
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
+            Err(DocumentError::Malformed)
+        ));
+
+        // The conventional target, spelled with a leading slash, is accepted.
+        let conventional = root_rels("/word/document.xml");
+        let preflight = docx_preflight(&[
+            ("_rels/.rels", &conventional),
+            ("word/document.xml", &visible),
+        ]);
+        assert!(!preflight.hidden_content);
+    }
+
+    #[test]
+    fn docx_story_parts_follow_relationships_and_fail_closed() {
+        let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let notes_rels = br#"<Relationships><Relationship Id="rId7" Type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target = "notes/fn.xml"/></Relationships>"#;
+        let symbol = word_part(
+            "footnotes",
+            r#"<w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p>"#,
+        );
+        let preflight = docx_preflight(&[
+            ("word/document.xml", &body),
+            ("word/_rels/document.xml.rels", notes_rels),
+            ("word/notes/fn.xml", &symbol),
+        ]);
+        assert!(
+            preflight.unsupported_content,
+            "relocated footnotes are scanned"
+        );
+
+        // AnyDoc accepts an end tag whose prefix differs; the scan continues.
+        let mismatched = format!(
+            "<w:footnotes {WORD_NS}><w:p><w:r><w:t>a</w:t></w:r></x:p><w:p><w:r><w:sym w:char=\"F0FE\"/></w:r></w:p></w:footnotes>"
+        );
+        let preflight = docx_preflight(&[
+            ("word/document.xml", &body),
+            ("word/footnotes.xml", mismatched.as_bytes()),
+        ]);
+        assert!(preflight.unsupported_content);
+
+        // A story part the reader cannot parse is rejected, not skipped.
+        let broken = format!("<w:footnotes {WORD_NS}><w:p><w:r");
+        let bytes = zip_entries(&[
+            ("[Content_Types].xml", DOCX_TYPES),
+            ("word/document.xml", &body),
+            ("word/footnotes.xml", broken.as_bytes()),
+        ]);
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Docx, DocumentVariant::Docx),
+            Err(DocumentError::Malformed)
+        ));
+
+        // A symbol inside a tracked deletion is omitted anyway.
+        let deleted = word_part(
+            "document",
+            r#"<w:p><w:del><w:r><w:sym w:char="F0FE"/></w:r></w:del></w:p>"#,
+        );
+        assert!(!docx_preflight(&[("word/document.xml", &deleted)]).unsupported_content);
+    }
+
+    #[test]
+    fn docx_hidden_text_follows_styles_and_ignores_non_text_vanish() {
+        let styles = format!(
+            r#"<w:styles {WORD_NS}><w:style w:type="character" w:styleId="Quiet"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="character" w:styleId="Quieter"><w:basedOn w:val="Quiet"/></w:style><w:style w:type="character" w:styleId="Loud"><w:basedOn w:val="Quiet"/><w:rPr><w:vanish w:val="0"/></w:rPr></w:style></w:styles>"#
+        );
+        let uses = |style: &str| {
+            word_part(
+                "document",
+                &format!(
+                    r#"<w:p><w:r><w:rPr><w:rStyle w:val="{style}"/></w:rPr><w:t>Text</w:t></w:r></w:p>"#
+                ),
+            )
+        };
+        for (style, hidden) in [("Quiet", true), ("Quieter", true), ("Loud", false)] {
+            let document = uses(style);
+            let preflight = docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/styles.xml", styles.as_bytes()),
+            ]);
+            assert_eq!(preflight.hidden_content, hidden, "{style}");
+        }
+
+        for body in [
+            // A hidden paragraph mark hides no text.
+            r#"<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr><w:r><w:t>Shown</w:t></w:r></w:p>"#,
+            // Revision history records formatting the text no longer has.
+            r#"<w:p><w:r><w:rPr><w:rPrChange><w:rPr><w:vanish/></w:rPr></w:rPrChange></w:rPr><w:t>Shown</w:t></w:r></w:p>"#,
+        ] {
+            let document = word_part("document", body);
+            assert!(!docx_preflight(&[("word/document.xml", &document)]).hidden_content);
+        }
+    }
+
+    #[test]
+    fn xlsx_parts_follow_relationships_with_spaced_attributes() {
+        let oversized = styles_with_code(&"0".repeat(MAX_NUMBER_FORMAT_BYTES + 1));
+        let rels = br#"<Relationships><Relationship Id="rId9" Type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target = "design/s.xml"/></Relationships>"#;
+        let bytes = xlsx_with_styles("xl/design/s.xml", &oversized, Some(rels));
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
+            Err(DocumentError::ResourceLimit)
+        ));
+
+        let workbook = br#"<workbook><sheets><sheet name="Data"/></sheets></workbook>"#;
+        let sheet_rels = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="data/s1.xml"/></Relationships>"#;
+        let sheet =
+            br#"<worksheet><sheetData><row><c r="A1"><f>1+1</f></c></row></sheetData></worksheet>"#;
+        let bytes = zip_entries(&[
+            ("[Content_Types].xml", XLSX_TYPES),
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", sheet_rels),
+            ("xl/data/s1.xml", sheet),
+        ]);
+        let preflight =
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx).unwrap();
+        assert!(
+            preflight.missing_formula_cache,
+            "relocated worksheets are checked"
+        );
+    }
+
+    #[test]
+    fn string_attribute_reader_tolerates_spacing_and_whole_names() {
+        let tag = r#"<Relationship TargetMode = "External" Target = 'x.xml' Id="r1"/>"#;
+        assert_eq!(xml_attribute(tag, "Target"), Some("x.xml"));
+        assert_eq!(xml_attribute(tag, "TargetMode"), Some("External"));
+        assert_eq!(xml_attribute(tag, "Mode"), None);
+        assert_eq!(xml_attribute(tag, "Id"), Some("r1"));
     }
 
     fn xlsx_with_styles(styles_name: &str, styles: &[u8], rels: Option<&[u8]>) -> Vec<u8> {

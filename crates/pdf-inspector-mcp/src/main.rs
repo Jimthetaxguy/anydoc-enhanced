@@ -163,6 +163,18 @@ fn to_pretty_json(value: &impl Serialize) -> Result<String, PdfToolError> {
     serde_json::to_string_pretty(value).map_err(|_| PdfToolError::Protocol)
 }
 
+/// Parse and serialize worker Markdown on the blocking pool: it can run to
+/// tens of megabytes, and work on an executor thread is work the tool
+/// timeout cannot interrupt.
+async fn on_blocking_pool<F>(work: F) -> Result<String, PdfToolError>
+where
+    F: FnOnce() -> Result<String, PdfToolError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| PdfToolError::Processing)?
+}
+
 fn document_json_error(error: &pdf_inspector_skillkit::document::DocumentError) -> String {
     let mut value = serde_json::json!({
         "error": error.to_string(),
@@ -361,7 +373,7 @@ impl PdfInspectorServer {
 
     /// Classify a PDF as TextBased, Scanned, ImageBased, or Mixed.
     #[tool(
-        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score, the pages that need OCR and why, and the software that produced the file",
+        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score, the pages that need OCR and why, and its recorded creation and modification dates",
         annotations(
             title = "Classify PDF",
             read_only_hint = true,
@@ -539,9 +551,12 @@ impl PdfInspectorServer {
         let path = params.0.path;
         dispatch_pdf("identify_tax_form", async move {
             let markdown = pdf_worker::markdown(&path).await?;
-            to_pretty_json(
-                &pdf_inspector_skillkit::domain::tax::identify_tax_form_markdown(&markdown),
-            )
+            on_blocking_pool(move || {
+                to_pretty_json(
+                    &pdf_inspector_skillkit::domain::tax::identify_tax_form_markdown(&markdown),
+                )
+            })
+            .await
         })
         .await
     }
@@ -561,9 +576,12 @@ impl PdfInspectorServer {
         let path = params.0.path;
         dispatch_pdf("split_sec_filing", async move {
             let markdown = pdf_worker::markdown(&path).await?;
-            to_pretty_json(&pdf_inspector_skillkit::domain::sec::split_sec_markdown(
-                &markdown,
-            ))
+            on_blocking_pool(move || {
+                to_pretty_json(&pdf_inspector_skillkit::domain::sec::split_sec_markdown(
+                    &markdown,
+                ))
+            })
+            .await
         })
         .await
     }
@@ -583,12 +601,15 @@ impl PdfInspectorServer {
         let path = params.0.path;
         dispatch_pdf("parse_irc_sections", async move {
             let markdown = pdf_worker::markdown(&path).await?;
-            to_pretty_json(
-                &pdf_inspector_skillkit::domain::irc::parse_irc_markdown_with_source(
-                    &markdown,
-                    std::path::Path::new(&path),
-                ),
-            )
+            on_blocking_pool(move || {
+                to_pretty_json(
+                    &pdf_inspector_skillkit::domain::irc::parse_irc_markdown_with_source(
+                        &markdown,
+                        std::path::Path::new(&path),
+                    ),
+                )
+            })
+            .await
         })
         .await
     }

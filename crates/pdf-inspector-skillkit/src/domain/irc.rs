@@ -67,9 +67,10 @@ fn section_re() -> &'static Regex {
 fn enumerator_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // A label is followed by whitespace, a bold closer, or nothing:
-        // `(1), July 1, 1972` and `(1)—` are wrapped citation fragments.
-        Regex::new(r"^\(([a-z]{1,7}|[0-9]{1,3}|[A-Z]{1,7})\)(\s.*|\*\*.*)?$")
+        // One or more labels, as in `(2)(A) If …`, followed by whitespace, a
+        // bold closer, or nothing: `(1), July 1, 1972` and `(1)—` are wrapped
+        // citation fragments.
+        Regex::new(r"^((?:\((?:[a-z]{1,7}|[0-9]{1,3}|[A-Z]{1,7})\))+)(\s.*|\*\*.*)?$")
             .expect("IRC enumerator regex must compile (compile-time invariant)")
     })
 }
@@ -195,15 +196,21 @@ impl<'a> Line<'a> {
         ) || text.starts_with("Effective Date")
     }
 
-    /// `(token, title, body)` when the line opens an enumerated provision.
-    fn enumerator(&self) -> Option<(&'a str, Option<String>, &'a str)> {
+    /// `(tokens, title, body)` when the line opens one or more nested
+    /// provisions: `(2)(A) If …` opens paragraph (2) and subparagraph (A).
+    fn enumerator(&self) -> Option<(Vec<&'a str>, Option<String>, &'a str)> {
         // `[(b) Repealed. …]` keeps its label so the sequence continues.
         let (text, bracketed) = match self.text.strip_prefix('[') {
             Some(rest) => (rest, true),
             None => (self.text, false),
         };
         let caps = enumerator_re().captures(text)?;
-        let token = caps.get(1)?.as_str();
+        let tokens: Vec<&'a str> = caps
+            .get(1)?
+            .as_str()
+            .split(')')
+            .filter_map(|label| label.strip_prefix('('))
+            .collect();
         let rest = caps.get(2).map_or("", |rest| rest.as_str().trim_start());
         let (title, body) = if self.bold {
             match rest.split_once("**") {
@@ -230,7 +237,7 @@ impl<'a> Line<'a> {
             title
         };
         let title = (!title.is_empty()).then(|| title.to_string());
-        Some((token, title, body))
+        Some((tokens, title, body))
     }
 }
 
@@ -334,7 +341,17 @@ fn level_for(
         // Continuing neither sequence: `(i)` opens a clause list (for
         // example in a subsection's flush text), and an unheaded numeral is
         // more likely a clause whose predecessors sat inline.
-        (false, false) if roman == Some(1) || (plain && roman.is_some()) => roman_level,
+        // Only numerals a clause list plausibly reaches (`i`, `v`, `x`) are
+        // read that way; `(c)` or `(d)` out of sequence stays a subsection.
+        (false, false)
+            if roman == Some(1)
+                || (plain
+                    && token
+                        .bytes()
+                        .all(|b| matches!(b.to_ascii_lowercase(), b'i' | b'v' | b'x'))) =>
+        {
+            roman_level
+        }
         (false, false) => alpha,
     })
 }
@@ -442,19 +459,36 @@ fn parse_markdown(text: &str, path_hint: &str) -> IrcParseResult {
             section.notes.push('\n');
             continue;
         }
-        if let Some((token, title, body)) = line.enumerator() {
+        if let Some((tokens, title, body)) = line.enumerator() {
             let plain = !(line.heading || line.bold);
-            if let Some(level) = level_for(token, &section.stack, section.lead_in, plain) {
-                section.stack[level] = Some(token.to_string());
-                for deeper in &mut section.stack[level + 1..] {
+            // Resolve every label in the chain before changing any state, so
+            // an unreadable chain leaves the line as text.
+            let mut stack = section.stack.clone();
+            let mut lead_in = section.lead_in;
+            let mut labels = Vec::with_capacity(tokens.len());
+            for token in &tokens {
+                let Some(level) = level_for(token, &stack, lead_in, plain) else {
+                    labels.clear();
+                    break;
+                };
+                stack[level] = Some(token.to_string());
+                for deeper in &mut stack[level + 1..] {
                     *deeper = None;
                 }
-                section.subsections.push(IrcSubsection {
-                    label: label_for(&section.stack, level),
-                    title,
-                    content: String::new(),
-                });
+                labels.push(label_for(&stack, level));
+                lead_in = false;
+            }
+            if !labels.is_empty() {
+                section.stack = stack;
                 section.lead_in = false;
+                let last = labels.len() - 1;
+                for (index, label) in labels.into_iter().enumerate() {
+                    section.subsections.push(IrcSubsection {
+                        label,
+                        title: if index == last { title.clone() } else { None },
+                        content: String::new(),
+                    });
+                }
                 section.push_text(raw, body);
                 continue;
             }
@@ -740,6 +774,36 @@ Except in any case to which section 1398 applies, no separate taxable entity sha
             labels(&result.sections[0]),
             ["(a)", "(a)(13)", "(a)(13)(i)", "(a)(13)(v)", "(b)"]
         );
+    }
+
+    #[test]
+    fn out_of_sequence_letters_that_are_numerals_stay_subsections() {
+        let markdown = "# §1. Test\n\
+            ## (a) First\n\
+            Text with an inline (b) reference.\n\
+            (c) Third subsection text.\n\
+            (1) A paragraph of (c).\n";
+        let result = parse_irc_markdown(markdown);
+        assert_eq!(labels(&result.sections[0]), ["(a)", "(c)", "(c)(1)"]);
+    }
+
+    #[test]
+    fn chained_labels_open_each_level() {
+        let markdown = "# §1504. Definitions\n\
+            ## (c) Includible insurance companies\n\
+            (1) Two or more domestic insurance companies.\n\
+            (2)(A) If an affiliated group is determined without regard to paragraph (2).\n\
+            (B) The group shall be treated as one.\n";
+        let result = parse_irc_markdown(markdown);
+        let section = &result.sections[0];
+        assert_eq!(
+            labels(section),
+            ["(c)", "(c)(1)", "(c)(2)", "(c)(2)(A)", "(c)(2)(B)"]
+        );
+        assert_eq!(section.subsections[2].content, "");
+        assert!(section.subsections[3]
+            .content
+            .starts_with("If an affiliated group"));
     }
 
     #[test]
