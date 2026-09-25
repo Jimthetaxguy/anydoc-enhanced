@@ -12,13 +12,17 @@
 //! all, though a viewer shows it.
 //!
 //! The walk follows pdf-inspector's through the field tree, within its
-//! bounds, and gives each value it misreads or passes over, as it would
+//! bounds, which count every entry of the tree's arrays, references or
+//! not, and gives each value it misreads or passes over, as it would
 //! write it if it read it right, with the pages a viewer shows it on: those
 //! whose annotations hold a widget of the field not hidden, by its flags or
 //! by a layer a reader hides. The Markdown decides: a value it shows was
 //! not lost, as when the page itself draws the value. A value pdf-inspector
 //! writes from a widget in a hidden layer is one no reader sees, and is
-//! given as it writes it, with the hidden-layer text of its page.
+//! given as it writes it, with the hidden-layer text of its page. Where
+//! pdf-inspector's bounds end its walk, the walk goes on as far again, and
+//! gives each value a viewer shows past them, which pdf-inspector never
+//! writes.
 //!
 //! A dynamic XFA form, whose catalog marks it as needing rendering and whose
 //! form holds XFA, keeps its content in XFA, which a viewer lays out; its
@@ -34,7 +38,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::optional_content::Layers;
 
-/// Field tree nodes pdf-inspector visits, and how deep it goes.
+/// Field tree nodes pdf-inspector visits, and entries of the tree's arrays
+/// it examines, and how deep it goes.
 const MAX_FIELD_NODES: usize = 100_000;
 const MAX_FIELD_DEPTH: usize = 100;
 /// Bytes of a text stream read as a field's value.
@@ -123,12 +128,20 @@ struct Walk<'a> {
     annotation_pages: HashMap<ObjectId, u32>,
     visited: HashSet<ObjectId>,
     examined: usize,
+    /// Whether pdf-inspector's walk has ended at its bounds: past them, it
+    /// writes no value.
+    past: bool,
     values: Values,
 }
 
 impl<'a> Walk<'a> {
-    fn exhausted(&self) -> bool {
-        self.visited.len() >= MAX_FIELD_NODES || self.examined >= MAX_FIELD_NODES
+    /// Whether the walk goes no further: it goes on past pdf-inspector's
+    /// bounds, where `past` is set, as far again.
+    fn stopped(&mut self) -> bool {
+        let spent = |bound: usize| self.visited.len() >= bound || self.examined >= bound;
+        let (ended, stopped) = (spent(MAX_FIELD_NODES), spent(2 * MAX_FIELD_NODES));
+        self.past |= ended;
+        stopped
     }
 
     fn dictionary(&self, object: &'a Object) -> Option<&'a Dictionary> {
@@ -301,7 +314,7 @@ impl<'a> Walk<'a> {
         inherited: Option<&'a Object>,
         depth: usize,
     ) {
-        if depth > MAX_FIELD_DEPTH || self.exhausted() {
+        if depth > MAX_FIELD_DEPTH || self.stopped() {
             return;
         }
         if !self.visited.insert(id) {
@@ -335,12 +348,12 @@ impl<'a> Walk<'a> {
         let own = dictionary.get(b"V").ok();
         let value = own.or(inherited);
 
-        if let Some(kids) = dictionary
+        if let Some(entries) = dictionary
             .get(b"Kids")
             .ok()
             .and_then(|kids| self.array(kids))
         {
-            let kids: Vec<ObjectId> = kids
+            let kids: Vec<ObjectId> = entries
                 .iter()
                 .filter_map(|kid| kid.as_reference().ok())
                 .collect();
@@ -358,7 +371,8 @@ impl<'a> Walk<'a> {
                         })
                         .collect()
                 };
-                let written_by_widget = !kids.is_empty()
+                let written_by_widget = !self.past
+                    && !kids.is_empty()
                     && widgets.iter().any(|(_, widget)| {
                         widget
                             .get(b"V")
@@ -376,12 +390,15 @@ impl<'a> Walk<'a> {
                     self.left_out(kind, &name_meant, value, dictionary, pages);
                 }
             }
-            for kid in kids {
-                if self.exhausted() {
+            // pdf-inspector counts every entry against its bounds.
+            for kid in entries {
+                if self.stopped() {
                     break;
                 }
                 self.examined += 1;
-                self.field(kid, kind, (&name_read, &name_meant), value, depth + 1);
+                if let Ok(kid) = kid.as_reference() {
+                    self.field(kid, kind, (&name_read, &name_meant), value, depth + 1);
+                }
             }
             return;
         }
@@ -392,7 +409,10 @@ impl<'a> Walk<'a> {
         // A widget in a layer a reader hides shows no value, and
         // pdf-inspector writes the value it holds all the same.
         if self.layered(dictionary) {
-            if let Some((read, _)) = own.and_then(|own| self.value(kind, own)) {
+            if let Some((read, _)) = own
+                .filter(|_| !self.past)
+                .and_then(|own| self.value(kind, own))
+            {
                 let page = self.written_page(id, dictionary);
                 self.values.hidden.push(FormValue {
                     text: written(&name_read, &read),
@@ -404,6 +424,14 @@ impl<'a> Walk<'a> {
         let Some(page) = self.page(id, dictionary) else {
             return;
         };
+        // Past pdf-inspector's bounds, a field that is its own widget, whose
+        // value pdf-inspector would have written, is not in the Markdown.
+        if self.past {
+            if dictionary.has(b"T") || depth == 0 {
+                self.left_out(kind, &name_meant, value, dictionary, vec![page]);
+            }
+            return;
+        }
         match own.and_then(|own| self.value(kind, own)) {
             Some((read, meant)) => {
                 let name_garbled = garbled(&name_read, &name_meant);
@@ -627,9 +655,10 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
         annotation_pages: HashMap::new(),
         visited: HashSet::new(),
         examined: 0,
+        past: false,
         values: Values::default(),
     };
-    let fields: Vec<ObjectId> = {
+    let fields: &[Object] = {
         let Some(root) = document
             .trailer
             .get(b"Root")
@@ -653,9 +682,6 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
             return Values::default();
         };
         fields
-            .iter()
-            .filter_map(|field| field.as_reference().ok())
-            .collect()
     };
     if fields.is_empty() {
         return Values::default();
@@ -677,12 +703,15 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
         }
     }
     walk.annotation_pages = annotation_pages;
+    // pdf-inspector counts every entry against its bounds.
     for field in fields {
-        if walk.exhausted() {
+        if walk.stopped() {
             break;
         }
         walk.examined += 1;
-        walk.field(field, None, ("", ""), None, 0);
+        if let Ok(field) = field.as_reference() {
+            walk.field(field, None, ("", ""), None, 0);
+        }
     }
     walk.values
 }
@@ -980,6 +1009,43 @@ mod tests {
                 pages: vec![1]
             }]
         );
+    }
+
+    #[test]
+    fn values_past_the_bounds_of_pdf_inspectors_walk_are_found() {
+        // pdf-inspector counts every entry of the form's fields against its
+        // bounds, references or not, the field's own among them, and a
+        // field listed past them is never written, though a viewer shows it.
+        for (entries, lost) in [(MAX_FIELD_NODES - 2, false), (MAX_FIELD_NODES - 1, true)] {
+            let mut document = form(|document, page| {
+                let payee = document.add_object(dictionary! {
+                    "FT" => "Tx", "T" => Object::string_literal("payee"),
+                    "V" => Object::string_literal("Example Payee LLC"), "P" => page,
+                });
+                (vec![payee], vec![payee])
+            });
+            let catalog = document
+                .trailer
+                .get(b"Root")
+                .and_then(Object::as_reference)
+                .expect("a catalog");
+            let fields = document
+                .get_dictionary_mut(catalog)
+                .and_then(|catalog| catalog.get_mut(b"AcroForm"))
+                .and_then(Object::as_dict_mut)
+                .and_then(|form| form.get_mut(b"Fields"))
+                .and_then(Object::as_array_mut)
+                .expect("fields");
+            fields.splice(0..0, std::iter::repeat_n(Object::Integer(0), entries));
+            let expected = lost.then(|| FormValue {
+                text: "Example Payee LLC".to_string(),
+                pages: vec![1],
+            });
+            assert_eq!(
+                values(&document, None).misread,
+                expected.into_iter().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

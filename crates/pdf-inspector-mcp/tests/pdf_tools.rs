@@ -2441,6 +2441,40 @@ fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
     assert_eq!(reported(&results[5]), None, "{}", results[5]);
 }
 
+/// A one-page form whose `/Fields` lists `entries` entries that are no
+/// fields before its one field, a payee.
+fn padded_form_pdf(entries: usize) -> Vec<u8> {
+    let mut fields = "0 ".repeat(entries);
+    fields.push_str("6 0 R");
+    pdf_file(&[
+        format!("<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [{fields}] >> >>").into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", b"BT /F1 12 Tf 72 740 Td (Payment request) Tj ET"),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (payee) /V (Example Payee LLC) /Rect [300 600 500 620] /P 3 0 R /F 4 >>".to_vec(),
+    ])
+}
+
+#[test]
+fn form_values_past_the_bounds_of_pdf_inspectors_walk_are_reported() {
+    // pdf-inspector 1.24.0 counts each entry of the fields against a bound
+    // of 100,000, the field's own among them; a field past the bound it
+    // never writes.
+    let results = convert_all(&[padded_form_pdf(99_998), padded_form_pdf(99_999)]);
+    let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown(0).contains("payee: Example Payee LLC"),
+        "{}",
+        markdown(0)
+    );
+    assert!(!markdown(1).contains("Example Payee"), "{}", markdown(1));
+    assert_eq!(
+        warned_pages(&results, "form_values_misread"),
+        [None, Some(serde_json::json!([1]))]
+    );
+}
+
 /// A statement page a reviewer marked up: a text box typed onto it and a
 /// stamp drawn in text, both annotations; `flattened` also sets their text
 /// in the page's own content.
