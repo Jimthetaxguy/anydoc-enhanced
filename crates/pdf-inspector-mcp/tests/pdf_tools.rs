@@ -2441,6 +2441,42 @@ fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
     assert_eq!(reported(&results[5]), None, "{}", results[5]);
 }
 
+/// A one-page form whose one field, on the page as object 6, is `field`.
+fn one_field_pdf(field: &str) -> Vec<u8> {
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", b"BT /F1 12 Tf 72 740 Td (Household questionnaire) Tj ET"),
+        field.as_bytes().to_vec(),
+    ])
+}
+
+#[test]
+fn choices_read_as_their_export_values_are_reported() {
+    // A choice whose options pair export values with the text a viewer
+    // shows; and one whose options are their own text.
+    let paired = "<< /Type /Annot /Subtype /Widget /FT /Ch /Ff 131072 /T (filing_status) \
+                  /V (MFJ) /Opt [[(S) (Single)] [(MFJ) (Married filing jointly)]] \
+                  /Rect [300 600 500 620] /P 3 0 R /F 4 >>";
+    let plain = "<< /Type /Annot /Subtype /Widget /FT /Ch /Ff 131072 /T (filing_status) \
+                 /V (Single) /Opt [(Single) (Married filing jointly)] \
+                 /Rect [300 600 500 620] /P 3 0 R /F 4 >>";
+    let results = convert_all(&[one_field_pdf(paired), one_field_pdf(plain)]);
+    // pdf-inspector 1.24.0 writes the export value; when a release writes
+    // the option's text, this expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("filing_status: MFJ") && !markdown.contains("Married filing jointly"),
+        "{markdown}"
+    );
+    assert_eq!(
+        warned_pages(&results, "form_values_misread"),
+        [Some(serde_json::json!([1])), None]
+    );
+}
+
 /// A one-page form whose `/Fields` lists `entries` entries that are no
 /// fields before its one field, a payee.
 fn padded_form_pdf(entries: usize) -> Vec<u8> {

@@ -9,7 +9,9 @@
 //! kept on a field whose widgets are its kids, as every group of radio
 //! buttons keeps its choice, inherited from a field above, given by
 //! reference, as a text stream, or only as rich text, is not written at
-//! all, though a viewer shows it.
+//! all, though a viewer shows it. A choice it writes as the value chosen,
+//! where a viewer shows the text the field's options give that value, "MFJ"
+//! for "Married filing jointly".
 //!
 //! The walk follows pdf-inspector's through the field tree, within its
 //! bounds, which count every entry of the tree's arrays, references or
@@ -44,6 +46,9 @@ const MAX_FIELD_NODES: usize = 100_000;
 const MAX_FIELD_DEPTH: usize = 100;
 /// Bytes of a text stream read as a field's value.
 const MAX_VALUE_BYTES: usize = 64 << 10;
+/// Options of choice fields read to find the text they give their values,
+/// in all.
+const MAX_OPTIONS: usize = 1_000_000;
 /// References followed to reach an object.
 const MAX_REFERENCE_HOPS: usize = 8;
 /// Annotation flags that keep a widget from view: hidden, and not viewed.
@@ -131,6 +136,8 @@ struct Walk<'a> {
     /// Whether pdf-inspector's walk has ended at its bounds: past them, it
     /// writes no value.
     past: bool,
+    /// Options left to read (see `MAX_OPTIONS`).
+    options: usize,
     values: Values,
 }
 
@@ -264,6 +271,49 @@ impl<'a> Walk<'a> {
         (!shown.trim().is_empty()).then_some(shown)
     }
 
+    /// The text a choice field's options give `value`, as a viewer shows
+    /// it: each value chosen, a text or texts, as the option pairing it, as
+    /// its export value, with text to show gives that text; `None` where no
+    /// option gives any value other text, or the options left to read run
+    /// out.
+    fn displayed(&mut self, field: &'a Dictionary, value: &'a Object) -> Option<String> {
+        let options = field
+            .get(b"Opt")
+            .ok()
+            .and_then(|options| self.array(options))?;
+        let chosen: Vec<&Object> = match resolved(self.document, value)? {
+            Object::Array(values) => values.iter().collect(),
+            value => vec![value],
+        };
+        let mut displayed = false;
+        let mut texts = Vec::new();
+        for value in chosen {
+            let Some((_, meant)) = readings(value) else {
+                continue;
+            };
+            let mut shown = None;
+            for option in options {
+                self.options = self.options.checked_sub(1)?;
+                let pair = self.array(option).and_then(|pair| match pair {
+                    [export, text] => Some((readings(export)?.1, readings(text)?.1)),
+                    _ => None,
+                });
+                if let Some((_, text)) = pair.filter(|(export, _)| *export == meant) {
+                    shown = Some(text);
+                    break;
+                }
+            }
+            match shown {
+                Some(shown) if shown != meant => {
+                    displayed = true;
+                    texts.push(shown);
+                }
+                _ => texts.push(meant),
+            }
+        }
+        displayed.then(|| texts.join(", "))
+    }
+
     /// The plain text of a text field's rich value, which a viewer shows
     /// where it has no value as plain text.
     fn rich(&self, kind: &[u8], field: &'a Dictionary) -> Option<String> {
@@ -289,8 +339,11 @@ impl<'a> Walk<'a> {
         if pages.is_empty() {
             return;
         }
-        let Some(shown) = value
-            .and_then(|value| self.shown(kind, value))
+        let displayed = value
+            .filter(|_| kind == b"Ch")
+            .and_then(|value| self.displayed(field, value));
+        let Some(shown) = displayed
+            .or_else(|| value.and_then(|value| self.shown(kind, value)))
             .or_else(|| self.rich(kind, field))
         else {
             return;
@@ -435,7 +488,12 @@ impl<'a> Walk<'a> {
         match own.and_then(|own| self.value(kind, own)) {
             Some((read, meant)) => {
                 let name_garbled = garbled(&name_read, &name_meant);
-                if name_garbled || garbled(&read, &meant) {
+                // A choice a viewer shows as the text its options give it.
+                let displayed = own
+                    .filter(|_| kind == b"Ch")
+                    .and_then(|own| self.displayed(dictionary, own));
+                if name_garbled || garbled(&read, &meant) || displayed.is_some() {
+                    let meant = displayed.unwrap_or(meant);
                     let text = if kind == b"Btn" || name_garbled {
                         written(&name_meant, &meant)
                     } else {
@@ -656,6 +714,7 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
         visited: HashSet::new(),
         examined: 0,
         past: false,
+        options: MAX_OPTIONS,
         values: Values::default(),
     };
     let fields: &[Object] = {
@@ -1008,6 +1067,62 @@ mod tests {
                 text: "old_balance: 1,000.00 superseded".to_string(),
                 pages: vec![1]
             }]
+        );
+    }
+
+    #[test]
+    fn choices_are_found_as_the_text_their_options_give_them() {
+        let document = form(|document, page| {
+            let pairs = || -> Object {
+                vec![
+                    vec![
+                        Object::string_literal("S"),
+                        Object::string_literal("Single"),
+                    ]
+                    .into(),
+                    vec![
+                        Object::string_literal("MFJ"),
+                        Object::string_literal("Married filing jointly"),
+                    ]
+                    .into(),
+                ]
+                .into()
+            };
+            // pdf-inspector writes the value chosen, "MFJ"; a viewer shows
+            // the text the options give it, one value or several.
+            let status = document.add_object(dictionary! {
+                "FT" => "Ch", "T" => Object::string_literal("filing_status"),
+                "V" => Object::string_literal("MFJ"), "Opt" => pairs(), "P" => page,
+            });
+            let statuses = document.add_object(dictionary! {
+                "FT" => "Ch", "T" => Object::string_literal("statuses"),
+                "V" => vec![Object::string_literal("S"), Object::string_literal("MFJ")],
+                "Opt" => pairs(), "P" => page,
+            });
+            // Options that are their own text, and a value no option names.
+            let plain = document.add_object(dictionary! {
+                "FT" => "Ch", "T" => Object::string_literal("state"),
+                "V" => Object::string_literal("Ohio"),
+                "Opt" => vec![Object::string_literal("Ohio"), Object::string_literal("Iowa")],
+                "P" => page,
+            });
+            let unnamed = document.add_object(dictionary! {
+                "FT" => "Ch", "T" => Object::string_literal("other"),
+                "V" => Object::string_literal("HOH"), "Opt" => pairs(), "P" => page,
+            });
+            (
+                vec![status, statuses, plain, unnamed],
+                vec![status, statuses, plain, unnamed],
+            )
+        });
+        let texts: Vec<String> = values(&document, None)
+            .misread
+            .into_iter()
+            .map(|value| value.text)
+            .collect();
+        assert_eq!(
+            texts,
+            ["Married filing jointly", "Single, Married filing jointly"]
         );
     }
 
