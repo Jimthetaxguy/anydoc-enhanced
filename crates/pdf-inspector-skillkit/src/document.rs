@@ -1045,13 +1045,7 @@ impl FormulaCandidate {
                 if !number.is_finite() {
                     return None;
                 }
-                if number < 0.0 {
-                    CellClass::Negative
-                } else if number > 0.0 {
-                    CellClass::Positive
-                } else {
-                    CellClass::Zero
-                }
+                CellClass::of(number)
             }
         };
         Some((self.style?, class))
@@ -1321,22 +1315,79 @@ fn xlsx_sheets_have_drawing_text(
     Ok(false)
 }
 
+/// Whether an `mc:Choice`'s `Requires` names only namespaces an Office
+/// application understands, so that it shows the choice.
+fn mc_choice_understood<R>(
+    reader: &quick_xml::NsReader<R>,
+    event: &quick_xml::events::BytesStart<'_>,
+) -> bool {
+    let Some(requires) = xml_attribute_value(event, b"Requires") else {
+        return false;
+    };
+    requires.split_whitespace().all(|prefix| {
+        let probe = format!("{prefix}:x");
+        match reader
+            .resolver()
+            .resolve_element(quick_xml::name::QName(probe.as_bytes()))
+            .0
+        {
+            quick_xml::name::ResolveResult::Bound(namespace) => [
+                b"http://schemas.microsoft.com/office/".as_slice(),
+                b"http://schemas.openxmlformats.org/",
+                b"http://purl.oclc.org/ooxml/",
+            ]
+            .iter()
+            .any(|family| namespace.as_ref().starts_with(family)),
+            _ => false,
+        }
+    })
+}
+
+/// One open element of a drawing part.
+struct DrawingNode {
+    /// A shape, group, or compatibility branch, which decides whether the
+    /// text in it shows.
+    shape: bool,
+    /// A shape, connector, or group, whose text a viewer draws.
+    drawn: bool,
+    shown: bool,
+    /// For `mc:AlternateContent`: whether Excel took one of its choices, so
+    /// that it shows none of the rest or the fallback.
+    choice_taken: Option<bool>,
+}
+
 /// Whether a drawing part holds text in a shape a viewer shows. A part that
 /// does not parse counts as holding some.
 fn drawing_shows_text(bytes: &[u8]) -> bool {
-    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    const MARKUP_COMPATIBILITY: &[u8] =
+        b"http://schemas.openxmlformats.org/markup-compatibility/2006";
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    // For each open element: whether it is a shape, and whether text in it
-    // is shown (not in a hidden or cell-linked shape).
-    let mut stack: Vec<(bool, bool)> = Vec::new();
+    let mut stack: Vec<DrawingNode> = Vec::new();
     let mut in_text = 0usize;
+    let shown = |stack: &[DrawingNode]| {
+        stack
+            .iter()
+            .rev()
+            .find(|node| node.shape)
+            .is_none_or(|node| node.shown)
+    };
     loop {
-        let (element, start) = match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(element)) => (element, true),
-            Ok(quick_xml::events::Event::Empty(element)) => (element, false),
-            Ok(quick_xml::events::Event::End(end)) => {
+        let (namespace, event) = match reader.read_resolved_event_into(&mut buffer) {
+            Ok(resolved) => resolved,
+            Err(_) => return true,
+        };
+        let compatibility = matches!(
+            namespace,
+            quick_xml::name::ResolveResult::Bound(quick_xml::name::Namespace(bound))
+                if bound == MARKUP_COMPATIBILITY
+        );
+        let (element, start) = match event {
+            quick_xml::events::Event::Start(element) => (element, true),
+            quick_xml::events::Event::Empty(element) => (element, false),
+            quick_xml::events::Event::End(end) => {
                 if xml_local_name(end.name().as_ref()) == b"t" {
                     in_text = in_text.saturating_sub(1);
                 }
@@ -1344,14 +1395,10 @@ fn drawing_shows_text(bytes: &[u8]) -> bool {
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::Text(text)) => {
-                let shown = stack
-                    .iter()
-                    .rev()
-                    .find(|(shape, _)| *shape)
-                    .is_some_and(|&(_, shown)| shown);
+            quick_xml::events::Event::Text(text) => {
                 if in_text > 0
-                    && shown
+                    && stack.iter().any(|node| node.drawn)
+                    && shown(&stack)
                     && String::from_utf8_lossy(text.as_ref())
                         .chars()
                         .any(|c| !c.is_whitespace())
@@ -1361,21 +1408,15 @@ fn drawing_shows_text(bytes: &[u8]) -> bool {
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::GeneralRef(_)) => {
-                let shown = stack
-                    .iter()
-                    .rev()
-                    .find(|(shape, _)| *shape)
-                    .is_some_and(|&(_, shown)| shown);
-                if in_text > 0 && shown {
+            quick_xml::events::Event::GeneralRef(_) => {
+                if in_text > 0 && stack.iter().any(|node| node.drawn) && shown(&stack) {
                     return true;
                 }
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::Eof) => return false,
-            Err(_) => return true,
-            Ok(_) => {
+            quick_xml::events::Event::Eof => return false,
+            _ => {
                 buffer.clear();
                 continue;
             }
@@ -1388,32 +1429,53 @@ fn drawing_shows_text(bytes: &[u8]) -> bool {
                 .find(|attribute| attribute.local() == name)
                 .map(|attribute| attribute.value.trim().to_string())
         };
-        match local.as_slice() {
-            // A shape; one linked to a cell repeats the cell's text.
-            b"sp" => {
-                let parent_shown = stack
-                    .iter()
-                    .rev()
-                    .find(|(shape, _)| *shape)
-                    .is_none_or(|&(_, shown)| shown);
+        let parent_shown = shown(&stack);
+        let node = match local.as_slice() {
+            // A shape or connector; one linked to a cell repeats the cell's
+            // text.
+            b"sp" | b"cxnSp" => {
                 let linked = value(b"textlink").is_some_and(|link| !link.is_empty());
-                if start {
-                    stack.push((true, parent_shown && !linked));
+                DrawingNode {
+                    shape: true,
+                    drawn: true,
+                    shown: parent_shown && !linked,
+                    choice_taken: None,
                 }
-                buffer.clear();
-                continue;
             }
-            b"grpSp" => {
-                let parent_shown = stack
-                    .iter()
-                    .rev()
-                    .find(|(shape, _)| *shape)
-                    .is_none_or(|&(_, shown)| shown);
-                if start {
-                    stack.push((true, parent_shown));
+            b"grpSp" => DrawingNode {
+                shape: true,
+                drawn: true,
+                shown: parent_shown,
+                choice_taken: None,
+            },
+            b"AlternateContent" if compatibility => DrawingNode {
+                shape: false,
+                drawn: false,
+                shown: false,
+                choice_taken: Some(false),
+            },
+            // Excel shows the first choice whose namespaces it understands,
+            // or else the fallback.
+            b"Choice" | b"Fallback" if compatibility => {
+                let understood = local == b"Fallback" || mc_choice_understood(&reader, &element);
+                let taken = stack
+                    .last_mut()
+                    .and_then(|parent| parent.choice_taken.as_mut());
+                let shows = match taken {
+                    Some(taken) if !*taken && understood => {
+                        *taken = true;
+                        true
+                    }
+                    Some(_) => false,
+                    // Outside `mc:AlternateContent`, it is read as it stands.
+                    None => true,
+                };
+                DrawingNode {
+                    shape: true,
+                    drawn: false,
+                    shown: parent_shown && shows,
+                    choice_taken: None,
                 }
-                buffer.clear();
-                continue;
             }
             // A hidden shape or group, such as the drawing copy of a form
             // control, shows none of its text.
@@ -1421,15 +1483,30 @@ fn drawing_shows_text(bytes: &[u8]) -> bool {
                 if value(b"hidden")
                     .is_some_and(|hidden| matches!(hidden.as_str(), "1" | "true")) =>
             {
-                if let Some(shape) = stack.iter_mut().rev().find(|(shape, _)| *shape) {
-                    shape.1 = false;
+                if let Some(shape) = stack.iter_mut().rev().find(|node| node.shape) {
+                    shape.shown = false;
+                }
+                DrawingNode {
+                    shape: false,
+                    drawn: false,
+                    shown: false,
+                    choice_taken: None,
                 }
             }
-            b"t" if start => in_text += 1,
-            _ => {}
-        }
+            _ => {
+                if local == b"t" && start {
+                    in_text += 1;
+                }
+                DrawingNode {
+                    shape: false,
+                    drawn: false,
+                    shown: false,
+                    choice_taken: None,
+                }
+            }
+        };
         if start {
-            stack.push((false, false));
+            stack.push(node);
         }
         buffer.clear();
     }
@@ -1709,6 +1786,9 @@ fn xml_has_odf_external_reference(bytes: &[u8]) -> bool {
     }
 }
 
+/// Whether an ODF part runs or links content: an OLE object, a plugin, an
+/// applet, a script, event listeners, or a live data link. Embedded objects (`draw:object`)
+/// are judged by what they embed ([`xml_odf_objects`]).
 fn xml_has_odf_active_content(bytes: &[u8]) -> bool {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
@@ -1719,7 +1799,7 @@ fn xml_has_odf_active_content(bytes: &[u8]) -> bool {
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 if matches!(
                     xml_local_name(event.name().as_ref()),
-                    b"object"
+                    b"object-ole"
                         | b"plugin"
                         | b"applet"
                         | b"script"
@@ -1736,6 +1816,81 @@ fn xml_has_odf_active_content(bytes: &[u8]) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// The embedded objects (`draw:object`) an ODF part shows, by reference;
+/// `None` for one embedded inline rather than stored in the package.
+fn xml_odf_objects(bytes: &[u8]) -> Vec<Option<String>> {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut objects = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                if xml_local_name(event.name().as_ref()) == b"object" {
+                    objects.push(xml_attribute_values(&event, b"href").into_iter().next());
+                }
+                buffer.clear();
+            }
+            Ok(quick_xml::events::Event::Eof) => return objects,
+            Ok(_) => buffer.clear(),
+            Err(_) => {
+                objects.push(None);
+                return objects;
+            }
+        }
+    }
+}
+
+/// The media type the package manifest gives each path, with a directory's
+/// trailing `/` removed.
+fn odf_manifest_media_types(bytes: &[u8]) -> HashMap<String, String> {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut types = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                if xml_local_name(event.name().as_ref()) == b"file-entry" {
+                    let path = xml_attribute_values(&event, b"full-path")
+                        .into_iter()
+                        .next();
+                    let media = xml_attribute_values(&event, b"media-type")
+                        .into_iter()
+                        .next();
+                    if let (Some(path), Some(media)) = (path, media) {
+                        types.insert(
+                            path.trim_end_matches('/').to_string(),
+                            media.trim().to_string(),
+                        );
+                    }
+                }
+                buffer.clear();
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return types,
+            Ok(_) => buffer.clear(),
+        }
+    }
+}
+
+/// Whether an embedded object is one AnyDoc handles: a chart, which it
+/// shows as the object's replacement image, or a formula, which it converts.
+/// Any other object, or one the manifest does not describe, is refused.
+fn odf_object_supported(object: Option<&str>, media_types: &HashMap<String, String>) -> bool {
+    object
+        .and_then(|reference| anydoc_resolve("content.xml", reference))
+        .and_then(|path| media_types.get(path.trim_end_matches('/')))
+        .is_some_and(|media| {
+            matches!(
+                media.as_str(),
+                "application/vnd.oasis.opendocument.chart"
+                    | "application/vnd.oasis.opendocument.formula"
+            )
+        })
 }
 
 fn xml_has_odf_encryption_data(bytes: &[u8]) -> bool {
@@ -4047,7 +4202,14 @@ fn odf_reference_missing(value: &str, archive_names: &HashSet<String>) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('#') || is_external_uri(trimmed) {
         return false;
     }
-    anydoc_resolve("content.xml", value).is_none_or(|part| !archive_names.contains(&part))
+    // An embedded object is a directory of parts.
+    anydoc_resolve("content.xml", value).is_none_or(|part| {
+        let directory = format!("{}/", part.trim_end_matches('/'));
+        !archive_names.contains(&part)
+            && !archive_names
+                .iter()
+                .any(|name| name.starts_with(&directory))
+    })
 }
 
 /// Whether a slide or notes slide hides content AnyDoc 0.2.4 converts: the
@@ -5433,6 +5595,9 @@ fn preflight_package(
     let mut odf_manifest = None;
     let mut archive_names = HashSet::new();
     let mut odf_references = Vec::new();
+    let mut odf_objects: Vec<Option<String>> = Vec::new();
+    let mut odf_spreadsheet_walk: Option<odf_walk::OdfWalk> = None;
+    let mut odf_styles: Option<Vec<u8>> = None;
 
     let layout = ooxml_layout(&mut archive, kind)?;
     let mut docx_scan = DocxStoryScan::default();
@@ -5506,16 +5671,14 @@ fn preflight_package(
             DocumentKind::Odt | DocumentKind::Ods | DocumentKind::Odp
         ) && (lower_name.starts_with("basic/")
             || lower_name.starts_with("scripts/")
-            || lower_name.contains("/object")
+            // An object's replacement image is judged with its object.
+            || (lower_name.contains("/object") && !lower_name.starts_with("objectreplacements/"))
             || lower_name.starts_with("object/")
             || lower_name.contains("/oleobject")
             || lower_name.starts_with("oleobject/")
             || lower_name.contains("/embeddings/")
             || lower_name.starts_with("embeddings/"))
         {
-            result.active_content = true;
-        }
-        if matches!(kind, DocumentKind::Odt) && lower_name.starts_with("objectreplacements/") {
             result.active_content = true;
         }
         if matches!(
@@ -5609,6 +5772,7 @@ fn preflight_package(
                     }
                     result.external_relationships |= xml_has_odf_external_reference(&content);
                     result.active_content |= xml_has_odf_active_content(&content);
+                    odf_objects.extend(xml_odf_objects(&content));
                     if name == "content.xml" {
                         let (body, spreadsheet) = match kind {
                             DocumentKind::Odt => (odf_walk::OdfBody::Text, false),
@@ -5620,7 +5784,8 @@ fn preflight_package(
                         if spreadsheet {
                             result.missing_formula_cache |= walk.uncached_formula;
                             result.hidden_content |= walk.hidden_value;
-                            result.unsupported_content |= walk.sign_lost;
+                            // Signs are decided with the styles part.
+                            odf_spreadsheet_walk = Some(walk);
                         }
                     }
                     if matches!(kind, DocumentKind::Ods) {
@@ -5652,7 +5817,11 @@ fn preflight_package(
                     if !xml_is_well_formed(&content) {
                         return Err(DocumentError::Malformed);
                     }
+                    if name == "styles.xml" {
+                        odf_styles = Some(content.clone());
+                    }
                     result.hidden_content |= xml_has_odf_hidden_content(&content);
+                    odf_objects.extend(xml_odf_objects(&content));
                     if matches!(kind, DocumentKind::Odt) {
                         result.hidden_content |= xml_has_odt_hidden_or_tracked_content(&content);
                         result.external_relationships |= xml_has_odf_external_reference(&content);
@@ -5748,11 +5917,26 @@ fn preflight_package(
                 .iter()
                 .any(|reference| odf_reference_missing(reference, &archive_names));
         }
-        if let Some(manifest) = odf_manifest {
-            if xml_has_odf_encryption_data(&manifest) {
+        if let Some(manifest) = &odf_manifest {
+            if xml_has_odf_encryption_data(manifest) {
                 return Err(DocumentError::Encrypted);
             }
         }
+        if let Some(mut walk) = odf_spreadsheet_walk {
+            walk.decide_signs(odf_styles.as_deref())?;
+            result.unsupported_content |= walk.sign_lost;
+        }
+        let media_types = odf_manifest
+            .as_deref()
+            .map(odf_manifest_media_types)
+            .unwrap_or_default();
+        // An OLE object stored in the package, whether shown or not.
+        result.active_content |= media_types
+            .values()
+            .any(|media| media.eq_ignore_ascii_case("application/vnd.sun.star.oleobject"));
+        result.active_content |= odf_objects
+            .iter()
+            .any(|object| !odf_object_supported(object.as_deref(), &media_types));
         return Ok(result);
     }
     if !has_content_types || !has_main {
@@ -9536,6 +9720,26 @@ mod tests {
             r#"<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="1" name="Group" hidden="1"/></xdr:nvGrpSpPr>{}</xdr:grpSp>"#,
             text_box("", "", "Inside a hidden group")
         )));
+        // A connector's label shows as a shape's does.
+        assert!(check(
+            r#"<xdr:cxnSp><xdr:nvCxnSpPr><xdr:cNvPr id="4" name="Connector 1"/></xdr:nvCxnSpPr><xdr:txBody><a:p><a:r><a:t>See schedule B</a:t></a:r></a:p></xdr:txBody></xdr:cxnSp>"#
+                .to_string()
+        ));
+        // Excel shows a chart or slicer it understands, not the notice its
+        // fallback holds for older versions; a choice it cannot read leaves
+        // the fallback shown.
+        let alternate = |requires: &str| {
+            format!(
+                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" xmlns:x="urn:example:unknown"><mc:Choice Requires="{requires}"><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="5" name="Chart 1"/></xdr:nvGraphicFramePr></xdr:graphicFrame></mc:Choice><mc:Fallback>{}</mc:Fallback></mc:AlternateContent>"#,
+                text_box(
+                    "",
+                    "",
+                    "This chart isn't available in your version of Excel."
+                )
+            )
+        };
+        assert!(!check(alternate("cx1")));
+        assert!(check(alternate("x")));
     }
 
     #[test]
@@ -10052,6 +10256,46 @@ mod tests {
         )
         .unwrap();
         assert!(formula_result.missing_formula_cache);
+    }
+
+    #[test]
+    fn odf_embedded_objects_are_judged_by_what_they_embed() {
+        let content = br#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:spreadsheet><table:table table:name="Sheet1"><table:shapes><draw:frame><draw:object xlink:href="./Object 1"/><draw:image xlink:href="./ObjectReplacements/Object 1"/></draw:frame></table:shapes><table:table-row><table:table-cell office:value-type="string"><text:p>Amount</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let manifest = |media: &str| {
+            format!(
+                r#"<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/><manifest:file-entry manifest:full-path="Object 1/" manifest:media-type="{media}"/></manifest:manifest>"#
+            )
+        };
+        let active = |manifest: Option<String>| {
+            let mut extra: Vec<(&str, &[u8])> = vec![
+                ("Object 1/content.xml", b"<office:document-content/>"),
+                ("ObjectReplacements/Object 1", b"replacement"),
+            ];
+            if let Some(manifest) = &manifest {
+                extra.push(("META-INF/manifest.xml", manifest.as_bytes()));
+            }
+            preflight_package(
+                &ods_package(content, &extra),
+                DocumentKind::Ods,
+                DocumentVariant::Ods,
+            )
+            .unwrap()
+            .active_content
+        };
+        // A chart shows as its replacement image, and AnyDoc converts a
+        // formula; another embedded document, or one the manifest does not
+        // describe, is refused.
+        assert!(!active(Some(manifest(
+            "application/vnd.oasis.opendocument.chart"
+        ))));
+        assert!(!active(Some(manifest(
+            "application/vnd.oasis.opendocument.formula"
+        ))));
+        assert!(active(Some(manifest(
+            "application/vnd.oasis.opendocument.text"
+        ))));
+        assert!(active(Some(manifest("application/vnd.sun.star.oleobject"))));
+        assert!(active(None));
     }
 
     #[test]

@@ -6,14 +6,18 @@
 //!
 //! - A negative value whose format marks it only by a colour, such as
 //!   `#,##0;[Red]#,##0`, renders as a positive number: the colour is gone,
-//!   and the section shows no sign.
+//!   and the section shows no sign. A section that shows other text than
+//!   the positive one (`"Refund "`, `▼`) still marks it, and a value too
+//!   small to show a digit at the section's decimals shows as zero either
+//!   way.
 //! - A value its format hides (an empty section, as in `;;;`) is shown by
 //!   no spreadsheet application, while the workbook still holds it; hidden
 //!   rows and columns are refused for the same reason. A zero a format
 //!   hides is the common "hide zeros" idiom and is not counted.
 //! - A date whose format AnyDoc cannot resolve renders as its serial
 //!   number: a built-in locale date format outside AnyDoc's table, or a
-//!   code its parser rejects.
+//!   code its parser rejects. So does a built-in percentage outside the
+//!   table (ids 67 and 68), a hundredth of what the format shows.
 //!
 //! The parse here follows AnyDoc's grammar closely enough to tell which
 //! codes it rejects, section by section; the number layout inside a section
@@ -22,10 +26,30 @@
 /// How a cell's value meets its format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum CellClass {
-    Negative,
+    /// A negative value, with the fewest decimals at which it shows a digit
+    /// other than zero: negative for a value of tens or more.
+    Negative {
+        shown_from: i8,
+    },
     Zero,
     Positive,
     Text,
+}
+
+impl CellClass {
+    /// The class of a finite number.
+    pub(super) fn of(number: f64) -> Self {
+        if number < 0.0 {
+            // The fewest decimals `d` at which `|number| × 10^d` rounds away
+            // from zero.
+            let shown_from = (0.5 / number.abs()).log10().ceil().clamp(-99.0, 99.0) as i8;
+            CellClass::Negative { shown_from }
+        } else if number > 0.0 {
+            CellClass::Positive
+        } else {
+            CellClass::Zero
+        }
+    }
 }
 
 /// What converting a cell of some class through a format loses.
@@ -74,9 +98,11 @@ fn builtin_code(id: u32) -> Option<&'static str> {
 }
 
 /// Built-in ids that are locale date and time formats (East Asian and
-/// Thai), which AnyDoc cannot resolve without the file's own code.
-fn builtin_locale_date(id: u32) -> bool {
-    matches!(id, 27..=36 | 50..=58 | 71..=81)
+/// Thai), which AnyDoc cannot resolve without the file's own code, and the
+/// Thai percentages, which a reader shows as `0%` and `0.00%` and AnyDoc as
+/// General.
+fn builtin_misrendered(id: u32) -> bool {
+    matches!(id, 27..=36 | 50..=58 | 67 | 68 | 71..=81)
 }
 
 /// One `;`-separated section, as far as the checks need it.
@@ -87,11 +113,19 @@ struct Section {
     empty: bool,
     condition: bool,
     colour: bool,
-    /// A `-`, parenthesis, or minus sign it shows, or a `CR` or `DR`.
+    /// A `-`, parenthesis, or minus sign it shows, or `CR` or `DR` as a
+    /// word.
     sign: bool,
     /// The text placeholder `@`.
     text: bool,
     date: bool,
+    /// The literal text it shows, without white space.
+    literal: String,
+    /// Decimals it shows, less three for each thousands scaling comma and
+    /// plus two for each percent sign.
+    decimals: i32,
+    /// An exponent, which shows a digit other than zero for any value.
+    exponent: bool,
 }
 
 /// A format code as AnyDoc reads it.
@@ -137,11 +171,27 @@ fn split_sections(code: &str) -> Option<Vec<String>> {
     Some(sections)
 }
 
+/// Characters a reader takes for a minus sign or accounting parentheses:
+/// hyphen-minus, the minus sign, figure and en dashes, and small and
+/// fullwidth forms. An em dash, which often stands for zero, is not one.
+const SIGNS: [char; 10] = [
+    '-', '(', ')', '\u{2212}', '\u{2012}', '\u{2013}', '\u{fe63}', '\u{ff0d}', '\u{ff08}',
+    '\u{ff09}',
+];
+
+/// Whether literal text marks a value negative: a minus or parenthesis, or
+/// the accounting words `CR` and `DR`, but not a currency code holding them
+/// (`IDR`, `CRC`).
 fn has_sign(literal: &str) -> bool {
-    literal.contains(['-', '(', ')', '\u{2212}']) || {
-        let upper = literal.to_ascii_uppercase();
-        upper.contains("CR") || upper.contains("DR")
-    }
+    literal.contains(SIGNS)
+        || literal
+            .split(|character: char| !character.is_alphabetic())
+            .any(|word| word.eq_ignore_ascii_case("CR") || word.eq_ignore_ascii_case("DR"))
+}
+
+/// The literal text a piece of a section shows, without white space.
+fn push_literal(literal: &mut String, text: &str) {
+    literal.extend(text.chars().filter(|character| !character.is_whitespace()));
 }
 
 /// Read one section; `None` where AnyDoc's parser rejects it.
@@ -151,6 +201,9 @@ fn parse_section(section: &str) -> Option<Section> {
     let mut tokens = 0usize;
     // Tokens a date section or a text section may not hold.
     let (mut digits, mut exponent, mut bare_digits, mut general) = (false, false, false, false);
+    // The number's decimals, its trailing (scaling) commas, and percents.
+    let (mut after_point, mut placeholders_after_point) = (false, 0i32);
+    let (mut commas_after_digit, mut percents) = (0i32, 0i32);
     let mut index = 0;
     while index < characters.len() {
         let character = characters[index];
@@ -174,6 +227,7 @@ fn parse_section(section: &str) -> Option<Section> {
                         if !symbol.is_empty() {
                             tokens += 1;
                             parsed.sign |= has_sign(symbol);
+                            push_literal(&mut parsed.literal, symbol);
                         }
                     }
                     first @ ('h' | 'H' | 'm' | 'M' | 's' | 'S')
@@ -203,14 +257,16 @@ fn parse_section(section: &str) -> Option<Section> {
                 if !literal.is_empty() {
                     tokens += 1;
                     parsed.sign |= has_sign(&literal);
+                    push_literal(&mut parsed.literal, &literal);
                 }
                 index = end + 1;
                 continue;
             }
             '\\' => {
-                let escaped = *characters.get(index + 1)?;
+                let escaped = characters.get(index + 1)?.to_string();
                 tokens += 1;
-                parsed.sign |= has_sign(&escaped.to_string());
+                parsed.sign |= has_sign(&escaped);
+                push_literal(&mut parsed.literal, &escaped);
                 index += 2;
                 continue;
             }
@@ -224,6 +280,15 @@ fn parse_section(section: &str) -> Option<Section> {
             }
             '0' | '#' | '?' | '.' | ',' | '%' => {
                 digits |= matches!(character, '0' | '#' | '?' | '.');
+                match character {
+                    '.' => after_point = true,
+                    ',' => commas_after_digit += 1,
+                    '%' => percents += 1,
+                    _ => {
+                        placeholders_after_point += i32::from(after_point);
+                        commas_after_digit = 0;
+                    }
+                }
                 tokens += 1;
             }
             '@' => {
@@ -232,6 +297,7 @@ fn parse_section(section: &str) -> Option<Section> {
             }
             'E' | 'e' if matches!(characters.get(index + 1), Some('+' | '-')) => {
                 exponent = true;
+                parsed.exponent = true;
                 tokens += 1;
                 index += 2;
                 continue;
@@ -284,6 +350,7 @@ fn parse_section(section: &str) -> Option<Section> {
             '$' | '-' | '+' | '(' | ')' | ':' | ' ' | '/' => {
                 tokens += 1;
                 parsed.sign |= matches!(character, '-' | '(' | ')');
+                push_literal(&mut parsed.literal, &character.to_string());
             }
             _ => return None,
         }
@@ -299,7 +366,40 @@ fn parse_section(section: &str) -> Option<Section> {
         return None;
     }
     parsed.empty = tokens == 0;
+    parsed.decimals = placeholders_after_point + 2 * percents - 3 * commas_after_digit;
     Some(parsed)
+}
+
+/// Whether a section AnyDoc rejects names a date: a date letter outside
+/// quotes, escapes, and brackets other than an elapsed-time one (`[h]`).
+fn names_date(section: &str) -> bool {
+    let mut characters = section.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => {
+                characters.by_ref().find(|&next| next == '"');
+            }
+            '\\' | '_' | '*' => {
+                characters.next();
+            }
+            '[' => {
+                let inner: String = characters
+                    .by_ref()
+                    .take_while(|&next| next != ']')
+                    .collect();
+                let mut letters = inner.chars();
+                if letters.next().is_some_and(|first| {
+                    matches!(first.to_ascii_lowercase(), 'h' | 'm' | 's')
+                        && letters.all(|next| next.eq_ignore_ascii_case(&first))
+                }) {
+                    return true;
+                }
+            }
+            'y' | 'Y' | 'd' | 'D' | 'm' | 'M' | 'h' | 'H' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn parse(code: &str) -> Code {
@@ -325,9 +425,7 @@ fn parse(code: &str) -> Code {
                 ..Section::default()
             },
             None => Section {
-                date: part
-                    .chars()
-                    .any(|c| matches!(c, 'y' | 'Y' | 'd' | 'D' | 'm' | 'M' | 'h' | 'H')),
+                date: names_date(part),
                 ..Section::default()
             },
         })
@@ -362,7 +460,7 @@ pub(super) fn loss(id: u32, code: Option<&str>, class: CellClass) -> FormatLoss 
         Some(code) => code,
         None => {
             return FormatLoss {
-                misrendered: numeric && builtin_locale_date(id),
+                misrendered: numeric && builtin_misrendered(id),
                 ..FormatLoss::default()
             };
         }
@@ -400,25 +498,39 @@ pub(super) fn loss(id: u32, code: Option<&str>, class: CellClass) -> FormatLoss 
     let index = match (numeric_sections.len(), class) {
         (0, _) => return FormatLoss::default(),
         (1, _) => 0,
-        (2, CellClass::Negative) => 1,
+        (2, CellClass::Negative { .. }) => 1,
         (2, _) => 0,
         (_, CellClass::Positive) => 0,
-        (_, CellClass::Negative) => 1,
+        (_, CellClass::Negative { .. }) => 1,
         _ => 2,
     };
     let section = &numeric_sections[index];
+    if let CellClass::Negative { shown_from } = class {
+        // Too small to show a digit: a zero, however it is marked.
+        if !section.exponent && i32::from(shown_from) > section.decimals {
+            return FormatLoss::default();
+        }
+    }
     FormatLoss {
         hidden: section.empty && class != CellClass::Zero,
         // The negative section renders the magnitude with only its own
-        // characters: a colour alone marked it negative.
-        misrendered: index == 1 && section.colour && !section.sign && !section.empty,
+        // characters: a colour alone marked it negative, with no sign and
+        // no text of its own.
+        misrendered: index == 1
+            && section.colour
+            && !section.sign
+            && !section.empty
+            && section.literal == numeric_sections[0].literal,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use CellClass::{Negative, Positive, Text, Zero};
+    use CellClass::{Positive, Text, Zero};
+
+    /// A negative value that shows at any decimals.
+    const NEGATIVE: CellClass = CellClass::Negative { shown_from: 0 };
 
     fn misrendered(code: &str, class: CellClass) -> bool {
         loss(164, Some(code), class).misrendered
@@ -436,7 +548,7 @@ mod tests {
             "#,##0;[Red]#,##0",
             "#,##0;[Color10]#,##0;0",
         ] {
-            assert!(misrendered(code, Negative), "{code}");
+            assert!(misrendered(code, NEGATIVE), "{code}");
             assert!(!misrendered(code, Positive), "{code}");
         }
         for code in [
@@ -449,20 +561,57 @@ mod tests {
             "[Red]0.00",
             "[<0][Red]0.00;0.00",
         ] {
-            assert!(!misrendered(code, Negative), "{code}");
+            assert!(!misrendered(code, NEGATIVE), "{code}");
         }
         // Built-in 38 and 40 wrap negatives in parentheses.
-        assert!(!loss(38, None, Negative).misrendered);
+        assert!(!loss(38, None, NEGATIVE).misrendered);
+        // A currency code holding `CR` or `DR` is no accounting marker.
+        for code in [
+            "\"IDR \"#,##0;[Red]\"IDR \"#,##0",
+            "[$IDR-421]#,##0;[Red][$IDR-421]#,##0",
+            "\"CRC \"#,##0;[Red]\"CRC \"#,##0",
+        ] {
+            assert!(misrendered(code, NEGATIVE), "{code}");
+        }
+        assert!(!misrendered("#,##0;[Red]#,##0\" DR\"", NEGATIVE));
+        // Text of its own, or an arrow, marks the section.
+        for code in [
+            "\"Balance due \"$#,##0;[Red]\"Refund \"$#,##0;\"Even\"",
+            "[$-409]\\▲0.0%;[RED]\\▼0.0%",
+        ] {
+            assert!(parse(code).parses, "{code}");
+            assert!(!misrendered(code, NEGATIVE), "{code}");
+        }
+        assert!(misrendered("$#,##0;[Red]$#,##0", NEGATIVE));
+        // A value too small to show a digit shows as zero either way.
+        let class = CellClass::of;
+        for (code, value, expected) in [
+            ("#,##0.00;[Red]#,##0.00", -2.91e-11, false),
+            ("#,##0.00;[Red]#,##0.00", -0.004, false),
+            ("#,##0.00;[Red]#,##0.00", -0.006, true),
+            ("#,##0.00;[Red]#,##0.00", -1250.0, true),
+            ("0%;[Red]0%", -0.004, false),
+            ("0%;[Red]0%", -0.006, true),
+            ("#,##0,;[Red]#,##0,", -400.0, false),
+            ("#,##0,;[Red]#,##0,", -600.0, true),
+            ("0.00E+00;[Red]0.00E+00", -2.91e-11, true),
+        ] {
+            assert_eq!(
+                loss(164, Some(code), class(value)).misrendered,
+                expected,
+                "{code} {value}"
+            );
+        }
     }
 
     #[test]
     fn values_a_format_hides_are_found() {
         for (code, class) in [
             (";;;", Positive),
-            (";;;", Negative),
+            (";;;", NEGATIVE),
             (";;;", Text),
-            ("0;;0", Negative),
-            ("0;[Red];0", Negative),
+            ("0;;0", NEGATIVE),
+            ("0;[Red];0", NEGATIVE),
         ] {
             assert!(hidden(code, class), "{code} {class:?}");
         }
@@ -507,11 +656,27 @@ mod tests {
             assert!(!misrendered(code, Positive), "{code}");
         }
         // A rejected currency code falls back to General, which keeps the
-        // sign and the value.
-        assert_eq!(
-            loss(164, Some("£#,##0.00"), Negative),
-            FormatLoss::default()
-        );
+        // sign and the value, whatever colours it names.
+        for code in [
+            "£#,##0.00",
+            "[Green]▲#,##0;[Red]▼#,##0",
+            "#,##0.00 €;[Red]-#,##0.00 €",
+            "[Magenta]#,##0 £",
+        ] {
+            assert!(!parse(code).parses, "{code}");
+            for class in [NEGATIVE, Positive] {
+                assert_eq!(
+                    loss(164, Some(code), class),
+                    FormatLoss::default(),
+                    "{code}"
+                );
+            }
+        }
+        // Built-in percentages outside AnyDoc's table show a hundredth.
+        for id in [67, 68] {
+            assert!(loss(id, None, Positive).misrendered, "{id}");
+            assert!(!loss(id, None, Text).misrendered, "{id}");
+        }
     }
 
     #[test]
