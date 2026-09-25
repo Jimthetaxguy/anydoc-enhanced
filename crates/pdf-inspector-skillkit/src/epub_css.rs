@@ -5532,6 +5532,11 @@ struct Open {
     /// The font size an SVG element's attributes or inline style set, on it
     /// or on an element around it inside the image.
     svg_font: Option<f64>,
+    /// For an SVG `text` or `tspan` that sets `dx`, how it moves its
+    /// glyphs, where it or an element around it moves one apart (see
+    /// [`svg_glyph_shifts`]), and how many of them came.
+    glyph_shifts: Vec<Tri>,
+    shifts_taken: usize,
     /// Children are laid out as flex or grid items, and how they stand so
     /// far.
     items: Tri,
@@ -5551,6 +5556,13 @@ struct Open {
     exempt: Exempt,
     /// What the element does to AnyDoc's inline run as it ends.
     effects: Effects,
+}
+
+impl Open {
+    /// Whether its `dx` list reaches glyphs still to come.
+    fn shifts_glyphs(&self) -> bool {
+        self.shifts_taken < self.glyph_shifts.len()
+    }
 }
 
 /// The flex or grid items of a box as the walk goes through them (see
@@ -5781,6 +5793,93 @@ fn svg_number(value: &str) -> Option<f64> {
     value.strip_suffix("px").unwrap_or(value).parse().ok()
 }
 
+/// The numbers of an SVG list of lengths (`dx="0 0 120 0"`); `None` where
+/// one is not a number [`svg_number`] reads.
+fn svg_numbers(value: &str) -> Option<Vec<f64>> {
+    value
+        .split(|character: char| character.is_ascii_whitespace() || character == ',')
+        .filter(|part| !part.is_empty())
+        .map(svg_number)
+        .collect()
+}
+
+/// How a glyph an SVG `dx` moves from where the glyphs before it end
+/// stands beside them: moved back no further than half an em, as a kerning
+/// pair is, it may touch them (`No`); moved on no further, it may stand
+/// apart (`Maybe`); further either way, over or past the glyphs before it,
+/// it does (`Yes`).
+fn svg_shift(dx: f64, em: f64) -> Tri {
+    if (-em / 2.0..=0.0).contains(&dx) {
+        Tri::No
+    } else if dx > 0.0 && dx <= em / 2.0 {
+        Tri::Maybe
+    } else {
+        Tri::Yes
+    }
+}
+
+/// How an SVG `text` or `tspan`'s `dx` moves its glyphs, one value for
+/// each, first to last: the first glyph goes where the element's own place
+/// sets it (see [`svg_text_flow`]), `No` here, and each after it as its
+/// value moves it from where the one before ends (see [`svg_shift`]). A
+/// reader takes the value for each glyph from the innermost element whose
+/// list reaches it (see [`add_positioned`]). Empty where the element sets
+/// no `dx` that reads.
+fn svg_glyph_shifts(element: &Element, em: f64) -> Vec<Tri> {
+    let Some(numbers) = element.first("dx").and_then(svg_numbers) else {
+        return Vec::new();
+    };
+    let Some((_, after)) = numbers.split_first() else {
+        return Vec::new();
+    };
+    std::iter::once(Tri::No)
+        .chain(after.iter().map(|dx| svg_shift(*dx, em)))
+        .collect()
+}
+
+/// Add text inside an SVG label whose `dx` lists move glyphs one by one
+/// (see [`svg_glyph_shifts`]) to the run, each glyph a list moves apart
+/// from the one before starting a piece of its own; whether it runs into
+/// the text before it. A reader numbers the characters of the label as
+/// they come, white space it collapses left out, and each open element's
+/// list gives the next of its values to each, until it runs out.
+fn add_positioned(run: &mut Run, text: &str, open: &mut [Open]) -> bool {
+    let mut lists: Vec<&mut Open> = open
+        .iter_mut()
+        .rev()
+        .filter(|state| state.shifts_glyphs())
+        .collect();
+    let mut space = run.svg_label_start || run.last.is_none_or(char::is_whitespace);
+    let mut fused = false;
+    let mut start = 0;
+    for (at, character) in text.char_indices() {
+        if lists.is_empty() {
+            break;
+        }
+        if character.is_whitespace() && space {
+            continue;
+        }
+        space = character.is_whitespace();
+        let mut shift = Tri::No;
+        let mut innermost = true;
+        lists.retain_mut(|state| {
+            if std::mem::take(&mut innermost) {
+                shift = state.glyph_shifts[state.shifts_taken];
+            }
+            state.shifts_taken += 1;
+            state.shifts_glyphs()
+        });
+        if shift != Tri::No {
+            if at > start {
+                fused |= run.add(&text[start..at]);
+                start = at;
+            }
+            run.mark(shift);
+        }
+    }
+    fused | run.add(&text[start..])
+}
+
 /// The font size, in pixels, an SVG element's inline style or attribute
 /// sets.
 fn svg_font_size(element: &Element) -> Option<f64> {
@@ -5789,17 +5888,20 @@ fn svg_font_size(element: &Element) -> Option<f64> {
         .or_else(|| element.first("font-size").and_then(svg_number))
 }
 
-/// How a reader sets an SVG `text` or `tspan` beside the text before it. A
-/// `text` sets a label of its own, from the place its `x` and `y` give the
-/// pen. A `tspan` placed anew goes on its label's line where it stays on
-/// the line (`y` within half an em) and starts where the glyphs since the
-/// pen reach (0.6 em each and an em for a space), as a kerning pair or a
-/// change of style is set, and may then touch the text before it; set on
-/// another line (a `y` beyond, or a `dy` with it), or further along, as a
-/// separate label is, it stands apart. A `tspan` moved from where the
-/// glyphs before it end stands apart past half an em along the line
-/// (`dx`), and may touch them moved off it as a superscript is (`dy`).
-/// `em` is the element's font's.
+/// How a reader sets an SVG `text`, `tspan`, or `textPath` beside the text
+/// before it. A `text` sets a label of its own, from the place its `x` and
+/// `y` give the pen. A `tspan` placed anew goes on its label's line where
+/// it stays on the line (`y` within half an em) and starts where the glyphs
+/// since the pen reach (0.6 em each and an em for a space), as a kerning
+/// pair or a change of style is set, and may then touch the text before
+/// it; set on another line (a `y` beyond, or a `dy` with it), or further
+/// along, as a separate label is, it stands apart. A `tspan` moved along
+/// the line from where the glyphs before it end (`dx`, of a list its
+/// first) stands as [`svg_shift`] tells, and may touch them moved off it
+/// as a superscript is (`dy`). A `textPath` sets its glyphs along its
+/// path, from where the path and its offset start them, and the glyphs
+/// after it go on from the path's end: it stands apart from both, as a
+/// label of its own. `em` is the element's font's.
 fn svg_text_flow(
     run: &mut Run,
     element: &Element,
@@ -5809,8 +5911,16 @@ fn svg_text_flow(
 ) -> Flow {
     let (em, sized) = (font.unwrap_or(16.0), font.is_some());
     let number = |name: &str| element.first(name).map(svg_number);
-    let (x, y, dx, dy) = (number("x"), number("y"), number("dx"), number("dy"));
+    let (x, y, dy) = (number("x"), number("y"), number("dy"));
+    let dx = element
+        .first("dx")
+        .map(|value| svg_numbers(value).and_then(|numbers| numbers.first().copied()));
+    if element.local == "textPath" {
+        run.svg_pen = None;
+        return Flow::Block;
+    }
     if element.local == "text" {
+        run.svg_label_start = true;
         run.svg_pen = match (x.unwrap_or(Some(0.0)), y.unwrap_or(Some(0.0))) {
             (Some(x), Some(y)) => Some(Pen {
                 x,
@@ -5830,8 +5940,11 @@ fn svg_text_flow(
                 run.svg_pen = pen;
                 own
             }
-            (Some(Some(dx)), None) if dx <= 0.0 => own,
-            (Some(Some(dx)), None) if dx <= em / 2.0 => Flow::MaybeApart,
+            (Some(Some(dx)), None) => match svg_shift(dx, em) {
+                Tri::No => own,
+                Tri::Maybe => Flow::MaybeApart,
+                Tri::Yes => Flow::Block,
+            },
             (None, Some(Some(_))) => Flow::MaybeApart,
             _ => Flow::Block,
         };
@@ -5855,9 +5968,10 @@ fn svg_text_flow(
     };
     let same_line = (y - pen.y).abs() <= pen.em / 2.0 && dy.is_none_or(|dy| dy == Some(0.0));
     let end = pen.x + reach(glyphs - pen.glyphs, pen.em, pen.sized);
+    let moved_apart = dx.flatten().is_some_and(|dx| svg_shift(dx, em) == Tri::Yes);
     match (x, placed_x) {
         // Moved up or down from where the glyphs before it end.
-        (None, _) if same_line => Flow::MaybeApart,
+        (None, _) if same_line && !moved_apart => Flow::MaybeApart,
         (Some(_), Some(x)) if same_line && x > pen.x && x <= end => Flow::MaybeApart,
         _ => Flow::Block,
     }
@@ -5891,6 +6005,9 @@ struct Run {
     after_placed: Option<(Placement, u64)>,
     /// Where the current chunk of an SVG text label starts, where known.
     svg_pen: Option<Pen>,
+    /// An SVG text label started and no text came yet: a reader collapses
+    /// the white space it starts with (see [`add_positioned`]).
+    svg_label_start: bool,
     /// A sign a `::before` or `::after` box shows sits before the next
     /// text.
     sign_before: Option<Sign>,
@@ -6109,6 +6226,7 @@ impl Run {
             joined && (self.boundary || (self.maybe_boundary && number)) && !beside && !alt_side;
         self.before_last = kept().rev().nth(1).or(self.last);
         self.last = Some(last);
+        self.svg_label_start = false;
         self.boundary = false;
         self.maybe_boundary = false;
         self.beside_float = None;
@@ -6882,8 +7000,8 @@ fn meet_run(
     };
     // A span of an SVG label meets the text before it as its place says
     // (see [`svg_text_flow`]); the text after it goes on from where its
-    // glyphs end.
-    if in_svg && matches!(local, "text" | "tspan") {
+    // glyphs end. Glyphs set along a path stand as a label of their own.
+    if in_svg && matches!(local, "text" | "tspan" | "textPath") {
         let junction = svg_text_flow(run, element, glyphs.0, svg_font, own);
         if local == "tspan" {
             run.mark(match junction {
@@ -6894,7 +7012,7 @@ fn meet_run(
         }
     }
     let flow = match (parent_items, own) {
-        _ if in_svg && local == "text" => Flow::Block,
+        _ if in_svg && matches!(local, "text" | "textPath") => Flow::Block,
         (Tri::Yes, Flow::Positioned) => Flow::Positioned,
         (Tri::Yes, _) => Flow::Inline,
         (_, Flow::Block) => Flow::Block,
@@ -7225,10 +7343,15 @@ pub(super) fn chapter_text(
                     (Reach::Whole, Whole::Tex) => Some(text.trim()),
                     _ => None,
                 };
+                let positioned = state.svg_text && open.iter().any(Open::shifts_glyphs);
                 if let Some(taken) = taken {
                     run.mark(apart);
                     count_glyphs(&mut glyphs, taken);
-                    found.fuses_blocks |= run.add(taken);
+                    found.fuses_blocks |= if positioned {
+                        add_positioned(run, taken, &mut open)
+                    } else {
+                        run.add(taken)
+                    };
                     found.drops_shown |= std::mem::take(&mut run.lost_sign);
                 }
             }
@@ -7536,6 +7659,20 @@ pub(super) fn chapter_text(
         let svg_text = parent.is_some_and(|parent| parent.svg_text)
             || (parent_in_svg && element.local == "text");
         let switch_taken = (in_svg && element.local == "switch").then_some(false);
+        // A `dx` list is read where it, or one around it, moves a glyph
+        // apart.
+        let glyph_shifts = if parent_in_svg && matches!(element.local.as_str(), "text" | "tspan") {
+            let shifts = svg_glyph_shifts(element, svg_font.unwrap_or(16.0));
+            let read = shifts.iter().any(|shift| *shift != Tri::No)
+                || open.iter().any(Open::shifts_glyphs);
+            if read {
+                shifts
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         // A `foreignObject` holds HTML, laid out as a reader lays out a page.
         let children_in_svg = in_svg && element.local != "foreignObject";
         let mut state = match &style {
@@ -7553,6 +7690,8 @@ pub(super) fn chapter_text(
                 svg_text,
                 switch_taken,
                 svg_font,
+                glyph_shifts,
+                shifts_taken: 0,
                 items: Tri::No,
                 row: Row::default(),
                 item,
@@ -7605,6 +7744,8 @@ pub(super) fn chapter_text(
                     svg_text,
                     switch_taken,
                     svg_font,
+                    glyph_shifts,
+                    shifts_taken: 0,
                     items,
                     row,
                     item,
@@ -8892,6 +9033,50 @@ mod tests {
             &[r#".amt::before { content: "\A" }"#],
             r#"<p>Units 12<span class="amt">50</span></p>"#
         ));
+    }
+
+    #[test]
+    fn svg_glyphs_moved_back_one_by_one_or_onto_a_path_stand_apart() {
+        let fuses = |body: &str| {
+            walk(
+                &[],
+                &format!(
+                    r#"<p>Figure 1.</p><svg xmlns="http://www.w3.org/2000/svg" width="500" height="120"><path id="p" d="M10 30 H490"/>{body}</svg>"#
+                ),
+            )
+            .fuses_blocks
+        };
+        for body in [
+            // A span moved back past half an em, over or before the glyphs
+            // before it.
+            r#"<text x="200" y="30" font-size="16">Units 12<tspan dx="-190">50</tspan></text>"#,
+            r#"<text x="200" y="30" font-size="16">Balance due<tspan dx="-190">Grand total</tspan></text>"#,
+            // On the line, but moved along it.
+            r#"<text x="10" y="30" font-size="16">Balance due<tspan y="30" dx="200">Grand total</tspan></text>"#,
+            // A `dx` list moving a glyph apart, from the element it is on or
+            // one around it, white space a reader collapses not counted.
+            r#"<text x="10" y="30" font-size="16">Units <tspan dx="0 0 120 0">1250</tspan></text>"#,
+            r#"<text x="10" y="30" font-size="16" dx="0,0,20,0">  1250</text>"#,
+            r#"<text x="10" y="30" font-size="16" dx="0 0 120 0">12<tspan>50</tspan></text>"#,
+            // Glyphs set along a path, and those after it, from the path's
+            // end.
+            r##"<text font-size="16">Units 12<textPath href="#p" startOffset="300">50</textPath></text>"##,
+            r##"<text font-size="16"><textPath href="#p">Units 12</textPath>50</text>"##,
+        ] {
+            assert!(fuses(body), "{body}");
+        }
+        for body in [
+            // Kerned: moved back no further than half an em.
+            r#"<text x="10" y="30" font-size="16">Units 1<tspan dx="-1">250</tspan></text>"#,
+            r#"<text x="10" y="30" font-size="16">Units 12<tspan dx="-7">50</tspan></text>"#,
+            r#"<text x="10" y="30" font-size="16">Units <tspan dx="0 -1 -0.5 0">1250</tspan></text>"#,
+            // An element's own `dx` comes before the list around it.
+            r#"<text x="10" y="30" font-size="16" dx="0 0 120 0">12<tspan dx="0">50</tspan></text>"#,
+            // A label set along a path alone.
+            r##"<text font-size="16"><textPath href="#p">Units 1250</textPath></text>"##,
+        ] {
+            assert!(!fuses(body), "{body}");
+        }
     }
 
     #[test]
