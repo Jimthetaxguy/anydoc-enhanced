@@ -3300,19 +3300,6 @@ impl DocxLevel {
     fn word_start(&self) -> u64 {
         self.start.unwrap_or(0)
     }
-
-    /// The levels whose numbers the number text shows.
-    fn shown_levels(&self) -> impl Iterator<Item = usize> + '_ {
-        let text = self.text.as_deref().unwrap_or("");
-        text.split('%').skip(1).filter_map(|after| {
-            after
-                .chars()
-                .next()
-                .and_then(|digit| digit.to_digit(10))
-                .filter(|digit| (1..=9).contains(digit))
-                .map(|digit| digit as usize - 1)
-        })
-    }
 }
 
 /// One counter per level, as Word keeps for a definition and AnyDoc for a
@@ -3413,6 +3400,65 @@ impl DocxCount {
             _ => return None,
         })
     }
+
+    /// A number in this format as AnyDoc writes it: letters count on past
+    /// `z` (`aa`, `ab`), and zero, or a Roman numeral past 3,999, is written
+    /// in decimal.
+    fn text(self, value: u64) -> String {
+        let lower = match self {
+            DocxCount::Decimal => return value.to_string(),
+            DocxCount::LowerRoman | DocxCount::UpperRoman => {
+                if value == 0 || value > 3999 {
+                    return value.to_string();
+                }
+                let mut rest = value;
+                let mut roman = String::new();
+                for (step, numeral) in [
+                    (1000, "m"),
+                    (900, "cm"),
+                    (500, "d"),
+                    (400, "cd"),
+                    (100, "c"),
+                    (90, "xc"),
+                    (50, "l"),
+                    (40, "xl"),
+                    (10, "x"),
+                    (9, "ix"),
+                    (5, "v"),
+                    (4, "iv"),
+                    (1, "i"),
+                ] {
+                    while rest >= step {
+                        roman.push_str(numeral);
+                        rest -= step;
+                    }
+                }
+                roman
+            }
+            DocxCount::LowerLetter | DocxCount::UpperLetter => {
+                if value == 0 {
+                    return value.to_string();
+                }
+                let mut rest = value;
+                let mut letters = Vec::new();
+                while rest > 0 {
+                    rest -= 1;
+                    letters.push(b'a' + (rest % 26) as u8);
+                    rest /= 26;
+                }
+                letters
+                    .iter()
+                    .rev()
+                    .map(|&letter| char::from(letter))
+                    .collect()
+            }
+        };
+        if matches!(self, DocxCount::UpperRoman | DocxCount::UpperLetter) {
+            lower.to_ascii_uppercase()
+        } else {
+            lower
+        }
+    }
 }
 
 impl DocxCount {
@@ -3471,14 +3517,167 @@ impl DocxMarker {
     }
 }
 
-/// A list instance as the replay counts it: the definition Word shares
-/// counters through, and each side's levels and markers.
+/// A list instance as one side of the replay counts it: the definition its
+/// levels come from, which Word shares counters through, and its levels and
+/// markers.
 struct DocxInstance {
-    word_definition: String,
-    word_levels: [DocxLevel; DOCX_LIST_LEVELS],
-    word_markers: [DocxMarker; DOCX_LIST_LEVELS],
-    anydoc_levels: [DocxLevel; DOCX_LIST_LEVELS],
-    anydoc_markers: [DocxMarker; DOCX_LIST_LEVELS],
+    definition: String,
+    levels: [DocxLevel; DOCX_LIST_LEVELS],
+    markers: [DocxMarker; DOCX_LIST_LEVELS],
+}
+
+/// A paragraph's list label as one side shows it.
+#[derive(Debug, PartialEq, Eq)]
+enum DocxLabel {
+    Nothing,
+    /// A bullet, which shows no count.
+    Bullet,
+    Text(String),
+    /// A number in a format AnyDoc does not write, such as an ordinal, which
+    /// differs from anything AnyDoc shows.
+    Unknown,
+}
+
+/// Written on both sides for a deeper level's number in a label, which is
+/// not compared.
+const DOCX_DEEPER_NUMBER: char = '\u{fffc}';
+
+/// A piece of a level's number text (`w:lvlText`): literal text, or `%1` to
+/// `%9` for a level's number.
+enum DocxTextPiece {
+    Literal(String),
+    Number(usize),
+}
+
+/// A level's number text in pieces, read alike by Word and AnyDoc.
+fn docx_number_text(text: &str) -> Vec<DocxTextPiece> {
+    let mut pieces: Vec<DocxTextPiece> = Vec::new();
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '%' {
+            if let Some(digit) = characters
+                .peek()
+                .and_then(|next| next.to_digit(10))
+                .filter(|digit| (1..=9).contains(digit))
+            {
+                characters.next();
+                pieces.push(DocxTextPiece::Number(digit as usize - 1));
+                continue;
+            }
+        }
+        match pieces.last_mut() {
+            Some(DocxTextPiece::Literal(literal)) => literal.push(character),
+            _ => pieces.push(DocxTextPiece::Literal(character.to_string())),
+        }
+    }
+    pieces
+}
+
+impl DocxInstance {
+    /// The label Word shows for a paragraph numbered `value` at `level`,
+    /// with `counters` holding the shallower levels' numbers. Legal
+    /// numbering (`w:isLgl`) shows the levels in decimal, but a format
+    /// beyond decimal, Roman numerals, and letters stays unknown at the
+    /// paragraph's own level, as it does at a shallower level without legal
+    /// numbering; past `z` Word doubles the letter (`aa`, `bb`) where AnyDoc
+    /// counts on (`aa`, `ab`).
+    fn word_label(&self, level: usize, value: u64, counters: &DocxCounters) -> DocxLabel {
+        match self.markers[level] {
+            DocxMarker::Nothing => return DocxLabel::Nothing,
+            DocxMarker::Bullet => return DocxLabel::Bullet,
+            DocxMarker::Count(_) | DocxMarker::Other => {}
+        }
+        let own = &self.levels[level];
+        let mut label = String::new();
+        for piece in docx_number_text(own.text.as_deref().unwrap_or("")) {
+            let shown = match piece {
+                DocxTextPiece::Literal(literal) => {
+                    label.push_str(&literal);
+                    continue;
+                }
+                DocxTextPiece::Number(shown) if shown > level => {
+                    label.push(DOCX_DEEPER_NUMBER);
+                    continue;
+                }
+                DocxTextPiece::Number(shown) => shown,
+            };
+            let count = match DocxCount::shown_by_word(&self.levels[shown]) {
+                Some(_) if own.legal => DocxCount::Decimal,
+                Some(count) => count,
+                None if own.legal && shown < level => DocxCount::Decimal,
+                None => return DocxLabel::Unknown,
+            };
+            let number = if shown == level {
+                value
+            } else {
+                counters.value[shown]
+            };
+            if matches!(count, DocxCount::LowerLetter | DocxCount::UpperLetter) && number > 26 {
+                return DocxLabel::Unknown;
+            }
+            label.push_str(&count.text(number));
+        }
+        DocxLabel::Text(label)
+    }
+
+    /// The label AnyDoc shows: its level's number text, or the number and a
+    /// full stop where the level has none, with every level in the level's
+    /// own marker, a bullet level as `-`, or in decimal for legal numbering.
+    /// A shallower level shows its count, or its start before it counts and
+    /// while it waits to restart.
+    fn anydoc_label(
+        &self,
+        level: usize,
+        value: u64,
+        counters: &DocxCounters,
+        start: impl Fn(usize) -> u64,
+    ) -> DocxLabel {
+        let own_count = match self.markers[level] {
+            DocxMarker::Count(count) => count,
+            DocxMarker::Bullet => return DocxLabel::Bullet,
+            DocxMarker::Nothing | DocxMarker::Other => return DocxLabel::Nothing,
+        };
+        let own = &self.levels[level];
+        let pieces = docx_number_text(own.text.as_deref().unwrap_or(""));
+        if pieces.is_empty() {
+            return DocxLabel::Text(format!("{}.", own_count.text(value)));
+        }
+        let mut label = String::new();
+        for piece in pieces {
+            match piece {
+                DocxTextPiece::Literal(literal) => label.push_str(&literal),
+                DocxTextPiece::Number(shown) if shown > level => label.push(DOCX_DEEPER_NUMBER),
+                DocxTextPiece::Number(shown) => {
+                    let count = if own.legal {
+                        Some(DocxCount::Decimal)
+                    } else if shown == level {
+                        Some(own_count)
+                    } else {
+                        DocxCount::shown_by_anydoc(&self.levels[shown])
+                    };
+                    let number = if shown == level {
+                        value
+                    } else {
+                        counters.shown(shown, start(shown))
+                    };
+                    match count {
+                        Some(count) => label.push_str(&count.text(number)),
+                        None => label.push('-'),
+                    }
+                }
+            }
+        }
+        DocxLabel::Text(label)
+    }
+}
+
+/// Where a paragraph's numbering resolves, as Word and as AnyDoc resolve
+/// it: a list instance and a level, or `None` where the side numbers
+/// nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DocxResolved {
+    word: Option<(u64, usize)>,
+    anydoc: Option<(u64, usize)>,
 }
 
 /// Definitions followed through list styles, as AnyDoc bounds nothing but a
@@ -3539,121 +3738,102 @@ impl DocxNumbering {
         Some(levels)
     }
 
-    fn instance(&self, list: u64, styles: &DocxStyleNumbering) -> Option<DocxInstance> {
+    /// A list instance as Word or as AnyDoc counts it.
+    fn instance(&self, list: u64, styles: &DocxStyleNumbering, word: bool) -> Option<DocxInstance> {
         let instance = self.lists.get(&list)?;
-        let anydoc = self.levels_from(
-            instance,
-            self.resolve_definition(&instance.definition, styles, false)?,
-        )?;
-        let word_definition = self.resolve_definition(&instance.definition, styles, true)?;
-        let word = self.levels_from(instance, word_definition)?;
+        let definition = self.resolve_definition(&instance.definition, styles, word)?;
+        let levels = self.levels_from(instance, definition)?;
         Some(DocxInstance {
-            word_definition: word_definition.to_string(),
-            word_markers: word
-                .each_ref()
-                .map(|level| DocxMarker::word(level.as_ref())),
-            word_levels: word.map(Option::unwrap_or_default),
-            anydoc_markers: anydoc
-                .each_ref()
-                .map(|level| DocxMarker::anydoc(level.as_ref())),
-            anydoc_levels: anydoc.map(Option::unwrap_or_default),
+            definition: definition.to_string(),
+            markers: levels.each_ref().map(|level| {
+                if word {
+                    DocxMarker::word(level.as_ref())
+                } else {
+                    DocxMarker::anydoc(level.as_ref())
+                }
+            }),
+            levels: levels.map(Option::unwrap_or_default),
         })
     }
 
-    /// The list instance and level a paragraph's numbering resolves to, as
-    /// AnyDoc resolves them: a list given directly or its style chain's, and
-    /// a level given directly, or the level bound to the first style along
-    /// the chain, or the first. A list instance of 0 removes numbering.
-    /// Whether Word numbers a paragraph at another level than AnyDoc: one
-    /// its style's numbering names, where no level of the list is bound to
-    /// the style. AnyDoc reads only that binding, else the first level.
-    fn style_level_differs(&self, used: &DocxListUse, styles: &DocxStyleNumbering) -> bool {
-        let (None, Some(style)) = (used.level, used.style.as_deref()) else {
-            return false;
-        };
-        let Some((list, level)) = self.resolve_use(used, styles) else {
-            return false;
-        };
-        let bound = self.lists.get(&list).is_some_and(|instance| {
-            self.resolve_definition(&instance.definition, styles, false)
-                .and_then(|definition| self.levels_from(instance, definition))
-                .is_some_and(|levels| {
-                    styles.chain(style).any(|style| {
-                        levels.iter().any(|level| {
-                            level
-                                .as_ref()
-                                .is_some_and(|level| level.style.as_deref() == Some(style))
-                        })
-                    })
-                })
-        });
-        !bound
-            && styles
-                .level(style)
-                .is_some_and(|named| named.min(DOCX_LIST_LEVELS - 1) != level)
-    }
-
-    fn resolve_use(&self, used: &DocxListUse, styles: &DocxStyleNumbering) -> Option<(u64, usize)> {
-        let list = match used.list {
-            Some(list) => list,
-            None => styles.list(used.style.as_deref()?)?,
+    /// Where a paragraph's numbering resolves, for Word and for AnyDoc: the
+    /// list given directly or its style chain's, and the level given
+    /// directly or read from the style chain. AnyDoc takes the level bound
+    /// to the first style along the chain that a level names
+    /// (`w:lvl/w:pStyle`), else the first, reading no style's own level, as
+    /// ECMA-376 says. Word, as LibreOffice shows it, takes the nearest style
+    /// along the chain that is bound or names its own level
+    /// (`w:numPr/w:ilvl`); a style that does both is numbered at the level
+    /// bound to it. A list instance of 0 removes numbering.
+    fn resolve_use(&self, used: &DocxListUse, styles: &DocxStyleNumbering) -> DocxResolved {
+        let list = match (used.list, used.style.as_deref()) {
+            (Some(list), _) => list,
+            (None, Some(style)) => match styles.list(style) {
+                Some(list) => list,
+                None => return DocxResolved::default(),
+            },
+            (None, None) => return DocxResolved::default(),
         };
         if list == 0 {
-            return None;
+            return DocxResolved::default();
         }
-        let level = match (used.level, &used.style) {
-            (Some(level), _) => level,
-            (None, Some(style)) => {
-                let instance = self.lists.get(&list)?;
-                let levels = self.levels_from(
-                    instance,
-                    self.resolve_definition(&instance.definition, styles, false)?,
-                )?;
-                styles
+        let side = |word: bool| {
+            let instance = self.lists.get(&list)?;
+            let levels = self.levels_from(
+                instance,
+                self.resolve_definition(&instance.definition, styles, word)?,
+            )?;
+            let level = match (used.level, used.style.as_deref()) {
+                (Some(level), _) => level,
+                (None, Some(style)) => styles
                     .chain(style)
                     .find_map(|style| {
-                        levels.iter().position(|level| {
+                        let bound = levels.iter().position(|level| {
                             level
                                 .as_ref()
                                 .is_some_and(|level| level.style.as_deref() == Some(style))
-                        })
+                        });
+                        let named = || {
+                            styles
+                                .styles
+                                .get(style)
+                                .and_then(|definition| definition.level)
+                        };
+                        if word {
+                            bound.or_else(named)
+                        } else {
+                            bound
+                        }
                     })
-                    .unwrap_or(0)
-            }
-            (None, None) => 0,
+                    .unwrap_or(0),
+                (None, None) => 0,
+            };
+            Some((list, level.min(DOCX_LIST_LEVELS - 1)))
         };
-        Some((list, level.min(DOCX_LIST_LEVELS - 1)))
+        DocxResolved {
+            word: side(true),
+            anydoc: side(false),
+        }
     }
 
-    /// Whether AnyDoc's list numbers differ from Word's. Both count the
-    /// paragraphs in order. Word keeps one set of counters per definition
-    /// in each story (the body, the text boxes, the footnotes, and the
-    /// endnotes). A list instance restarts it once in a story, at the
-    /// instance's first paragraph whose level has a `w:startOverride`,
-    /// which that level takes; every other restart takes the level's own
-    /// start, 0 if it names none. AnyDoc keeps one set per list instance
-    /// through the body, meeting text boxes where they are anchored, then
-    /// the footnotes, then the endnotes; it advances only the levels it
-    /// numbers, restarts a level at its override whenever it restarts, and
-    /// starts at 1 where a level names no start. A paragraph Word does not
-    /// show, such as one whose mark is deleted, still takes a number in
-    /// AnyDoc.
     /// Whether a list runs through notes whose stored order, id order, and
     /// order of reference disagree. AnyDoc numbers the notes as they are
     /// stored; LibreOffice numbers them by id, and Word lays them out as the
     /// text references them. With the three apart, which numbers the reader
     /// sees is uncertain, and the list is disclosed.
-    fn notes_out_of_order(scan: &DocxStoryScan, resolved: &[Option<(u64, usize)>]) -> bool {
+    fn notes_out_of_order(scan: &DocxStoryScan, resolved: &[DocxResolved]) -> bool {
         let mut notes: HashMap<(DocxPart, u64), Vec<u32>> = HashMap::new();
         for paragraph in &scan.list_paragraphs {
-            let (Some(note), Some(Some((list, _)))) =
+            let (Some(note), Some(resolved)) =
                 (paragraph.note, resolved.get(paragraph.used as usize))
             else {
                 continue;
             };
-            let seen = notes.entry((paragraph.part, *list)).or_default();
-            if seen.last() != Some(&note) {
-                seen.push(note);
+            for (list, _) in [resolved.word, resolved.anydoc].into_iter().flatten() {
+                let seen = notes.entry((paragraph.part, list)).or_default();
+                if seen.last() != Some(&note) {
+                    seen.push(note);
+                }
             }
         }
         notes.values().filter(|seen| seen.len() > 1).any(|seen| {
@@ -3674,12 +3854,25 @@ impl DocxNumbering {
         })
     }
 
+    /// Whether AnyDoc's list labels differ from Word's. Both count the
+    /// paragraphs in order, each at the list and level it resolves them to.
+    /// Word keeps one set of counters per definition in each story (the
+    /// body, the text boxes, the footnotes, and the endnotes). A list
+    /// instance restarts it once in a story, at the instance's first
+    /// paragraph whose level has a `w:startOverride`, which that level
+    /// takes; every other restart takes the level's own start, 0 if it
+    /// names none. AnyDoc keeps one set per list instance through the body,
+    /// meeting text boxes where they are anchored, then the footnotes, then
+    /// the endnotes; it advances only the levels it numbers, restarts a
+    /// level at its override whenever it restarts, and starts at 1 where a
+    /// level names no start. A paragraph Word does not show, such as one
+    /// whose mark is deleted, still takes a number in AnyDoc.
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
         // A value only Word can read may number what AnyDoc does not.
         if scan.padded_numbering || self.padded || styles.padded {
             return !scan.list_paragraphs.is_empty();
         }
-        let resolved: Vec<Option<(u64, usize)>> = scan
+        let resolved: Vec<DocxResolved> = scan
             .list_uses
             .iter()
             .map(|used| self.resolve_use(used, styles))
@@ -3687,21 +3880,8 @@ impl DocxNumbering {
         if Self::notes_out_of_order(scan, &resolved) {
             return true;
         }
-        // A level only Word reads from the paragraph's style.
-        let shown_by_both: HashSet<u32> = scan
-            .list_paragraphs
-            .iter()
-            .filter(|paragraph| paragraph.anydoc && paragraph.word)
-            .map(|paragraph| paragraph.used)
-            .collect();
-        if shown_by_both.iter().any(|&used| {
-            scan.list_uses
-                .get(used as usize)
-                .is_some_and(|used| self.style_level_differs(used, styles))
-        }) {
-            return true;
-        }
-        let mut instances: HashMap<u64, Option<DocxInstance>> = HashMap::new();
+        let mut word_instances: HashMap<u64, Option<DocxInstance>> = HashMap::new();
+        let mut anydoc_instances: HashMap<u64, Option<DocxInstance>> = HashMap::new();
         // Word's stories: a part, or `None` for the text boxes.
         let mut word: HashMap<(Option<DocxPart>, String), DocxCounters> = HashMap::new();
         let mut anydoc: HashMap<u64, DocxCounters> = HashMap::new();
@@ -3714,104 +3894,81 @@ impl DocxNumbering {
                     .filter(move |paragraph| paragraph.part == part)
             });
         for paragraph in in_order {
-            let Some((list, level)) = resolved.get(paragraph.used as usize).copied().flatten()
-            else {
-                continue;
+            let resolved = resolved
+                .get(paragraph.used as usize)
+                .copied()
+                .unwrap_or_default();
+            let restart = |list: u64, level: usize| {
+                self.lists
+                    .get(&list)
+                    .and_then(|instance| instance.starts[level])
             };
-            let Some(instance) = instances
-                .entry(list)
-                .or_insert_with(|| self.instance(list, styles))
-                .as_ref()
-            else {
-                continue;
+            let anydoc_label = match resolved.anydoc.filter(|_| paragraph.anydoc) {
+                Some((list, level)) => match anydoc_instances
+                    .entry(list)
+                    .or_insert_with(|| self.instance(list, styles, false))
+                {
+                    Some(instance) if matches!(instance.markers[level], DocxMarker::Count(_)) => {
+                        let start = |level: usize| {
+                            restart(list, level).unwrap_or_else(|| instance.levels[level].start())
+                        };
+                        let counters = anydoc.entry(list).or_default();
+                        let value = counters.next(level, start(level), None, &instance.levels);
+                        instance.anydoc_label(level, value, counters, start)
+                    }
+                    Some(instance) if instance.markers[level] == DocxMarker::Bullet => {
+                        DocxLabel::Bullet
+                    }
+                    _ => DocxLabel::Nothing,
+                },
+                None => DocxLabel::Nothing,
             };
-            let restart_value = self.lists.get(&list).and_then(|list| list.starts[level]);
-            let anydoc_marker = instance.anydoc_markers[level];
-            let anydoc_value = (paragraph.anydoc && matches!(anydoc_marker, DocxMarker::Count(_)))
-                .then(|| {
-                    let start =
-                        restart_value.unwrap_or_else(|| instance.anydoc_levels[level].start());
-                    anydoc.entry(list).or_default().next(
-                        level,
-                        start,
-                        None,
-                        &instance.anydoc_levels,
-                    )
-                });
             if !paragraph.word {
                 // A paragraph Word does not show still takes a number in
                 // AnyDoc.
-                if anydoc_value.is_some() {
+                if matches!(anydoc_label, DocxLabel::Text(_)) {
                     return true;
                 }
                 continue;
             }
-            let story = (!paragraph.in_text_box).then_some(paragraph.part);
-            let restart_at = restart_value.filter(|_| restarted.insert((story, list)));
-            let start = instance.word_levels[level].word_start();
-            let counters = word
-                .entry((story, instance.word_definition.clone()))
-                .or_default();
-            counters.imply_parents(level, &instance.word_levels);
-            let word_value = counters.next(level, start, restart_at, &instance.word_levels);
+            let word_label = match resolved.word {
+                Some((list, level)) => match word_instances
+                    .entry(list)
+                    .or_insert_with(|| self.instance(list, styles, true))
+                {
+                    Some(instance) => {
+                        let story = (!paragraph.in_text_box).then_some(paragraph.part);
+                        let restart_at =
+                            restart(list, level).filter(|_| restarted.insert((story, list)));
+                        let counters = word
+                            .entry((story, instance.definition.clone()))
+                            .or_default();
+                        counters.imply_parents(level, &instance.levels);
+                        let value = counters.next(
+                            level,
+                            instance.levels[level].word_start(),
+                            restart_at,
+                            &instance.levels,
+                        );
+                        instance.word_label(level, value, counters)
+                    }
+                    None => DocxLabel::Nothing,
+                },
+                None => DocxLabel::Nothing,
+            };
             // A paragraph AnyDoc drops takes no number there; its text is
             // missing, which the checks of that content find.
             if !paragraph.anydoc {
                 continue;
             }
-            // The paragraph's own number, where its number text shows it.
-            let text_level = &instance.word_levels[level];
-            let own_shown = text_level.shown_levels().any(|shown| shown == level);
-            let differs = match (instance.word_markers[level], anydoc_marker) {
-                (DocxMarker::Other, _) => true,
-                (DocxMarker::Count(shown), DocxMarker::Count(converted)) => {
-                    own_shown
-                        && (shown != converted
-                            || anydoc_value != Some(word_value)
-                            // Past `z` Word doubles the letter (`aa`, `bb`),
-                            // and AnyDoc counts on (`aa`, `ab`).
-                            || (matches!(shown, DocxCount::LowerLetter | DocxCount::UpperLetter)
-                                && word_value > 26))
-                }
-                (DocxMarker::Count(_), _) | (_, DocxMarker::Count(_)) => true,
+            // Labels differ where either shows a number, unless both show
+            // the same text; a bullet shows no count to differ.
+            let differs = match (&word_label, &anydoc_label) {
+                (DocxLabel::Text(shown), DocxLabel::Text(converted)) => shown != converted,
+                (DocxLabel::Text(_) | DocxLabel::Unknown, _) | (_, DocxLabel::Text(_)) => true,
                 _ => false,
             };
-            // The shallower numbers the text shows (`%1.%2`), as each side
-            // counts them: Word a level a deeper paragraph skipped as used
-            // once, AnyDoc a level's start until it counts and while it
-            // waits to restart. Legal numbering shows each in decimal.
-            let parents_differ = matches!(anydoc_marker, DocxMarker::Count(_))
-                && matches!(instance.word_markers[level], DocxMarker::Count(_))
-                && text_level
-                    .shown_levels()
-                    .filter(|&shown| shown < level)
-                    .any(|shown| {
-                        let legal = |levels: &[DocxLevel; DOCX_LIST_LEVELS], count| {
-                            if levels[level].legal {
-                                DocxCount::Decimal
-                            } else {
-                                count
-                            }
-                        };
-                        let (Some(word_count), Some(anydoc_count)) = (
-                            DocxCount::shown_by_word(&instance.word_levels[shown]),
-                            DocxCount::shown_by_anydoc(&instance.anydoc_levels[shown]),
-                        ) else {
-                            return false;
-                        };
-                        let anydoc_start = self
-                            .lists
-                            .get(&list)
-                            .and_then(|list| list.starts[shown])
-                            .unwrap_or_else(|| instance.anydoc_levels[shown].start());
-                        let anydoc_number = anydoc
-                            .get(&list)
-                            .map_or(anydoc_start, |counters| counters.shown(shown, anydoc_start));
-                        legal(&instance.word_levels, word_count)
-                            != legal(&instance.anydoc_levels, anydoc_count)
-                            || counters.value[shown] != anydoc_number
-                    });
-            if differs || parents_differ {
+            if differs {
                 return true;
             }
         }
@@ -3822,7 +3979,7 @@ impl DocxNumbering {
 /// Paragraph styles' numbering (`w:pPr/w:numPr/w:numId`), with the styles
 /// they are based on, from every styles part. AnyDoc ignores a style's
 /// `w:ilvl`, as ECMA-376 says to, and takes the level from the list
-/// levels' style bindings.
+/// levels' style bindings; Word reads it.
 #[derive(Default)]
 struct DocxStyleNumbering {
     styles: HashMap<String, DocxStyleList>,
@@ -3869,16 +4026,6 @@ impl DocxStyleNumbering {
     /// Whether the chains stepped through ran past their budget.
     fn exhausted(&self) -> bool {
         self.steps.get() > MAX_DOCX_CHAIN_STEPS
-    }
-
-    /// The level a paragraph style's numbering names: the first along its
-    /// chain that names one.
-    fn level(&self, style: &str) -> Option<usize> {
-        self.chain(style).find_map(|style| {
-            self.styles
-                .get(style)
-                .and_then(|definition| definition.level)
-        })
     }
 
     /// The list instance a paragraph style numbers with: the first along its
@@ -10370,6 +10517,122 @@ mod tests {
             headings.to_string(),
             heading_styles
         ));
+    }
+
+    #[test]
+    fn docx_style_levels_are_compared_by_the_labels_each_side_shows() {
+        let styled = |style: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#
+            )
+        };
+        let level = |ilvl: u32, format: &str, text: &str, extra: &str| {
+            format!(
+                r#"<w:lvl w:ilvl="{ilvl}"><w:start w:val="1"/><w:numFmt w:val="{format}"/>{extra}<w:lvlText w:val="{text}"/></w:lvl>"#
+            )
+        };
+        let bound = |style: &str| format!(r#"<w:pStyle w:val="{style}"/>"#);
+        let style = |id: &str, base: &str, numbering: &str| {
+            let base = if base.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<w:basedOn w:val="{base}"/>"#)
+            };
+            format!(
+                r#"<w:style w:type="paragraph" w:styleId="{id}">{base}<w:pPr><w:numPr>{numbering}</w:numPr></w:pPr></w:style>"#
+            )
+        };
+        let differs = |body: String, levels: String, styles: String| {
+            let document = word_part("document", &body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{levels}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        // A template's second and third levels are styles based on the
+        // first, bound one, each naming its own level: Word shows "1.1." and
+        // "(a)", AnyDoc numbers every paragraph at the first level.
+        let template = |second: &str, third: &str| {
+            [
+                level(0, "decimal", "%1.", &bound("Level1")),
+                level(1, "decimal", "%1.%2.", second),
+                level(2, "lowerLetter", "(%3)", third),
+            ]
+            .concat()
+        };
+        let chain = [
+            style("Level1", "", r#"<w:numId w:val="1"/>"#),
+            style("Level2", "Level1", r#"<w:ilvl w:val="1"/>"#),
+            style("Level3", "Level2", r#"<w:ilvl w:val="2"/>"#),
+        ]
+        .concat();
+        let outline = ["Level1", "Level2", "Level2", "Level3", "Level1", "Level2"]
+            .map(styled)
+            .concat();
+        assert!(differs(outline.clone(), template("", ""), chain.clone()));
+        assert!(!differs(
+            outline.clone(),
+            template(&bound("Level2"), &bound("Level3")),
+            chain.clone()
+        ));
+        // A paragraph numbered directly, without a level, reads its style's
+        // level in Word too.
+        let direct = r#"<w:p><w:pPr><w:pStyle w:val="Level2"/><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#;
+        assert!(differs(
+            format!("{}{direct}", styled("Level1")),
+            template("", ""),
+            chain.clone()
+        ));
+        // Labels that read alike at either level match, and bullets show no
+        // count to differ.
+        let alike = (0..3)
+            .map(|ilvl| level(ilvl, "decimal", &format!("%{}.", ilvl + 1), ""))
+            .collect::<String>();
+        let named = style("Named", "", r#"<w:ilvl w:val="1"/><w:numId w:val="1"/>"#);
+        let items = ["Named", "Named"].map(styled).concat();
+        assert!(!differs(items.clone(), alike, named.clone()));
+        let bullets = (0..3)
+            .map(|ilvl| level(ilvl, "bullet", "o", ""))
+            .collect::<String>();
+        assert!(!differs(items.clone(), bullets, named.clone()));
+        // A style bound to one level and naming another is numbered at the
+        // one bound to it.
+        let conflicting = [
+            style("Level1", "", r#"<w:numId w:val="1"/>"#),
+            style("Level2", "", r#"<w:ilvl w:val="2"/><w:numId w:val="1"/>"#),
+        ]
+        .concat();
+        assert!(!differs(
+            ["Level1", "Level2", "Level2"].map(styled).concat(),
+            template(&bound("Level2"), ""),
+            conflicting
+        ));
+        // A composite label shows a shallower level in its format: one
+        // AnyDoc writes otherwise, zero-padded, ordinal, or a bullet, differs
+        // unless legal numbering shows it in decimal.
+        let composite = |parent: &str, legal: &str| {
+            let numbered = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#;
+            differs(
+                numbered.repeat(2),
+                [
+                    level(0, parent, "%1.", ""),
+                    level(1, "decimal", "%1.%2.", legal),
+                ]
+                .concat(),
+                String::new(),
+            )
+        };
+        for parent in ["decimalZero", "ordinal", "bullet"] {
+            assert!(composite(parent, ""), "{parent}");
+            assert!(!composite(parent, "<w:isLgl/>"), "{parent}");
+        }
+        assert!(!composite("upperRoman", ""));
     }
 
     #[test]
