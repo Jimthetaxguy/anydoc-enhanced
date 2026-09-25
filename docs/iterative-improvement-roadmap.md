@@ -285,6 +285,7 @@ came back clean. The evidence and dispositions are in
 | 18 | PDF text drawn through forms pdf-inspector 1.24 does not reach or reads without a font (open upstream #312) | `form_text_unread` names the page; a W-2 whose box lines a form draws through a form without resources, converted with only its heading at confidence 1.0, is reported, and no corpus or upstream-fixture PDF changes |
 | 19 | PDF table amounts pdf-inspector pushes out of their rows (open upstream #424) | `table_values_detached`; a 1099-B's dropped wash-sale column and a long card statement's Amount column, listed after the table with their rows lost, are reported; among 551 corpus, fixture, and review PDFs the ten it names are all such dropouts, and totals on lines of their own are not named |
 | 20 | PDF lines pdf-inspector drops as running headers or footers though they differ from the line it keeps (upstream issue #483) | `header_footer_dropped`; a consolidated statement whose second and third accounts lost their account numbers, and a payroll register whose later employees lost their IDs, are reported, while headers repeated as they are or numbering their pages are not; no corpus, fixture, review, or fuzz PDF among 4,521 is named |
+| 21 | PDF form values pdf-inspector reads as UTF-8 or never reads (upstream issue #504) | `form_values_misread`; a UTF-16 payee name that read as "��\0J\0o\0s…", an accented city, and a radio group's filing status that the Markdown left out are reported, while plain values on their own widgets are not |
 
 ## Next slices
 

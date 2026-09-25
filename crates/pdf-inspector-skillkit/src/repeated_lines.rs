@@ -169,7 +169,7 @@ fn counts_pages(other: &str, other_page: u32, text: &str, page: u32) -> bool {
 /// A text with its white space, table pipes, emphasis and escape marks,
 /// heading marks, and underline and break tags left out, as it is looked
 /// for in the Markdown.
-fn bare(text: &str) -> String {
+pub(crate) fn bare(text: &str) -> String {
     let text = text
         .replace("<u>", "")
         .replace("</u>", "")

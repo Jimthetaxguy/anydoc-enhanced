@@ -131,6 +131,7 @@ through the server:
 | Issue | Report | Local disposition |
 |---|---|---|
 | #483 | Page content dropped when three or more pages share near-identical text | Reproduced, and wider than reported: pdf-inspector drops, from every page but the first, a line it finds near the top or bottom of three pages and three in ten at about the same height, comparing lines with the digits at either end left out, and drops the lines beside it with it. A consolidated statement's second and third accounts lose their "Account number" lines; a payroll register's later employees lose their IDs and hour totals. Reported as `header_footer_dropped` (Loop 20) where a dropped line says what no kept line says, other than by a page number, and the Markdown does not show it. Identical copies, such as a W-2's Copy C and Copy 2, keep their lines on the first copy only; that is not reported. |
+| #504 | Form field names and values are decoded as UTF-8, mangling UTF-16 text strings | Reproduced, and wider than reported: PDFDocEncoding values lose their accented letters ("S�o Paulo"), and pdf-inspector reads a value only from a field that is its own widget, so a radio group's choice or a field shown twice is not written at all. Reported as `form_values_misread` (Loop 21) where the Markdown does not show the value read right. |
 | #588 | A table row continuing onto the next page loses its continuation | Not reproduced as a loss: in a generated statement whose last row wraps onto the next page, the continuation reads there, as a heading of its own, apart from its row. |
 | #587 | Expose a one-parse structured page result | Would let the checks that read pages again (repeats, word gaps, tables, and dropped headers) reuse the conversion's own positioned text instead of reading it a second time. |
 | #565 | Literal `<`, `>`, and `&` are not escaped | The same defect as pull request #589. |
@@ -396,7 +397,9 @@ When pdf-inspector publishes a release after 1.24.0:
    right, and update the `sample-2.pdf` and card-statement expectations in
    the PDF integration tests. If the release changes how it strips running
    headers and footers (#483), re-check `header_footer_dropped` against its
-   rule, and update the consolidated-statement expectation.
+   rule, and update the consolidated-statement expectation; if it reads form
+   values another way (#504), re-check `form_values_misread` and the form
+   expectations.
 4. Re-run the sixth-round furniture, white-copy, and clip fixtures: the
    repeat warning is confirmed against the Markdown, so a release that
    strips or hides differently changes which pages it names.

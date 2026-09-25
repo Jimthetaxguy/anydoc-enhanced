@@ -731,6 +731,9 @@ pub(crate) struct Findings {
     /// in the document, on the pages read for repeats, with the page and
     /// how often; of the first `MAX_GLYPH_WORDS` the pages show.
     pub(crate) glyph_words: Vec<(u32, String, u32)>,
+    /// Form field values pdf-inspector misreads or never writes, when the
+    /// pages are read for repeats (see `form_fields`).
+    pub(crate) form_values: Vec<crate::form_fields::FormValue>,
 }
 
 /// Words shown glyph by glyph kept across a document.
@@ -760,6 +763,9 @@ pub(crate) fn scan(
     let mut gap_fonts = GapFonts::default();
     let mut glyph_fonts = GlyphFonts::default();
     let mut found = Findings::default();
+    if twice_skip.is_some() {
+        found.form_values = crate::form_fields::misread(&document);
+    }
     // Words shown glyph by glyph, by page and font, and the fonts seen
     // painting their spaces on any page.
     let mut shown: Vec<(u32, String, usize, u32)> = Vec::new();

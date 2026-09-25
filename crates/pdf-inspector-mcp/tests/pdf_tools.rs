@@ -875,6 +875,111 @@ fn lines_dropped_as_running_headers_that_differ_are_reported() {
     assert_eq!(reported(&results[2]), None, "{}", results[2]);
 }
 
+/// A filled one-page form whose fields are `fields`, objects 6 on, each
+/// given its number; `annotations` lists the page's widgets (pdf-inspector
+/// issue #504).
+fn filled_form_pdf(fields: &[(u32, &str)], annotations: &[u32]) -> Vec<u8> {
+    let references = |ids: &mut dyn Iterator<Item = u32>| {
+        ids.map(|id| format!("{id} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let top: Vec<u32> = fields
+        .iter()
+        .filter(|(_, field)| !field.contains("/Parent"))
+        .map(|(id, _)| *id)
+        .collect();
+    let mut objects = vec![
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [{}] >> >>",
+            references(&mut top.into_iter())
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [{}] >>",
+            references(&mut annotations.iter().copied())
+        )
+        .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Request for Taxpayer Identification Number) Tj ET \
+              BT /F1 10 Tf 72 700 Td (Filing status: Single or Married filing jointly) Tj ET",
+        ),
+    ];
+    for (id, field) in fields {
+        assert_eq!(
+            *id as usize,
+            objects.len() + 1,
+            "fields are numbered from 6"
+        );
+        objects.push(field.as_bytes().to_vec());
+    }
+    pdf_file(&objects)
+}
+
+#[test]
+fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let widget = |rect: &str| format!("/Type /Annot /Subtype /Widget /P 3 0 R /Rect [{rect}]");
+    // "José García" in UTF-16, "São Paulo" in PDFDocEncoding.
+    let name = format!(
+        "<< /FT /Tx /T (payee_name) /V <FEFF004A006F007300E90020004700610072006300ED0061> {} >>",
+        widget("150 696 400 712")
+    );
+    let city = format!(
+        "<< /FT /Tx /T (city) /V <53E36F205061756C6F> {} >>",
+        widget("150 666 400 682")
+    );
+    // A group of radio buttons keeps its choice on itself, not its widgets.
+    let status =
+        "<< /FT /Btn /Ff 49152 /T (filing_status) /V /MFJ /Kids [7 0 R 8 0 R] >>".to_string();
+    let single = format!("<< /Parent 6 0 R /AS /Off {} >>", widget("72 680 84 692"));
+    let joint = format!("<< /Parent 6 0 R /AS /MFJ {} >>", widget("172 680 184 692"));
+    let amount = format!(
+        "<< /FT /Tx /T (amount) /V (1,250.00) {} >>",
+        widget("150 636 400 652")
+    );
+    let documents = [
+        filled_form_pdf(&[(6, &name), (7, &city)], &[6, 7]),
+        filled_form_pdf(&[(6, &status), (7, &single), (8, &joint)], &[7, 8]),
+        filled_form_pdf(&[(6, &amount)], &[6]),
+    ];
+    let mut calls = Vec::new();
+    for (index, pdf) in documents.iter().enumerate() {
+        let path = temporary.path().join(format!("form-{index}.pdf"));
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "form_values_misread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // pdf-inspector 1.24.0 reads the values as UTF-8, and never reads the
+    // group's choice; when a release fixes #504, these expectations go.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("S\u{FFFD}o Paulo") && !markdown.contains("José"),
+        "{markdown:?}"
+    );
+    let markdown = results[1]["markdown"].as_str().unwrap_or_default();
+    assert!(!markdown.contains("MFJ"), "{markdown:?}");
+    for result in &results[..2] {
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+    }
+    // A plain value on its own widget reads as filled.
+    let markdown = results[2]["markdown"].as_str().unwrap_or_default();
+    assert!(markdown.contains("amount: 1,250.00"), "{markdown}");
+    assert_eq!(reported(&results[2]), None, "{}", results[2]);
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

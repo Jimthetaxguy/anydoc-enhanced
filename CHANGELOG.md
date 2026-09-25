@@ -51,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PDF results carry a `warnings` list, absent when empty, naming text the
   Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
   form text it does not read, pages that lose a line it takes for a running
-  header, and tables whose amounts may sit in the wrong row or column or
-  after the table (see Fixed). A full run that yields no Markdown for a text PDF
+  header, form values it garbles or leaves out, and tables whose amounts
+  may sit in the wrong row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -193,6 +193,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Form field values pdf-inspector 1.24.0 garbles or leaves out are reported
+  (upstream issue #504). pdf-inspector writes each filled form field into
+  the Markdown as its name and value, but reads the value as UTF-8, while a
+  PDF writes it in PDFDocEncoding or UTF-16. A payee filled in as UTF-16,
+  "José García", came out as "��\0J\0o\0s…" with control characters in the
+  Markdown, and "São Paulo" as "S�o Paulo". It also reads a value only from
+  a field that is its own widget, so it left out the choice of a group of
+  radio buttons, such as a return's filing status, and the value of any
+  field shown in more than one place. The fields are walked as
+  pdf-inspector walks them, and a page whose values it garbles or leaves
+  out, where the Markdown does not show them, carries the new
+  `form_values_misread` warning; the Markdown is not changed. The walk
+  reuses the document the page scan loads. Values in XFA forms, which
+  pdf-inspector does not read, are not checked. No PDF among 4,412 corpus,
+  fixture, review, and fuzz files is named (only one of them holds a form).
 - Lines pdf-inspector 1.24.0 drops as running headers or footers, though
   they say what the line it keeps does not, are reported (upstream issue
   #483). In a document of three pages or more, pdf-inspector drops from

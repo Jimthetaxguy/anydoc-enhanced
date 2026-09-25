@@ -92,6 +92,8 @@ pub const PDF_WARNING_TABLE_VALUES_DETACHED: &str = "table_values_detached";
 /// A line pdf-inspector drops as a running header or footer says what no
 /// line it keeps says.
 pub const PDF_WARNING_HEADER_FOOTER_DROPPED: &str = "header_footer_dropped";
+/// A form field's value is garbled or missing in the Markdown.
+pub const PDF_WARNING_FORM_VALUES_MISREAD: &str = "form_values_misread";
 
 /// Pages read again for lines dropped as running headers and footers, how
 /// many are read at a time and grouped into lines at a time, and the time
@@ -573,6 +575,51 @@ impl PdfInfo {
         }
     }
 
+    /// Report the pages of form field values pdf-inspector garbles or never
+    /// writes (see `form_fields`) that the Markdown does not show.
+    fn check_form_values(
+        &mut self,
+        values: &[form_fields::FormValue],
+        only: Option<&HashSet<u32>>,
+    ) {
+        let Some(markdown) = self.markdown.as_deref() else {
+            return;
+        };
+        let values: Vec<(&[u32], String)> = values
+            .iter()
+            .map(|value| (value.pages.as_slice(), repeated_lines::bare(&value.text)))
+            .filter(|(_, text)| !text.is_empty())
+            .collect();
+        let mut patterns: Vec<&str> = values.iter().map(|(_, text)| text.as_str()).collect();
+        patterns.sort_unstable();
+        patterns.dedup();
+        if patterns.is_empty() {
+            return;
+        }
+        let Ok(automaton) = aho_corasick::AhoCorasick::new(&patterns) else {
+            return;
+        };
+        let shown: HashSet<&str> = automaton
+            .find_overlapping_iter(&repeated_lines::bare(markdown))
+            .map(|found| patterns[found.pattern().as_usize()])
+            .collect();
+        let mut pages: Vec<u32> = values
+            .iter()
+            .filter(|(_, text)| !shown.contains(text.as_str()))
+            .flat_map(|(pages, _)| pages.iter().copied())
+            .filter(|page| only.is_none_or(|only| only.contains(page)))
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        if !pages.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_FORM_VALUES_MISREAD,
+                "On these pages pdf-inspector 1.24.0 garbles or leaves out values filled into the form: it reads accented or UTF-16 text byte by byte, as in \"S\u{FFFD}o Paulo\", and never writes the value of a field whose widgets are its kids, such as a group of radio buttons; read the form's values another way.",
+                pages,
+            ));
+        }
+    }
+
     /// Scan what the pages paint and report what the scan finds but a
     /// repeat, which the Markdown confirms.
     fn scan_text_paints(
@@ -598,10 +645,12 @@ impl PdfInfo {
         }
         // The scan only adds signals: if it fails, the result stands as
         // pdf-inspector gave it.
-        let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             text_paints::scan(buffer, &layer_skip, twice_skip.as_ref(), only)
         }))
         .unwrap_or_default();
+        let values = std::mem::take(&mut found.form_values);
+        self.check_form_values(&values, only);
         if found.hidden_layer.is_empty() {
             return found;
         }
@@ -701,6 +750,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 pub mod document;
 pub mod domain;
 mod doubled_text;
+mod form_fields;
 mod glyph_words;
 mod markdown_tables;
 pub mod pdf_worker;

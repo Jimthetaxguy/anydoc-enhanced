@@ -44,6 +44,7 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content as AnyDoc's walkers read it |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats as AnyDoc renders them |
 | `crates/pdf-inspector-skillkit/src/text_paints.rs` | PDF pages whose invisible OCR layer pdf-inspector 1.24.0 skips, and text they paint twice |
+| `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form values pdf-inspector 1.24.0 garbles or leaves out |
 | `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.24.0 drops as running headers that differ from the one it keeps |
 | `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF table rows pdf-inspector 1.24.0 repeats, amounts it merges, and amounts it pushes out of their rows |
 | `crates/pdf-inspector-mcp/` | MCP server binary, worker mode, and tool registration |
