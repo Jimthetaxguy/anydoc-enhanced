@@ -17,7 +17,7 @@
 //! pdf-inspector to read a space there. Where the Markdown holds such a word
 //! split by a space or a cell edge, the pages showing it are read again, as
 //! pdf-inspector places their text, and reported when their own text splits
-//! it.
+//! it, a page for each split the Markdown shows.
 //!
 //! Glyphs are read by the font's ToUnicode map, then the names its
 //! differences give, then, for a simple font, as printable ASCII. Words are
@@ -723,18 +723,33 @@ impl KeptWords {
     }
 }
 
-/// How often each of `patterns` stands whole in `text`, and how often split
-/// by a space or a cell edge, where nothing of a word adjoins it; escapes
-/// and emphasis marks are read through. A line end inside a word is where
-/// the page wrapped it, which splits nothing.
-fn counts(text: &str, patterns: &[&str]) -> (Vec<u32>, Vec<u32>) {
-    let mut whole = vec![0u32; patterns.len()];
-    let mut split = vec![0u32; patterns.len()];
+/// How often a text shows a word split by a space or a cell edge, and how
+/// often split other than right after a hyphen.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Splits {
+    all: u32,
+    /// A space after a hyphen may be where a paragraph joins the lines of a
+    /// compound the page wrapped ("self- employment"), which splits nothing.
+    definite: u32,
+}
+
+/// Each split of one of `automaton`'s patterns in `text`: where the text
+/// shows it split by a space or a cell edge, with nothing of a word
+/// adjoining it; escapes and emphasis marks are read through. A line end
+/// inside a word is where the page wrapped it, which splits nothing.
+/// `split` is given the pattern, the line it stands on, and whether it is
+/// split other than right after a hyphen.
+fn each_split(text: &str, automaton: &AhoCorasick, mut split: impl FnMut(usize, usize, bool)) {
     let mut squeezed: Vec<u8> = Vec::with_capacity(text.len());
     let mut separated: Vec<bool> = Vec::with_capacity(text.len() + 1);
     let mut wrapped: Vec<bool> = Vec::with_capacity(text.len());
+    // Where each line starts in the squeezed text.
+    let mut lines: Vec<usize> = vec![0];
     let (mut gap, mut line_end) = (true, false);
     for character in text.chars() {
+        if character == '\n' {
+            lines.push(squeezed.len());
+        }
         if character.is_whitespace() || character == '|' {
             gap = true;
             line_end |= matches!(character, '\n' | '\r');
@@ -752,9 +767,6 @@ fn counts(text: &str, patterns: &[&str]) -> (Vec<u32>, Vec<u32>) {
         }
     }
     separated.push(true);
-    let Ok(automaton) = AhoCorasick::new(patterns) else {
-        return (whole, split);
-    };
     // A word ends at a separator, or where a character no word holds
     // stands next to it, as a quote mark or a parenthesis.
     let edge =
@@ -768,26 +780,32 @@ fn counts(text: &str, patterns: &[&str]) -> (Vec<u32>, Vec<u32>) {
         if wrapped[start + 1..end].iter().any(|&wrap| wrap) {
             continue;
         }
-        // A space after a hyphen is where a paragraph joins the lines of a
-        // compound the page wrapped ("self- employment").
-        let gaps: Vec<usize> = (start + 1..end).filter(|&at| separated[at]).collect();
-        if !gaps.is_empty() && gaps.iter().all(|&at| squeezed[at - 1] == b'-') {
+        let mut gaps = (start + 1..end).filter(|&at| separated[at]).peekable();
+        if gaps.peek().is_none() {
             continue;
         }
-        let index = found.pattern().as_usize();
-        if !gaps.is_empty() {
-            split[index] += 1;
-        } else {
-            whole[index] += 1;
-        }
+        let definite = gaps.any(|at| squeezed[at - 1] != b'-');
+        let line = lines.partition_point(|&line| line <= start) - 1;
+        split(found.pattern().as_usize(), line, definite);
     }
-    (whole, split)
 }
 
-/// The words among `words` that the Markdown shows split somewhere, each
-/// with whether it also shows it whole: which page splits them, the pages'
-/// own text tells (see [`split_pages`]).
-pub(crate) fn misread(markdown: &str, words: &[ShownWord]) -> HashMap<String, bool> {
+/// How often `text` shows each of `patterns` split (see [`each_split`]).
+fn counts(text: &str, patterns: &[&str]) -> Vec<Splits> {
+    let mut splits = vec![Splits::default(); patterns.len()];
+    if let Ok(automaton) = AhoCorasick::new(patterns) {
+        each_split(text, &automaton, |pattern, _, definite| {
+            splits[pattern].all += 1;
+            splits[pattern].definite += u32::from(definite);
+        });
+    }
+    splits
+}
+
+/// The words among `words` that the Markdown shows split somewhere, with how
+/// often: which pages split them, the pages' own text tells (see
+/// [`split_pages`]).
+pub(crate) fn misread(markdown: &str, words: &[ShownWord]) -> HashMap<String, Splits> {
     let patterns: Vec<&str> = words
         .iter()
         .map(|word| word.text.as_str())
@@ -797,19 +815,18 @@ pub(crate) fn misread(markdown: &str, words: &[ShownWord]) -> HashMap<String, bo
     if patterns.is_empty() {
         return HashMap::new();
     }
-    let (whole, split) = counts(markdown, &patterns);
     patterns
         .iter()
-        .enumerate()
-        .filter(|&(index, _)| split[index] > 0)
-        .map(|(index, text)| ((*text).to_string(), whole[index] > 0))
+        .zip(counts(markdown, &patterns))
+        .filter(|(_, splits)| splits.all > 0)
+        .map(|(text, splits)| ((*text).to_string(), splits))
         .collect()
 }
 
 /// The pages showing a misread word, whose own text tells whether they
 /// split it: those whose words step widest past their glyphs' advances
 /// first, then in order.
-pub(crate) fn pages_to_read(misread: &HashMap<String, bool>, words: &[ShownWord]) -> Vec<u32> {
+pub(crate) fn pages_to_read(misread: &HashMap<String, Splits>, words: &[ShownWord]) -> Vec<u32> {
     let mut widest: HashMap<u32, f64> = HashMap::new();
     for word in words.iter().filter(|word| misread.contains_key(&word.text)) {
         let gap = widest.entry(word.page).or_insert(f64::NEG_INFINITY);
@@ -820,28 +837,104 @@ pub(crate) fn pages_to_read(misread: &HashMap<String, bool>, words: &[ShownWord]
     pages.into_iter().map(|(page, _)| page).collect()
 }
 
+/// A line of a page's text as pdf-inspector compares lines repeated across
+/// pages: its words, without the page number at either end.
+fn repeat_key(line: &str) -> String {
+    let words: Vec<&str> = line
+        .split(|character: char| character.is_whitespace() || character == ITEM_EDGE)
+        .filter(|word| !word.is_empty())
+        .collect();
+    words
+        .join(" ")
+        .trim_start_matches(char::is_numeric)
+        .trim_start()
+        .trim_end_matches(char::is_numeric)
+        .trim_end()
+        .to_string()
+}
+
 /// The pages whose own text, as pdf-inspector places it (`page_text`),
-/// shows a misread word split, and, where a page's text is not at hand,
-/// those showing a word the Markdown never shows whole.
+/// shows a misread word split, a page for each split the Markdown shows,
+/// and, past the pages read, those showing a word whose splits the pages
+/// read do not account for. A page's splits count in order, those in a
+/// line an earlier page shows too after the others: pdf-inspector keeps a
+/// running header on the first page showing it and strips the rest. A page
+/// not read counts for one split, those whose words step widest past their
+/// glyphs' advances first, and only for a split away from a hyphen.
 pub(crate) fn split_pages(
-    misread: &HashMap<String, bool>,
+    misread: &HashMap<String, Splits>,
     words: &[ShownWord],
     page_text: &HashMap<u32, String>,
 ) -> Vec<u32> {
-    let mut shown: HashMap<u32, Vec<&str>> = HashMap::new();
+    let mut patterns: Vec<&str> = misread.keys().map(String::as_str).collect();
+    patterns.sort_unstable();
+    let index: HashMap<&str, usize> = patterns
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| (*pattern, index))
+        .collect();
+    let mut shown: HashMap<u32, HashSet<usize>> = HashMap::new();
+    let mut unread: Vec<Vec<(u32, f64)>> = vec![Vec::new(); patterns.len()];
     for word in words {
-        if misread.contains_key(&word.text) {
-            shown.entry(word.page).or_default().push(&word.text);
+        let Some(&pattern) = index.get(word.text.as_str()) else {
+            continue;
+        };
+        if page_text.contains_key(&word.page) {
+            shown.entry(word.page).or_default().insert(pattern);
+        } else {
+            unread[pattern].push((word.page, word.gap));
         }
     }
-    let mut named: Vec<u32> = shown
-        .into_iter()
-        .filter(|(page, texts)| match page_text.get(page) {
-            Some(own) => counts(own, texts).1.iter().any(|&split| split > 0),
-            None => texts.iter().any(|text| misread.get(*text) == Some(&false)),
-        })
-        .map(|(page, _)| page)
-        .collect();
+    let mut read: Vec<u32> = shown.keys().copied().collect();
+    read.sort_unstable();
+    // Each word's splits on the pages read, in order: in lines first shown
+    // there, and in lines an earlier page shows too.
+    let mut own: Vec<Vec<(u32, [Splits; 2])>> = vec![Vec::new(); patterns.len()];
+    if let Ok(automaton) = AhoCorasick::new(&patterns) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for &page in &read {
+            let text = &page_text[&page];
+            let keys: Vec<String> = text.lines().map(repeat_key).collect();
+            let repeated: Vec<bool> = keys.iter().map(|key| seen.contains(key)).collect();
+            let showing = &shown[&page];
+            each_split(text, &automaton, |pattern, line, definite| {
+                if !showing.contains(&pattern) {
+                    return;
+                }
+                let pages = &mut own[pattern];
+                if pages.last().is_none_or(|(last, _)| *last != page) {
+                    pages.push((page, [Splits::default(); 2]));
+                }
+                if let Some((_, splits)) = pages.last_mut() {
+                    let class = usize::from(repeated.get(line).copied().unwrap_or(false));
+                    splits[class].all += 1;
+                    splits[class].definite += u32::from(definite);
+                }
+            });
+            seen.extend(keys);
+        }
+    }
+    let mut named: HashSet<u32> = HashSet::new();
+    for (pattern, text) in patterns.iter().enumerate() {
+        let (mut all, mut definite) = (misread[*text].all, misread[*text].definite);
+        for class in 0..2 {
+            for (page, found) in &own[pattern] {
+                let found = found[class];
+                if found.all == 0 || all == 0 {
+                    continue;
+                }
+                named.insert(*page);
+                all -= found.all.min(all);
+                definite -= found.definite.min(definite);
+            }
+        }
+        let pages = &mut unread[pattern];
+        pages.sort_by(|one, other| other.1.total_cmp(&one.1).then(one.0.cmp(&other.0)));
+        for &(page, _) in pages.iter().take(all.min(definite) as usize) {
+            named.insert(page);
+        }
+    }
+    let mut named: Vec<u32> = named.into_iter().collect();
     named.sort_unstable();
     named
 }
@@ -867,6 +960,14 @@ mod tests {
         super::split_pages(&misread(markdown, shown), shown, &HashMap::new())
     }
 
+    /// Page texts by page.
+    fn texts(pages: &[(u32, &str)]) -> HashMap<u32, String> {
+        pages
+            .iter()
+            .map(|(page, text)| (*page, (*text).to_string()))
+            .collect()
+    }
+
     #[test]
     fn words_the_markdown_splits_name_their_pages() {
         let shown = words(&[
@@ -885,25 +986,25 @@ mod tests {
             vec![1, 2]
         );
         // A word several pages show names those whose own text splits it;
-        // without their text, a word the Markdown also shows whole names
-        // none.
+        // without their text, a page for each split, those whose words
+        // step widest past their glyphs first.
         let shown = words(&[
             (2, "Limitations", 0.1),
             (7, "Limitations", 0.1),
-            (18, "Limitations", 0.1),
+            (18, "Limitations", 0.3),
         ]);
         let found = misread("Limitations; (Limitations) \"L imitations\"", &shown);
-        assert_eq!(pages_to_read(&found, &shown), vec![2, 7, 18]);
-        assert!(super::split_pages(&found, &shown, &HashMap::new()).is_empty());
-        let own: HashMap<u32, String> = [
+        assert_eq!(pages_to_read(&found, &shown), vec![18, 2, 7]);
+        assert_eq!(
+            super::split_pages(&found, &shown, &HashMap::new()),
+            vec![18]
+        );
+        let own = texts(&[
             (2, "Limitations"),
-            (7, "Limitations"),
-            (18, "(A) L imitations"),
-        ]
-        .into_iter()
-        .map(|(page, text)| (page, text.to_string()))
-        .collect();
-        assert_eq!(super::split_pages(&found, &shown, &own), vec![18]);
+            (7, "(A) L imitations"),
+            (18, "Limitations"),
+        ]);
+        assert_eq!(super::split_pages(&found, &shown, &own), vec![7]);
     }
 
     #[test]
@@ -922,15 +1023,10 @@ mod tests {
             &words(&[(1, "LIABI-LITIES", 0.1)])
         )
         .is_empty());
-        assert!(split_pages(
-            "self-employment and self- employment",
-            &words(&[(1, "self-employment", 0.1)])
-        )
-        .is_empty());
         // A split elsewhere in the Markdown names a page only when its own
         // text splits the word.
         let found = misread("LIABILITIES LIABILITIES LIAB ILITIES", &shown);
-        let own: HashMap<u32, String> = [(1, "LIABILITIES and LIABILITIES".to_string())].into();
+        let own = texts(&[(1, "LIABILITIES and LIABILITIES")]);
         assert!(super::split_pages(&found, &shown, &own).is_empty());
         // Items of a line meet at an edge, which ends a word and splits
         // none: a word split inside its item before an amount is split, and
@@ -940,6 +1036,74 @@ mod tests {
         assert_eq!(super::split_pages(&found, &shown, &own), vec![1]);
         let own: HashMap<u32, String> = [(1, edge(&["L", "IABILITIES", "4,514"]))].into();
         assert!(super::split_pages(&found, &shown, &own).is_empty());
+    }
+
+    #[test]
+    fn a_split_after_a_hyphen_is_found_by_the_page_text() {
+        // A paragraph joins a compound the page wrapped with a space after
+        // its hyphen: the Markdown alone does not tell it from a split.
+        let shown = words(&[(1, "2025-12-31", 0.1), (2, "self-employment", 0.1)]);
+        let markdown = "Trade date 2025- 12- 31 and self- employment";
+        assert!(split_pages(markdown, &shown).is_empty());
+        let found = misread(markdown, &shown);
+        let own = texts(&[
+            (1, "Trade date 2025- 12- 31"),
+            (2, "income from self-\nemployment"),
+        ]);
+        assert_eq!(super::split_pages(&found, &shown, &own), vec![1]);
+    }
+
+    #[test]
+    fn a_page_is_named_for_each_split_the_markdown_shows() {
+        // A running header each page's text splits, which the Markdown
+        // shows once: pdf-inspector keeps it on the first page.
+        let header = "LIAB ILITIES AND EQ UITY STATEMENT";
+        let shown: Vec<ShownWord> = (1..=5)
+            .flat_map(|page| words(&[(page, "LIABILITIES", 0.1), (page, "EQUITY", 0.1)]))
+            .collect();
+        let own: HashMap<u32, String> = (1..=5)
+            .map(|page| (page, format!("{header}\nDeposit {page} reference")))
+            .collect();
+        let found = misread(&format!("**{header}**\n\nDeposits"), &shown);
+        assert_eq!(super::split_pages(&found, &shown, &own), vec![1]);
+        // A split of its own on a later page names that page too.
+        let mut own = own;
+        own.insert(3, format!("{header}\nTotal LIAB ILITIES 4,514"));
+        let found = misread(&format!("**{header}**\n\nTotal LIAB ILITIES 4,514"), &shown);
+        assert_eq!(super::split_pages(&found, &shown, &own), vec![1, 3]);
+        // A header the Markdown shows on every page names every page.
+        let found = misread(&format!("{header}\n\n").repeat(5), &shown);
+        assert_eq!(
+            super::split_pages(&found, &shown, &own),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn splits_the_pages_read_leave_name_pages_past_them() {
+        // Seventy pages show the word; the Markdown splits it once, on a
+        // page past those read, where its glyphs step widest.
+        let mut shown: Vec<ShownWord> = (1..=69)
+            .map(|page| words(&[(page, "LIABILITIES", 0.05)]).remove(0))
+            .collect();
+        shown.extend(words(&[(70, "LIABILITIES", 0.12)]));
+        let markdown = format!("{}LIAB ILITIES\n", "LIABILITIES\n".repeat(69));
+        let found = misread(&markdown, &shown);
+        assert_eq!(pages_to_read(&found, &shown)[0], 70);
+        let own: HashMap<u32, String> = (1..=64).map(|page| (page, "LIABILITIES".into())).collect();
+        assert_eq!(super::split_pages(&found, &shown, &own), vec![70]);
+        // Splits the pages read account for leave none.
+        let own: HashMap<u32, String> = (1..=64)
+            .map(|page| {
+                let text = if page == 10 {
+                    "LIAB ILITIES"
+                } else {
+                    "LIABILITIES"
+                };
+                (page, text.to_string())
+            })
+            .collect();
+        assert_eq!(super::split_pages(&found, &shown, &own), vec![10]);
     }
 
     /// Show strings, each at its x on the baseline at 100, one em 8 wide,
