@@ -3788,7 +3788,8 @@ struct DocxDefinition {
 
 /// A list instance: the definition it shares counters through, the levels
 /// it replaces (`w:lvlOverride/w:lvl`), and the levels it restarts
-/// (`w:startOverride`).
+/// (`w:startOverride`). AnyDoc replaces a level whole; Word, as LibreOffice
+/// shows it, lays the instance's level over the definition's.
 #[derive(Default)]
 struct DocxList {
     definition: Option<String>,
@@ -3796,15 +3797,16 @@ struct DocxList {
     starts: [Option<u64>; DOCX_LIST_LEVELS],
 }
 
-/// One list level (`w:lvl`). Its text is shared, not copied, by the list
-/// instances that use it.
+/// One list level (`w:lvl`), each property `None` where the level does not
+/// give it. Its text is shared, not copied, by the list instances that use
+/// it.
 #[derive(Clone, Default)]
 struct DocxLevel {
     /// `w:numFmt`: `None` for a level defined without one, which Word
     /// numbers and AnyDoc renders as bullets.
     format: Option<Rc<str>>,
-    /// `w:start`, clamped as AnyDoc clamps it. When it is absent AnyDoc
-    /// starts at 1 and Word at 0.
+    /// `w:start`, clamped at 0. When it is absent AnyDoc starts at 1 and
+    /// Word at 0.
     start: Option<u64>,
     /// `w:lvlRestart`: `None` restarts the level after any shallower one,
     /// 0 never, `n` after a level shallower than `n`.
@@ -3815,7 +3817,7 @@ struct DocxLevel {
     /// numbers: `None` when absent, and then Word shows no number.
     text: Option<DocxLevelText>,
     /// Legal numbering (`w:isLgl`): every level's number shows in decimal.
-    legal: bool,
+    legal: Option<bool>,
 }
 
 /// A level's number text (`w:lvlText`).
@@ -3824,6 +3826,16 @@ enum DocxLevelText {
     Text(Rc<str>),
     /// Longer than the replay reads (see [`MAX_DOCX_LEVEL_TEXT_BYTES`]).
     Oversized,
+}
+
+impl DocxLevelText {
+    fn of(text: String) -> Self {
+        if text.len() > MAX_DOCX_LEVEL_TEXT_BYTES {
+            DocxLevelText::Oversized
+        } else {
+            DocxLevelText::Text(text.into())
+        }
+    }
 }
 
 /// The longest level number text the replay reads. Word's number texts run
@@ -3835,6 +3847,23 @@ const MAX_DOCX_LEVEL_TEXT_BYTES: usize = 1024;
 impl DocxLevel {
     fn start(&self) -> u64 {
         self.start.unwrap_or(1)
+    }
+
+    fn legal(&self) -> bool {
+        self.legal == Some(true)
+    }
+
+    /// This level laid over `base`: each property it gives replaces the
+    /// base's.
+    fn merged_over(&self, base: &DocxLevel) -> DocxLevel {
+        DocxLevel {
+            format: self.format.clone().or_else(|| base.format.clone()),
+            start: self.start.or(base.start),
+            restart: self.restart.or(base.restart),
+            style: self.style.clone().or_else(|| base.style.clone()),
+            text: self.text.clone().or_else(|| base.text.clone()),
+            legal: self.legal.or(base.legal),
+        }
     }
 
     /// The level's start as Word reads it: 0 when `w:start` is absent.
@@ -3930,7 +3959,8 @@ enum DocxMarker {
     /// words, zero-padded numbers, and the rest.
     Other,
     /// A level the list does not define, where what Word shows is
-    /// uncertain: LibreOffice numbers it in decimal.
+    /// uncertain: LibreOffice numbers it in decimal where the list defines
+    /// no level, and shows nothing where it defines another.
     Undefined,
 }
 
@@ -4180,9 +4210,9 @@ impl DocxShape {
                 DocxTextPiece::Number(shown) => shown,
             };
             let count = match DocxCount::shown_by_word(&self.levels[shown]) {
-                Some(_) if own.legal => DocxCount::Decimal,
+                Some(_) if own.legal() => DocxCount::Decimal,
                 Some(count) => count,
-                None if own.legal && shown < level => DocxCount::Decimal,
+                None if own.legal() && shown < level => DocxCount::Decimal,
                 None => return DocxLabel::Unknown,
             };
             let number = if shown == level {
@@ -4261,7 +4291,7 @@ impl DocxShape {
                 DocxTextPiece::Literal(literal) => label.push_str(&literal),
                 DocxTextPiece::Number(shown) if shown > level => label.push(DOCX_DEEPER_NUMBER),
                 DocxTextPiece::Number(shown) => {
-                    let count = if own.legal {
+                    let count = if own.legal() {
                         Some(DocxCount::Decimal)
                     } else if shown == level {
                         Some(own_count)
@@ -4333,18 +4363,24 @@ impl DocxNumbering {
     }
 
     /// A list instance's effective levels from a resolved definition, with
-    /// the instance's replacements applied; a level neither defines is
-    /// `None`. The levels share their text with the definition's.
+    /// the instance's replacements applied: AnyDoc's whole, Word's laid over
+    /// the definition's levels, as LibreOffice shows them. A level neither
+    /// defines is `None`. The levels share their text with the definition's.
     fn levels_from(
         &self,
         instance: &DocxList,
         definition: usize,
+        word: bool,
     ) -> [Option<DocxLevel>; DOCX_LIST_LEVELS] {
         let mut levels = self.definitions[definition].levels.clone();
         for (level, replaced) in instance.levels.iter().enumerate() {
-            if replaced.is_some() {
-                levels[level] = replaced.clone();
-            }
+            let Some(replaced) = replaced else {
+                continue;
+            };
+            levels[level] = Some(match &levels[level] {
+                Some(base) if word => replaced.merged_over(base),
+                _ => replaced.clone(),
+            });
         }
         levels
     }
@@ -4357,7 +4393,7 @@ impl DocxNumbering {
         chains: &DocxStyleChains,
         word: bool,
     ) -> DocxShape {
-        let levels = self.levels_from(instance, definition);
+        let levels = self.levels_from(instance, definition, word);
         DocxShape {
             bound: chains.bound(&levels),
             markers: levels.each_ref().map(|level| {
@@ -5131,6 +5167,18 @@ fn word_attribute(
     event: &quick_xml::events::BytesStart<'_>,
     wanted: &[u8],
 ) -> Option<String> {
+    let (qualified, unprefixed) = word_attribute_forms(resolver, event, wanted);
+    qualified.or(unprefixed)
+}
+
+/// An attribute's first value in WordprocessingML's namespace, Transitional
+/// or Strict, and its first value without a prefix.
+fn word_attribute_forms(
+    resolver: &quick_xml::name::NamespaceResolver,
+    event: &quick_xml::events::BytesStart<'_>,
+    wanted: &[u8],
+) -> (Option<String>, Option<String>) {
+    let mut qualified = None;
     let mut unprefixed = None;
     for attribute in event.attributes().flatten() {
         let key = attribute.key.as_ref();
@@ -5149,9 +5197,10 @@ fn word_attribute(
         };
         match namespace {
             quick_xml::name::ResolveResult::Bound(namespace)
-                if WORDPROCESSINGML_NAMESPACES.contains(&namespace.as_ref()) =>
+                if qualified.is_none()
+                    && WORDPROCESSINGML_NAMESPACES.contains(&namespace.as_ref()) =>
             {
-                return Some(value());
+                qualified = Some(value());
             }
             quick_xml::name::ResolveResult::Unbound if unprefixed.is_none() => {
                 unprefixed = Some(value());
@@ -5159,7 +5208,7 @@ fn word_attribute(
             _ => {}
         }
     }
-    unprefixed
+    (qualified, unprefixed)
 }
 
 /// An open element of a numbering part: its local name, and whether it is
@@ -5177,6 +5226,8 @@ struct DocxOpenDefinition {
     style_links: Vec<String>,
     /// A `w:numStyleLink` has been read; AnyDoc reads the first.
     style_link_read: bool,
+    /// Word's current level (see [`word_level_index`]).
+    current: Option<usize>,
 }
 
 /// A list instance (`w:num`) being read, and whether its `w:abstractNumId`
@@ -5185,10 +5236,13 @@ struct DocxOpenList {
     id: Option<u64>,
     list: DocxList,
     definition_read: bool,
+    /// Word's current level (see [`word_level_index`]).
+    current: Option<usize>,
 }
 
-/// A `w:lvlOverride` being read: the level it names, and the level and the
-/// start it gives, each as the first of its kind AnyDoc reads.
+/// A `w:lvlOverride` being read for AnyDoc: the level it names, and the
+/// level and the start it gives, each the first of its kind. Word applies
+/// what an override gives as it reads it.
 struct DocxOpenOverride {
     index: Option<usize>,
     level: Option<DocxLevel>,
@@ -5207,13 +5261,131 @@ struct DocxOpenLevel {
     read: Vec<&'static [u8]>,
 }
 
-/// A `w:start` or `w:startOverride` value, clamped to `xsd:int`'s
-/// non-negative range as AnyDoc clamps it.
+/// A `w:start` or `w:startOverride` value as AnyDoc reads it, clamped to
+/// `xsd:int`'s non-negative range.
 fn docx_start_value(value: &str) -> Option<u64> {
     value
         .parse::<i64>()
         .ok()
         .map(|value| value.clamp(0, i64::from(i32::MAX)) as u64)
+}
+
+/// An integer as Word, as LibreOffice shows it, reads one from an
+/// attribute (`rtl_str_toInt32`): white space and control characters
+/// skipped at its start, a sign, and the decimal digits up to the first
+/// other character, so `7x` reads as 7. A value without digits reads as 0,
+/// as does one outside `i32`'s range.
+fn word_integer(value: &str) -> i64 {
+    let rest = value.trim_start_matches(|character: char| character != '\0' && character <= ' ');
+    let (negative, digits) = match rest.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix('+').unwrap_or(rest)),
+    };
+    let mut number = 0i64;
+    for digit in digits.bytes().take_while(u8::is_ascii_digit) {
+        number = number * 10 + i64::from(digit - b'0');
+        if number > i64::from(i32::MAX) + 1 {
+            return 0;
+        }
+    }
+    match if negative { -number } else { number } {
+        number if number > i64::from(i32::MAX) => 0,
+        number => number,
+    }
+}
+
+/// The number formats ECMA-376 defines (`ST_NumberFormat`). Word, as
+/// LibreOffice shows it, reads no other: `<w:numFmt w:val=" upperRoman"/>`
+/// leaves the level's format as it was.
+const WORD_NUMBER_FORMATS: [&str; 63] = [
+    "decimal",
+    "upperRoman",
+    "lowerRoman",
+    "upperLetter",
+    "lowerLetter",
+    "ordinal",
+    "cardinalText",
+    "ordinalText",
+    "hex",
+    "chicago",
+    "ideographDigital",
+    "japaneseCounting",
+    "aiueo",
+    "iroha",
+    "decimalFullWidth",
+    "decimalHalfWidth",
+    "japaneseLegal",
+    "japaneseDigitalTenThousand",
+    "decimalEnclosedCircle",
+    "decimalFullWidth2",
+    "aiueoFullWidth",
+    "irohaFullWidth",
+    "decimalZero",
+    "bullet",
+    "ganada",
+    "chosung",
+    "decimalEnclosedFullstop",
+    "decimalEnclosedParen",
+    "decimalEnclosedCircleChinese",
+    "ideographEnclosedCircle",
+    "ideographTraditional",
+    "ideographZodiac",
+    "ideographZodiacTraditional",
+    "taiwaneseCounting",
+    "ideographLegalTraditional",
+    "taiwaneseCountingThousand",
+    "taiwaneseDigital",
+    "chineseCounting",
+    "chineseLegalSimplified",
+    "chineseCountingThousand",
+    "koreanDigital",
+    "koreanCounting",
+    "koreanLegal",
+    "koreanDigital2",
+    "vietnameseCounting",
+    "russianLower",
+    "russianUpper",
+    "none",
+    "numberInDash",
+    "hebrew1",
+    "hebrew2",
+    "arabicAlpha",
+    "arabicAbjad",
+    "hindiVowels",
+    "hindiConsonants",
+    "hindiNumbers",
+    "hindiCounting",
+    "thaiLetters",
+    "thaiNumbers",
+    "thaiCounting",
+    "bahtText",
+    "dollarText",
+    "custom",
+];
+
+/// A `w:start` or `w:startOverride` value as Word reads it (see
+/// [`word_integer`]), a negative one as 0. An element without a value
+/// reads as 0.
+fn word_start_value(value: Option<&str>) -> u64 {
+    word_integer(value.unwrap_or_default()).max(0) as u64
+}
+
+/// The level a `w:lvl` or `w:lvlOverride` names as Word, as LibreOffice
+/// shows it, reads it: its WordprocessingML `w:ilvl` read as an integer,
+/// `Some(None)` for a level past the ninth, which numbers nothing. `None`
+/// where it names none: Word then reads the element into its current
+/// level, the last one named in the definition or list instance, and drops
+/// it where none has been.
+fn word_level_index(
+    resolver: &quick_xml::name::NamespaceResolver,
+    event: &quick_xml::events::BytesStart<'_>,
+) -> Option<Option<usize>> {
+    let (qualified, _) = word_attribute_forms(resolver, event, b"ilvl");
+    Some(
+        usize::try_from(word_integer(&qualified?))
+            .ok()
+            .filter(|&index| index < DOCX_LIST_LEVELS),
+    )
 }
 
 /// Read a numbering part's list definitions as Word or AnyDoc reads them,
@@ -5330,6 +5502,7 @@ fn docx_numbering_definitions(
                             definition: DocxDefinition::default(),
                             style_links: Vec::new(),
                             style_link_read: false,
+                            current: None,
                         });
                 }
                 b"num" => {
@@ -5339,6 +5512,7 @@ fn docx_numbering_definitions(
                         id: id.filter(|id| !word || !numbering.lists.contains_key(id)),
                         list: DocxList::default(),
                         definition_read: false,
+                        current: None,
                     });
                 }
                 _ => {}
@@ -5346,9 +5520,31 @@ fn docx_numbering_definitions(
         } else if parent_is(b"abstractNum") && stack.len() == 2 {
             if let Some(open) = definition.as_mut() {
                 match local {
+                    // Word starts afresh the level an element names, and
+                    // reads one naming none into its current level. AnyDoc
+                    // takes the level named, else the first.
+                    b"lvl" if word => {
+                        let (index, base) = match word_level_index(reader.resolver(), &event) {
+                            Some(named) => {
+                                open.current = named;
+                                (named, None)
+                            }
+                            None => (
+                                open.current,
+                                open.current
+                                    .and_then(|current| open.definition.levels[current].clone()),
+                            ),
+                        };
+                        open_level = index.map(|index| DocxOpenLevel {
+                            index,
+                            depth: stack.len(),
+                            level: base.unwrap_or_default(),
+                            read: Vec::new(),
+                        });
+                    }
                     b"lvl" => {
                         let index = attribute(b"ilvl")
-                            .and_then(|value| number(value).parse::<usize>().ok())
+                            .and_then(|value| value.parse::<usize>().ok())
                             .unwrap_or(0);
                         if index < DOCX_LIST_LEVELS {
                             open_level = Some(DocxOpenLevel {
@@ -5386,8 +5582,15 @@ fn docx_numbering_definitions(
                         open.definition_read = true;
                     }
                     b"lvlOverride" => {
+                        // An override naming no level goes on, for Word,
+                        // with the level the previous one named.
+                        if word {
+                            if let Some(named) = word_level_index(reader.resolver(), &event) {
+                                open.current = named;
+                            }
+                        }
                         let index = attribute(b"ilvl")
-                            .and_then(|value| number(value).parse::<usize>().ok())
+                            .and_then(|value| value.parse::<usize>().ok())
                             .unwrap_or(0);
                         override_level = Some(DocxOpenOverride {
                             index: (index < DOCX_LIST_LEVELS).then_some(index),
@@ -5401,15 +5604,49 @@ fn docx_numbering_definitions(
                 }
             }
         } else if parent_is(b"lvlOverride") && stack.len() == 3 {
-            if let Some(open) = override_level.as_mut() {
-                match local {
-                    b"startOverride" if word || !open.start_read => {
-                        open.start_read = true;
-                        open.start = attribute(b"val")
-                            .and_then(|start| docx_start_value(&number(start)))
-                            .or(open.start.filter(|_| word));
+            match (override_level.as_mut(), list.as_mut()) {
+                // Word applies each start override and level as it reads
+                // them, to its current level, a level naming its own
+                // becoming current: LibreOffice restarts level 0 and
+                // replaces level 1 for an override of level 0 holding a
+                // level 1.
+                (Some(_), Some(instance)) if word => match local {
+                    b"startOverride" => {
+                        if let Some(current) = instance.current {
+                            instance.list.starts[current] =
+                                Some(word_start_value(attribute(b"val").as_deref()));
+                        }
                     }
-                    b"lvl" if word || !open.level_read => {
+                    b"lvl" => {
+                        let (index, base) = match word_level_index(reader.resolver(), &event) {
+                            Some(named) => {
+                                instance.current = named;
+                                (named, None)
+                            }
+                            None => (
+                                instance.current,
+                                instance
+                                    .current
+                                    .and_then(|current| instance.list.levels[current].clone()),
+                            ),
+                        };
+                        open_level = index.map(|index| DocxOpenLevel {
+                            index,
+                            depth: stack.len(),
+                            level: base.unwrap_or_default(),
+                            read: Vec::new(),
+                        });
+                    }
+                    _ => {}
+                },
+                // AnyDoc reads an override's first start override and first
+                // level, both for the level the override names.
+                (Some(open), _) if !word => match local {
+                    b"startOverride" if !open.start_read => {
+                        open.start_read = true;
+                        open.start = attribute(b"val").and_then(|start| docx_start_value(&start));
+                    }
+                    b"lvl" if !open.level_read => {
                         open.level_read = true;
                         if let Some(index) = open.index {
                             open_level = Some(DocxOpenLevel {
@@ -5421,11 +5658,12 @@ fn docx_numbering_definitions(
                         }
                     }
                     _ => {}
-                }
+                },
+                _ => {}
             }
         } else if parent_is(b"lvl") {
             if let Some(open) = open_level.as_mut() {
-                docx_level_property(open, local, word, |name| attribute(name), &event, number);
+                docx_level_property(open, local, word, |name| attribute(name), &event);
             }
         }
         if start {
@@ -5446,16 +5684,21 @@ fn docx_numbering_definitions(
     }
 }
 
-/// Read one property of an open list level: AnyDoc reads the first element
-/// of each, and Word the first that gives a value, except that legal
-/// numbering (`w:isLgl`) is Word's last.
+/// Read one property of an open list level. AnyDoc reads the first element
+/// of each, its value as it stands. Word, as LibreOffice shows it, reads
+/// every element, the last winning: a number (`w:start`, `w:lvlRestart`)
+/// as it reads integers, an element without a value as 0; a format
+/// (`w:numFmt`), number text (`w:lvlText`), or style (`w:pStyle`) only from
+/// an element that gives one, a format only one ECMA-376 defines, so
+/// `<w:numFmt/>` leaves the format before it.
+/// LibreOffice does not apply `w:lvlRestart` at all; Word's, which ECMA-376
+/// defines, is read as its other numbers are.
 fn docx_level_property(
     open: &mut DocxOpenLevel,
     local: &[u8],
     word: bool,
     attribute: impl Fn(&[u8]) -> Option<String>,
     event: &quick_xml::events::BytesStart<'_>,
-    number: impl Fn(String) -> String,
 ) {
     let property: &'static [u8] = match local {
         b"numFmt" => b"numFmt",
@@ -5466,36 +5709,43 @@ fn docx_level_property(
         b"isLgl" => b"isLgl",
         _ => return,
     };
-    let first = !open.read.contains(&property);
-    if first {
-        open.read.push(property);
-    }
     let level = &mut open.level;
     let value = attribute(b"val");
+    if word {
+        match property {
+            b"numFmt" => {
+                level.format = value
+                    .filter(|format| WORD_NUMBER_FORMATS.contains(&format.as_str()))
+                    .map(Rc::from)
+                    .or(level.format.take());
+            }
+            b"start" => level.start = Some(word_start_value(value.as_deref())),
+            b"lvlRestart" => {
+                level.restart =
+                    u32::try_from(word_integer(value.as_deref().unwrap_or_default())).ok();
+            }
+            b"pStyle" => level.style = value.map(Rc::from).or(level.style.take()),
+            b"lvlText" => level.text = value.map(DocxLevelText::of).or(level.text.take()),
+            b"isLgl" => level.legal = Some(!xml_toggle_off(event)),
+            _ => {}
+        }
+        return;
+    }
+    if open.read.contains(&property) {
+        return;
+    }
+    open.read.push(property);
     match property {
-        b"numFmt" if (word && level.format.is_none()) || (!word && first) => {
-            level.format = value.map(|format| format.trim().into());
-        }
-        b"start" if (word && level.start.is_none()) || (!word && first) => {
-            level.start = value.and_then(|start| docx_start_value(&number(start)));
-        }
-        b"lvlRestart" if (word && level.restart.is_none()) || (!word && first) => {
-            level.restart = value.and_then(|restart| number(restart).parse().ok());
-        }
-        b"pStyle" if (word && level.style.is_none()) || (!word && first) => {
-            level.style = value.map(Rc::from);
-        }
-        b"lvlText" if first => {
-            let text = value.unwrap_or_default();
-            level.text = Some(if text.len() > MAX_DOCX_LEVEL_TEXT_BYTES {
-                DocxLevelText::Oversized
-            } else {
-                DocxLevelText::Text(text.into())
-            });
-        }
-        b"isLgl" if word => level.legal = !xml_toggle_off(event),
-        b"isLgl" if first => {
-            level.legal = !matches!(value.as_deref(), Some("0" | "false" | "off" | "none"));
+        b"numFmt" => level.format = value.map(Rc::from),
+        b"start" => level.start = value.and_then(|start| docx_start_value(&start)),
+        b"lvlRestart" => level.restart = value.and_then(|restart| restart.parse().ok()),
+        b"pStyle" => level.style = value.map(Rc::from),
+        b"lvlText" => level.text = Some(DocxLevelText::of(value.unwrap_or_default())),
+        b"isLgl" => {
+            level.legal = Some(!matches!(
+                value.as_deref(),
+                Some("0" | "false" | "off" | "none")
+            ));
         }
         _ => {}
     }
@@ -5527,6 +5777,10 @@ fn docx_numbering_close(
                 if let Some(definition) = definition.as_mut() {
                     definition.definition.levels[open.index] = Some(open.level);
                 }
+            } else if word {
+                if let Some(instance) = list.as_mut() {
+                    instance.list.levels[open.index] = Some(open.level);
+                }
             } else if let Some(replacing) = override_level.as_mut() {
                 replacing.level = Some(open.level);
             }
@@ -5535,6 +5789,10 @@ fn docx_numbering_close(
             let (Some(replacing), Some(open)) = (override_level.take(), list.as_mut()) else {
                 return Ok(());
             };
+            // Word has applied what the override gives.
+            if word {
+                return Ok(());
+            }
             let Some(index) = replacing.index else {
                 return Ok(());
             };
@@ -5542,9 +5800,7 @@ fn docx_numbering_close(
                 open.list.levels[index] = Some(level);
                 // AnyDoc replaces the whole level, and then restarts it
                 // at this override's start, if it gives one.
-                if !word {
-                    open.list.starts[index] = None;
-                }
+                open.list.starts[index] = None;
             }
             if let Some(start) = replacing.start {
                 open.list.starts[index] = Some(start);
@@ -13523,6 +13779,202 @@ mod tests {
             );
             assert!(!differs(&direct, &numbering), "{numbering}");
         }
+    }
+
+    #[test]
+    fn docx_level_properties_are_read_as_each_side_reads_them() {
+        let item = |ilvl: u32| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#
+            )
+        };
+        let flat = item(0).repeat(3);
+        let nested = [item(0), item(1), item(0), item(1)].concat();
+        let differs = |body: &str, levels: &str, instance: &str| {
+            let document = word_part("document", body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{levels}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/>{instance}</w:num></w:numbering>"#
+            );
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let level = |attributes: &str, inner: &str| format!("<w:lvl{attributes}>{inner}</w:lvl>");
+        let zero = |inner: &str| level(r#" w:ilvl="0""#, inner);
+        let decimal =
+            zero(r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#);
+        let letters = level(
+            r#" w:ilvl="1""#,
+            r#"<w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/>"#,
+        );
+        assert!(!differs(&flat, &decimal, ""));
+        // Word, as LibreOffice shows it, reads a repeated property's last
+        // element and AnyDoc its first: 7. 8. 9. against 1. 2. 3.
+        let text = r#"<w:lvlText w:val="%1."/>"#;
+        let format = r#"<w:numFmt w:val="decimal"/>"#;
+        let start = r#"<w:start w:val="1"/>"#;
+        for inner in [
+            format!(r#"<w:start w:val="1"/><w:start w:val="7"/>{format}{text}"#),
+            format!(r#"{start}<w:numFmt w:val="decimal"/><w:numFmt w:val="upperRoman"/>{text}"#),
+            format!(r#"{start}{format}<w:lvlText w:val="%1."/><w:lvlText w:val="Art %1:"/>"#),
+            format!(r#"{start}{format}<w:lvlText w:val="Art %1:"/><w:lvlText w:val=""/>"#),
+            // A number without a value, or with one LibreOffice cannot
+            // read, is 0; it reads `7x` as 7 and a value past `i32` as 0.
+            format!(r#"<w:start w:val="7"/><w:start/>{format}{text}"#),
+            format!(r#"<w:start w:val="7"/><w:start w:val="abc"/>{format}{text}"#),
+            format!(r#"<w:start w:val="1"/><w:start w:val="7x"/>{format}{text}"#),
+            format!(r#"<w:start w:val="99999999999"/>{format}{text}"#),
+            // The number text is classified as Word reads it: here past the
+            // bound the replay reads.
+            format!(
+                r#"{start}{format}{text}<w:lvlText w:val="{} %1."/>"#,
+                "X".repeat(MAX_DOCX_LEVEL_TEXT_BYTES + 1)
+            ),
+        ] {
+            assert!(differs(&flat, &zero(&inner), ""), "{inner}");
+        }
+        // A format, number text, or style Word finds no value in, or a
+        // format ECMA-376 does not define, leaves the one before it.
+        let roman = r#"<w:numFmt w:val="upperRoman"/>"#;
+        for inner in [
+            format!(r#"<w:start w:val="3"/><w:start w:val="3"/>{format}{format}{text}{text}"#),
+            format!(r#"{start}{roman}<w:numFmt/>{text}"#),
+            format!(r#"{start}{roman}<w:numFmt w:val="bogus"/>{text}"#),
+            format!(r#"{start}<w:numFmt w:val=" upperRoman"/>{text}"#),
+            format!(r#"{start}{format}<w:lvlText w:val="Art %1:"/><w:lvlText/>"#),
+            format!(r#"<w:start w:val="+7"/>{format}{text}"#),
+        ] {
+            assert!(!differs(&flat, &zero(&inner), ""), "{inner}");
+        }
+        // Restarts: Word takes the last `w:lvlRestart`, never after level
+        // 0 here, where AnyDoc takes the first.
+        let restarting = level(
+            r#" w:ilvl="1""#,
+            r#"<w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlRestart w:val="1"/><w:lvlRestart w:val="0"/><w:lvlText w:val="%2)"/>"#,
+        );
+        assert!(differs(
+            &nested,
+            &[decimal.clone(), restarting].concat(),
+            ""
+        ));
+        // Levels are found by WordprocessingML's `w:ilvl`, read as an
+        // integer: a level naming none, or naming one only without a
+        // prefix, is dropped where no level precedes it and otherwise
+        // read into the level before it; `1x` names level 1.
+        let upper = r#"<w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/>"#;
+        for levels in [
+            level("", upper),
+            [level("", upper), letters.clone()].concat(),
+            [level(r#" ilvl="0""#, upper), letters.clone()].concat(),
+            [decimal.clone(), letters.clone(), level("", upper)].concat(),
+            [
+                decimal.clone(),
+                letters.clone(),
+                level(r#" w:ilvl="1x""#, upper),
+            ]
+            .concat(),
+        ] {
+            assert!(differs(&nested, &levels, ""), "{levels}");
+        }
+        for levels in [
+            [decimal.clone(), level("", upper), letters.clone()].concat(),
+            [level(r#" w:ilvl="x""#, upper), letters.clone()].concat(),
+            [level(r#" w:ilvl=" 0 ""#, upper), letters.clone()].concat(),
+        ] {
+            assert!(!differs(&nested, &levels, ""), "{levels}");
+        }
+        // An override's level replaces the level it names itself, laid over
+        // the definition's, and its start override the level the override
+        // names; AnyDoc puts both at the override's level. An override
+        // naming no level goes on with the previous one's, and is dropped
+        // where there is none.
+        let two = [decimal.clone(), letters.clone()].concat();
+        let override_of = |attributes: &str, inner: &str| {
+            format!("<w:lvlOverride{attributes}>{inner}</w:lvlOverride>")
+        };
+        for instance in [
+            override_of(
+                r#" w:ilvl="0""#,
+                &level(
+                    r#" w:ilvl="1""#,
+                    r#"<w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="(%2)"/>"#,
+                ),
+            ),
+            override_of("", r#"<w:startOverride w:val="5"/>"#),
+            override_of(r#" w:ilvl="1x""#, r#"<w:startOverride w:val="5"/>"#),
+            override_of(
+                "",
+                &level(
+                    r#" w:ilvl="1""#,
+                    r#"<w:start w:val="1"/><w:numFmt w:val="upperLetter"/><w:lvlText w:val="%2."/>"#,
+                ),
+            ),
+            override_of(
+                r#" w:ilvl="0""#,
+                r#"<w:startOverride w:val="9"/><w:startOverride/>"#,
+            ),
+            override_of(
+                r#" w:ilvl="0""#,
+                &zero(r#"<w:start w:val="1"/><w:start w:val="5"/>"#),
+            ),
+        ] {
+            assert!(differs(&nested, &two, &instance), "{instance}");
+        }
+        for instance in [
+            override_of(
+                r#" w:ilvl="1""#,
+                &level(
+                    "",
+                    r#"<w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="[%2]"/>"#,
+                ),
+            ),
+            override_of(r#" w:ilvl="x""#, r#"<w:startOverride w:val="5"/>"#),
+            [
+                override_of(r#" w:ilvl="0""#, &zero(upper)),
+                override_of(r#" w:ilvl="0""#, r#"<w:startOverride w:val="6"/>"#),
+            ]
+            .concat(),
+        ] {
+            assert!(!differs(&nested, &two, &instance), "{instance}");
+        }
+        // Word lays an override's level over the definition's: a level
+        // giving only its format keeps the definition's start and number
+        // text, "(III)" where AnyDoc shows "I.".
+        let definition =
+            zero(r#"<w:start w:val="3"/><w:numFmt w:val="decimal"/><w:lvlText w:val="(%1)"/>"#);
+        let shown = |instance: &str| {
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{definition}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/>{instance}</w:num></w:numbering>"#
+            );
+            let word = docx_numbering_definitions(numbering.as_bytes(), true).expect("numbering");
+            let levels = word.levels_from(&word.lists[&1], 0, true);
+            let level = levels[0].clone().expect("level 0");
+            (
+                level.format.as_deref().map(str::to_string),
+                level.start,
+                level.number_text().map(str::to_string),
+            )
+        };
+        let expected = (
+            Some("upperRoman".to_string()),
+            Some(3),
+            Some("(%1)".to_string()),
+        );
+        assert_eq!(
+            shown(&override_of(r#" w:ilvl="0""#, &zero(roman))),
+            expected
+        );
+        assert_eq!(
+            shown(&override_of(r#" w:ilvl="0""#, &level("", roman))),
+            expected
+        );
+        assert!(differs(
+            &flat,
+            &definition,
+            &override_of(r#" w:ilvl="0""#, &zero(roman))
+        ));
     }
 
     #[test]

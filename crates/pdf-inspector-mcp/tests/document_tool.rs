@@ -1582,6 +1582,55 @@ fn docx_notes_from_another_part_than_words_are_refused() {
 }
 
 #[test]
+fn docx_repeated_level_properties_are_reported_as_partial() {
+    let temporary = tempfile::tempdir().expect("temporary DOCX directory");
+    let numbering = |level: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:numbering {WORD_NAMESPACE}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0">{level}<w:lvlJc w:val="left"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        )
+    };
+    let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>LIST-ITEM</w:t></w:r></w:p>"#.repeat(3);
+    let relationships = r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#;
+    let convert = |name: &str, level: &str| {
+        let path = temporary.path().join(name);
+        let entries = docx_parts(
+            &body,
+            relationships,
+            &[("word/numbering.xml", numbering(level))],
+        );
+        let entries: Vec<(&str, String)> = entries
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.clone()))
+            .collect();
+        write_package(&path, &entries);
+        run_document_tool(
+            path.to_string_lossy().into_owned(),
+            "docx-level-properties-test",
+        )
+    };
+    // LibreOffice numbers this list 7, 8, 9 from the last `w:start`, and
+    // AnyDoc 1, 2, 3 from the first.
+    let repeated = convert(
+        "repeated.docx",
+        r#"<w:start w:val="1"/><w:start w:val="7"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+    );
+    assert_eq!(repeated["completeness"], "partial", "{repeated}");
+    assert!(repeated["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "list_numbering_differs"));
+    let single = convert(
+        "single.docx",
+        r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+    );
+    assert_eq!(single["completeness"], "complete", "{single}");
+    assert!(single["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("LIST-ITEM")));
+}
+
+#[test]
 fn docx_dropped_hyphens_are_reported_as_partial() {
     let fixture = format!(
         "{}/../../test-corpus/docx/non-breaking-hyphen.docx",
