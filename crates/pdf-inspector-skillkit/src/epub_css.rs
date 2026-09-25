@@ -3527,12 +3527,90 @@ struct Effects {
 }
 
 /// Where a floated or positioned box began: the glyphs and digits taken in
-/// before it, and whether it is a float to the line's start that opens its
-/// paragraph.
+/// before it, whether it is a float to the line's start that opens its
+/// paragraph, and where its inline style places a positioned box.
 #[derive(Clone, Copy)]
 struct FloatStart {
     glyphs: (u64, u64),
     opens: bool,
+    placed: Option<Placement>,
+}
+
+/// Where an absolutely positioned box's inline style sets it, in pixels:
+/// its top and left edges, and the em of its font, from the same style or
+/// the default 16 pixels. Fixed-layout books (InDesign's `_idTextSpan`) set
+/// each run of a line so, split wherever the character style or the
+/// kerning changes, even inside a word.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    top: f64,
+    left: f64,
+    em: f64,
+}
+
+impl Placement {
+    /// Whether a box placed at `next` goes on the line this one starts,
+    /// which took in `glyphs`: its top within half an em, as a superscript
+    /// stands, and its left further right, no further than the glyphs
+    /// reach at 0.6 em each, a wide average, and an em for a space after
+    /// them. Further on, the box stands apart as words set apart do.
+    fn goes_on(&self, next: &Placement, glyphs: u64) -> bool {
+        (next.top - self.top).abs() <= self.em / 2.0
+            && next.left > self.left
+            && next.left <= self.left + (glyphs as f64 * 0.6 + 1.0) * self.em
+    }
+}
+
+/// A CSS length in pixels: `px`, `pt`, `em` (of `em` pixels), `rem`, or a
+/// bare zero; `None` for anything else, a percentage among them.
+fn pixels(number: &str, em: f64) -> Option<f64> {
+    let split = number
+        .find(|character: char| character.is_ascii_alphabetic() || character == '%')
+        .unwrap_or(number.len());
+    let (value, unit) = number.split_at(split);
+    let value: f64 = value.parse().ok()?;
+    let scale = match unit.to_ascii_lowercase().as_str() {
+        "px" => 1.0,
+        "pt" => 4.0 / 3.0,
+        "em" => em,
+        "rem" => 16.0,
+        "" if value == 0.0 => 1.0,
+        _ => return None,
+    };
+    Some(value * scale)
+}
+
+/// Where an element's inline style places it (see [`Placement`]); `None`
+/// where it does not set `top` and `left` as lengths.
+fn placement(element: &Element) -> Option<Placement> {
+    let tokens = tokenize(element.first("style")?).ok()?;
+    let mut lengths: [Option<&str>; 3] = [None; 3];
+    for declaration in split_top_level(&tokens, &Token::Semicolon) {
+        let [Token::Ident(name), rest @ ..] = trim_whitespace(declaration) else {
+            continue;
+        };
+        let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
+            continue;
+        };
+        let slot = match name.to_ascii_lowercase().as_str() {
+            "top" => 0,
+            "left" => 1,
+            "font-size" => 2,
+            _ => continue,
+        };
+        lengths[slot] = match trim_whitespace(value) {
+            [Token::Numeric(number)] => Some(number.as_str()),
+            _ => None,
+        };
+    }
+    let em = lengths[2]
+        .and_then(|size| pixels(size, 16.0))
+        .unwrap_or(16.0);
+    Some(Placement {
+        top: pixels(lengths[0]?, em)?,
+        left: pixels(lengths[1]?, em)?,
+        em,
+    })
 }
 
 /// One inline run of AnyDoc's walker (a `Builder`): the text it last
@@ -3557,6 +3635,10 @@ struct Run {
     alt: Option<String>,
     /// A floated drop cap ended, and the next text starts beside it.
     beside_float: Option<DropCap>,
+    /// A positioned box ended where its inline style places it, having
+    /// taken in these glyphs: what comes next starts a line of its own,
+    /// unless it is a sibling placed where that line goes on.
+    after_placed: Option<(Placement, u64)>,
     /// A sign a `::before` or `::after` box shows sits before the next
     /// text.
     sign_before: Option<Sign>,
@@ -3728,6 +3810,10 @@ impl Run {
                 self.sign_before = None;
             }
             return false;
+        }
+        // Text in the flow after a positioned box starts a line of its own.
+        if self.after_placed.take().is_some() {
+            self.boundary = true;
         }
         let at_space = self.at_space();
         let mut from_first = kept().skip_while(|character| at_space && character.is_whitespace());
@@ -4285,6 +4371,16 @@ fn meet_run(
     let (breaks_before, breaks_after) = style.map_or((Tri::No, Tri::No), |style| {
         (style.before.breaks, style.after.breaks)
     });
+    // A positioned box before this one, its sibling, left a line: this one
+    // goes on it where its inline style places it there, perhaps touching
+    // the text before it; anything else starts a line of its own.
+    let placed_at = (flow == Flow::Positioned)
+        .then(|| placement(element))
+        .flatten();
+    if let Some((before, glyphs)) = run.after_placed.take() {
+        let goes_on = placed_at.is_some_and(|here| before.goes_on(&here, glyphs));
+        run.mark(if goes_on { Tri::Maybe } else { Tri::Yes });
+    }
     let keep_in_run = |run: &mut Run, effects: &mut Effects, glyphs: (u64, u64)| match flow {
         // A block `::before` or `::after` box still breaks the line.
         Flow::Inline => {
@@ -4302,6 +4398,7 @@ fn meet_run(
             effects.glyphs_at = Some(FloatStart {
                 glyphs,
                 opens: flow == Flow::Float && to_start && run.last.is_none(),
+                placed: placed_at,
             });
             run.maybe_boundary = true;
             effects.boundary_after = Tri::Yes;
@@ -4440,8 +4537,17 @@ fn end_element(effects: &Effects, runs: &mut Vec<Run>, glyphs: (u64, u64)) -> bo
     if effects.flush_after {
         run.flush();
     }
-    match effects.glyphs_at.and_then(|start| drop_cap(start, glyphs)) {
-        Some(cap) => run.beside_float = Some(cap),
+    // The line a positioned box inside the element left goes on no further
+    // than the element.
+    if run.after_placed.take().is_some() {
+        run.boundary = true;
+    }
+    match effects.glyphs_at {
+        Some(start) => match (drop_cap(start, glyphs), start.placed) {
+            (Some(cap), _) => run.beside_float = Some(cap),
+            (None, Some(placed)) => run.after_placed = Some((placed, glyphs.0 - start.glyphs.0)),
+            (None, None) => run.mark(effects.boundary_after),
+        },
         None => run.mark(effects.boundary_after),
     }
     // Otherwise the sign sits before the text that goes on in the line,
@@ -5703,6 +5809,33 @@ mod tests {
                 &[],
                 r#"<p><span style="position:absolute;left:300px">12</span>50 units</p>"#.into(),
             ),
+            // Positioned runs set on the next line, or far along this one,
+            // text in the flow after one, and runs whose places do not
+            // share a containing box; on one line, digits that meet.
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:0px;left:0px">Balance due</span><span style="position:absolute;top:26px;left:0px">Grand total</span></p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:0;left:0">Name</span><span style="position:absolute;top:0;left:300px">Amount</span></p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:40px;left:40px">Once</span><span style="position:absolute;top:40px;left:100px">upon</span></p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:0;left:0">Balance due</span>Grand total</p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><b><span style="position:absolute;top:0;left:0">Balance</span></b><span style="position:absolute;top:0;left:70px">Grand</span></p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:0;left:0">Units 12</span><span style="position:absolute;top:0;left:60px">50</span></p>"#.into(),
+            ),
             // AnyDoc drops a link holding only a line break, and flattens
             // a display formula in a link into the text around it.
             (&[], "<p>Balance due<a><br/></a>1,250.00</p>".into()),
@@ -5776,6 +5909,17 @@ mod tests {
             (
                 &[".dc { float: left; font-size: 3em }"],
                 r#"<h1>Four</h1><p><span class="dc">1</span>914 began quietly.</p>"#.into(),
+            ),
+            // A fixed-layout line set as positioned runs, split inside a
+            // word where the kerning or the character style changes, and a
+            // superscript raised off the line.
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:0px;left:0px">The Wo</span><span style="position:absolute;top:0px;left:62.97px">nderful Morning</span></p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute;top:40px;left:20px">Filed on the 21</span><span style="position:absolute;top:36px;left:140.55px">st </span></p>"#.into(),
             ),
             // A box a reader keeps in the line, though AnyDoc splits a link's
             // content at the heading inside it.
