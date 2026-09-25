@@ -13,11 +13,12 @@
 //!   positions from a pass over the chapter before the walk, `+` from the
 //!   earlier siblings the walk keeps, and a rule's `~` step from the first
 //!   sibling that fits it, noted as each sibling ends, which costs a lookup
-//!   however far back that sibling is. Where it cannot decide (`:has()`,
-//!   an unknown pseudo-class, a value set through `var()`, a condition on
-//!   a container's size or on a screen only some readers have), it lets a
-//!   hiding rule apply and keeps a showing rule from overriding one, so it
-//!   errs toward finding hidden text.
+//!   however far back that sibling is. Text some of the readers show for
+//!   certain counts as shown: AnyDoc may convert it, and loses it where it
+//!   drops it. Where the check cannot decide (`:has()`, an unknown
+//!   pseudo-class, a value set through `var()`, a container's size), text
+//!   counts as hidden where AnyDoc converts it and as shown where AnyDoc
+//!   drops it (see [`hidden`]), so it errs toward finding both.
 //! - The AnyDoc model ports AnyDoc 0.2.4's own subset (`shared::html`):
 //!   `display` from bare `tag`, `.class`, and `tag.class` rules and from
 //!   inline styles, applied only to the elements its walker styles.
@@ -601,16 +602,6 @@ impl Applies {
             Tri::Yes => Applies::Yes,
             Tri::Maybe => Applies::Doubt,
             Tri::No => Applies::No,
-        }
-    }
-
-    /// Whether it applies on every reader: `Maybe` where that varies or is
-    /// in doubt.
-    fn everywhere(self) -> Tri {
-        match self {
-            Applies::Yes => Tri::Yes,
-            Applies::No => Tri::No,
-            Applies::Doubt | Applies::Varies => Tri::Maybe,
         }
     }
 
@@ -2932,7 +2923,7 @@ enum Simple {
     Class(String),
     Attribute {
         name: String,
-        namespaced: bool,
+        namespace: AttributeNamespace,
         operator: AttributeOperator,
         value: String,
         case_insensitive: bool,
@@ -2940,6 +2931,17 @@ enum Simple {
     Pseudo(PseudoClass),
     /// Syntax this model does not interpret; it may match.
     Unknown,
+}
+
+/// The namespace an attribute selector asks of the attribute: none
+/// (`[type]`, `[|type]`), any (`[*|type]`), or the one a prefix names
+/// (`[epub|type]`), as the sheet's `@namespace` rules declare it; `None`
+/// for a prefix no rule declares, which matches no attribute.
+#[derive(Clone, Debug)]
+enum AttributeNamespace {
+    Unprefixed,
+    Any,
+    Named(Option<Rc<str>>),
 }
 
 #[derive(Clone, Debug)]
@@ -3033,12 +3035,19 @@ struct Nest {
     scope: bool,
 }
 
-/// Parse a selector list; `nest` says what `&` stands for in a nested
-/// rule's.
+/// What a selector is read with: what `&` stands for in a nested rule's
+/// (see [`Nest`]), and the namespace prefixes its sheet declares.
+#[derive(Clone, Copy)]
+struct SelectorContext<'a> {
+    nest: Option<&'a Nest>,
+    namespaces: &'a [(String, Rc<str>)],
+}
+
+/// Parse a selector list.
 fn parse_selector_list(
     tokens: &[Token],
     nesting: usize,
-    nest: Option<&Nest>,
+    context: SelectorContext,
 ) -> Vec<ComplexSelector> {
     let parts = split_top_level(tokens, &Token::Comma);
     if parts.len() > MAX_SELECTORS_PER_RULE {
@@ -3046,7 +3055,7 @@ fn parse_selector_list(
     }
     parts
         .into_iter()
-        .map(|part| parse_complex(trim_whitespace(part), nesting, nest))
+        .map(|part| parse_complex(trim_whitespace(part), nesting, context))
         .collect()
 }
 
@@ -3081,7 +3090,7 @@ enum SelectorItem {
     Combinator(Combinator),
 }
 
-fn parse_complex(tokens: &[Token], nesting: usize, nest: Option<&Nest>) -> ComplexSelector {
+fn parse_complex(tokens: &[Token], nesting: usize, context: SelectorContext) -> ComplexSelector {
     let mut items: Vec<SelectorItem> = Vec::new();
     let mut current = Compound::default();
     let mut specificity = (0, 0, 0);
@@ -3124,7 +3133,7 @@ fn parse_complex(tokens: &[Token], nesting: usize, nest: Option<&Nest>) -> Compl
             tokens,
             index,
             nesting,
-            nest,
+            context,
             &mut current,
             &mut specificity,
             &mut pseudo_element,
@@ -3178,7 +3187,7 @@ fn parse_simple(
     tokens: &[Token],
     index: usize,
     nesting: usize,
-    nest: Option<&Nest>,
+    context: SelectorContext,
     compound: &mut Compound,
     specificity: &mut (u32, u32, u32),
     pseudo_element: &mut PseudoElement,
@@ -3227,7 +3236,9 @@ fn parse_simple(
         Token::OpenSquare => {
             let (contents, end) = block_at(tokens, index);
             specificity.1 += 1;
-            compound.parts.push(parse_attribute(contents));
+            compound
+                .parts
+                .push(parse_attribute(contents, context.namespaces));
             end
         }
         Token::Colon => {
@@ -3263,7 +3274,7 @@ fn parse_simple(
                         specificity.2 += 1;
                     } else {
                         specificity.1 += 1;
-                        let pseudo = match nest {
+                        let pseudo = match context.nest {
                             Some(nest) if nest.scope && name == "scope" => {
                                 PseudoClass::Is(nest.parent.clone())
                             }
@@ -3276,7 +3287,7 @@ fn parse_simple(
                 Some(Token::Function(name)) => {
                     let (arguments, end) = block_at(tokens, index + 1);
                     let pseudo =
-                        functional_pseudo_class(name, arguments, nesting, nest, specificity);
+                        functional_pseudo_class(name, arguments, nesting, context, specificity);
                     compound.parts.push(Simple::Pseudo(pseudo));
                     end
                 }
@@ -3290,7 +3301,7 @@ fn parse_simple(
         // [`Nest`]), however deep, as the weight a selector may carry bounds
         // what it stands for; in a rule of its own, the root.
         Token::Delim('&') => {
-            let pseudo = match nest {
+            let pseudo = match context.nest {
                 Some(nest) => {
                     add_specificity(specificity, nest.specificity);
                     PseudoClass::Is(nest.parent.clone())
@@ -3333,12 +3344,12 @@ fn functional_pseudo_class(
     name: &str,
     arguments: &[Token],
     nesting: usize,
-    nest: Option<&Nest>,
+    context: SelectorContext,
     specificity: &mut (u32, u32, u32),
 ) -> PseudoClass {
     let name = name.to_ascii_lowercase();
     let list = |specificity: &mut (u32, u32, u32), counts: bool| {
-        let list = parse_selector_list(arguments, nesting + 1, nest);
+        let list = parse_selector_list(arguments, nesting + 1, context);
         if counts {
             let highest = list
                 .iter()
@@ -3415,13 +3426,24 @@ fn parse_nth(tokens: &[Token]) -> Option<(i64, i64)> {
     }
 }
 
-fn parse_attribute(tokens: &[Token]) -> Simple {
+/// An attribute selector, a prefix before its name read through the
+/// namespaces the sheet declares.
+fn parse_attribute(tokens: &[Token], namespaces: &[(String, Rc<str>)]) -> Simple {
     let tokens = trim_whitespace(tokens);
-    let (name, namespaced, rest) = match tokens {
-        [Token::Ident(_), Token::Delim('|'), Token::Ident(name), rest @ ..] => (name, true, rest),
-        [Token::Delim('*'), Token::Delim('|'), Token::Ident(name), rest @ ..]
-        | [Token::Delim('|'), Token::Ident(name), rest @ ..]
-        | [Token::Ident(name), rest @ ..] => (name, false, rest),
+    let (name, namespace, rest) = match tokens {
+        [Token::Ident(prefix), Token::Delim('|'), Token::Ident(name), rest @ ..] => {
+            let uri = namespaces
+                .iter()
+                .find(|(declared, _)| declared == prefix)
+                .map(|(_, uri)| uri.clone());
+            (name, AttributeNamespace::Named(uri), rest)
+        }
+        [Token::Delim('*'), Token::Delim('|'), Token::Ident(name), rest @ ..] => {
+            (name, AttributeNamespace::Any, rest)
+        }
+        [Token::Delim('|'), Token::Ident(name), rest @ ..] | [Token::Ident(name), rest @ ..] => {
+            (name, AttributeNamespace::Unprefixed, rest)
+        }
         _ => return Simple::Unknown,
     };
     let rest = trim_whitespace(rest);
@@ -3429,7 +3451,7 @@ fn parse_attribute(tokens: &[Token]) -> Simple {
         [] => {
             return Simple::Attribute {
                 name: name.to_ascii_lowercase(),
-                namespaced,
+                namespace,
                 operator: AttributeOperator::Exists,
                 value: String::new(),
                 case_insensitive: false,
@@ -3455,7 +3477,7 @@ fn parse_attribute(tokens: &[Token]) -> Simple {
     };
     Simple::Attribute {
         name: name.to_ascii_lowercase(),
-        namespaced,
+        namespace,
         operator,
         value,
         case_insensitive,
@@ -3482,9 +3504,11 @@ pub(super) struct Element {
     /// The local name as written.
     local: String,
     lower: String,
-    /// Attribute local names (lowercased), whether each is prefixed, and
+    /// Attribute local names (lowercased), the namespace each is in, by the
+    /// name its prefix is bound to (`None` for an unprefixed one, empty for
+    /// a prefix bound to none), and
     /// decoded values, in document order.
-    attributes: Vec<(String, bool, String)>,
+    attributes: Vec<(String, Option<Rc<str>>, String)>,
     position: Position,
     /// Its element name, and its ids and classes, as the keys rules are
     /// filtered by (see [`selector_key`]).
@@ -3494,6 +3518,9 @@ pub(super) struct Element {
     /// whether its `style` attribute is prefixed, parsed when first needed
     /// (see [`Element::inline_style`]).
     inline: std::cell::OnceCell<Box<[(bool, Declaration)]>>,
+    /// The namespace prefixes it binds (`xmlns:epub`), by the names they
+    /// are bound to.
+    bindings: Box<[(String, Rc<str>)]>,
     /// What the custom properties looked up at it say there, by name (see
     /// [`Cascade::custom_value`]).
     customs: std::cell::RefCell<HashMap<u64, Option<Tri>>>,
@@ -3505,7 +3532,7 @@ pub(super) struct Element {
 impl Element {
     pub(super) fn new(
         local: &str,
-        attributes: Vec<(String, bool, String)>,
+        attributes: Vec<(String, Option<Rc<str>>, String)>,
         position: Position,
     ) -> Self {
         let lower = local.to_ascii_lowercase();
@@ -3517,6 +3544,7 @@ impl Element {
             position,
             other_keys: Box::default(),
             inline: std::cell::OnceCell::new(),
+            bindings: Box::default(),
             customs: std::cell::RefCell::default(),
             container: std::cell::Cell::new(Tri::No),
         };
@@ -3537,11 +3565,22 @@ impl Element {
         std::iter::once(self.name_key).chain(self.other_keys.iter().copied())
     }
 
+    /// The values of an attribute by local name, each with whether it is
+    /// prefixed.
     fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (bool, &'a str)> + 'a {
+        self.namespaced_values(name)
+            .map(|(namespace, value)| (namespace.is_some(), value))
+    }
+
+    /// The values of an attribute by local name, each with its namespace.
+    fn namespaced_values<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = (Option<&'a str>, &'a str)> + 'a {
         self.attributes
             .iter()
             .filter(move |(attribute, _, _)| attribute == name)
-            .map(|(_, prefixed, value)| (*prefixed, value.as_str()))
+            .map(|(_, namespace, value)| (namespace.as_deref(), value.as_str()))
     }
 
     /// The first value of an attribute by local name, in any namespace, as
@@ -3925,28 +3964,36 @@ fn match_simple(simple: &Simple, tree: &Tree, node: Node, work: &mut u64) -> Tri
         ),
         Simple::Attribute {
             name,
-            namespaced,
+            namespace,
             operator,
             value,
             case_insensitive,
         } => {
-            let certainty = attribute_certainty(
-                element,
-                name,
-                |actual, loose| {
-                    if loose || *case_insensitive {
-                        attribute_test_folded(*operator, actual, value)
-                    } else {
-                        attribute_test(*operator, actual, value)
+            // Of the attributes in the namespace asked for, one whose value
+            // passes; only without regard to case, it may.
+            let mut result = Tri::No;
+            for (attribute_namespace, actual) in element.namespaced_values(name) {
+                let asked = match namespace {
+                    AttributeNamespace::Unprefixed => attribute_namespace.is_none(),
+                    AttributeNamespace::Any => true,
+                    AttributeNamespace::Named(uri) => uri
+                        .as_deref()
+                        .is_some_and(|uri| attribute_namespace == Some(uri)),
+                };
+                if !asked {
+                    continue;
+                }
+                if *case_insensitive {
+                    if attribute_test_folded(*operator, actual, value) {
+                        return Tri::Yes;
                     }
-                },
-                *namespaced,
-            );
-            if *namespaced && certainty == Tri::Yes {
-                Tri::Maybe
-            } else {
-                certainty
+                } else if attribute_test(*operator, actual, value) {
+                    return Tri::Yes;
+                } else if attribute_test_folded(*operator, actual, value) {
+                    result = Tri::Maybe;
+                }
             }
+            result
         }
         Simple::Pseudo(pseudo) => match pseudo {
             PseudoClass::Never => Tri::No,
@@ -4354,6 +4401,9 @@ pub(super) struct Stylesheet {
     /// The cascade layers it declares, in order, each by its names from the
     /// outermost; an anonymous one by a name no sheet can write.
     layers: Vec<Box<[String]>>,
+    /// The namespace prefixes it declares (`@namespace`), by the names
+    /// they are bound to.
+    namespaces: Rc<[(String, Rc<str>)]>,
 }
 
 impl Stylesheet {
@@ -4439,7 +4489,11 @@ fn parse_rule_list(
                     break;
                 }
                 let (block, end) = block_at(tokens, index);
-                let selectors = RuleSelectors::new(&tokens[start..index], scope.cloned());
+                let selectors = RuleSelectors::new(
+                    &tokens[start..index],
+                    scope.cloned(),
+                    sheet.namespaces.clone(),
+                );
                 parse_style_block(&selectors, block, context, sheet, nesting)?;
                 index = end;
             }
@@ -4507,7 +4561,7 @@ fn parse_at_rule(
                 container: true,
                 ..within(Applies::Doubt)
             }),
-            "scope" => match (selectors, scope_prelude(prelude)) {
+            "scope" => match (selectors, scope_prelude(prelude, &sheet.namespaces)) {
                 (None, Some((root, limited))) => {
                     scope = Some(root);
                     let limit = if limited {
@@ -4566,6 +4620,29 @@ fn parse_at_rule(
             }
         }
     }
+    if name == "namespace" && top_level && selectors.is_none() {
+        // `@namespace epub "http://www.idpf.org/2007/ops";` binds a prefix
+        // the sheet's selectors name namespaces by.
+        let parts = components(trim_whitespace(prelude));
+        let uri = |part: &[Token]| match part {
+            [Token::Str(uri) | Token::Url(uri)] => Some(uri.clone()),
+            [Token::Function(function), ..] if function.eq_ignore_ascii_case("url") => {
+                match trim_whitespace(block_contents(part)) {
+                    [Token::Str(uri)] => Some(uri.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let [[Token::Ident(prefix)], target] = parts.as_slice() {
+            if let Some(uri) = uri(target) {
+                let mut namespaces = sheet.namespaces.to_vec();
+                namespaces.retain(|(declared, _)| declared != prefix);
+                namespaces.push((prefix.clone(), Rc::from(uri)));
+                sheet.namespaces = namespaces.into();
+            }
+        }
+    }
     if name == "import" && top_level && selectors.is_none() {
         if let Some((target, applies)) = import_target(prelude) {
             let applies = applies.min(context.condition);
@@ -4583,7 +4660,7 @@ fn parse_at_rule(
 /// The root an `@scope` rule's style rules match inside, as what `&` and
 /// `:scope` stand for in them, and whether limits (`to (...)`) cut the
 /// scope short; `None` for a rule without a root.
-fn scope_prelude(prelude: &[Token]) -> Option<(Nest, bool)> {
+fn scope_prelude(prelude: &[Token], namespaces: &[(String, Rc<str>)]) -> Option<(Nest, bool)> {
     let parts = components(trim_whitespace(prelude));
     let parenthesized = |part: &[Token]| part.first() == Some(&Token::OpenParen);
     let (root, limited) = match parts.as_slice() {
@@ -4593,7 +4670,11 @@ fn scope_prelude(prelude: &[Token]) -> Option<(Nest, bool)> {
         }
         _ => return None,
     };
-    let list = parse_selector_list(trim_whitespace(block_contents(root)), 0, None);
+    let context = SelectorContext {
+        nest: None,
+        namespaces,
+    };
+    let list = parse_selector_list(trim_whitespace(block_contents(root)), 0, context);
     let nest = Nest {
         parent: list
             .into_iter()
@@ -4656,28 +4737,39 @@ fn import_target(prelude: &[Token]) -> Option<(String, Applies)> {
 struct RuleSelectors<'a> {
     prelude: &'a [Token],
     parent: Option<Nest>,
+    /// The namespace prefixes the sheet declares.
+    namespaces: Rc<[(String, Rc<str>)]>,
     list: std::cell::OnceCell<Vec<ComplexSelector>>,
     nest: std::cell::OnceCell<Nest>,
 }
 
 impl<'a> RuleSelectors<'a> {
-    fn new(prelude: &'a [Token], parent: Option<Nest>) -> Self {
+    fn new(
+        prelude: &'a [Token],
+        parent: Option<Nest>,
+        namespaces: Rc<[(String, Rc<str>)]>,
+    ) -> Self {
         RuleSelectors {
             prelude,
             parent,
+            namespaces,
             list: std::cell::OnceCell::new(),
             nest: std::cell::OnceCell::new(),
         }
     }
 
     fn list(&self) -> &[ComplexSelector] {
-        self.list.get_or_init(|| match &self.parent {
-            Some(parent) => parse_selector_list(
-                &nested_selectors(self.prelude, parent.scope),
-                0,
-                Some(parent),
-            ),
-            None => parse_selector_list(self.prelude, 0, None),
+        self.list.get_or_init(|| {
+            let context = SelectorContext {
+                nest: self.parent.as_ref(),
+                namespaces: &self.namespaces,
+            };
+            match &self.parent {
+                Some(parent) => {
+                    parse_selector_list(&nested_selectors(self.prelude, parent.scope), 0, context)
+                }
+                None => parse_selector_list(self.prelude, 0, context),
+            }
         })
     }
 
@@ -4748,7 +4840,11 @@ fn parse_style_block(
                     }
                     push_style_rule(selectors, &mut declarations, &mut paintings, context, sheet)?;
                     let (inner, end) = block_at(block, index);
-                    let nested = RuleSelectors::new(&block[start..index], Some(selectors.nest()));
+                    let nested = RuleSelectors::new(
+                        &block[start..index],
+                        Some(selectors.nest()),
+                        selectors.namespaces.clone(),
+                    );
                     parse_style_block(&nested, inner, context, sheet, nesting + 1)?;
                     index = end;
                 } else {
@@ -4861,7 +4957,23 @@ fn push_style_rule(
 /// Where a painting declaration stands in the cascade, how surely it
 /// applies, and the SVG resource it names, if one (see
 /// [`Cascade::references`]).
-type Named = (Precedence, Tri, Option<Rc<str>>);
+type Named = (Precedence, Applies, Option<Rc<str>>);
+
+/// The resource a painting property names for some reader for certain: that
+/// of the declaration that wins the cascade where the declarations naming
+/// one apply on some reader, and those naming none may apply on all, unless
+/// one the check cannot settle above it names another.
+fn names_surely(slot: &[Named]) -> Option<Rc<str>> {
+    let (precedence, _, target) = slot
+        .iter()
+        .filter(|(_, applies, target)| Lens::Surely.admits(*applies, target.is_some()))
+        .max_by_key(|(precedence, _, _)| *precedence)?;
+    let target = target.clone()?;
+    let doubted = slot.iter().any(|(other, applies, named)| {
+        other > precedence && *applies == Applies::Doubt && named.as_ref() != Some(&target)
+    });
+    (!doubted).then_some(target)
+}
 
 /// A declaration of a painting property (see [`PAINTING_PROPERTIES`]): which
 /// one, whether it is `!important`, and the SVG resource its value names
@@ -4964,58 +5076,90 @@ fn inline_precedence(important: bool) -> Precedence {
 #[derive(Clone, Copy)]
 struct Applied {
     precedence: Precedence,
-    certainty: Tri,
+    applies: Applies,
     effect: Effect,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Resolved {
-    Hidden,
-    Shown,
-    /// Nothing decides; for `visibility`, the parent's value holds.
-    Inherited,
+/// A reading of how the declarations that vary between readers, or that
+/// the check cannot settle, apply, to tell whether something a reader
+/// shows, or sets apart, holds for some reader.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lens {
+    /// Whether it holds for some reader for certain: a declaration toward
+    /// it counts where it applies on some reader, one against it where it
+    /// may apply on all.
+    Surely,
+    /// Whether it may hold for some reader: a declaration toward it counts
+    /// where it may apply, one against it where it applies on all.
+    Possibly,
 }
 
-/// Resolve one property. A hiding declaration counts unless a declaration
-/// that certainly applies and shows the content beats it in the cascade.
-fn resolve(applied: &[Applied]) -> Resolved {
-    let beaten = |hide: &Applied| {
-        applied.iter().any(|other| {
-            other.certainty == Tri::Yes
-                && matches!(other.effect, Effect::Show | Effect::Inherit)
-                && other.precedence > hide.precedence
-        })
-    };
-    if applied
-        .iter()
-        .any(|hide| hide.effect == Effect::Hide && !beaten(hide))
-    {
-        return Resolved::Hidden;
+impl Lens {
+    fn admits(self, applies: Applies, toward: bool) -> bool {
+        match (self, toward) {
+            (Lens::Surely, true) => applies >= Applies::Varies,
+            (Lens::Surely, false) => matches!(applies, Applies::Doubt | Applies::Yes),
+            (Lens::Possibly, true) => applies != Applies::No,
+            (Lens::Possibly, false) => applies == Applies::Yes,
+        }
     }
-    let Some(best) = applied
+}
+
+/// The value a property takes in a lens (see [`Lens`]): that of the
+/// declaration it admits that wins the cascade, `toward` telling the values
+/// the lens looks for, or `default` where it admits none.
+fn lens_value<T: Clone>(
+    applied: &[(Precedence, Applies, T)],
+    default: T,
+    lens: Lens,
+    toward: impl Fn(&T) -> bool,
+) -> T {
+    applied
         .iter()
-        .filter(|entry| entry.certainty == Tri::Yes && entry.effect != Effect::Neutral)
-        .max_by_key(|entry| entry.precedence)
-    else {
-        return Resolved::Inherited;
+        .filter(|(_, applies, value)| lens.admits(*applies, toward(value)))
+        .max_by_key(|(precedence, _, _)| *precedence)
+        .map_or(default, |(_, _, value)| value.clone())
+}
+
+/// Whether a property hides an element from the readers the check follows:
+/// `No` where some reader shows it for certain, `Yes` where every reader
+/// hides it for certain, and `Maybe` where the check cannot tell. A value
+/// that varies between readers shows the element to those it does not hide
+/// it from. `inherited` is how the parent's value hides it, which
+/// `visibility: inherit` takes, and which holds where nothing decides.
+fn hidden(applied: &[Applied], inherited: Tri) -> Tri {
+    let hides_in = |lens: Lens| {
+        let parent = match lens {
+            Lens::Surely => inherited != Tri::No,
+            Lens::Possibly => inherited == Tri::Yes,
+        };
+        let hides = |effect: Effect| match effect {
+            Effect::Hide => true,
+            Effect::Inherit => parent,
+            Effect::Show | Effect::Neutral => false,
+        };
+        applied
+            .iter()
+            .filter(|entry| {
+                entry.effect != Effect::Neutral && lens.admits(entry.applies, !hides(entry.effect))
+            })
+            .max_by_key(|entry| entry.precedence)
+            .map_or(parent, |entry| hides(entry.effect))
     };
-    let contested = applied.iter().any(|entry| {
-        entry.certainty == Tri::Maybe
-            && !matches!(entry.effect, Effect::Neutral | Effect::Show)
-            && entry.precedence > best.precedence
-    });
-    if best.effect == Effect::Show && !contested {
-        Resolved::Shown
-    } else {
-        Resolved::Inherited
+    match (hides_in(Lens::Surely), hides_in(Lens::Possibly)) {
+        (false, _) => Tri::No,
+        (true, false) => Tri::Maybe,
+        (true, true) => Tri::Yes,
     }
 }
 
 /// What the reader's cascade gives one element.
 pub(super) struct ReaderStyle {
-    display: Resolved,
-    visibility: Resolved,
-    content_visibility: Resolved,
+    /// Whether `display`, `visibility`, and `content-visibility` hide it
+    /// (see [`hidden`]); `visibility` with what it inherits.
+    display: Tri,
+    visibility: Tri,
+    content_visibility: Tri,
     /// Whether the box is inline-level.
     inline: Tri,
     /// Whether it floats beside the lines around it, and whether to their
@@ -5119,16 +5263,20 @@ impl ReaderStyle {
     }
 }
 
-/// The value of the certain declaration that wins the cascade, or `default`
-/// when none does, and whether one that may apply above it says otherwise.
-fn resolve_value<T: Clone + PartialEq>(applied: &[(Precedence, Tri, T)], default: T) -> (T, bool) {
+/// The value of the declaration that wins the cascade among those applying
+/// on every reader for certain, or `default` when none does, and whether
+/// one that may apply above it, or applies on some readers, says otherwise.
+fn resolve_value<T: Clone + PartialEq>(
+    applied: &[(Precedence, Applies, T)],
+    default: T,
+) -> (T, bool) {
     let best = applied
         .iter()
-        .filter(|(_, certainty, _)| *certainty == Tri::Yes)
+        .filter(|(_, applies, _)| *applies == Applies::Yes)
         .max_by_key(|(precedence, _, _)| *precedence);
     let value = best.map_or(default, |best| best.2.clone());
-    let contested = applied.iter().any(|(precedence, certainty, other)| {
-        *certainty != Tri::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
+    let contested = applied.iter().any(|(precedence, applies, other)| {
+        *applies != Applies::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
     });
     (value, contested)
 }
@@ -5148,14 +5296,14 @@ fn all_three(first: Tri, second: Tri, third: Tri) -> Tri {
 /// Resolve how a box flows from the declarations that may apply: the value
 /// of the certain one that wins the cascade, or `default` when none does,
 /// unless one that may apply above it says otherwise.
-fn resolve_flow(applied: &[(Precedence, Tri, Tri)], default: bool) -> Tri {
+fn resolve_flow(applied: &[(Precedence, Applies, Tri)], default: bool) -> Tri {
     let best = applied
         .iter()
-        .filter(|(_, certainty, _)| *certainty == Tri::Yes)
+        .filter(|(_, applies, _)| *applies == Applies::Yes)
         .max_by_key(|(precedence, _, _)| *precedence);
     let value = best.map_or(if default { Tri::Yes } else { Tri::No }, |best| best.2);
-    let contested = applied.iter().any(|(precedence, certainty, other)| {
-        *certainty != Tri::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
+    let contested = applied.iter().any(|(precedence, applies, other)| {
+        *applies != Applies::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
     });
     if contested {
         Tri::Maybe
@@ -5629,7 +5777,7 @@ impl Cascade {
             depth,
             sibling: None,
         };
-        let mut applied: Vec<(Precedence, Tri, Tri)> = Vec::new();
+        let mut applied: Vec<(Precedence, Applies, Tri)> = Vec::new();
         if let Some(rules) = self.custom_rules.get(&name) {
             let mut candidates: Vec<u32> = element
                 .keys()
@@ -5651,8 +5799,8 @@ impl Cascade {
                     *work += 1;
                     continue;
                 }
-                let certainty = rule_applies(rule, *condition, &[], tree, node, work).everywhere();
-                if certainty == Tri::No {
+                let certainty = rule_applies(rule, *condition, &[], tree, node, work);
+                if certainty == Applies::No {
                     continue;
                 }
                 for declaration in rule.declarations.iter().filter(|declaration| {
@@ -5673,7 +5821,11 @@ impl Cascade {
             if declaration.property != Property::Custom || declaration.var != Some(name) {
                 continue;
             }
-            let certainty = if *prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if *prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             applied.push((
                 inline_precedence(declaration.important),
                 certainty,
@@ -5685,7 +5837,7 @@ impl Cascade {
         }
         let certain = applied
             .iter()
-            .any(|(_, certainty, _)| *certainty == Tri::Yes);
+            .any(|(_, certainty, _)| *certainty == Applies::Yes);
         let (value, contested) = resolve_value(&applied, Tri::Maybe);
         Ok(Some(if certain && !contested {
             value
@@ -5721,7 +5873,7 @@ impl Cascade {
         // The fill, the stroke, the clip path, the mask, and the start,
         // middle, and end markers, which `marker` sets together.
         let mut slots: [Vec<Named>; 7] = Default::default();
-        let mut add = |painting: &Painting, precedence: Precedence, certainty: Tri| {
+        let mut add = |painting: &Painting, precedence: Precedence, certainty: Applies| {
             let targets: &[usize] = match painting.property {
                 0..=3 => &[painting.property as usize][..],
                 4 => &[4, 5, 6],
@@ -5740,7 +5892,11 @@ impl Cascade {
         };
         for (property, name) in PAINTING_PROPERTIES.iter().enumerate() {
             for (prefixed, value) in element.values(name) {
-                let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+                let certainty = if prefixed {
+                    Applies::Doubt
+                } else {
+                    Applies::Yes
+                };
                 let tokens = tokenize(value)?;
                 let painting = Painting {
                     property: property as u8,
@@ -5770,9 +5926,8 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty =
-                rule_applies(rule, *condition, &[], tree, tree.top(), work).everywhere();
-            if certainty == Tri::No {
+            let certainty = rule_applies(rule, *condition, &[], tree, tree.top(), work);
+            if certainty == Applies::No {
                 continue;
             }
             for painting in rule.paintings.iter() {
@@ -5784,7 +5939,11 @@ impl Cascade {
             return Err(DocumentError::ResourceLimit);
         }
         for (prefixed, style) in element.values("style") {
-            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             let tokens = tokenize(style)?;
             for painting in split_top_level(&tokens, &Token::Semicolon)
                 .into_iter()
@@ -5805,13 +5964,8 @@ impl Cascade {
                 add(&painting, precedence, certainty);
             }
         }
-        let mut targets: Vec<Rc<str>> = slots
-            .iter()
-            .filter_map(|slot| match resolve_value(slot, None) {
-                (Some(target), false) => Some(target),
-                _ => None,
-            })
-            .collect();
+        let mut targets: Vec<Rc<str>> =
+            slots.iter().filter_map(|slot| names_surely(slot)).collect();
         targets.sort_unstable();
         targets.dedup();
         Ok(targets)
@@ -5844,9 +5998,9 @@ impl Cascade {
         // The left margin, the right margin, the left padding, the right
         // padding, and the width; and the flex basis, `None` where it
         // takes the width.
-        let mut sides: [Vec<(Precedence, Tri, Tri)>; 5] = Default::default();
-        let mut bases: Vec<(Precedence, Tri, Option<Tri>)> = Vec::new();
-        let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
+        let mut sides: [Vec<(Precedence, Applies, Tri)>; 5] = Default::default();
+        let mut bases: Vec<(Precedence, Applies, Option<Tri>)> = Vec::new();
+        let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Applies| {
             let slot = match declaration.property {
                 Property::MarginLeft => 0,
                 Property::MarginRight => 1,
@@ -5878,9 +6032,8 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty =
-                rule_applies(rule, *condition, &[], tree, tree.top(), work).everywhere();
-            if certainty == Tri::No {
+            let certainty = rule_applies(rule, *condition, &[], tree, tree.top(), work);
+            if certainty == Applies::No {
                 continue;
             }
             for declaration in rule.declarations.iter() {
@@ -5896,7 +6049,11 @@ impl Cascade {
             return Err(DocumentError::ResourceLimit);
         }
         for (prefixed, declaration) in element.inline_style(work)? {
-            let certainty = if *prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if *prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             add(
                 &self.resolved(declaration, tree, ancestors, work)?,
                 inline_precedence(declaration.important),
@@ -6039,11 +6196,13 @@ impl Cascade {
 
     /// The cascade for the element at the top of `stack`: author rules,
     /// its inline style, SVG presentation attributes, and the user-agent
-    /// rules that hide content.
+    /// rules that hide content; `inherited_invisible` is how its parent's
+    /// visibility hides it (see [`hidden`]).
     fn evaluate(
         &self,
         tree: &Tree,
         ancestors: &AncestorKeys,
+        inherited_invisible: Tri,
         work: &mut u64,
     ) -> Result<ReaderStyle, DocumentError> {
         let element = tree.stack.last().expect("an element to style");
@@ -6074,10 +6233,10 @@ impl Cascade {
         // a column or in reverse, may wrap, stand in a column of an old
         // flexible box, are spread along the line, and have a gap between
         // them, and whether an old flexible box clamps its lines.
-        let mut flows: [Vec<(Precedence, Tri, Tri)>; 6] = Default::default();
-        let mut layouts: Vec<(Precedence, Tri, Layout)> = Vec::new();
-        let mut item_flags: [Vec<(Precedence, Tri, Tri)>; 6] = Default::default();
-        let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
+        let mut flows: [Vec<(Precedence, Applies, Tri)>; 6] = Default::default();
+        let mut layouts: Vec<(Precedence, Applies, Layout)> = Vec::new();
+        let mut item_flags: [Vec<(Precedence, Applies, Tri)>; 6] = Default::default();
+        let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Applies| {
             let slot = match declaration.property {
                 Property::Display => 0,
                 Property::Visibility => 1,
@@ -6144,9 +6303,16 @@ impl Cascade {
             if let (Property::Display, Some(layout)) = (declaration.property, declaration.layout) {
                 layouts.push((precedence, certainty, layout));
             }
+            // A value computed at run time (`var()`) may hide the element
+            // or not.
+            let applies = if declaration.effect == Effect::Hide && declaration.flow.is_some() {
+                certainty.min(Applies::Doubt)
+            } else {
+                certainty
+            };
             applied[slot].push(Applied {
                 precedence,
-                certainty,
+                applies,
                 effect: declaration.effect,
             });
         };
@@ -6158,16 +6324,17 @@ impl Cascade {
         // is transparent, and whether a margin or padding sets it apart
         // from the element's content (its right for `::before`, its left
         // for `::after`).
-        let mut pseudo_blocks: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_none: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_content: [Vec<(Precedence, Tri, Option<Generated>)>; 2] = Default::default();
-        let mut pseudo_out: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_floats: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_line_feeds: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_hidden: [Vec<(Precedence, Tri, Option<Tri>)>; 2] = Default::default();
-        let mut pseudo_clear: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_margin: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
-        let mut pseudo_padding: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_blocks: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_none: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_content: [Vec<(Precedence, Applies, Option<Generated>)>; 2] =
+            Default::default();
+        let mut pseudo_out: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_floats: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_line_feeds: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_hidden: [Vec<(Precedence, Applies, Option<Tri>)>; 2] = Default::default();
+        let mut pseudo_clear: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_margin: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        let mut pseudo_padding: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
         // Whether a rule for each box may apply at all.
         let mut pseudo_styled = [false; 2];
         for index in candidates {
@@ -6182,9 +6349,8 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty =
-                rule_applies(rule, *condition, recorded, tree, tree.top(), work).everywhere();
-            if certainty == Tri::No {
+            let certainty = rule_applies(rule, *condition, recorded, tree, tree.top(), work);
+            if certainty == Applies::No {
                 continue;
             }
             let pseudo = match rule.selector.pseudo_element {
@@ -6304,7 +6470,11 @@ impl Cascade {
             if declaration.property.spaces() {
                 continue;
             }
-            let certainty = if *prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if *prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             add(
                 &self.resolved(declaration, tree, ancestors, work)?,
                 inline_precedence(declaration.important),
@@ -6328,7 +6498,11 @@ impl Cascade {
             } else {
                 Effect::Neutral
             };
-            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             add(
                 &Declaration {
                     property: Property::Display,
@@ -6351,7 +6525,11 @@ impl Cascade {
                 "inherit" => Effect::Inherit,
                 _ => Effect::Neutral,
             };
-            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             add(
                 &Declaration {
                     property: Property::Visibility,
@@ -6368,7 +6546,11 @@ impl Cascade {
             );
         }
         for (prefixed, value) in element.values("opacity") {
-            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            let certainty = if prefixed {
+                Applies::Doubt
+            } else {
+                Applies::Yes
+            };
             let clear =
                 svg_number(value).map(|opacity| if opacity <= 0.0 { Tri::Yes } else { Tri::No });
             add(
@@ -6429,7 +6611,7 @@ impl Cascade {
                     var: None,
                 },
                 user_agent,
-                Tri::Yes,
+                Applies::Yes,
             );
         }
         // A box exists where `content` gives one and `display` does not take
@@ -6455,8 +6637,23 @@ impl Cascade {
                 resolve_flow(&pseudo_none[slot], false).not(),
                 Tri::Yes,
             );
-            let certain = !contested && exists == Tri::Yes;
-            let text = certain && content == Some(Generated::Text);
+            // What it shows for some reader for certain: what the content
+            // that wins shows where the rules that vary between readers
+            // give it, and neither these nor the rules the check cannot
+            // settle take the box away.
+            let shows =
+                |content: &Option<Generated>| !matches!(content, None | Some(Generated::Nothing));
+            let kept = lens_value(&pseudo_none[slot], Tri::No, Lens::Surely, |none| {
+                *none == Tri::No
+            }) == Tri::No;
+            let surely = lens_value(
+                &pseudo_content[slot],
+                Some(Generated::Nothing),
+                Lens::Surely,
+                shows,
+            )
+            .filter(|_| kept);
+            let text = surely == Some(Generated::Text);
             let line_feed = match content {
                 Some(Generated::LineFeed) if !contested => {
                     match resolve_value(&pseudo_line_feeds[slot], Tri::Maybe) {
@@ -6479,18 +6676,16 @@ impl Cascade {
                         .max(out_of_flow)
                         == Tri::Yes
             };
-            let (sign, bullet) = match content {
-                Some(Generated::Sign(Sign::Dash { trailing, .. })) if certain && slot == 0 => {
+            let (sign, bullet) = match surely {
+                Some(Generated::Sign(Sign::Dash { trailing, .. })) if slot == 0 => {
                     (Some(Sign::Amount), apart(trailing))
                 }
-                Some(Generated::Sign(Sign::Dash { leading, .. })) if certain && apart(leading) => {
+                Some(Generated::Sign(Sign::Dash { leading, .. })) if apart(leading) => {
                     (Some(Sign::Between), false)
                 }
-                Some(Generated::Sign(Sign::Dash { .. })) if certain => (Some(Sign::Amount), false),
-                Some(Generated::Sign(sign)) if certain => (Some(sign), false),
-                Some(Generated::Ornament | Generated::LineFeed) if certain => {
-                    (Some(Sign::Between), false)
-                }
+                Some(Generated::Sign(Sign::Dash { .. })) => (Some(Sign::Amount), false),
+                Some(Generated::Sign(sign)) => (Some(sign), false),
+                Some(Generated::Ornament | Generated::LineFeed) => (Some(Sign::Between), false),
                 _ => (None, false),
             };
             let breaks = all_three(
@@ -6554,9 +6749,9 @@ impl Cascade {
             }
         };
         Ok(ReaderStyle {
-            display: resolve(&applied[0]),
-            visibility: resolve(&applied[1]),
-            content_visibility: resolve(&applied[2]),
+            display: hidden(&applied[0], Tri::No),
+            visibility: hidden(&applied[1], inherited_invisible),
+            content_visibility: hidden(&applied[2], Tri::No),
             inline,
             floats: resolve_flow(&flows[1], false),
             floats_to_start: resolve_flow(&flows[3], false),
@@ -6776,12 +6971,14 @@ enum Exempt {
 struct Open {
     reach: Reach,
     caption_seen: bool,
-    /// The element is not rendered: `display: none` on it or an ancestor,
-    /// or fallback content of a media element.
-    undisplayed: bool,
-    invisible: bool,
-    /// `content-visibility: hidden`: nothing inside is rendered.
-    contents_hidden: bool,
+    /// Whether the element is not rendered: `display: none` on it or an
+    /// ancestor, or fallback content of a media element; whether it is
+    /// invisible; and whether nothing inside is rendered
+    /// (`content-visibility: hidden`). Each `No` where some reader shows it
+    /// for certain, `Yes` where every reader hides it (see [`hidden`]).
+    undisplayed: Tri,
+    invisible: Tri,
+    contents_hidden: Tri,
     /// Children are fallback content a reader replaces.
     fallback: bool,
     /// It is, or may be, transparent (`opacity: 0`), with all it holds.
@@ -8339,7 +8536,7 @@ fn meet_run(
             // AnyDoc skips an element its styles hide as though it were not
             // there, while a reader may show it: a line break, or a block,
             // even an empty one, starts a new line.
-            let shown = style.is_some_and(|style| style.display != Resolved::Hidden);
+            let shown = style.is_some_and(|style| style.display != Tri::Yes);
             if shown && local == "br" {
                 run.boundary = true;
             } else if shown {
@@ -8405,7 +8602,7 @@ fn meet_run(
             // link holding nothing else loses it with its empty paragraph.
             ("br", Reach::Dropped) => {
                 run.space('\n');
-                if style.is_none_or(|style| style.display != Resolved::Hidden) {
+                if style.is_none_or(|style| style.display != Tri::Yes) {
                     run.boundary = true;
                 }
             }
@@ -8627,19 +8824,24 @@ pub(super) fn chapter_text(
                 .last()
                 .filter(|_| text.chars().any(|character| !character.is_whitespace()));
             if let Some(state) = state {
-                let hidden = state.undisplayed
-                    || state.invisible
-                    || state.contents_hidden
-                    || state.fallback
-                    || state.paint == Paint::No
-                    || (state.in_svg && !state.svg_text);
+                // Hidden from every reader for certain (`Yes`), shown to
+                // some for certain (`No`), or in doubt: text in doubt
+                // counts both where AnyDoc converts it and where it drops
+                // it.
+                let certainly =
+                    state.fallback || state.paint == Paint::No || (state.in_svg && !state.svg_text);
+                let hidden = state
+                    .undisplayed
+                    .max(state.invisible)
+                    .max(state.contents_hidden)
+                    .max(if certainly { Tri::Yes } else { Tri::No });
                 let shown_anyway = match state.exempt {
                     Exempt::None => false,
                     Exempt::Description => true,
                     Exempt::RubyParenthesis => !text.chars().any(char::is_alphanumeric),
                 };
                 match state.reach {
-                    Reach::Walk | Reach::Whole if hidden => {
+                    Reach::Walk | Reach::Whole if hidden != Tri::No => {
                         found.converts_hidden |= !shown_anyway;
                     }
                     // Text in a resource converts hidden unless something a
@@ -8660,7 +8862,7 @@ pub(super) fn chapter_text(
                     | Reach::RowGroup
                     | Reach::Row
                     | Reach::Omitted => {
-                        found.drops_shown |= !hidden && state.exempt == Exempt::None;
+                        found.drops_shown |= hidden != Tri::Yes && state.exempt == Exempt::None;
                     }
                 }
                 if found.converts_hidden && found.drops_shown && found.fuses_blocks {
@@ -8686,17 +8888,51 @@ pub(super) fn chapter_text(
         element_index += 1;
         let local =
             String::from_utf8_lossy(super::xml_local_name(start.name().as_ref())).into_owned();
+        // The namespaces its attributes are in, as the prefixes are bound on
+        // it or around it.
+        let bindings: Vec<(String, Rc<str>)> = start
+            .attributes()
+            .flatten()
+            .filter_map(|attribute| {
+                let prefix = attribute.key.as_ref().strip_prefix(b"xmlns:")?;
+                let uri = String::from_utf8_lossy(attribute.value.as_ref()).into_owned();
+                Some((String::from_utf8_lossy(prefix).into_owned(), Rc::from(uri)))
+            })
+            .collect();
+        let namespace = |key: &[u8]| {
+            let colon = key.iter().position(|byte| *byte == b':')?;
+            let prefix = String::from_utf8_lossy(&key[..colon]);
+            let bound = bindings
+                .iter()
+                .rev()
+                .chain(
+                    elements
+                        .iter()
+                        .rev()
+                        .flat_map(|element| element.bindings.iter().rev()),
+                )
+                .find(|(bound, _)| *bound == prefix)
+                .map(|(_, uri)| uri.clone());
+            Some(bound.unwrap_or_else(|| {
+                Rc::from(if prefix == "xml" {
+                    "http://www.w3.org/XML/1998/namespace"
+                } else {
+                    ""
+                })
+            }))
+        };
         let attributes = super::xml_attributes(&start)
             .into_iter()
             .map(|attribute| {
                 (
                     String::from_utf8_lossy(attribute.local()).to_ascii_lowercase(),
-                    attribute.prefixed(),
+                    namespace(&attribute.key),
                     attribute.value,
                 )
             })
             .collect();
-        let element = Element::new(&local, attributes, fact.position);
+        let mut element = Element::new(&local, attributes, fact.position);
+        element.bindings = bindings.into_boxed_slice();
         let reach = match open.last_mut() {
             None => {
                 if element.local == "html" && !root_taken {
@@ -8815,7 +9051,8 @@ pub(super) fn chapter_text(
                 stack: &elements,
                 earlier: &earlier,
             };
-            Some(reader.evaluate(&tree, &ancestors, work)?)
+            let inherited_invisible = open.last().map_or(Tri::No, |parent| parent.invisible);
+            Some(reader.evaluate(&tree, &ancestors, inherited_invisible, work)?)
         } else {
             None
         };
@@ -8951,9 +9188,9 @@ pub(super) fn chapter_text(
             None => Open {
                 reach,
                 caption_seen: false,
-                undisplayed: false,
-                invisible: false,
-                contents_hidden: false,
+                undisplayed: Tri::No,
+                invisible: Tri::No,
+                contents_hidden: Tri::No,
                 fallback: false,
                 transparent: false,
                 in_svg: children_in_svg,
@@ -8973,7 +9210,6 @@ pub(super) fn chapter_text(
                 effects,
             },
             Some(style) => {
-                let inherited_invisible = parent.is_some_and(|parent| parent.invisible);
                 let exempt = match parent.map(|parent| parent.exempt) {
                     Some(exempt) if exempt != Exempt::None => exempt,
                     _ if in_svg
@@ -8998,15 +9234,14 @@ pub(super) fn chapter_text(
                 Open {
                     reach,
                     caption_seen: false,
-                    undisplayed: parent.is_some_and(|parent| {
-                        parent.undisplayed || parent.contents_hidden || parent.fallback
-                    }) || style.display == Resolved::Hidden,
-                    invisible: match style.visibility {
-                        Resolved::Hidden => true,
-                        Resolved::Shown => false,
-                        Resolved::Inherited => inherited_invisible,
-                    },
-                    contents_hidden: style.content_visibility == Resolved::Hidden,
+                    undisplayed: parent
+                        .map_or(Tri::No, |parent| {
+                            let fallback = if parent.fallback { Tri::Yes } else { Tri::No };
+                            parent.undisplayed.max(parent.contents_hidden).max(fallback)
+                        })
+                        .max(style.display),
+                    invisible: style.visibility,
+                    contents_hidden: style.content_visibility,
                     fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
                     transparent: parent.is_some_and(|parent| parent.transparent)
                         || style.transparent != Tri::No,
@@ -9039,8 +9274,8 @@ pub(super) fn chapter_text(
         // transparent, drawing something, and standing where the image
         // paints, or in a resource that paints where drawn.
         if !references.is_empty()
-            && !state.undisplayed
-            && !state.invisible
+            && state.undisplayed == Tri::No
+            && state.invisible == Tri::No
             && !state.transparent
             && svg_draws(element, has_children, fact.has_elements)
         {
@@ -9055,11 +9290,12 @@ pub(super) fn chapter_text(
                 resources.refer(*painting, id, drawn, sized_zero);
             }
         }
-        let hidden = state.undisplayed || state.contents_hidden || state.paint == Paint::No;
+        let hidden =
+            state.undisplayed.max(state.contents_hidden) != Tri::No || state.paint == Paint::No;
         let generated = style
             .as_ref()
             .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
-        let seen = |pseudo: &PseudoBox| !pseudo.unseen.unwrap_or(state.invisible);
+        let seen = |pseudo: &PseudoBox| !pseudo.unseen.unwrap_or(state.invisible != Tri::No);
         found.drops_shown |= generated.is_some_and(|style| {
             [style.before, style.after]
                 .iter()
@@ -9512,6 +9748,30 @@ mod tests {
             &["span[data-kind=\"pagenum\"] { display: none }"],
             &pagebreak("12")
         ));
+    }
+
+    #[test]
+    fn attribute_selectors_ask_for_the_namespace_their_prefix_names() {
+        // A page number a publisher hides through `epub:type`, set between
+        // list items, where AnyDoc drops it too.
+        let listed = r#"<ol><li>Mortgage interest</li><span epub:type="pagebreak">14</span><li>State and local taxes</li></ol>"#;
+        let ops = r#"@namespace epub "http://www.idpf.org/2007/ops";"#;
+        for rule in [
+            r#"span[epub|type~="pagebreak"] { display: none }"#,
+            r#"span[*|type~="pagebreak"] { display: none }"#,
+        ] {
+            assert!(!drops_shown(&[&format!("{ops} {rule}")], listed), "{rule}");
+        }
+        // No namespace, another one, or a prefix no rule declares match
+        // no attribute in the EPUB namespace.
+        for sheet in [
+            format!(r#"{ops} span[type~="pagebreak"] {{ display: none }}"#),
+            format!(r#"{ops} span[|type~="pagebreak"] {{ display: none }}"#),
+            r#"@namespace epub "http://example.com/other"; span[epub|type~="pagebreak"] { display: none }"#.to_string(),
+            r#"span[ops|type~="pagebreak"] { display: none }"#.to_string(),
+        ] {
+            assert!(drops_shown(&[&sheet], listed), "{sheet}");
+        }
     }
 
     #[test]
@@ -11071,16 +11331,68 @@ mod tests {
     }
 
     #[test]
+    fn text_some_readers_show_is_shown_and_text_in_doubt_counts_both_ways() {
+        let refund = r#"<p>Refund due <span class="x">1,250.00</span> by April.</p>"#;
+        // Text readers of some screens show, which AnyDoc drops, is lost;
+        // converted, it is text those readers show. A first rule in a
+        // media block is one AnyDoc does not read, the rules after it ones
+        // it reads everywhere.
+        for (sheet, drops) in [
+            (
+                ".x { display: none } @media (max-width: 600px) { .x { display: inline } }",
+                true,
+            ),
+            (
+                "@media (min-width: 768px) { .z { color: red } .x { display: none !important } }",
+                true,
+            ),
+            (
+                ".x { display: none !important } @media (min-width: 768px) { .z { color: red } .x { display: inline !important } }",
+                false,
+            ),
+            ("@media (max-width: 600px) { .x { display: none } }", false),
+            (
+                "p { visibility: hidden } @media (min-width: 768px) { p { visibility: visible } }",
+                false,
+            ),
+        ] {
+            assert_eq!(drops_shown(&[sheet], refund), drops, "{sheet}");
+            assert!(!converts_hidden(&[sheet], refund), "{sheet}");
+        }
+        // Text a rule the check cannot settle may show or hide counts where
+        // AnyDoc drops it and where it converts it.
+        assert!(drops_shown(
+            &[".x { display: none } p:has(.x) .x { display: inline }"],
+            refund
+        ));
+        assert!(converts_hidden(
+            &["p .x { display: none } p:has(b) .x { display: inline }"],
+            refund
+        ));
+        assert!(drops_shown(
+            &["p { container-type: inline-size } @container (min-width: 0) { .d { color: red } .x { display: none } }"],
+            refund
+        ));
+        // Text every reader hides for certain, AnyDoc may drop.
+        assert!(!drops_shown(
+            &[".x { display: none } p .x { display: none }"],
+            refund
+        ));
+    }
+
+    #[test]
     fn rules_whose_conditions_may_not_hold_neither_hide_nor_show() {
         let body = r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#;
         let sign = r#".s::before { content: "\2212" }"#;
         // A rule a condition guards that may not hold, or never holds,
-        // keeps no sign from showing.
+        // keeps no sign from showing, nor one that holds only on some
+        // readers' screens.
         for guarded in [
             "@supports (display: bogus-value) { .s::before { opacity: 0 } }",
             "@supports not (display: grid) { .s::before { opacity: 0 } }",
             "@media (min-width: 5000px) { .s::before { visibility: hidden } }",
             "@media print { .s::before { visibility: hidden } }",
+            "@media (max-width: 40em) { .s::before { visibility: hidden } }",
             "@container (min-width: 5000px) { .s::before { opacity: 0 } }",
             "@scope (.nothing) { .s::before { opacity: 0 } }",
             "@starting-style { .s::before { opacity: 0 } }",
@@ -11095,18 +11407,24 @@ mod tests {
             ],
             body
         ));
-        // Nor shows a sign it gives.
+        // A sign it gives shows where it holds on some readers' screens,
+        // and not where the check cannot tell.
+        for guarded in [
+            r#"@media screen { .s::before { content: "\2212" } }"#,
+            r#"@media (min-width: 40em) { .s::before { content: "\2212" } }"#,
+            r#"@media (hover: hover) { .s::before { content: "\2212" } }"#,
+        ] {
+            assert!(drops_shown(&[guarded], body), "{guarded}");
+        }
         for guarded in [
             r#"@supports (display: totally-bogus) { .s::before { content: "\2212" } }"#,
-            r#"@media (min-width: 40em) { .s::before { content: "\2212" } }"#,
             r#"@starting-style { .s::before { content: "\2212" } }"#,
+            r#"p { container-type: inline-size } @container (min-width: 40em) { .s::before { content: "\2212" } }"#,
+            r#"@media (min-width: 40em) { .s::before { content: "\2212" } } p:has(b) .s::before { content: none }"#,
         ] {
             assert!(!drops_shown(&[guarded], body), "{guarded}");
         }
-        assert!(drops_shown(
-            &[r#"@media screen { .s::before { content: "\2212" } }"#],
-            body
-        ));
+
         // Blocks a flex box that may not be one lays out stand apart.
         let rows = r#"<div class="r"><div>Balance due</div><div>Grand total</div></div>"#;
         for guarded in [
@@ -11403,7 +11721,7 @@ mod tests {
         let element = |class: &str| {
             Element::new(
                 "p",
-                vec![("class".to_string(), false, class.to_string())],
+                vec![("class".to_string(), None, class.to_string())],
                 Position::default(),
             )
         };
