@@ -8043,11 +8043,48 @@ fn preflight_rejection(kind: DocumentKind, preflight: &PackagePreflight) -> Opti
     incomplete.then_some(DocumentError::IncompleteConversion)
 }
 
+/// Whether a zip archive holds more central directory records than AnyDoc
+/// reads (`MAX_ARCHIVE_ENTRIES`), counted by their signature without
+/// reading the directory. Opening the archive indexes every entry first:
+/// a 43 MB package of empty entries costs a second and 340 MiB before any
+/// bound applies, and AnyDoc then refuses it.
+fn zip_past_entry_bound(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"PK\x03\x04") {
+        return false;
+    }
+    let mut records = 0usize;
+    let mut rest = bytes;
+    while let Some(at) = rest.windows(4).position(|window| window == b"PK\x01\x02") {
+        records += 1;
+        if records > MAX_ARCHIVE_ENTRIES {
+            return true;
+        }
+        rest = &rest[at + 4..];
+    }
+    false
+}
+
 fn classify_bytes(bytes: &[u8], path: &Path) -> DocumentClassification {
-    let detected_format =
-        anydoc::Format::from_bytes(bytes).or_else(|| anydoc::Format::from_path(path));
+    classify_package(bytes, path, zip_past_entry_bound(bytes))
+}
+
+/// Classify bytes, `oversized` when they are an archive past AnyDoc's
+/// entry bound: such an archive is not opened, and as AnyDoc's detection
+/// finds no format in it, its extension names one.
+fn classify_package(bytes: &[u8], path: &Path, oversized: bool) -> DocumentClassification {
+    let detected_format = if oversized {
+        anydoc::Format::from_path(path)
+    } else {
+        anydoc::Format::from_bytes(bytes).or_else(|| anydoc::Format::from_path(path))
+    };
     let detected = detected_format.map(DocumentKind::from_anydoc);
-    let variant = detected_format.map(|format| DocumentVariant::for_format(format, bytes, path));
+    let variant = detected_format.map(|format| {
+        if oversized {
+            DocumentVariant::from_extension(path, format)
+        } else {
+            DocumentVariant::for_format(format, bytes, path)
+        }
+    });
     let capabilities = detected.map(capabilities);
     let enabled = capabilities.as_ref().is_some_and(|value| value.enabled)
         && matches!(
@@ -8086,7 +8123,12 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
     if bytes.len() as u64 > MAX_DOCUMENT_SIZE {
         return Err(DocumentError::ResourceLimit);
     }
-    let classification = classify_bytes(&bytes, &canonical);
+    // An archive with more entries than AnyDoc reads is refused unopened,
+    // as the worker would refuse it after indexing them all.
+    if zip_past_entry_bound(&bytes) {
+        return Err(DocumentError::ResourceLimit);
+    }
+    let classification = classify_package(&bytes, &canonical, false);
     let kind = classification.kind.ok_or(DocumentError::Unrecognized)?;
     let variant = classification.variant.ok_or(DocumentError::Unrecognized)?;
     if kind == DocumentKind::Docx && variant != DocumentVariant::Docx {
@@ -13475,10 +13517,19 @@ mod tests {
             .iter()
             .map(|(name, bytes)| (name.as_str(), *bytes))
             .collect();
+        let oversized = zip_entries(&entries);
         assert!(matches!(
-            open_package(&zip_entries(&entries)),
+            open_package(&oversized),
             Err(DocumentError::ResourceLimit)
         ));
+        // It is found without opening it, and classified by its extension.
+        assert!(zip_past_entry_bound(&oversized));
+        let classified = classify_bytes(&oversized, Path::new("many.docx"));
+        assert_eq!(classified.kind, Some(DocumentKind::Docx));
+        assert_eq!(classified.variant, Some(DocumentVariant::Docx));
+        let within = zip_entries(&entries[1..]);
+        assert!(!zip_past_entry_bound(&within));
+        assert!(!zip_past_entry_bound(b"%PDF-1.7 PK\x01\x02"));
     }
 
     #[test]
