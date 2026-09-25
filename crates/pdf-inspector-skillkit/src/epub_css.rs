@@ -16,6 +16,12 @@
 //!
 //! Text that both models hide, or that AnyDoc drops, is not flagged: the
 //! conversion then matches what a reader shows.
+//!
+//! A chapter is also flagged when AnyDoc runs together text a reader shows
+//! on separate lines. For that the reader model reads how boxes flow:
+//! `display` (inline-level or block-level), `float`, and block `::before`
+//! and `::after` boxes. The chapter walk mirrors AnyDoc's inline runs,
+//! including the way it flattens a link's blocks into the text around it.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -30,8 +36,8 @@ const MAX_COMPOUNDS: usize = 32;
 const MAX_SELECTOR_NESTING: usize = 8;
 /// `@import` statements one stylesheet may carry.
 pub(super) const MAX_IMPORTS_PER_SHEET: usize = 256;
-/// Style rules that set `display`, `visibility`, or `content-visibility`,
-/// across a package's stylesheets. Real books carry a few dozen.
+/// Style rules that set `display`, `visibility`, `content-visibility`, or
+/// `float`, across a package's stylesheets. Real books carry a few dozen.
 pub(super) const MAX_STYLE_RULES: usize = 16_384;
 /// Compound-selector evaluations across a package: one element tested
 /// against one rule costs one per compound it reaches.
@@ -572,6 +578,7 @@ enum Property {
     Display,
     Visibility,
     ContentVisibility,
+    Float,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,7 +596,50 @@ struct Declaration {
     property: Property,
     effect: Effect,
     important: bool,
+    /// How the box flows: for `display`, whether it is inline-level; for
+    /// `float`, whether it floats. `Maybe` for a value not known until run
+    /// time; `None` for a declaration a reader ignores.
+    flow: Option<Tri>,
 }
+
+/// `display` keywords that make a box inline-level: it sits in the line
+/// around it. `initial` and `unset` give `inline`.
+const INLINE_DISPLAY_KEYWORDS: [&str; 17] = [
+    "inline",
+    "inline-block",
+    "inline-table",
+    "inline-flex",
+    "inline-grid",
+    "inline-list-item",
+    "ruby",
+    "ruby-base",
+    "ruby-text",
+    "contents",
+    "math",
+    "-webkit-inline-box",
+    "-webkit-inline-flex",
+    "-moz-inline-box",
+    "-ms-inline-flexbox",
+    "-ms-inline-grid",
+    "initial",
+];
+
+/// `display` keywords that make a box block-level: a reader starts a new
+/// line for it.
+const BLOCK_DISPLAY_KEYWORDS: [&str; 12] = [
+    "block",
+    "flow",
+    "flow-root",
+    "table",
+    "flex",
+    "grid",
+    "list-item",
+    "-webkit-box",
+    "-webkit-flex",
+    "-moz-box",
+    "-ms-flexbox",
+    "-ms-grid",
+];
 
 const DISPLAY_KEYWORDS: [&str; 44] = [
     "block",
@@ -639,8 +689,8 @@ const DISPLAY_KEYWORDS: [&str; 44] = [
 ];
 
 /// The declaration a token run holds, if it sets `display`, `visibility`,
-/// or `content-visibility`. A value computed at run time (`var()`, `env()`,
-/// `attr()`, `if()`) may hide, so it counts as hiding.
+/// `content-visibility`, or `float`. A value computed at run time (`var()`,
+/// `env()`, `attr()`, `if()`) may hide, so it counts as hiding.
 fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
     let tokens = trim_whitespace(tokens);
     let [Token::Ident(name), rest @ ..] = tokens else {
@@ -650,6 +700,7 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         "display" => Property::Display,
         "visibility" => Property::Visibility,
         "content-visibility" => Property::ContentVisibility,
+        "float" => Property::Float,
         _ => return None,
     };
     let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
@@ -707,10 +758,24 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         }
         _ => Effect::Neutral,
     };
+    let flow = match property {
+        _ if computed => Some(Tri::Maybe),
+        _ if other || keywords.is_empty() => None,
+        Property::Display if effect != Effect::Show => None,
+        Property::Display if has(&INLINE_DISPLAY_KEYWORDS) || has(&["unset"]) => Some(Tri::Yes),
+        Property::Display if has(&BLOCK_DISPLAY_KEYWORDS) => Some(Tri::No),
+        Property::Display => Some(Tri::Maybe),
+        Property::Float if keywords.len() > 1 => None,
+        Property::Float if has(&["left", "right", "inline-start", "inline-end"]) => Some(Tri::Yes),
+        Property::Float if has(&["none", "initial", "unset"]) => Some(Tri::No),
+        Property::Float => Some(Tri::Maybe),
+        Property::Visibility | Property::ContentVisibility => None,
+    };
     Some(Declaration {
         property,
         effect,
         important,
+        flow,
     })
 }
 
@@ -814,7 +879,19 @@ struct ComplexSelector {
     combinators: Vec<Combinator>,
     specificity: (u32, u32, u32),
     /// Styles a pseudo-element, whose hiding hides no element text.
-    pseudo_element: bool,
+    pseudo_element: PseudoElement,
+}
+
+/// The pseudo-element a selector styles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PseudoElement {
+    None,
+    /// `::before`, a box before the element's content.
+    Before,
+    /// `::after`, a box after it.
+    After,
+    /// `::first-line`, `::marker`, and the rest.
+    Other,
 }
 
 impl ComplexSelector {
@@ -826,7 +903,7 @@ impl ComplexSelector {
             }],
             combinators: Vec::new(),
             specificity: (0, 0, 0),
-            pseudo_element: false,
+            pseudo_element: PseudoElement::None,
         }
     }
 }
@@ -857,7 +934,7 @@ fn parse_complex(tokens: &[Token], nesting: usize) -> ComplexSelector {
     let mut items: Vec<SelectorItem> = Vec::new();
     let mut current = Compound::default();
     let mut specificity = (0, 0, 0);
-    let mut pseudo_element = false;
+    let mut pseudo_element = PseudoElement::None;
     let mut index = 0;
     let flush = |current: &mut Compound, items: &mut Vec<SelectorItem>| {
         if !current.parts.is_empty() {
@@ -933,7 +1010,7 @@ fn parse_simple(
     nesting: usize,
     compound: &mut Compound,
     specificity: &mut (u32, u32, u32),
-    pseudo_element: &mut bool,
+    pseudo_element: &mut PseudoElement,
 ) -> usize {
     let name_at = |at: usize| matches!(tokens.get(at), Some(Token::Ident(_) | Token::Delim('*')));
     match &tokens[index] {
@@ -984,7 +1061,15 @@ fn parse_simple(
         }
         Token::Colon => {
             if tokens.get(index + 1) == Some(&Token::Colon) {
-                *pseudo_element = true;
+                *pseudo_element = match tokens.get(index + 2) {
+                    Some(Token::Ident(name)) if name.eq_ignore_ascii_case("before") => {
+                        PseudoElement::Before
+                    }
+                    Some(Token::Ident(name)) if name.eq_ignore_ascii_case("after") => {
+                        PseudoElement::After
+                    }
+                    _ => PseudoElement::Other,
+                };
                 specificity.2 += 1;
                 return if index + 2 < tokens.len() {
                     skip_component(tokens, index + 2)
@@ -999,7 +1084,11 @@ fn parse_simple(
                         name.as_str(),
                         "before" | "after" | "first-line" | "first-letter"
                     ) {
-                        *pseudo_element = true;
+                        *pseudo_element = match name.as_str() {
+                            "before" => PseudoElement::Before,
+                            "after" => PseudoElement::After,
+                            _ => PseudoElement::Other,
+                        };
                         specificity.2 += 1;
                     } else {
                         specificity.1 += 1;
@@ -1684,8 +1773,18 @@ fn parse_style_block(
     }
     if media && !declarations.is_empty() {
         let declarations: Rc<[Declaration]> = declarations.into();
+        // A `::before` or `::after` box matters only for where a reader
+        // breaks lines, which its `display` decides.
+        let lays_out = declarations
+            .iter()
+            .any(|declaration| declaration.property == Property::Display);
         for selector in parse_selector_list(selectors, 0) {
-            if !selector.pseudo_element {
+            let kept = match selector.pseudo_element {
+                PseudoElement::None => true,
+                PseudoElement::Before | PseudoElement::After => lays_out,
+                PseudoElement::Other => false,
+            };
+            if kept {
                 sheet.rules.push(Rc::new(StyleRule {
                     selector,
                     declarations: declarations.clone(),
@@ -1767,6 +1866,67 @@ pub(super) struct ReaderStyle {
     display: Resolved,
     visibility: Resolved,
     content_visibility: Resolved,
+    /// Whether the box is inline-level.
+    inline: Tri,
+    /// Whether it floats.
+    floats: Tri,
+    /// A `::before` or `::after` box that may be a block, breaking the line
+    /// before or after the element's content.
+    breaks_before: bool,
+    breaks_after: bool,
+}
+
+impl ReaderStyle {
+    /// A reader certainly lays the element out in the line around it.
+    fn inline(&self) -> bool {
+        self.inline == Tri::Yes && self.floats == Tri::No
+    }
+
+    /// A reader certainly floats the element beside the lines that follow.
+    fn floats(&self) -> bool {
+        self.floats == Tri::Yes
+    }
+}
+
+/// Resolve how a box flows from the declarations that may apply: the value
+/// of the certain one that wins the cascade, or `default` when none does,
+/// unless one that may apply above it says otherwise.
+fn resolve_flow(applied: &[(Precedence, Tri, Tri)], default: bool) -> Tri {
+    let best = applied
+        .iter()
+        .filter(|(_, certainty, _)| *certainty == Tri::Yes)
+        .max_by_key(|(precedence, _, _)| *precedence);
+    let value = best.map_or(if default { Tri::Yes } else { Tri::No }, |best| best.2);
+    let contested = applied.iter().any(|(precedence, certainty, other)| {
+        *certainty != Tri::Yes && best.is_none_or(|best| *precedence > best.0) && *other != value
+    });
+    if contested {
+        Tri::Maybe
+    } else {
+        value
+    }
+}
+
+/// Elements a reader shows as blocks by default (HTML's rendering section)
+/// that AnyDoc walks inline: its containers, and block elements it does not
+/// know.
+fn reader_block_by_default(local: &str) -> bool {
+    anydoc_container(local)
+        || matches!(
+            local,
+            "address"
+                | "dialog"
+                | "fieldset"
+                | "form"
+                | "hgroup"
+                | "legend"
+                | "listing"
+                | "menu"
+                | "dir"
+                | "plaintext"
+                | "search"
+                | "xmp"
+        )
 }
 
 enum RuleKey {
@@ -1784,6 +1944,8 @@ pub(super) struct Cascade {
     by_class: HashMap<String, Vec<usize>>,
     by_tag: HashMap<String, Vec<usize>>,
     universal: Vec<usize>,
+    /// Rules for `::before` and `::after` boxes.
+    pseudo_rules: usize,
 }
 
 impl Cascade {
@@ -1818,6 +1980,9 @@ impl Cascade {
                         })
                     })
                 });
+            if rule.selector.pseudo_element != PseudoElement::None {
+                self.pseudo_rules += 1;
+            }
             match key {
                 Some(RuleKey::Id(id)) => self.by_id.entry(id).or_default().push(index),
                 Some(RuleKey::Class(class)) => self.by_class.entry(class).or_default().push(index),
@@ -1830,6 +1995,12 @@ impl Cascade {
 
     pub(super) fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Whether any rule styles a `::before` or `::after` box, which may
+    /// break lines around an element with no content of its own.
+    fn styles_pseudo_boxes(&self) -> bool {
+        self.pseudo_rules > 0
     }
 
     /// The cascade for the element at the top of `stack`: author rules,
@@ -1857,22 +2028,63 @@ impl Cascade {
         candidates.dedup();
 
         let mut applied: [Vec<Applied>; 3] = Default::default();
+        let mut flows: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
             let slot = match declaration.property {
                 Property::Display => 0,
                 Property::Visibility => 1,
                 Property::ContentVisibility => 2,
+                Property::Float => {
+                    if let Some(flow) = declaration.flow {
+                        flows[1].push((precedence, certainty, flow));
+                    }
+                    return;
+                }
             };
+            if let (Property::Display, Some(flow)) = (declaration.property, declaration.flow) {
+                flows[0].push((precedence, certainty, flow));
+            }
             applied[slot].push(Applied {
                 precedence,
                 certainty,
                 effect: declaration.effect,
             });
         };
+        // Whether each of `::before` and `::after` is a block box.
+        let mut pseudo_blocks: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         for index in candidates {
             let (rule, order) = &self.rules[index];
             let certainty = match_complex(&rule.selector, stack, work);
             if certainty == Tri::No {
+                continue;
+            }
+            let pseudo = match rule.selector.pseudo_element {
+                PseudoElement::None => None,
+                PseudoElement::Before => Some(0),
+                PseudoElement::After => Some(1),
+                PseudoElement::Other => continue,
+            };
+            if let Some(slot) = pseudo {
+                for declaration in rule.declarations.iter() {
+                    let block = match (declaration.property, declaration.flow) {
+                        (Property::Display, Some(Tri::No)) => Tri::Yes,
+                        (Property::Display, Some(Tri::Yes)) => Tri::No,
+                        (Property::Display, Some(Tri::Maybe)) => Tri::Maybe,
+                        (Property::Display, None) if declaration.effect == Effect::Hide => Tri::No,
+                        _ => continue,
+                    };
+                    let tier = if declaration.important {
+                        TIER_AUTHOR_IMPORTANT
+                    } else {
+                        TIER_AUTHOR
+                    };
+                    let precedence = Precedence {
+                        tier,
+                        specificity: rule.selector.specificity,
+                        order: *order,
+                    };
+                    pseudo_blocks[slot].push((precedence, certainty, block));
+                }
                 continue;
             }
             for declaration in rule.declarations.iter() {
@@ -1935,6 +2147,7 @@ impl Cascade {
                     property: Property::Display,
                     effect,
                     important: false,
+                    flow: None,
                 },
                 presentation,
                 certainty,
@@ -1953,6 +2166,7 @@ impl Cascade {
                     property: Property::Visibility,
                     effect,
                     important: false,
+                    flow: None,
                 },
                 presentation,
                 certainty,
@@ -1992,6 +2206,7 @@ impl Cascade {
                     property: Property::Display,
                     effect: Effect::Hide,
                     important: false,
+                    flow: None,
                 },
                 user_agent,
                 Tri::Yes,
@@ -2001,6 +2216,10 @@ impl Cascade {
             display: resolve(&applied[0]),
             visibility: resolve(&applied[1]),
             content_visibility: resolve(&applied[2]),
+            inline: resolve_flow(&flows[0], !reader_block_by_default(&element.lower)),
+            floats: resolve_flow(&flows[1], false),
+            breaks_before: resolve_flow(&pseudo_blocks[0], false) != Tri::No,
+            breaks_after: resolve_flow(&pseudo_blocks[1], false) != Tri::No,
         })
     }
 }
@@ -2220,10 +2439,26 @@ struct Open {
     fallback: bool,
     in_svg: bool,
     exempt: Exempt,
-    /// How AnyDoc's inline run treats the element (see [`Run`]).
+    /// What the element does to AnyDoc's inline run as it ends.
+    effects: Effects,
+}
+
+/// What an element does to AnyDoc's inline run (see [`Run`]) as it ends.
+#[derive(Clone, Copy, Default)]
+struct Effects {
+    /// It opened a run of its own.
     opens_run: bool,
+    /// AnyDoc starts a new paragraph after it.
     flush_after: bool,
+    /// A reader starts a new line after it and AnyDoc does not.
     boundary_after: bool,
+    /// It opened a [`Splice`].
+    closes_splice: bool,
+    /// It is a block inside a link (see [`Run::edge`]).
+    edge_after: bool,
+    /// A reader floats it: the letters taken in before it, to tell a drop
+    /// cap, beside which the lines after it start.
+    letters_at: Option<u64>,
 }
 
 /// One inline run of AnyDoc's walker (a `Builder`): the text it last
@@ -2234,11 +2469,119 @@ struct Open {
 struct Run {
     last: Option<char>,
     boundary: bool,
+    /// The links, and the lists, tables, and quotes inside them, whose
+    /// content the run is taking in, innermost last.
+    splices: Vec<Splice>,
+    /// The alt text of the packaged image the run last took in, while no
+    /// other text follows it.
+    alt: Option<String>,
+    /// A floated drop cap ended, and the next text starts beside it.
+    beside_float: bool,
+}
+
+/// A link's content, which AnyDoc flattens into the run around the link
+/// (`inline_children_at`): the blocks inside it joined by line breaks, the
+/// first and last with nothing between them and the text on either side,
+/// and each list, table, or quote inside it reduced to its text with its
+/// items, cells, and blocks joined by spaces (`block_text`). A reader shows
+/// every one of those blocks on lines of its own.
+struct Splice {
+    /// What AnyDoc writes between two parts that keep content: a line break
+    /// between a link's blocks, a space within a list, table, or quote.
+    separator: char,
+    /// A part before the current one kept content.
+    parts: bool,
+    /// The current part keeps content.
+    kept: bool,
+    /// Leading white space of the current part is dropped (AnyDoc's
+    /// `start_boundary`, set at every block edge).
+    trim: bool,
+    /// White space or a line break waiting in the current part, kept only
+    /// if content follows before the part ends.
+    pending: Option<char>,
+    /// `pre` text, which AnyDoc keeps whole (`elem.text()`).
+    verbatim: bool,
 }
 
 impl Run {
     fn flush(&mut self) {
         *self = Run::default();
+    }
+
+    /// Whether AnyDoc drops the leading white space of text added now
+    /// (`at_space_boundary`).
+    fn at_space(&self) -> bool {
+        match self.splices.last() {
+            Some(splice) if !splice.kept => splice.trim || splice.pending.is_some(),
+            _ => self.last.is_none_or(char::is_whitespace),
+        }
+    }
+
+    /// Start taking in a link's content, or a list, table, quote, or `pre`
+    /// inside one.
+    fn open_splice(&mut self, separator: char, verbatim: bool) {
+        let trim = match separator {
+            '\n' => self.at_space(),
+            _ => !verbatim,
+        };
+        self.splices.push(Splice {
+            separator,
+            parts: false,
+            kept: false,
+            trim,
+            pending: None,
+            verbatim,
+        });
+    }
+
+    /// A block starts or ends inside a link, where a reader starts a new
+    /// line: the part ends, and white space waiting in it is dropped.
+    fn edge(&mut self) {
+        if let Some(splice) = self.splices.last_mut() {
+            splice.parts |= splice.kept;
+            splice.kept = false;
+            splice.trim = true;
+            splice.pending = None;
+        }
+        self.boundary = true;
+    }
+
+    /// Content arrives: in a link, each part it starts is first given its
+    /// separator, or the white space waiting in it.
+    fn content(&mut self) {
+        let mut gap = None;
+        for splice in &mut self.splices {
+            if !splice.kept {
+                if splice.parts {
+                    gap = Some(splice.separator);
+                } else if let Some(pending) = splice.pending {
+                    gap = gap.or(Some(pending));
+                }
+                splice.kept = true;
+                splice.pending = None;
+            }
+        }
+        if gap.is_some() {
+            self.last = gap;
+        }
+    }
+
+    /// White space, or a line break (`br`), with no content beside it.
+    fn space(&mut self, character: char) {
+        match self.splices.last_mut() {
+            Some(splice) if !splice.kept => {
+                if character == '\n' {
+                    splice.pending = Some('\n');
+                } else if !(splice.trim || splice.pending.is_some()) {
+                    splice.pending = Some(' ');
+                }
+            }
+            _ => {
+                if self.last.is_some() {
+                    self.last = Some(character);
+                }
+            }
+        }
     }
 
     /// Add text to the run; whether it runs into the text before it.
@@ -2248,17 +2591,54 @@ impl Run {
             return false;
         };
         if kept().all(char::is_whitespace) {
-            if self.last.is_some() {
-                self.last = Some(' ');
-            }
+            self.space(' ');
             return false;
         }
+        let first = match self.at_space() {
+            true => kept().find(|character| !character.is_whitespace()),
+            false => Some(first),
+        };
+        self.content();
         let fused = self.boundary
+            && !self.beside_float
             && self.last.is_some_and(|previous| !previous.is_whitespace())
-            && !first.is_whitespace();
+            && first.is_some_and(|first| !first.is_whitespace())
+            && !self.repeats_alt(text);
         self.last = Some(last);
         self.boundary = false;
+        self.beside_float = false;
+        self.alt = None;
         fused
+    }
+
+    /// Take in a packaged image's alt text.
+    fn add_alt(&mut self, alt: &str) -> bool {
+        let fused = self.add(alt);
+        self.alt = Some(alt.to_string()).filter(|alt| !alt.is_empty());
+        fused
+    }
+
+    /// Whether text that runs into a packaged image's alt text only repeats
+    /// it: pandoc 2 gives an implicit figure's image its caption as alt
+    /// text, and the caption runs into it ("ChartChart"), which repeats the
+    /// words without joining two of a reader's values. Digits on both sides
+    /// could be read as one number, so they count as joined.
+    fn repeats_alt(&self, text: &str) -> bool {
+        let Some(alt) = &self.alt else {
+            return false;
+        };
+        let words = |text: &str| {
+            text.chars()
+                .filter(|character| anydoc_keeps(*character))
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (alt, text) = (words(alt), words(text));
+        let digits = alt.ends_with(|character: char| character.is_numeric())
+            && text.starts_with(|character: char| character.is_numeric());
+        !text.is_empty() && (alt.starts_with(&text) || text.starts_with(&alt)) && !digits
     }
 }
 
@@ -2413,6 +2793,204 @@ fn walked_reach(element: &Element, anydoc: &AnyDocCascade) -> Reach {
     }
 }
 
+/// Letters a floated box may hold and still be a drop cap, beside which the
+/// text after it continues the word ("O" and "nce upon a time").
+const MAX_DROP_CAP_LETTERS: u64 = 2;
+
+/// The characters of text AnyDoc keeps that are not white space.
+fn letter_count(text: &str) -> u64 {
+    text.chars()
+        .filter(|character| anydoc_keeps(*character) && !character.is_whitespace())
+        .count() as u64
+}
+
+/// Take in an image AnyDoc converts: a packaged image as its alt text,
+/// inline, and an image from outside the package as Markdown image markup,
+/// which keeps the text on either side apart, except inside a list, table,
+/// or quote in a link, which AnyDoc reduces to plain text, alt text and all.
+/// Whether the alt text runs into the text before it.
+fn take_image(run: &mut Run, element: &Element, letters: &mut u64) -> bool {
+    let source = element
+        .first("src")
+        .or_else(|| element.first("href"))
+        .unwrap_or("");
+    let alt = element.first("alt").unwrap_or("").trim();
+    let plain = run
+        .splices
+        .last()
+        .is_some_and(|splice| splice.separator == ' ');
+    run.content();
+    if anydoc_absolute_uri(source) && !plain {
+        if run.last.is_some() {
+            run.last = Some(' ');
+        }
+        run.alt = None;
+        false
+    } else {
+        *letters += letter_count(alt);
+        run.add_alt(alt)
+    }
+}
+
+/// An element as it starts, for [`meet_run`].
+struct Meeting<'a> {
+    parent: Reach,
+    reach: Reach,
+    element: &'a Element,
+    /// A child element is one of AnyDoc's blocks.
+    has_blocks: bool,
+    /// AnyDoc's styles hide the element, and it skips it as though absent.
+    anydoc_hidden: bool,
+    /// The reader's style, where it was read.
+    style: Option<&'a ReaderStyle>,
+}
+
+/// How an element meets the run it sits in as it starts, and what it will
+/// do to the run as it ends.
+fn meet_run(
+    run: &mut Run,
+    meeting: &Meeting,
+    letters: &mut u64,
+    found: &mut ChapterText,
+) -> Effects {
+    let mut effects = Effects::default();
+    let Meeting {
+        parent,
+        reach,
+        element,
+        has_blocks,
+        anydoc_hidden,
+        style,
+    } = *meeting;
+    let local = element.local.as_str();
+    let spliced = !run.splices.is_empty();
+    // Where AnyDoc keeps the element in the run: a reader starts a new line
+    // for it unless it certainly lays it out inline, and floats it beside
+    // the lines after it when it certainly floats. An element whose style
+    // was not read holds no text; the reader's defaults decide.
+    let (inline, floats) = match style {
+        Some(style) => (style.inline(), style.floats()),
+        None => (!reader_block_by_default(local), false),
+    };
+    let (breaks_before, breaks_after) = style.map_or((false, false), |style| {
+        (style.breaks_before, style.breaks_after)
+    });
+    let keep_in_run = |run: &mut Run, effects: &mut Effects| {
+        if inline {
+            // A block `::before` or `::after` box still breaks the line.
+            run.boundary |= breaks_before;
+            effects.boundary_after = breaks_after;
+            return;
+        }
+        run.boundary = true;
+        effects.boundary_after = true;
+        if floats {
+            effects.letters_at = Some(*letters);
+        }
+    };
+    match (parent, reach) {
+        // An item, caption, or cell of a list or table inside a link: AnyDoc
+        // joins its text to the next with a space.
+        (Reach::List | Reach::Table | Reach::Row, Reach::Walk) if spliced => {
+            run.edge();
+            effects.edge_after = true;
+        }
+        (Reach::Walk, _) if anydoc_hidden => {
+            // AnyDoc skips an element its styles hide as though it were not
+            // there, while a reader may show it: a line break, a rule, or a
+            // block, even an empty one, starts a new line.
+            let shown = style.is_some_and(|style| style.display != Resolved::Hidden);
+            if shown && (matches!(local, "br" | "hr") || anydoc_block(local) || !inline) {
+                run.boundary = true;
+                effects.boundary_after = true;
+            }
+        }
+        (Reach::Walk, _) => match (local, reach) {
+            ("a", Reach::Walk) => {
+                keep_in_run(run, &mut effects);
+                run.open_splice('\n', false);
+                effects.closes_splice = true;
+            }
+            ("p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6", Reach::Walk) if spliced => {
+                run.edge();
+                effects.edge_after = true;
+            }
+            ("blockquote", Reach::Walk) | (_, Reach::List | Reach::Table) if spliced => {
+                run.edge();
+                run.open_splice(' ', false);
+                effects.closes_splice = true;
+                effects.edge_after = true;
+            }
+            ("pre", Reach::Whole) if spliced => {
+                run.edge();
+                run.open_splice(' ', true);
+                effects.closes_splice = true;
+                effects.edge_after = true;
+            }
+            // `math` converts as TeX, kept apart from the text around it.
+            (_, Reach::Whole) if spliced => {
+                run.content();
+                run.last = Some(' ');
+            }
+            ("hr", _) if spliced => {
+                run.edge();
+                run.content();
+                effects.edge_after = true;
+            }
+            ("p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote", Reach::Walk) => {
+                run.flush();
+                effects.opens_run = true;
+                effects.flush_after = true;
+            }
+            (_, Reach::List | Reach::Table | Reach::Whole) | ("hr", _) => {
+                run.flush();
+                effects.flush_after = true;
+            }
+            ("br", Reach::Dropped) => run.space('\n'),
+            ("img" | "image", Reach::Dropped) => {
+                found.fuses_blocks |= take_image(run, element, letters);
+            }
+            (container, Reach::Walk) if anydoc_container(container) && has_blocks => {
+                if spliced {
+                    run.edge();
+                    effects.edge_after = true;
+                } else {
+                    run.flush();
+                    effects.flush_after = true;
+                }
+            }
+            // Walked inline.
+            (_, Reach::Walk) => keep_in_run(run, &mut effects),
+            _ => {}
+        },
+        _ => {}
+    }
+    effects
+}
+
+/// Apply what an element does to AnyDoc's inline run as it ends.
+fn end_element(effects: &Effects, runs: &mut Vec<Run>, letters: u64) {
+    if effects.opens_run {
+        runs.pop();
+    }
+    let Some(run) = runs.last_mut() else {
+        return;
+    };
+    if effects.closes_splice {
+        run.splices.pop();
+    }
+    if effects.edge_after {
+        run.edge();
+    }
+    if effects.flush_after {
+        run.flush();
+    }
+    match effects.letters_at {
+        Some(start) if letters - start <= MAX_DROP_CAP_LETTERS => run.beside_float = true,
+        _ => run.boundary |= effects.boundary_after,
+    }
+}
+
 /// How a chapter's text fares between a reading system and AnyDoc.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ChapterText {
@@ -2446,6 +3024,8 @@ pub(super) fn chapter_text(
     let blocks = block_children(chapter)?;
     let mut element_index = 0usize;
     let mut runs: Vec<Run> = Vec::new();
+    // Characters taken into runs so far, to tell a floated drop cap.
+    let mut letters = 0u64;
     loop {
         let event = xml
             .read_event_into(&mut buffer)
@@ -2456,15 +3036,7 @@ pub(super) fn chapter_text(
             quick_xml::events::Event::End(_) => {
                 elements.pop();
                 if let Some(closed) = open.pop() {
-                    if closed.opens_run {
-                        runs.pop();
-                    }
-                    if let Some(run) = runs.last_mut() {
-                        if closed.flush_after {
-                            run.flush();
-                        }
-                        run.boundary |= closed.boundary_after;
-                    }
+                    end_element(&closed.effects, &mut runs, letters);
                 }
                 buffer.clear();
                 continue;
@@ -2490,8 +3062,11 @@ pub(super) fn chapter_text(
             }
         };
         if let Some(text) = text {
-            if open.last().is_some_and(|state| state.reach == Reach::Walk) {
-                if let Some(run) = runs.last_mut() {
+            if let (Some(state), Some(run)) = (open.last(), runs.last_mut()) {
+                // `pre` text inside a link joins the run around it.
+                let verbatim = run.splices.last().is_some_and(|splice| splice.verbatim);
+                if state.reach == Reach::Walk || (state.reach == Reach::Whole && verbatim) {
+                    letters += letter_count(&text);
                     found.fuses_blocks |= run.add(&text);
                 }
             }
@@ -2616,99 +3191,77 @@ pub(super) fn chapter_text(
                 Reach::Dropped => Reach::Dropped,
             },
         };
+        let parent_reach = open.last().map(|parent| parent.reach);
+        // AnyDoc skips an element its styles hide as though it were absent.
+        let anydoc_hidden = parent_reach == Some(Reach::Walk)
+            && matches!(reach, Reach::Omitted | Reach::Dropped)
+            && anydoc.hides(&element);
+        elements.push(element);
+        let element = elements.last().expect("the element just pushed");
+        // The reader's style: for the text below the element, and for
+        // whether a reader shows an element AnyDoc skips. Nothing below a
+        // dropped or empty element converts or shows.
+        let style = if (has_children && reach != Reach::Dropped)
+            || (anydoc_hidden && (reach == Reach::Omitted || matches!(local.as_str(), "br" | "hr")))
+            || (reach == Reach::Walk
+                && parent_reach == Some(Reach::Walk)
+                && reader.styles_pseudo_boxes())
+        {
+            Some(reader.evaluate(&elements, work)?)
+        } else {
+            None
+        };
         // How the element meets AnyDoc's inline run. Paragraphs, headings,
         // quotes, list items, cells, captions, and the body get runs of
         // their own; lists, tables, `pre`, rules, and containers holding
-        // blocks end the current paragraph; any other container is walked
-        // inline although a reader starts a new block.
-        let parent_reach = open.last().map(|parent| parent.reach);
-        let local = element.local.as_str();
-        let (mut opens_run, mut flush_after, mut boundary_after) = (false, false, false);
-        match (parent_reach, reach) {
-            (Some(Reach::Root), Reach::Walk)
-            | (Some(Reach::List | Reach::Table | Reach::Row), Reach::Walk) => opens_run = true,
-            (Some(Reach::Walk), _) => {
-                let run = runs.last_mut();
-                match (local, reach) {
-                    ("p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote", Reach::Walk) => {
-                        if let Some(run) = run {
-                            run.flush();
-                        }
-                        opens_run = true;
-                        flush_after = true;
-                    }
-                    (_, Reach::List | Reach::Table | Reach::Whole) | ("hr", _) => {
-                        if let Some(run) = run {
-                            run.flush();
-                        }
-                        flush_after = true;
-                    }
-                    ("br", Reach::Dropped) => {
-                        if let Some(run) = run.filter(|run| run.last.is_some()) {
-                            run.last = Some('\n');
-                        }
-                    }
-                    // AnyDoc writes a packaged image as its alt text, inline,
-                    // and an image from outside the package as Markdown image
-                    // markup, which keeps the text on either side apart.
-                    ("img" | "image", Reach::Dropped) if !anydoc.hides(&element) => {
-                        let source = element
-                            .first("src")
-                            .or_else(|| element.first("href"))
-                            .unwrap_or("");
-                        if let Some(run) = run {
-                            if anydoc_absolute_uri(source) {
-                                if run.last.is_some() {
-                                    run.last = Some(' ');
-                                }
-                            } else {
-                                let alt = element.first("alt").unwrap_or("").trim();
-                                found.fuses_blocks |= run.add(alt);
-                            }
-                        }
-                    }
-                    (container, Reach::Walk) if anydoc_container(container) => {
-                        if let Some(run) = run {
-                            if has_blocks {
-                                run.flush();
-                            } else {
-                                run.boundary = true;
-                            }
-                        }
-                        if has_blocks {
-                            flush_after = true;
-                        } else {
-                            boundary_after = true;
-                        }
-                    }
-                    _ => {}
+        // blocks end the current paragraph; everything else is walked
+        // inline, although a reader starts a new line for a container, and
+        // for anything its style makes a block. A link's content joins the
+        // run around it (see [`Splice`]).
+        let spliced = runs.last().is_some_and(|run| !run.splices.is_empty());
+        let mut effects = match (parent_reach, reach, runs.last_mut()) {
+            (Some(Reach::Root), Reach::Walk, _) => Effects {
+                opens_run: true,
+                ..Effects::default()
+            },
+            (Some(Reach::List | Reach::Table | Reach::Row), Reach::Walk, _) if !spliced => {
+                Effects {
+                    opens_run: true,
+                    ..Effects::default()
                 }
             }
-            _ => {}
-        }
+            (Some(parent), _, Some(run)) => meet_run(
+                run,
+                &Meeting {
+                    parent,
+                    reach,
+                    element,
+                    has_blocks,
+                    anydoc_hidden,
+                    style: style.as_ref(),
+                },
+                &mut letters,
+                &mut found,
+            ),
+            _ => Effects::default(),
+        };
         // An empty element holds no text to check.
         if !has_children {
-            if let Some(run) = runs.last_mut() {
-                if flush_after {
-                    run.flush();
-                }
-                run.boundary |= boundary_after;
-            }
+            elements.pop();
+            effects.opens_run = false;
+            end_element(&effects, &mut runs, letters);
             buffer.clear();
             continue;
         }
-        if opens_run {
+        if effects.opens_run {
             runs.push(Run::default());
         }
-        elements.push(element);
         let parent = open.last();
-        let in_svg = parent.is_some_and(|parent| parent.in_svg)
-            || elements
-                .last()
-                .is_some_and(|element| element.lower == "svg");
-        let state = if reach == Reach::Dropped {
+        let element = elements.last().expect("the element just pushed");
+        let in_svg = parent.is_some_and(|parent| parent.in_svg) || element.lower == "svg";
+        let state = match style {
             // Nothing below converts or shows, so its style does not matter.
-            Open {
+            None => Open {
                 children: 0,
                 reach,
                 caption_seen: false,
@@ -2718,41 +3271,38 @@ pub(super) fn chapter_text(
                 fallback: false,
                 in_svg,
                 exempt: Exempt::None,
-                opens_run,
-                flush_after,
-                boundary_after,
-            }
-        } else {
-            let style = reader.evaluate(&elements, work)?;
-            let element = elements.last().expect("the element just pushed");
-            let inherited_invisible = parent.is_some_and(|parent| parent.invisible);
-            let exempt = match parent.map(|parent| parent.exempt) {
-                Some(exempt) if exempt != Exempt::None => exempt,
-                _ if in_svg && matches!(element.lower.as_str(), "title" | "desc" | "metadata") => {
-                    Exempt::Description
+                effects,
+            },
+            Some(style) => {
+                let inherited_invisible = parent.is_some_and(|parent| parent.invisible);
+                let exempt = match parent.map(|parent| parent.exempt) {
+                    Some(exempt) if exempt != Exempt::None => exempt,
+                    _ if in_svg
+                        && matches!(element.lower.as_str(), "title" | "desc" | "metadata") =>
+                    {
+                        Exempt::Description
+                    }
+                    _ if element.lower == "rp" => Exempt::RubyParenthesis,
+                    _ => Exempt::None,
+                };
+                Open {
+                    children: 0,
+                    reach,
+                    caption_seen: false,
+                    undisplayed: parent.is_some_and(|parent| {
+                        parent.undisplayed || parent.contents_hidden || parent.fallback
+                    }) || style.display == Resolved::Hidden,
+                    invisible: match style.visibility {
+                        Resolved::Hidden => true,
+                        Resolved::Shown => false,
+                        Resolved::Inherited => inherited_invisible,
+                    },
+                    contents_hidden: style.content_visibility == Resolved::Hidden,
+                    fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
+                    in_svg,
+                    exempt,
+                    effects,
                 }
-                _ if element.lower == "rp" => Exempt::RubyParenthesis,
-                _ => Exempt::None,
-            };
-            Open {
-                children: 0,
-                reach,
-                caption_seen: false,
-                undisplayed: parent.is_some_and(|parent| {
-                    parent.undisplayed || parent.contents_hidden || parent.fallback
-                }) || style.display == Resolved::Hidden,
-                invisible: match style.visibility {
-                    Resolved::Hidden => true,
-                    Resolved::Shown => false,
-                    Resolved::Inherited => inherited_invisible,
-                },
-                contents_hidden: style.content_visibility == Resolved::Hidden,
-                fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
-                in_svg,
-                exempt,
-                opens_run,
-                flush_after,
-                boundary_after,
             }
         };
         open.push(state);
@@ -3131,6 +3681,167 @@ mod tests {
         ] {
             assert!(!fuses(body), "{body}");
         }
+    }
+
+    #[test]
+    fn blocks_inside_links_run_into_the_text_around_them() {
+        let fuses = |body: &str| walk(&[], body).fuses_blocks;
+        // AnyDoc flattens a link's blocks into the run around the link:
+        // the first and last with nothing between them and the text on
+        // either side, a list, table, quote, or `pre` reduced to its text.
+        for body in [
+            r#"<div>Note:<a id="c1"><h2>Total 1,250.00</h2></a></div>"#,
+            "<div>Balance due<a><p>1,250.00</p></a></div>",
+            r##"<div>Balance due<a href="#nowhere"><p>1,250.00</p></a></div>"##,
+            r#"<div>Balance due<a href="https://example.com/x"><p>1,250.00</p></a></div>"#,
+            "<div><a><p>Balance due</p></a>1,250.00</div>",
+            r#"<a id="c1"><h2>Chapter One</h2></a>Opening balance 1,250.00"#,
+            "<p>Balance due<a><div><p>1,250.00</p></div></a></p>",
+            "<div>Balance due<a><blockquote>1,250.00</blockquote></a></div>",
+            "<div>Balance due<a><ul><li>1,250.00</li></ul></a></div>",
+            "<div>Balance due<a><table><tr><td>1,250.00</td></tr></table></a></div>",
+            "<div>Balance due<a><pre>1,250.00</pre></a></div>",
+            // White space or a lone line break before a block inside the
+            // link is dropped with the empty paragraph it would start, and
+            // a block drops its own leading white space.
+            "<div>Note:<a> <h2>Total</h2></a></div>",
+            "<div>Note:<a><h2> Total</h2></a></div>",
+            "<div>Note:<a><br/><p>Total</p></a></div>",
+            "<div>Note:<a><p>Total</p> </a>Due</div>",
+            // A rule converts as nothing, and so does an empty paragraph,
+            // where a reader still starts a new line.
+            "<div>Note:<a><hr/></a>Total</div>",
+            "<div>Balance due<a><p> </p>1,250.00</a> </div>",
+            // Only the last of several blocks runs into what follows.
+            "<div><a><p>A</p><p>B</p></a>C</div>",
+            // A link inside a link.
+            "<div>Note:<a><a><p>Total</p></a></a></div>",
+        ] {
+            assert!(fuses(body), "{body}");
+        }
+        for body in [
+            "<div>Balance due <a><p>1,250.00</p></a></div>",
+            // AnyDoc joins a link's blocks with line breaks, and the items
+            // of a list inside one with spaces.
+            "<div><a><p>A</p><p>B</p></a></div>",
+            "<div>A<a>B<p>C</p></a></div>",
+            "<div><a><p>A</p>tail</a></div>",
+            "<div>Items: <a><ul><li>A</li><li>B</li></ul></a> </div>",
+            "<div>Note:<a><br/>Total</a></div>",
+            "<div>Note: <a><p>X</p></a> Y</div>",
+            // Only a link splices its blocks; other inline elements do not.
+            "<div>Balance due<span><p>1,250.00</p></span></div>",
+            "<div>Balance due<b><p>1,250.00</p></b></div>",
+            r#"<section><a id="c1"><h2>Summary</h2></a><p>Total 1,250.00</p></section>"#,
+            r#"<a id="c1"><p>Balance due</p></a><p>1,250.00</p>"#,
+        ] {
+            assert!(!fuses(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn how_a_reader_lays_boxes_out_decides_their_lines() {
+        let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
+        // A reader starts a new line for a box its style makes a block, and
+        // for a block element AnyDoc does not know.
+        assert!(fuses(
+            &[".line { display: block }"],
+            r#"<p><span class="line">Balance due</span><span class="line">1,250.00</span></p>"#
+        ));
+        assert!(fuses(
+            &[],
+            r#"<p><span style="display:block">Balance due</span><span style="display:block">1,250.00</span></p>"#
+        ));
+        assert!(fuses(
+            &[],
+            "<div>Balance due<address>1,250.00</address></div>"
+        ));
+        // A floated box with more than a drop cap's letters stands apart.
+        assert!(fuses(
+            &[".side { float: left }"],
+            r#"<div class="side">Note</div><div>1,250.00</div>"#
+        ));
+        // A line break, rule, or empty block AnyDoc's styles skip, where a
+        // reader shows it.
+        assert!(fuses(
+            &["br { display: none } p br { display: inline }"],
+            "<p>Balance due<br/>1,250.00</p>"
+        ));
+        assert!(fuses(
+            &["hr { display: none } div hr { display: block }"],
+            "<div>Balance due<hr/>1,250.00</div>"
+        ));
+        assert!(fuses(
+            &[".a.b { display: none }"],
+            r#"<div>Balance due<p class="a.b"></p>1,250.00</div>"#
+        ));
+        // An inline box, a floated drop cap, and a line break both hide
+        // keep the reader's line.
+        assert!(!fuses(
+            &[],
+            r#"<div style="display:inline">Balance </div><div style="display:inline">due</div>"#
+        ));
+        assert!(!fuses(
+            &[".x { display: inline-block }"],
+            r#"<div class="x">A</div><div class="x">B</div>"#
+        ));
+        assert!(!fuses(
+            &[".dropcap { float: left; font-size: 3em }"],
+            r#"<div class="opening"><div class="dropcap">O</div><div class="rest">nce the office opened</div></div>"#
+        ));
+        assert!(!fuses(
+            &[],
+            r#"<p><span style="float:left">O</span>nce upon a time</p>"#
+        ));
+        assert!(!fuses(
+            &["br { display: none }"],
+            "<p>Balance due<br/>1,250.00</p>"
+        ));
+        // A rule that may not apply keeps a container a block.
+        assert!(fuses(
+            &[".x { display: inline } p + .x { display: block }"],
+            r#"<p>A</p><div class="x">Balance due</div><div class="x">1,250.00</div>"#
+        ));
+        // A block `::before` or `::after` box breaks the line around an
+        // inline box, even an empty one.
+        let glossary = "dt { display: inline } dd { display: inline; margin: 0 }";
+        let entries = "<dl><dt>Basis</dt><dd>: what you paid.</dd><dt>Carryover</dt><dd>: an amount moved.</dd></dl>";
+        assert!(!fuses(&[glossary], entries));
+        assert!(fuses(
+            &[glossary, "dd:after { content: ''; display: block }"],
+            entries
+        ));
+        assert!(fuses(
+            &[".br::after { content: ''; display: block }"],
+            r#"<p><span class="br">Balance due</span>1,250.00</p>"#
+        ));
+        assert!(fuses(
+            &[".brk::before { content: ''; display: block }"],
+            r#"<p>Balance due<span class="brk"/>1,250.00</p>"#
+        ));
+        assert!(!fuses(
+            &[".br::after { content: ''; display: inline }"],
+            r#"<p><span class="br">Balance due</span>1,250.00</p>"#
+        ));
+    }
+
+    #[test]
+    fn a_caption_repeating_its_image_alt_text_is_not_a_join() {
+        let fuses = |body: &str| walk(&[], body).fuses_blocks;
+        // pandoc 2 gives an implicit figure's image its caption as alt text.
+        assert!(!fuses(
+            r#"<figure><img src="chart.png" alt="Revenue by quarter"/><figcaption>Revenue by quarter</figcaption></figure>"#
+        ));
+        assert!(!fuses(
+            r#"<figure><img src="chart.png" alt="Revenue by quarter"/><figcaption>Revenue <em>by quarter</em></figcaption></figure>"#
+        ));
+        // Other text, or digits on both sides, still runs together.
+        assert!(fuses(
+            r#"<figure><img src="chart.png" alt="Chart"/><figcaption>Revenue by quarter</figcaption></figure>"#
+        ));
+        assert!(fuses(
+            r#"<figure><img src="chart.png" alt="2023"/><figcaption>2023</figcaption></figure>"#
+        ));
     }
 
     #[test]
