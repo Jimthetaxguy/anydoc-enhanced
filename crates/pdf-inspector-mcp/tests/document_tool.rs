@@ -573,6 +573,7 @@ fn strict_epub_negative_fixtures_fail_closed() {
         // AnyDoc's own reading finds.
         ("encoded-chapter-href.epub", "incomplete_conversion"),
         ("linked-css-hidden.epub", "incomplete_conversion"),
+        ("escaped-selector.epub", "incomplete_conversion"),
         ("nav-spine-mismatch.epub", "incomplete_conversion"),
         ("missing-local-resource.epub", "incomplete_conversion"),
         ("external-reference.epub", "incomplete_conversion"),
@@ -592,6 +593,33 @@ fn strict_epub_negative_fixtures_fail_closed() {
             "{name} leaked a local path"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn epub_text_readers_hide_and_anydoc_omits_converts() {
+    let fixture = |name: &str| {
+        format!(
+            "{}/../../test-corpus/epub/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    };
+    // A `display: none` rule AnyDoc applies too: the text is omitted, as a
+    // reader omits it.
+    let document = run_document_tool(fixture("display-none-omitted.epub"), "epub-omitted-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("VISIBLE-CHAPTER"));
+    assert!(!markdown.contains("OMITTED-LIKE-A-READER"));
+    // A web address written in the text loads nothing; it is sanitized.
+    let document = run_document_tool(fixture("web-address-in-text.epub"), "epub-address-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    assert!(!document.to_string().contains("example.com"));
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "sanitized_output"));
 }
 
 #[test]
@@ -1199,6 +1227,7 @@ fn strict_odp_negative_fixtures_fail_closed() {
         ("malformed-content.odp", "malformed"),
         ("missing-asset.odp", "incomplete_conversion"),
         ("wrong-mimetype.odp", "malformed"),
+        ("linked-frame.odp", "incomplete_conversion"),
     ] {
         let fixture = format!(
             "{}/../../test-corpus/odp/{name}",
@@ -1284,6 +1313,20 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
         ("docx/namespace-shadowed-main.docx", "malformed"),
         ("xlsx/binary-workbook.xlsx", "unsupported"),
         ("xlsx/oversized-number-format.xlsx", "resource_limit"),
+        // Review round four: parts, cells, and values found where AnyDoc
+        // finds them.
+        (
+            "docx/cell-in-compatibility-block.docx",
+            "incomplete_conversion",
+        ),
+        ("pptx/relocated-notes.pptx", "incomplete_conversion"),
+        ("xlsx/xlsb-fallback-decoy.xlsx", "malformed"),
+        (
+            "xlsx/unrendered-formula-cache.xlsx",
+            "incomplete_conversion",
+        ),
+        ("odt/page-anchored-frame.odt", "incomplete_conversion"),
+        ("ods/untyped-formula-value.ods", "incomplete_conversion"),
     ] {
         let fixture = format!(
             "{}/../../test-corpus/{relative_path}",

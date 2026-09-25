@@ -52,6 +52,32 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
 - epub/encoded-chapter-href.epub: a spine href AnyDoc percent-decodes to a
   chapter with hidden text, beside a clean decoy stored under the encoded
   name. Expected `incomplete_conversion`.
+- xlsx/xlsb-fallback-decoy.xlsx: a case-variant `XL/workbook.xml` decoy and
+  no root relationships, so AnyDoc's exact lookup falls back to the binary
+  `xl/workbook.bin`. Expected `malformed`.
+- xlsx/unrendered-formula-cache.xlsx: a formula whose cached value does not
+  parse as a number, which AnyDoc converts as an empty cell. Expected
+  `incomplete_conversion`.
+- pptx/relocated-notes.pptx: speaker notes with a hidden shape, stored
+  outside `ppt/notesSlides/` and reached through the slide's notesSlide
+  relationship. Expected `incomplete_conversion`.
+- docx/cell-in-compatibility-block.docx: a table cell wrapped in
+  `mc:AlternateContent`, which AnyDoc's row walker drops with its text.
+  Expected `incomplete_conversion`.
+- odt/page-anchored-frame.odt: a text box anchored to the page, which AnyDoc
+  skips. Expected `incomplete_conversion`.
+- ods/untyped-formula-value.ods: a formula cell whose cached value has no
+  `office:value-type`, so AnyDoc renders nothing. Expected
+  `incomplete_conversion`.
+- odp/linked-frame.odp: a slide frame wrapped in `draw:a`, which AnyDoc's
+  shape walk skips. Expected `incomplete_conversion`.
+- epub/escaped-selector.epub: a linked stylesheet whose escaped class
+  selector (`p.\73 ecret`) hides text with `visibility: hidden`. Expected
+  `incomplete_conversion`.
+- epub/web-address-in-text.epub: a chapter whose visible text mentions a web
+  address. Expected complete output with the address sanitized.
+- epub/display-none-omitted.epub: text a linked `display: none` rule hides,
+  which AnyDoc omits as a reader does. Expected complete output without it.
 
 All content is synthetic and contains no personal data.
 """
@@ -348,6 +374,105 @@ def write_binary_workbook():
     )
 
 
+def patched_workpaper(name, patch):
+    """public-workpaper.xlsx with its entries rewritten by `patch`."""
+    source = CORPUS / "xlsx" / "public-workpaper.xlsx"
+    with ZipFile(source) as archive:
+        entries = [
+            (info.filename, archive.read(info))
+            for info in archive.infolist()
+            if not info.filename.endswith("/")
+        ]
+    write_package(CORPUS / "xlsx" / name, patch(entries))
+
+
+def write_xlsb_fallback_decoy():
+    def patch(entries):
+        out = []
+        for filename, data in entries:
+            if filename == "_rels/.rels":
+                continue
+            if filename == "xl/workbook.xml":
+                out.append(("XL/workbook.xml", data))
+                continue
+            out.append((filename, data))
+        # BrtBeginBook and BrtEndBook records: a binary workbook stream.
+        out.append(("xl/workbook.bin", bytes([0x83, 0x01, 0x00, 0x84, 0x01, 0x00])))
+        return out
+
+    patched_workpaper("xlsb-fallback-decoy.xlsx", patch)
+
+
+def write_unrendered_formula_cache():
+    def patch(entries):
+        return [
+            (
+                filename,
+                data.replace(b"<v>150000</v>", b"<v>RECEIPTS-TOTAL</v>")
+                if filename == "xl/worksheets/sheet1.xml"
+                else data,
+            )
+            for filename, data in entries
+        ]
+
+    patched_workpaper("unrendered-formula-cache.xlsx", patch)
+
+
+ODF_NS = (
+    'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+    'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+    'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+    'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
+    'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" '
+    'xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" '
+    'xmlns:xlink="http://www.w3.org/1999/xlink"'
+)
+
+
+def write_odf(folder, name, mimetype, body):
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<office:document-content {ODF_NS} office:version="1.3">'
+        f"<office:body>{body}</office:body></office:document-content>"
+    )
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" '
+        'manifest:version="1.3">'
+        f'<manifest:file-entry manifest:full-path="/" manifest:media-type="{mimetype}"/>'
+        '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>'
+        "</manifest:manifest>"
+    )
+    write_package(
+        CORPUS / folder / name,
+        [("mimetype", mimetype), ("META-INF/manifest.xml", manifest), ("content.xml", content)],
+        stored={"mimetype"},
+    )
+
+
+def epub_chapter(head, body):
+    xhtml = 'xmlns="http://www.w3.org/1999/xhtml"'
+    return (
+        f'<?xml version="1.0"?><html {xhtml}><head><title>Chapter</title>{head}</head>'
+        f"<body>{body}</body></html>"
+    )
+
+
+def write_styled_epub(name, css, body):
+    link = '<link rel="stylesheet" type="text/css" href="../Styles/main.css"/>'
+    write_epub(
+        name,
+        '<item id="ch1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/>'
+        '<item id="css" href="Styles/main.css" media-type="text/css"/>',
+        '<itemref idref="ch1"/>',
+        "Text/ch1.xhtml",
+        [
+            ("OPS/Text/ch1.xhtml", epub_chapter(link, body)),
+            ("OPS/Styles/main.css", css),
+        ],
+    )
+
+
 def main():
     write_docx(
         "symbol-checkbox.docx",
@@ -492,6 +617,78 @@ def main():
                 ),
             )
         ],
+    )
+    write_xlsb_fallback_decoy()
+    write_unrendered_formula_cache()
+    write_pptx(
+        "relocated-notes.pptx",
+        [
+            ("ppt/_rels/presentation.xml.rels", presentation_rels("slides/slide1.xml")),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                f'<Relationships xmlns="{RELS_NS}">'
+                f'<Relationship Id="rId3" Type="{REL_TYPE}/notesSlide" '
+                'Target="../notes/notes1.xml"/></Relationships>',
+            ),
+            (
+                "ppt/notes/notes1.xml",
+                f"<p:notes {PRESENTATION_NS}><p:cSld><p:spTree>"
+                '<p:sp><p:nvSpPr><p:cNvPr id="2" name="Hidden" hidden="1"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+                "<p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>HIDDEN-NOTE-TEXT</a:t></a:r></a:p>"
+                "</p:txBody></p:sp></p:spTree></p:cSld></p:notes>",
+            ),
+        ],
+        hidden_decoy=False,
+    )
+    write_docx(
+        "cell-in-compatibility-block.docx",
+        '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>VISIBLE-CELL</w:t></w:r></w:p></w:tc>'
+        '<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+        '<mc:Choice Requires="w"><w:tc><w:p><w:r><w:t>WRAPPED-CELL</w:t></w:r></w:p></w:tc>'
+        "</mc:Choice></mc:AlternateContent></w:tr></w:tbl>",
+    )
+    write_odf(
+        "odt",
+        "page-anchored-frame.odt",
+        "application/vnd.oasis.opendocument.text",
+        "<office:text><text:p>VISIBLE-TEXT</text:p>"
+        '<draw:frame text:anchor-type="page" svg:width="5cm" svg:height="2cm">'
+        "<draw:text-box><text:p>PAGE-FRAME-TEXT</text:p></draw:text-box></draw:frame>"
+        "</office:text>",
+    )
+    write_odf(
+        "ods",
+        "untyped-formula-value.ods",
+        "application/vnd.oasis.opendocument.spreadsheet",
+        '<office:spreadsheet><table:table table:name="Sheet1"><table:table-row>'
+        '<table:table-cell office:value-type="string"><text:p>Total</text:p></table:table-cell>'
+        '<table:table-cell table:formula="of:=40+2" office:value="42"/>'
+        "</table:table-row></table:table></office:spreadsheet>",
+    )
+    write_odf(
+        "odp",
+        "linked-frame.odp",
+        "application/vnd.oasis.opendocument.presentation",
+        '<office:presentation><draw:page draw:name="Slide1">'
+        '<draw:frame presentation:class="title"><draw:text-box><text:p>VISIBLE-TITLE</text:p>'
+        "</draw:text-box></draw:frame><draw:a><draw:frame><draw:text-box>"
+        "<text:p>LINKED-FRAME-TEXT</text:p></draw:text-box></draw:frame></draw:a>"
+        "</draw:page></office:presentation>",
+    )
+    write_styled_epub(
+        "escaped-selector.epub",
+        "p.\\73 ecret { visibility: hidden }\n",
+        '<p>VISIBLE-CHAPTER</p><p class="secret">HIDDEN-ESCAPED-TEXT</p>',
+    )
+    write_styled_epub(
+        "web-address-in-text.epub",
+        "p { margin: 0 }\n",
+        "<p>VISIBLE-CHAPTER</p><p>Forms are at https://www.example.com/forms today.</p>",
+    )
+    write_styled_epub(
+        "display-none-omitted.epub",
+        ".gone { display: none }\n",
+        '<p>VISIBLE-CHAPTER</p><p class="gone">OMITTED-LIKE-A-READER</p>',
     )
 
 
