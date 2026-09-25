@@ -8,8 +8,9 @@
 //! fifth of an em past its declared width, over pdf-inspector 1.24.0's
 //! word-gap thresholds, so the Markdown splits words and amounts: "LIAB
 //! ILITIES", "83, 476. 03". The painted spaces say where the words end: the
-//! scan collects each word a font that paints its spaces shows glyph by
-//! glyph. Where the Markdown holds such a word split by a space or a cell
+//! scan collects each word a font that paints its spaces anywhere in the
+//! document shows glyph by glyph. Where the Markdown holds such a word split
+//! by a space or a cell
 //! edge, each page showing it is read again, as pdf-inspector places its
 //! text, and reported when its own text splits it.
 //!
@@ -344,16 +345,16 @@ impl GlyphWords {
         }
     }
 
-    /// The words shown in fonts that paint their spaces, with how often.
-    pub(crate) fn finish(mut self) -> Vec<(String, u32)> {
+    /// The words shown, each with its font and how often, and the fonts
+    /// seen painting their spaces.
+    pub(crate) fn finish(mut self) -> (Vec<(String, usize, u32)>, HashSet<usize>) {
         self.end_word();
-        let mut words: HashMap<String, u32> = HashMap::new();
-        for ((text, font), count) in self.words {
-            if self.painting_spaces.contains(&font) {
-                *words.entry(text).or_default() += count;
-            }
-        }
-        words.into_iter().collect()
+        let words = self
+            .words
+            .into_iter()
+            .map(|((text, font), count)| (text, font, count))
+            .collect();
+        (words, self.painting_spaces)
     }
 }
 
@@ -583,6 +584,18 @@ mod tests {
         assert!(super::split_pages(&found, &shown, &own).is_empty());
     }
 
+    /// The words a page shows in fonts it sees painting their spaces.
+    fn painted(page: GlyphWords) -> Vec<(String, u32)> {
+        let (words, painting) = page.finish();
+        let mut found: Vec<(String, u32)> = words
+            .into_iter()
+            .filter(|(_, font, _)| painting.contains(font))
+            .map(|(text, _, count)| (text, count))
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
     fn glyphs_on_one_baseline_make_words_ended_by_painted_spaces() {
         let em = [8.0, 0.0];
@@ -597,10 +610,8 @@ mod tests {
             });
             x += 6.0;
         }
-        let mut found = page.finish();
-        found.sort();
         assert_eq!(
-            found,
+            painted(page),
             vec![
                 ("1,120".to_string(), 1),
                 ("ARE".to_string(), 1),
@@ -618,7 +629,7 @@ mod tests {
                 em,
             });
         }
-        assert!(page.finish().is_empty());
+        assert!(painted(page).is_empty());
         // A word a string of several glyphs goes on with is not read
         // whole; one a string past it does not reach ends where it stands.
         let mut page = GlyphWords::default();
@@ -659,10 +670,8 @@ mod tests {
             });
         }
         page.interrupt(Some([300.0, 100.0]), Some('Z'));
-        let mut found = page.finish();
-        found.sort();
         assert_eq!(
-            found,
+            painted(page),
             vec![
                 ("AB".to_string(), 1),
                 ("OF".to_string(), 1),

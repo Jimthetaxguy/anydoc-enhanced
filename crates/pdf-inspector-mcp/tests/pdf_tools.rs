@@ -457,32 +457,23 @@ const HINTED_GLYPHS: &[(char, u32, u32)] = &[
 /// or, when `hinted` is false, at the glyphs' own widths (pdf-inspector
 /// #531).
 fn glyph_by_glyph_pdf(hinted: bool) -> Vec<u8> {
+    glyph_by_glyph_pages(
+        hinted,
+        &[&[
+            (60, "LIABILITIES"),
+            (80, "BALANCE DUE AFTER PAYMENTS AND CREDITS"),
+        ]],
+    )
+}
+
+/// Pages of `glyph_by_glyph_pdf`, each the lines given, by their height.
+fn glyph_by_glyph_pages(hinted: bool, pages: &[&[(u32, &str)]]) -> Vec<u8> {
     let glyph = |character: char| {
         HINTED_GLYPHS
             .iter()
             .find(|(known, ..)| *known == character)
             .expect("a glyph of the font")
     };
-    let mut content = String::from("1 0 0 -1 0 792 cm 0.75 0 0 0.75 0 0 cm\n");
-    for (y, text) in [
-        (60, "LIABILITIES"),
-        (80, "BALANCE DUE AFTER PAYMENTS AND CREDITS"),
-    ] {
-        content.push_str(&format!("BT /F1 8 Tf 1 0 0 -1 0 0 Tm 40 -{y} Td"));
-        for (index, character) in text.chars().enumerate() {
-            if index > 0 {
-                let (_, width, advance) = glyph(text.chars().nth(index - 1).expect("glyph"));
-                let travel = if hinted {
-                    f64::from(*advance)
-                } else {
-                    f64::from(*width) * 8.0 / 1000.0
-                };
-                content.push_str(&format!(" {travel} 0 Td"));
-            }
-            content.push_str(&format!(" <{:02x}> Tj", u32::from(character)));
-        }
-        content.push_str(" ET\n");
-    }
     let widths: Vec<String> = (32..=90u8)
         .map(|code| {
             HINTED_GLYPHS
@@ -497,13 +488,48 @@ fn glyph_by_glyph_pdf(hinted: bool) -> Vec<u8> {
          /LastChar 90 /Widths [{}] /Encoding /WinAnsiEncoding >>",
         widths.join(" ")
     );
-    pdf_file(&[
+    let kids: Vec<String> = (0..pages.len())
+        .map(|index| format!("{} 0 R", 4 + 2 * index))
+        .collect();
+    let mut objects = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            pages.len()
+        )
+        .into_bytes(),
         font.into_bytes(),
-        stream("", content.as_bytes()),
-    ])
+    ];
+    for (index, lines) in pages.iter().enumerate() {
+        let mut content = String::from("1 0 0 -1 0 792 cm 0.75 0 0 0.75 0 0 cm\n");
+        for (y, text) in lines.iter() {
+            content.push_str(&format!("BT /F1 8 Tf 1 0 0 -1 0 0 Tm 40 -{y} Td"));
+            for (position, character) in text.chars().enumerate() {
+                if position > 0 {
+                    let (_, width, advance) = glyph(text.chars().nth(position - 1).expect("glyph"));
+                    let travel = if hinted {
+                        f64::from(*advance)
+                    } else {
+                        f64::from(*width) * 8.0 / 1000.0
+                    };
+                    content.push_str(&format!(" {travel} 0 Td"));
+                }
+                content.push_str(&format!(" <{:02x}> Tj", u32::from(character)));
+            }
+            content.push_str(" ET\n");
+        }
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                5 + 2 * index
+            )
+            .into_bytes(),
+        );
+        objects.push(stream("", content.as_bytes()));
+    }
+    pdf_file(&objects)
 }
 
 #[test]
@@ -546,6 +572,53 @@ fn words_split_at_hinted_glyph_advances_are_reported() {
     // Glyphs advanced by their own widths are read whole, and nothing is
     // reported.
     assert!(!reported(&results[1]), "{}", results[1]);
+    // A page whose words stand alone on their lines is read in a font seen
+    // painting its spaces on another page.
+    let alone = temporary.path().join("alone.pdf");
+    std::fs::write(
+        &alone,
+        glyph_by_glyph_pages(
+            true,
+            &[
+                &[
+                    (60, "BALANCE DUE AFTER PAYMENTS AND CREDITS"),
+                    (80, "AMENDED RETURN DUE AFTER CREDITS"),
+                    (100, "PAYMENTS AND CREDITS APPLIED"),
+                    (120, "BALANCE DUE AFTER PAYMENTS"),
+                ],
+                &[
+                    (60, "LIABILITIES"),
+                    (80, "ASSETS"),
+                    (100, "SURPLUS"),
+                    (120, "PAYMENTS"),
+                    (140, "CREDITS"),
+                    (160, "BALANCE"),
+                ],
+            ],
+        ),
+    )
+    .expect("write PDF");
+    let alone_results = call_tools(
+        &[(
+            "pdf_to_markdown",
+            serde_json::json!({ "path": alone.to_str().expect("UTF-8 path") }),
+        )],
+        None,
+    );
+    assert!(
+        alone_results[0]["warnings"]
+            .as_array()
+            .is_some_and(|warnings| {
+                warnings.iter().any(|warning| {
+                    warning["code"] == "word_gaps_misread"
+                        && warning["pages"]
+                            .as_array()
+                            .is_some_and(|pages| pages.contains(&serde_json::json!(2)))
+                })
+            }),
+        "{}",
+        alone_results[0]
+    );
     assert!(
         results[1]["markdown"].as_str().is_some_and(
             |markdown| markdown.contains("LIABILITIES") && markdown.contains("BALANCE DUE")

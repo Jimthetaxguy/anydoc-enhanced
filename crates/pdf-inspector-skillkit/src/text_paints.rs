@@ -655,9 +655,9 @@ pub(crate) struct Findings {
     /// Where the visible runs placed on the pages read for repeats start,
     /// up to `MAX_PLACED_RUNS`.
     pub(crate) placed: Vec<Placed>,
-    /// Words shown glyph by glyph in fonts that paint their spaces, on the
-    /// pages read for repeats, with the page and how often, up to
-    /// `MAX_GLYPH_WORDS`.
+    /// Words shown glyph by glyph in fonts that paint their spaces anywhere
+    /// in the document, on the pages read for repeats, with the page and
+    /// how often; of the first `MAX_GLYPH_WORDS` the pages show.
     pub(crate) glyph_words: Vec<(u32, String, u32)>,
 }
 
@@ -688,6 +688,10 @@ pub(crate) fn scan(
     let mut gap_fonts = GapFonts::default();
     let mut glyph_fonts = GlyphFonts::default();
     let mut found = Findings::default();
+    // Words shown glyph by glyph, by page and font, and the fonts seen
+    // painting their spaces on any page.
+    let mut shown: Vec<(u32, String, usize, u32)> = Vec::new();
+    let mut painting_spaces: HashSet<usize> = HashSet::new();
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
             continue;
@@ -711,13 +715,14 @@ pub(crate) fn scan(
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
                 }
-                let room = MAX_GLYPH_WORDS.saturating_sub(found.glyph_words.len());
-                found.glyph_words.extend(
+                let room = MAX_GLYPH_WORDS.saturating_sub(shown.len());
+                shown.extend(
                     page.glyph_words
                         .into_iter()
                         .take(room)
-                        .map(|(text, count)| (number, text, count)),
+                        .map(|(text, font, count)| (number, text, font, count)),
                 );
+                painting_spaces.extend(page.glyph_spaces);
                 let room = MAX_PLACED_RUNS.saturating_sub(found.placed.len());
                 found.placed.extend(
                     page.placed
@@ -742,6 +747,16 @@ pub(crate) fn scan(
             Err(Exhausted) => break,
         }
     }
+    let mut words: HashMap<(u32, String), u32> = HashMap::new();
+    for (page, text, font, count) in shown {
+        if painting_spaces.contains(&font) {
+            *words.entry((page, text)).or_default() += count;
+        }
+    }
+    found.glyph_words = words
+        .into_iter()
+        .map(|((page, text), count)| (page, text, count))
+        .collect();
     found
 }
 
@@ -764,8 +779,10 @@ struct PageFindings {
     /// Where placed runs start, measured from the visible box, and whether
     /// they are plain.
     placed: Vec<([f64; 2], bool)>,
-    /// Words shown glyph by glyph in fonts that paint their spaces.
-    glyph_words: Vec<(String, u32)>,
+    /// Words shown glyph by glyph, with their font and how often, and the
+    /// fonts seen painting their spaces.
+    glyph_words: Vec<(String, usize, u32)>,
+    glyph_spaces: HashSet<usize>,
 }
 
 fn scan_page(
@@ -843,7 +860,7 @@ fn scan_page(
                 .collect()
         })
         .unwrap_or_default();
-    let glyph_words = page
+    let (glyph_words, glyph_spaces) = page
         .glyph_words
         .take()
         .map(GlyphWords::finish)
@@ -853,6 +870,7 @@ fn scan_page(
         gaps_misread: page.gaps_misread,
         placed,
         glyph_words,
+        glyph_spaces,
         repeats: page
             .runs
             .map(|runs| {
