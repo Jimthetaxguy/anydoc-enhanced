@@ -446,6 +446,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rejects renders as General. Eight fraction formats that show an unsigned
     non-zero value for a negative are now refused, and 26 that show zero now
     convert; all 204 format and value pairs checked agree with LibreOffice.
+  - EPUB: generated content and SVG are read as a reader shows them. A "."
+    or "," a pseudo box sets between digits counts where digits follow it,
+    and more signs count beside digits (the cent to yen signs, the currency
+    block such as the rupee sign, and the dashes), while a sign on a list
+    item AnyDoc numbers itself does not; an `::after` sign meets the text
+    after it, and a pseudo box a reader hides (`opacity: 0`, `visibility:
+    hidden`) or floats off the line no longer counts. SVG text in resources
+    nothing references, in unknown elements, or outside a `text` element is
+    refused as hidden; `switch` renders one child, `foreignObject` holds
+    HTML, and label spans follow the pen through x, y, dx, and dy. A `~`
+    step is matched exactly at any distance. Flex items in a row may touch,
+    as a reader sets them; in a column, reversed, gapped, spread along the
+    line, or set apart by a margin or padding they stand apart, and grid
+    items always do; a line-clamped `-webkit-box` is a block. Fixed-layout
+    runs that continue a line may touch, and a single-figure drop cap is
+    read with its paragraph. Against Chromium's layout, 29 bypasses are now
+    refused and 20 chapters refused in error convert; over 760 randomized
+    chapters, errors of refusal fall from 48 to 10 with no join newly
+    missed, and real books check as fast as before.
 - Review round seven checked the round-six fixes again:
   - EPUB: a reader sets more boxes apart than the chapter walk knew, and
     AnyDoc ran their text together with no warning. Each flex or grid
