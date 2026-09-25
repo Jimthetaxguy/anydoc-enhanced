@@ -2878,21 +2878,26 @@ impl DocxNumbering {
                 continue;
             };
             let group = self.group(&instance.definition);
+            let format = instance
+                .formats
+                .get(&level)
+                .or_else(|| formats.get(&(group.clone(), level)).copied());
             // Word keeps one counter per definition; AnyDoc one per list
             // instance, so a second instance restarts where Word continues,
-            // unless it overrides the level.
-            let sharing = users.entry((group.clone(), level)).or_default();
-            if !sharing.is_empty()
+            // unless it overrides the level. Bullets show no count.
+            let counted = !matches!(
+                format,
+                Some(Some(format)) if matches!(format.as_str(), "bullet" | "none")
+            );
+            let sharing = users.entry((group, level)).or_default();
+            if counted
+                && !sharing.is_empty()
                 && !sharing.contains(&list)
                 && !instance.overridden.contains(&level)
             {
                 return true;
             }
             sharing.insert(list);
-            let format = instance
-                .formats
-                .get(&level)
-                .or_else(|| formats.get(&(group, level)).copied());
             match format {
                 // AnyDoc renders a level without a format as bullets; Word
                 // numbers it.
@@ -8684,6 +8689,12 @@ mod tests {
             two_lists(""),
             ""
         ));
+        // Bullet lists sharing a definition show no count to differ.
+        let bullets = format!(
+            r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/></w:num>"#,
+            definition(0, r#"<w:numFmt w:val="bullet"/>"#)
+        );
+        assert!(!differs(items.clone(), bullets, ""));
         // Numbering through a paragraph style counts too.
         let heading = r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:basedOn w:val="Heading1"/></w:style>"#;
         let styled = |style: &str| {
