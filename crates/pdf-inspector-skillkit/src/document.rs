@@ -2938,7 +2938,7 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     node.word_skips = true;
                 }
                 scan.hidden_run |= drawing_choice_word_skips(&reader, &event, &node, &stack);
-                scan_docx_element(&event, &node, &stack, scan)?;
+                scan_docx_element(reader.resolver(), &event, &node, &stack, scan)?;
                 stack.push(node);
             }
             quick_xml::events::Event::Empty(event) => {
@@ -2949,7 +2949,7 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                 );
                 take_word_branch(&reader, &event, &mut node, &mut stack);
                 scan.hidden_run |= drawing_choice_word_skips(&reader, &event, &node, &stack);
-                scan_docx_element(&event, &node, &stack, scan)?;
+                scan_docx_element(reader.resolver(), &event, &node, &stack, scan)?;
                 // An empty paragraph Word numbers through its default style.
                 if node.is(WordVocabulary::Word, b"p") {
                     record_list_paragraph(scan, &stack, DocxListUse::default(), false)?;
@@ -3139,6 +3139,7 @@ fn docx_note(
 }
 
 fn scan_docx_element(
+    resolver: &quick_xml::name::NamespaceResolver,
     event: &quick_xml::events::BytesStart<'_>,
     node: &WordNode,
     stack: &[WordNode],
@@ -3228,24 +3229,25 @@ fn scan_docx_element(
         {
             scan.mark = DocxParagraphMark::default();
         }
+        // Both sides read the attribute AnyDoc reads, each as it reads a
+        // number: Word collapsing white space around it, AnyDoc as it stands.
         b"numId" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
             let values = xml_attribute_values(event, b"val");
             scan.mark.numbered |= values.iter().any(|value| value.trim() != "0");
-            let list = |value: &str| value.parse::<u64>().ok();
-            if let Some(list) = values.iter().find_map(|value| list(value.trim())) {
+            let value = word_attribute(resolver, event, b"val");
+            if let Some(list) = value.as_deref().and_then(|value| value.trim().parse().ok()) {
                 scan.mark.list = Some(list);
             }
-            if let Some(list) = values.iter().find_map(|value| list(value)) {
+            if let Some(list) = value.as_deref().and_then(|value| value.parse().ok()) {
                 scan.mark.anydoc_list = Some(list);
             }
         }
         b"ilvl" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
-            let values = xml_attribute_values(event, b"val");
-            let level = |value: &str| value.parse::<usize>().ok();
-            if let Some(level) = values.iter().find_map(|value| level(value.trim())) {
+            let value = word_attribute(resolver, event, b"val");
+            if let Some(level) = value.as_deref().and_then(|value| value.trim().parse().ok()) {
                 scan.mark.level = Some(level);
             }
-            if let Some(level) = values.iter().find_map(|value| level(value)) {
+            if let Some(level) = value.as_deref().and_then(|value| value.parse().ok()) {
                 scan.mark.anydoc_level = Some(level);
             }
         }
@@ -4617,12 +4619,89 @@ fn docx_style_numbering(
     }
 }
 
-/// A list level being read: its index, whether a list instance replaces it,
-/// and what it says so far.
+/// The attribute AnyDoc 0.2.4 reads for `attr(ns::W, name)`: the first in
+/// WordprocessingML's namespace, Transitional or Strict, else the first
+/// without a prefix. Word reads the same attribute, and each side then reads
+/// its value as it reads numbers and names.
+fn word_attribute(
+    resolver: &quick_xml::name::NamespaceResolver,
+    event: &quick_xml::events::BytesStart<'_>,
+    wanted: &[u8],
+) -> Option<String> {
+    let mut unprefixed = None;
+    for attribute in event.attributes().flatten() {
+        let key = attribute.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            continue;
+        }
+        let (namespace, local) = resolver.resolve_attribute(attribute.key);
+        if local.as_ref() != wanted {
+            continue;
+        }
+        let value = || {
+            attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map(|value| value.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
+        };
+        match namespace {
+            quick_xml::name::ResolveResult::Bound(namespace)
+                if WORDPROCESSINGML_NAMESPACES.contains(&namespace.as_ref()) =>
+            {
+                return Some(value());
+            }
+            quick_xml::name::ResolveResult::Unbound if unprefixed.is_none() => {
+                unprefixed = Some(value());
+            }
+            _ => {}
+        }
+    }
+    unprefixed
+}
+
+/// An open element of a numbering part: its local name, and whether it is
+/// in WordprocessingML's namespace.
+struct DocxNumberingNode {
+    local: Vec<u8>,
+    word: bool,
+}
+
+/// A definition (`w:abstractNum`) being read, and the list styles it
+/// declares; `None` for one the side does not keep.
+struct DocxOpenDefinition {
+    id: String,
+    definition: DocxDefinition,
+    style_links: Vec<String>,
+    /// A `w:numStyleLink` has been read; AnyDoc reads the first.
+    style_link_read: bool,
+}
+
+/// A list instance (`w:num`) being read, and whether its `w:abstractNumId`
+/// has been read, since AnyDoc reads the first.
+struct DocxOpenList {
+    id: Option<u64>,
+    list: DocxList,
+    definition_read: bool,
+}
+
+/// A `w:lvlOverride` being read: the level it names, and the level and the
+/// start it gives, each as the first of its kind AnyDoc reads.
+struct DocxOpenOverride {
+    index: Option<usize>,
+    level: Option<DocxLevel>,
+    start: Option<u64>,
+    level_read: bool,
+    start_read: bool,
+}
+
+/// A list level being read: its index, how deep it opened, what it says so
+/// far, and the properties whose first element AnyDoc has read.
 struct DocxOpenLevel {
     index: usize,
-    replaces: bool,
+    /// The elements open outside it, which close it again.
+    depth: usize,
     level: DocxLevel,
+    read: Vec<&'static [u8]>,
 }
 
 /// A `w:start` or `w:startOverride` value, clamped to `xsd:int`'s
@@ -4634,24 +4713,29 @@ fn docx_start_value(value: &str) -> Option<u64> {
         .map(|value| value.clamp(0, i64::from(i32::MAX)) as u64)
 }
 
-/// Read a numbering part's list definitions, streamed under AnyDoc's depth
-/// and node bounds.
+/// Read a numbering part's list definitions as Word or AnyDoc reads them,
+/// streamed under AnyDoc's depth and node bounds: the WordprocessingML
+/// `w:abstractNum` and `w:num` children of the first `w:numbering`, each
+/// attribute as AnyDoc picks it. Of two definitions or list instances with
+/// one id, AnyDoc keeps the last, read afresh, and Word, as LibreOffice
+/// shows it, the first.
 fn docx_numbering_definitions(
     reader: impl std::io::BufRead,
     word: bool,
 ) -> Result<DocxNumbering, DocumentError> {
-    let mut reader = quick_xml::Reader::from_reader(reader);
+    let mut reader = quick_xml::NsReader::from_reader(reader);
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut stack: Vec<DocxNumberingNode> = Vec::new();
     let mut nodes = 0usize;
     let mut numbering = DocxNumbering::default();
-    // The open definition or list instance, the level an open
-    // `w:lvlOverride` names, and the open `w:lvl`.
-    let mut definition: Option<usize> = None;
-    let mut list: Option<u64> = None;
-    let mut override_level: Option<usize> = None;
+    // Whether the part's first `w:numbering` is open, and has been read.
+    let mut in_root = false;
+    let mut root_read = false;
+    let mut definition: Option<DocxOpenDefinition> = None;
+    let mut list: Option<DocxOpenList> = None;
+    let mut override_level: Option<DocxOpenOverride> = None;
     let mut open_level: Option<DocxOpenLevel> = None;
     // A number as the side reads it: Word reads an XML Schema integer,
     // collapsing white space around it, and AnyDoc parses the text as it
@@ -4667,54 +4751,40 @@ fn docx_numbering_definitions(
     // integer it reads.
     let definition_id = |id: String| {
         if word {
-            id.parse::<i64>().ok().map(|id| id.to_string())
+            id.trim().parse::<i64>().ok().map(|id| id.to_string())
         } else {
             Some(id)
         }
     };
-    // A missing or unreadable level index reads as the first, and an index
-    // past the last level is skipped.
-    let level_of = |event: &quick_xml::events::BytesStart<'_>| {
-        let level = xml_attribute_values(event, b"ilvl")
-            .into_iter()
-            .next()
-            .and_then(|value| number(value).parse::<usize>().ok())
-            .unwrap_or(0);
-        (level < DOCX_LIST_LEVELS).then_some(level)
-    };
-    let commit = |numbering: &mut DocxNumbering,
-                  definition: Option<usize>,
-                  list: Option<u64>,
-                  open: DocxOpenLevel| {
-        if open.replaces {
-            if let Some(list) = list {
-                numbering.lists.entry(list).or_default().levels[open.index] = Some(open.level);
-            }
-        } else if let Some(definition) = definition {
-            numbering.definitions[definition].levels[open.index] = Some(open.level);
-        }
-    };
     loop {
-        let (event, start) = match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(event)) => (event, true),
-            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
-            Ok(quick_xml::events::Event::End(_)) => {
-                match stack.pop().as_deref() {
-                    Some(b"abstractNum") => definition = None,
-                    Some(b"num") => list = None,
-                    Some(b"lvlOverride") => override_level = None,
-                    Some(b"lvl") => {
-                        if let Some(open) = open_level.take() {
-                            commit(&mut numbering, definition, list, open);
-                        }
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        let in_word = WordVocabulary::of(&namespace) == WordVocabulary::Word;
+        let (event, start) = match event {
+            quick_xml::events::Event::Start(event) => (event, true),
+            quick_xml::events::Event::Empty(event) => (event, false),
+            quick_xml::events::Event::End(_) => {
+                if let Some(closed) = stack.pop() {
+                    docx_numbering_close(
+                        &closed,
+                        stack.len(),
+                        word,
+                        &mut numbering,
+                        &mut definition,
+                        &mut list,
+                        &mut override_level,
+                        &mut open_level,
+                    )?;
+                    if stack.is_empty() && in_root {
+                        in_root = false;
                     }
-                    _ => {}
                 }
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::Eof) => return Ok(numbering),
-            Ok(_) => {
+            quick_xml::events::Event::Eof => return Ok(numbering),
+            _ => {
                 nodes += 1;
                 if nodes > MAX_XML_NODES {
                     return Err(DocumentError::ResourceLimit);
@@ -4722,147 +4792,304 @@ fn docx_numbering_definitions(
                 buffer.clear();
                 continue;
             }
-            Err(_) => return Err(DocumentError::Malformed),
         };
         nodes += 1;
         if nodes > MAX_XML_NODES || (start && stack.len() >= MAX_XML_DEPTH) {
             return Err(DocumentError::ResourceLimit);
         }
-        let local = xml_local_name(event.name().as_ref()).to_vec();
-        let raw = |name: &[u8]| xml_attribute_values(&event, name).into_iter().next();
-        let value = |name: &[u8]| raw(name).map(|value| value.trim().to_string());
-        let numeric = |name: &[u8]| raw(name).map(number);
-        match local.as_slice() {
-            b"abstractNum" if stack.len() == 1 => {
-                definition = None;
-                if let Some(id) = numeric(b"abstractNumId").and_then(definition_id) {
-                    if id.len() > MAX_STYLE_ID_BYTES
-                        || (numbering.definitions.len() >= MAX_DOCX_STYLES
-                            && !numbering.definition_ids.contains_key(&id))
-                    {
-                        return Err(DocumentError::ResourceLimit);
+        let node = DocxNumberingNode {
+            local: xml_local_name(event.name().as_ref()).to_vec(),
+            word: in_word,
+        };
+        let attribute = |name: &[u8]| word_attribute(reader.resolver(), &event, name);
+        // A WordprocessingML element whose parent is the named one.
+        let parent_is = |name: &[u8]| {
+            node.word
+                && stack
+                    .last()
+                    .is_some_and(|parent| parent.word && parent.local == name)
+        };
+        let local = node.local.as_slice();
+        if stack.is_empty() {
+            if node.word && local == b"numbering" && !root_read {
+                root_read = true;
+                in_root = start;
+            }
+        } else if in_root && stack.len() == 1 && node.word {
+            match local {
+                b"abstractNum" => {
+                    definition = attribute(b"abstractNumId")
+                        .and_then(definition_id)
+                        // Word keeps a definition's first reading.
+                        .filter(|id| !word || !numbering.definition_ids.contains_key(id))
+                        .map(|id| DocxOpenDefinition {
+                            id,
+                            definition: DocxDefinition::default(),
+                            style_links: Vec::new(),
+                            style_link_read: false,
+                        });
+                }
+                b"num" => {
+                    let id = attribute(b"numId").and_then(|id| number(id).parse().ok());
+                    list = Some(DocxOpenList {
+                        // Word keeps a list instance's first reading.
+                        id: id.filter(|id| !word || !numbering.lists.contains_key(id)),
+                        list: DocxList::default(),
+                        definition_read: false,
+                    });
+                }
+                _ => {}
+            }
+        } else if parent_is(b"abstractNum") && stack.len() == 2 {
+            if let Some(open) = definition.as_mut() {
+                match local {
+                    b"lvl" => {
+                        let index = attribute(b"ilvl")
+                            .and_then(|value| number(value).parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if index < DOCX_LIST_LEVELS {
+                            open_level = Some(DocxOpenLevel {
+                                index,
+                                depth: stack.len(),
+                                level: DocxLevel::default(),
+                                read: Vec::new(),
+                            });
+                        }
                     }
-                    let next = numbering.definitions.len();
-                    let index = *numbering.definition_ids.entry(id).or_insert(next);
-                    if index == next {
-                        numbering.definitions.push(DocxDefinition::default());
+                    b"numStyleLink" => {
+                        // AnyDoc reads the first; Word the last that names
+                        // a style.
+                        let style = attribute(b"val");
+                        if word {
+                            open.definition.style_link =
+                                style.or(open.definition.style_link.take());
+                        } else if !open.style_link_read {
+                            open.definition.style_link = style;
+                        }
+                        open.style_link_read = true;
                     }
-                    definition = Some(index);
+                    b"styleLink" => open.style_links.extend(attribute(b"val")),
+                    _ => {}
                 }
             }
-            b"num" if stack.len() == 1 => {
-                list = numeric(b"numId").and_then(|id| id.parse().ok());
-                if let Some(id) = list {
-                    if numbering.lists.len() >= MAX_DOCX_STYLES
-                        && !numbering.lists.contains_key(&id)
-                    {
-                        return Err(DocumentError::ResourceLimit);
+        } else if parent_is(b"num") && stack.len() == 2 {
+            if let Some(open) = list.as_mut() {
+                match local {
+                    b"abstractNumId" => {
+                        // AnyDoc reads the first; Word the last.
+                        if word || !open.definition_read {
+                            open.list.definition = attribute(b"val").and_then(definition_id);
+                        }
+                        open.definition_read = true;
                     }
-                    numbering.lists.entry(id).or_default();
-                }
-            }
-            b"abstractNumId" if list.is_some() && xml_path_ends_with(&stack, &[b"num"]) => {
-                if let Some(id) = list {
-                    numbering.lists.entry(id).or_default().definition =
-                        numeric(b"val").and_then(definition_id);
-                }
-            }
-            b"numStyleLink" if xml_path_ends_with(&stack, &[b"abstractNum"]) => {
-                if let (Some(definition), Some(style)) = (definition, value(b"val")) {
-                    numbering.definitions[definition].style_link = Some(style);
-                }
-            }
-            b"styleLink" if xml_path_ends_with(&stack, &[b"abstractNum"]) => {
-                if let (Some(definition), Some(style)) = (definition, value(b"val")) {
-                    if numbering.style_definitions.len() >= MAX_DOCX_STYLES
-                        && !numbering.style_definitions.contains_key(&style)
-                    {
-                        return Err(DocumentError::ResourceLimit);
-                    }
-                    numbering
-                        .style_definitions
-                        .entry(style)
-                        .or_insert(definition);
-                }
-            }
-            b"lvlOverride" if list.is_some() && xml_path_ends_with(&stack, &[b"num"]) => {
-                override_level = level_of(&event);
-            }
-            b"startOverride" if xml_path_ends_with(&stack, &[b"num", b"lvlOverride"]) => {
-                if let (Some(id), Some(level), Some(start)) = (
-                    list,
-                    override_level,
-                    numeric(b"val").and_then(|start| docx_start_value(&start)),
-                ) {
-                    numbering.lists.entry(id).or_default().starts[level] = Some(start);
-                }
-            }
-            b"lvl" => {
-                let opened = if definition.is_some()
-                    && xml_path_ends_with(&stack, &[b"abstractNum"])
-                {
-                    level_of(&event).map(|index| (index, false))
-                } else if list.is_some() && xml_path_ends_with(&stack, &[b"num", b"lvlOverride"]) {
-                    override_level.map(|index| (index, true))
-                } else {
-                    None
-                };
-                if let Some((index, replaces)) = opened {
-                    let open = DocxOpenLevel {
-                        index,
-                        replaces,
-                        level: DocxLevel::default(),
-                    };
-                    if start {
-                        open_level = Some(open);
-                    } else {
-                        commit(&mut numbering, definition, list, open);
-                    }
-                }
-            }
-            b"lvlText" if xml_path_ends_with(&stack, &[b"lvl"]) => {
-                if let Some(open) = open_level.as_mut() {
-                    if open.level.text.is_none() {
-                        let text = raw(b"val").unwrap_or_default();
-                        open.level.text = Some(if text.len() > MAX_DOCX_LEVEL_TEXT_BYTES {
-                            DocxLevelText::Oversized
-                        } else {
-                            DocxLevelText::Text(text.into())
+                    b"lvlOverride" => {
+                        let index = attribute(b"ilvl")
+                            .and_then(|value| number(value).parse::<usize>().ok())
+                            .unwrap_or(0);
+                        override_level = Some(DocxOpenOverride {
+                            index: (index < DOCX_LIST_LEVELS).then_some(index),
+                            level: None,
+                            start: None,
+                            level_read: false,
+                            start_read: false,
                         });
                     }
+                    _ => {}
                 }
             }
-            b"isLgl" if xml_path_ends_with(&stack, &[b"lvl"]) => {
-                if let Some(open) = open_level.as_mut() {
-                    open.level.legal = !xml_toggle_off(&event);
-                }
-            }
-            b"numFmt" | b"start" | b"lvlRestart" | b"pStyle"
-                if xml_path_ends_with(&stack, &[b"lvl"]) =>
-            {
-                if let (Some(open), Some(found)) = (open_level.as_mut(), value(b"val")) {
-                    let level = &mut open.level;
-                    let found_number = numeric(b"val").unwrap_or_default();
-                    match local.as_slice() {
-                        b"numFmt" if level.format.is_none() => level.format = Some(found.into()),
-                        b"start" if level.start.is_none() => {
-                            level.start = docx_start_value(&found_number);
-                        }
-                        b"lvlRestart" if level.restart.is_none() => {
-                            level.restart = found_number.parse().ok();
-                        }
-                        b"pStyle" if level.style.is_none() => level.style = Some(found.into()),
-                        _ => {}
+        } else if parent_is(b"lvlOverride") && stack.len() == 3 {
+            if let Some(open) = override_level.as_mut() {
+                match local {
+                    b"startOverride" if word || !open.start_read => {
+                        open.start_read = true;
+                        open.start = attribute(b"val")
+                            .and_then(|start| docx_start_value(&number(start)))
+                            .or(open.start.filter(|_| word));
                     }
+                    b"lvl" if word || !open.level_read => {
+                        open.level_read = true;
+                        if let Some(index) = open.index {
+                            open_level = Some(DocxOpenLevel {
+                                index,
+                                depth: stack.len(),
+                                level: DocxLevel::default(),
+                                read: Vec::new(),
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
+        } else if parent_is(b"lvl") {
+            if let Some(open) = open_level.as_mut() {
+                docx_level_property(open, local, word, |name| attribute(name), &event, number);
+            }
         }
         if start {
-            stack.push(local);
+            stack.push(node);
+        } else {
+            docx_numbering_close(
+                &node,
+                stack.len(),
+                word,
+                &mut numbering,
+                &mut definition,
+                &mut list,
+                &mut override_level,
+                &mut open_level,
+            )?;
         }
         buffer.clear();
     }
+}
+
+/// Read one property of an open list level: AnyDoc reads the first element
+/// of each, and Word the first that gives a value, except that legal
+/// numbering (`w:isLgl`) is Word's last.
+fn docx_level_property(
+    open: &mut DocxOpenLevel,
+    local: &[u8],
+    word: bool,
+    attribute: impl Fn(&[u8]) -> Option<String>,
+    event: &quick_xml::events::BytesStart<'_>,
+    number: impl Fn(String) -> String,
+) {
+    let property: &'static [u8] = match local {
+        b"numFmt" => b"numFmt",
+        b"start" => b"start",
+        b"lvlRestart" => b"lvlRestart",
+        b"pStyle" => b"pStyle",
+        b"lvlText" => b"lvlText",
+        b"isLgl" => b"isLgl",
+        _ => return,
+    };
+    let first = !open.read.contains(&property);
+    if first {
+        open.read.push(property);
+    }
+    let level = &mut open.level;
+    let value = attribute(b"val");
+    match property {
+        b"numFmt" if (word && level.format.is_none()) || (!word && first) => {
+            level.format = value.map(|format| format.trim().into());
+        }
+        b"start" if (word && level.start.is_none()) || (!word && first) => {
+            level.start = value.and_then(|start| docx_start_value(&number(start)));
+        }
+        b"lvlRestart" if (word && level.restart.is_none()) || (!word && first) => {
+            level.restart = value.and_then(|restart| number(restart).parse().ok());
+        }
+        b"pStyle" if (word && level.style.is_none()) || (!word && first) => {
+            level.style = value.map(Rc::from);
+        }
+        b"lvlText" if first => {
+            let text = value.unwrap_or_default();
+            level.text = Some(if text.len() > MAX_DOCX_LEVEL_TEXT_BYTES {
+                DocxLevelText::Oversized
+            } else {
+                DocxLevelText::Text(text.into())
+            });
+        }
+        b"isLgl" if word => level.legal = !xml_toggle_off(event),
+        b"isLgl" if first => {
+            level.legal = !matches!(value.as_deref(), Some("0" | "false" | "off" | "none"));
+        }
+        _ => {}
+    }
+}
+
+/// Close an element of a numbering part, `depth` elements deep: commit the
+/// level, override, list instance, or definition it ends as the side keeps
+/// it.
+#[allow(clippy::too_many_arguments)]
+fn docx_numbering_close(
+    closed: &DocxNumberingNode,
+    depth: usize,
+    word: bool,
+    numbering: &mut DocxNumbering,
+    definition: &mut Option<DocxOpenDefinition>,
+    list: &mut Option<DocxOpenList>,
+    override_level: &mut Option<DocxOpenOverride>,
+    open_level: &mut Option<DocxOpenLevel>,
+) -> Result<(), DocumentError> {
+    if !closed.word {
+        return Ok(());
+    }
+    match (closed.local.as_slice(), depth) {
+        (b"lvl", 2 | 3) if open_level.as_ref().is_some_and(|open| open.depth == depth) => {
+            let Some(open) = open_level.take() else {
+                return Ok(());
+            };
+            if depth == 2 {
+                if let Some(definition) = definition.as_mut() {
+                    definition.definition.levels[open.index] = Some(open.level);
+                }
+            } else if let Some(replacing) = override_level.as_mut() {
+                replacing.level = Some(open.level);
+            }
+        }
+        (b"lvlOverride", 2) => {
+            let (Some(replacing), Some(open)) = (override_level.take(), list.as_mut()) else {
+                return Ok(());
+            };
+            let Some(index) = replacing.index else {
+                return Ok(());
+            };
+            if let Some(level) = replacing.level {
+                open.list.levels[index] = Some(level);
+                // AnyDoc replaces the whole level, and then restarts it
+                // at this override's start, if it gives one.
+                if !word {
+                    open.list.starts[index] = None;
+                }
+            }
+            if let Some(start) = replacing.start {
+                open.list.starts[index] = Some(start);
+            }
+        }
+        (b"num", 1) => {
+            let Some(open) = list.take() else {
+                return Ok(());
+            };
+            // AnyDoc keeps an instance naming a definition, and Word the
+            // first reading of each id.
+            let Some(id) = open.id.filter(|_| word || open.list.definition.is_some()) else {
+                return Ok(());
+            };
+            if numbering.lists.len() >= MAX_DOCX_STYLES && !numbering.lists.contains_key(&id) {
+                return Err(DocumentError::ResourceLimit);
+            }
+            numbering.lists.insert(id, open.list);
+        }
+        (b"abstractNum", 1) => {
+            let Some(open) = definition.take() else {
+                return Ok(());
+            };
+            if open.id.len() > MAX_STYLE_ID_BYTES
+                || (numbering.definitions.len() >= MAX_DOCX_STYLES
+                    && !numbering.definition_ids.contains_key(&open.id))
+            {
+                return Err(DocumentError::ResourceLimit);
+            }
+            let next = numbering.definitions.len();
+            let index = *numbering.definition_ids.entry(open.id).or_insert(next);
+            if index == next {
+                numbering.definitions.push(open.definition);
+            } else {
+                numbering.definitions[index] = open.definition;
+            }
+            for style in open.style_links {
+                if numbering.style_definitions.len() >= MAX_DOCX_STYLES
+                    && !numbering.style_definitions.contains_key(&style)
+                {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                numbering.style_definitions.entry(style).or_insert(index);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The paragraph styles' numbering each side of the list replay reads: Word
@@ -12122,6 +12349,156 @@ mod tests {
                 (part, &symbol),
             ]);
             assert!(preflight.unsupported_content, "{target}");
+        }
+    }
+
+    #[test]
+    fn docx_numbering_is_read_as_each_side_reads_it() {
+        const IGNORABLE: &str = r#"xmlns:x="urn:x" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x""#;
+        let items = |numbering: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr>{numbering}</w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#
+            )
+            .repeat(3)
+        };
+        let direct = items(r#"<w:ilvl w:val="0"/><w:numId w:val="1"/>"#);
+        let level = |ilvl: u32, format: &str, text: &str, start: &str| {
+            format!(
+                r#"<w:lvl w:ilvl="{ilvl}"><w:start {start}/><w:numFmt w:val="{format}"/><w:lvlText w:val="{text}"/></w:lvl>"#
+            )
+        };
+        let decimal = level(0, "decimal", "%1.", r#"w:val="1""#);
+        let definition =
+            |id: &str, levels: &str| format!(r#"<w:abstractNum {id}>{levels}</w:abstractNum>"#);
+        let differs = |body: &str, numbering: &str| {
+            let document =
+                format!("<w:document {WORD_NS} {IGNORABLE}><w:body>{body}</w:body></w:document>");
+            let numbering = format!("<w:numbering {WORD_NS} {IGNORABLE}>{numbering}</w:numbering>");
+            docx_preflight(&[
+                ("word/document.xml", document.as_bytes()),
+                ("word/numbering.xml", numbering.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let one = format!(
+            r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+            definition(r#"w:abstractNumId="0""#, &decimal)
+        );
+        assert!(!differs(&direct, &one));
+        // A paragraph's list and level are read from WordprocessingML's
+        // attribute, else the unprefixed one, never another vocabulary's:
+        // Word reads " 1" and AnyDoc cannot.
+        for numbering in [
+            r#"<w:ilvl w:val="0"/><w:numId w:val=" 1" x:val="1"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId x:val="1" w:val=" 1"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId val=" 1"/>"#,
+        ] {
+            assert!(differs(&items(numbering), &one), "{numbering}");
+        }
+        for numbering in [
+            r#"<w:ilvl w:val="0"/><w:numId x:val=" 1" w:val="1"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId val="1"/>"#,
+        ] {
+            assert!(!differs(&items(numbering), &one), "{numbering}");
+        }
+        let two_levels = format!(
+            r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+            definition(
+                r#"w:abstractNumId="0""#,
+                &format!(
+                    "{decimal}{}",
+                    level(1, "lowerLetter", "%2)", r#"w:val="1""#)
+                )
+            )
+        );
+        assert!(differs(
+            &items(r#"<w:ilvl w:val=" 1" x:val="1"/><w:numId w:val="1"/>"#),
+            &two_levels
+        ));
+        // So is every number and id of the numbering part.
+        for numbering in [
+            format!(
+                r#"{}<w:num x:numId="1" w:numId=" 1"><w:abstractNumId w:val="0"/></w:num>"#,
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId x:val="0" w:val=" 0"/></w:num>"#,
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+                definition(
+                    r#"w:abstractNumId="0""#,
+                    &level(0, "decimal", "%1.", r#"x:val="1" w:val=" 5""#)
+                )
+            ),
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride x:val="1" w:val=" 5"/></w:lvlOverride></w:num>"#,
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+            format!(
+                r#"{}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+                definition(r#"x:abstractNumId="0" w:abstractNumId="00""#, &decimal)
+            ),
+        ] {
+            assert!(differs(&direct, &numbering), "{numbering}");
+        }
+        // Of two definitions or instances with one id, Word keeps the first
+        // and AnyDoc the last, read afresh.
+        let roman = level(0, "upperRoman", "%1.", r#"w:val="1""#);
+        let plain = r#"<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
+        let restarted = r#"<w:num w:numId="1"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num>"#;
+        for numbering in [
+            format!(
+                "{}{}{plain}",
+                definition(r#"w:abstractNumId="0""#, &decimal),
+                definition(r#"w:abstractNumId="0""#, &roman)
+            ),
+            format!(
+                "{}{restarted}{plain}",
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+            format!(
+                "{}{plain}{restarted}",
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+            format!(
+                r#"{}{}{plain}<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>"#,
+                definition(r#"w:abstractNumId="0""#, &decimal),
+                definition(r#"w:abstractNumId="1""#, &roman)
+            ),
+        ] {
+            assert!(differs(&direct, &numbering), "{numbering}");
+        }
+        for numbering in [
+            format!(
+                "{}{}{plain}",
+                definition(r#"w:abstractNumId="0""#, &decimal),
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+            // An instance naming no definition is no reading AnyDoc keeps.
+            format!(
+                r#"{}{plain}<w:num w:numId="1"/>"#,
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            ),
+        ] {
+            assert!(!differs(&direct, &numbering), "{numbering}");
+        }
+        // Only WordprocessingML's definitions and instances, children of the
+        // part's numbering, count: a later definition of the id in another
+        // vocabulary, or wrapped, replaces nothing for AnyDoc.
+        for later in [
+            format!(r#"<x:abstractNum w:abstractNumId="0">{roman}</x:abstractNum>"#),
+            format!(
+                "<x:wrap>{}</x:wrap>",
+                definition(r#"w:abstractNumId="0""#, &roman)
+            ),
+        ] {
+            let numbering = format!(
+                "{}{later}{plain}",
+                definition(r#"w:abstractNumId="0""#, &decimal)
+            );
+            assert!(!differs(&direct, &numbering), "{numbering}");
         }
     }
 
