@@ -62,26 +62,35 @@ struct Decoder {
     cmap: Option<ToUnicodeCMap>,
     /// For a simple font, the name its differences give each code.
     names: HashMap<u8, String>,
+    /// What the codes read so far read as.
+    read: HashMap<u16, Option<String>>,
 }
 
 impl Decoder {
-    /// What a code reads as: one character, or `None` when the font does
-    /// not say, or says more than one.
-    fn read(&self, code: u16) -> Option<char> {
+    /// What a code reads as, when the font says.
+    fn text(&self, code: u16) -> Option<String> {
         let mapped = self
             .cmap
             .as_ref()
             .and_then(|cmap| cmap.lookup(code))
             .filter(|text| !text.contains('\u{FFFD}'));
-        let text = match mapped {
-            Some(text) => text,
-            None if self.two_byte => return None,
+        match mapped {
+            Some(text) => Some(text),
+            None if self.two_byte => None,
             None => match self.names.get(&(code as u8)) {
-                Some(name) => glyph_name_to_string(name)?,
-                None if (0x20..=0x7E).contains(&code) => return char::from_u32(u32::from(code)),
-                None => return None,
+                Some(name) => glyph_name_to_string(name),
+                None if (0x20..=0x7E).contains(&code) => {
+                    char::from_u32(u32::from(code)).map(String::from)
+                }
+                None => None,
             },
-        };
+        }
+    }
+
+    /// What a code reads as: one character, or `None` when the font does
+    /// not say, or says more than one.
+    fn read(&self, code: u16) -> Option<char> {
+        let text = self.text(code)?;
         let mut characters = text.chars();
         match (characters.next(), characters.next()) {
             (Some(character), None) => Some(character),
@@ -128,6 +137,30 @@ impl GlyphFonts {
             _ => return None,
         };
         Some(decoder.read(code))
+    }
+
+    /// What a string shown in `font` reads as, when every glyph of it can
+    /// be read.
+    pub(crate) fn text(&mut self, font: usize, bytes: &[u8]) -> Option<String> {
+        let decoder = &mut self.decoders[font];
+        let width = if decoder.two_byte { 2 } else { 1 };
+        if !bytes.len().is_multiple_of(width) {
+            return None;
+        }
+        let mut text = String::with_capacity(bytes.len());
+        for code in bytes.chunks(width) {
+            let code = match code {
+                [byte] => u16::from(*byte),
+                [high, low] => u16::from_be_bytes([*high, *low]),
+                _ => return None,
+            };
+            if !decoder.read.contains_key(&code) {
+                let reading = decoder.text(code);
+                decoder.read.insert(code, reading);
+            }
+            text.push_str(decoder.read.get(&code)?.as_deref()?);
+        }
+        Some(text)
     }
 
     /// What the first glyph of a string shown in `font` reads as.
@@ -178,6 +211,7 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
         two_byte,
         cmap,
         names,
+        read: HashMap::new(),
     })
 }
 

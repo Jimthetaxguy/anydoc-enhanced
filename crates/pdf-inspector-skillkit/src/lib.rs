@@ -253,6 +253,12 @@ impl PdfInfo {
     }
 }
 
+/// Positioned text, with the turn of each page whose text reads rotated.
+type PositionedText = (
+    Vec<pdf_inspector::TextItem>,
+    HashMap<u32, pdf_inspector::PageRotation>,
+);
+
 impl PdfInfo {
     /// Scan what the pages paint (see `text_paints`). Pages whose text is
     /// mostly an invisible layer over a scan, which pdf-inspector reads as
@@ -279,13 +285,45 @@ impl PdfInfo {
             .map(|markdown| glyph_words::misread(markdown, &found.glyph_words))
             .unwrap_or_default();
         let shared = glyph_words::pages_to_read(&misread, &found.glyph_words);
-        let items = self.positions(
+        let read = self.positions(
             buffer,
             &found.painted_twice,
             !tables.merged.is_empty(),
             &shared,
             only,
         );
+        // The scan's run starts, turned as pdf-inspector turns the text of
+        // a page that reads rotated.
+        let (items, turns) = match read {
+            Some((items, turns)) => (Some(items), turns),
+            None => (None, HashMap::new()),
+        };
+        let turned = |page: u32, at: [f64; 2]| match turns.get(&page) {
+            Some(pdf_inspector::PageRotation::Ccw) => [at[1], -at[0]],
+            Some(pdf_inspector::PageRotation::Cw) => [-at[1], at[0]],
+            _ => at,
+        };
+        let placed: Vec<text_paints::Placed> = found
+            .placed
+            .iter()
+            .map(|start| text_paints::Placed {
+                at: turned(start.page, start.at),
+                ..*start
+            })
+            .collect();
+        let repeats: Vec<(u32, text_paints::Repeat)> = found
+            .repeats
+            .iter()
+            .map(|(page, repeat)| {
+                (
+                    *page,
+                    text_paints::Repeat {
+                        at: turned(*page, repeat.at),
+                        ..repeat.clone()
+                    },
+                )
+            })
+            .collect();
         // Each page's text as pdf-inspector reads it, its lines ended, where
         // a word may wrap, and the items of a line apart without a space: a
         // gap misjudged as a word space is a space inside an item.
@@ -322,7 +360,7 @@ impl PdfInfo {
             ));
         }
         let painted_twice =
-            self.confirm_painted_twice(found.painted_twice, &found.repeats, items.as_deref());
+            self.confirm_painted_twice(found.painted_twice, &repeats, items.as_deref());
         if !painted_twice.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_TEXT_PAINTED_TWICE,
@@ -349,11 +387,17 @@ impl PdfInfo {
                 size: f64::from(item.font_size.abs().max(item.height.abs())),
             })
             .collect();
+        let layout = markdown_tables::Layout::new(&runs, &placed);
+        // Cells alike are placed alike, so each is placed once.
+        let mut placed_cells = HashSet::new();
         let values_merged = tables.merged.iter().any(|cell| {
             if items.is_none() {
                 return cell.in_table;
             }
-            match markdown_tables::merged_on_one_line(cell, &runs, &found.placed) {
+            if !placed_cells.insert((&cell.amounts, &cell.row, cell.in_table)) {
+                return false;
+            }
+            match layout.placement(cell) {
                 markdown_tables::Placement::OneLine => true,
                 markdown_tables::Placement::AsSet => false,
                 markdown_tables::Placement::Unread => cell.in_table,
@@ -371,8 +415,9 @@ impl PdfInfo {
     /// The positioned text of the pages the checks read again: the first
     /// `MAX_CONFIRMED_PAGES` pages painting text twice, as many of the pages
     /// sharing a word shown glyph by glyph that the Markdown splits, and,
-    /// when a table cell holds two amounts, as many of the pages converted.
-    /// `None` when it cannot be read.
+    /// when a table cell holds two amounts, as many of the pages converted;
+    /// with the turn of each page whose text reads rotated, which its items
+    /// take. `None` when it cannot be read.
     fn positions(
         &self,
         buffer: &[u8],
@@ -380,7 +425,7 @@ impl PdfInfo {
         tables: bool,
         glyph_words: &[u32],
         only: Option<&HashSet<u32>>,
-    ) -> Option<Vec<pdf_inspector::TextItem>> {
+    ) -> Option<PositionedText> {
         let mut wanted: HashSet<u32> = painted_twice
             .iter()
             .take(MAX_CONFIRMED_PAGES)
@@ -395,10 +440,10 @@ impl PdfInfo {
             );
         }
         if wanted.is_empty() {
-            return Some(Vec::new());
+            return Some((Vec::new(), HashMap::new()));
         }
         std::panic::catch_unwind(|| {
-            pdf_inspector::extract_text_with_positions_mem_in_frame(
+            pdf_inspector::extract_text_with_positions_and_rotations_mem_in_frame(
                 buffer,
                 Some(&wanted),
                 pdf_inspector::PositionFrame::Sheet,

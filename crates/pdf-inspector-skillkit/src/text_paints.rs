@@ -19,8 +19,14 @@
 //! pdf-inspector keeps every paint, so its Markdown repeats the text:
 //! "TToottaall", or "84.19 84.19" (open upstream #317, #377). The scan notes
 //! where each visible run starts when its position was just set, and
-//! reports a page on which a run with the same bytes starts again within a
-//! tenth of its size of an earlier one, in whatever font.
+//! reports a page on which a run showing the same bytes, or the same text
+//! as its font reads it, starts again near an earlier one, in whatever
+//! font: within a tenth of its size, or, for a run of two glyphs or more,
+//! which cannot start again so near itself, a third, as a shadow does. A
+//! run that starts where a longer or shorter one did, the one beginning the
+//! other, repeats it too, as a second paint split in two strings does; so
+//! does a string a `TJ` array shows again after stepping back, as an
+//! overstrike does.
 //!
 //! **Word gaps judged against the wrong space.** On the same pages, text
 //! shown in a subset font whose differences name the space at another code
@@ -66,10 +72,22 @@ const MAX_RUNS_PER_PAGE: usize = 100_000;
 const MAX_REPEATS_PER_PAGE: usize = 16;
 /// Placed run starts kept per document, for the table check.
 const MAX_PLACED_RUNS: usize = 400_000;
-/// How near a run must start again to repeat one, as a share of its size,
-/// and at least.
+/// How near a run must start again to repeat one, as a share of its size:
+/// a run of one glyph, and of more; and at least.
 const REPEAT_SHARE: f64 = 0.1;
+const REPEAT_SHARE_GLYPHS: f64 = 0.35;
 const MIN_REPEAT_DISTANCE: f64 = 0.3;
+/// The side, in points, of the squares run starts are filed in for runs
+/// that begin one another; runs whose reach spans more squares than
+/// `MAX_REPEAT_SQUARES` on a side are matched whole only.
+const REPEAT_SQUARE: f64 = 4.0;
+const MAX_REPEAT_SQUARES: i64 = 16;
+/// The least text, in bytes, that a run beginning another must show.
+const MIN_BEGINNING_BYTES: usize = 4;
+/// Least step back between two strings of a `TJ` array, in thousandths of
+/// the font size, that paints the second over the first: past kerning, and
+/// no more than the narrowest glyph's width.
+const REWIND_TRAVEL: f64 = 180.0;
 
 const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
@@ -119,8 +137,14 @@ impl Budget {
 struct State {
     ctm: [f64; 6],
     render_mode: i64,
+    /// The render mode as pdf-inspector reads text by it: it takes each
+    /// text object to start in mode 0.
+    read_mode: i64,
     /// Whether `Tf` has set a font; text shown before shows nothing.
     font: bool,
+    /// Whether `Tf` finds fonts pdf-inspector reads text by: not in a form
+    /// without resources of its own, where it finds none.
+    fonts: bool,
     /// The font, when pdf-inspector and its fix take different word-gap
     /// thresholds from it and the page is checked for them.
     gaps: Option<GapFont>,
@@ -140,7 +164,9 @@ impl State {
     const START: State = State {
         ctm: IDENTITY,
         render_mode: 0,
+        read_mode: 0,
         font: false,
+        fonts: true,
         gaps: None,
         glyph_font: None,
         size: 0.0,
@@ -152,19 +178,58 @@ impl State {
     };
 }
 
-/// Where the visible runs of one page start, by a hash of their bytes. The
-/// font is left out: pdf-inspector keeps the text of every paint, whichever
-/// font object draws it, so a second paint in an identical font object, or
-/// another font, repeats the text all the same.
+/// Where the visible runs of one page start, by a hash of their bytes and
+/// one of their text as the font reads it. The font is left out:
+/// pdf-inspector keeps the text of every paint, whichever font object draws
+/// it, so a second paint in an identical font object, or another font,
+/// repeats the text all the same.
 #[derive(Default)]
 struct Runs {
     starts: HashMap<u64, Vec<[f64; 2]>>,
+    /// What the runs long enough to begin another show, and where each
+    /// starts, filed by square.
+    shown: Vec<Shows>,
+    squares: HashMap<(i64, i64), Vec<Filed>>,
     noted: usize,
     /// Where repeated runs start, with their size.
     repeats: Vec<Repeat>,
     /// Where every placed run starts, whatever its bytes, and whether it
     /// is plain.
     placed: Vec<([f64; 2], bool)>,
+}
+
+/// Where a run starts, and where what it shows is kept.
+type Filed = ([f64; 2], usize);
+
+/// What a run shows: its bytes, and its text when its font reads it.
+#[derive(Clone, Debug)]
+struct Shows {
+    bytes: Vec<u8>,
+    text: Option<String>,
+}
+
+impl Shows {
+    /// Whether one of two runs shows the beginning of what the other does,
+    /// by their text where both fonts read it, else by their bytes.
+    fn begins(&self, other: &Shows) -> bool {
+        let (one, another): (&[u8], &[u8]) = match (&self.text, &other.text) {
+            (Some(one), Some(another)) => (one.as_bytes(), another.as_bytes()),
+            _ => (&self.bytes, &other.bytes),
+        };
+        let (shorter, longer) = if one.len() <= another.len() {
+            (one, another)
+        } else {
+            (another, one)
+        };
+        shorter.len() >= MIN_BEGINNING_BYTES && longer.starts_with(shorter)
+    }
+
+    /// How many glyphs it shows, or its bytes where its font does not say.
+    fn glyphs(&self) -> usize {
+        self.text
+            .as_ref()
+            .map_or(self.bytes.len(), |text| text.chars().count())
+    }
 }
 
 /// Where a visible run placed on a page starts, measured from the page's
@@ -204,37 +269,114 @@ fn plain(text: Option<&Object>) -> bool {
     true
 }
 
-/// Where a repeated run starts, in user space, and its size.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Where a repeated run starts, in user space, its size, and its text when
+/// its font reads it.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Repeat {
     pub(crate) at: [f64; 2],
     pub(crate) size: f64,
+    pub(crate) text: Option<String>,
 }
 
 impl Runs {
-    fn note(&mut self, text: &[u8], at: [f64; 2], size: f64) {
+    fn note(&mut self, shows: Shows, at: [f64; 2], size: f64) {
         if self.repeats.len() >= MAX_REPEATS_PER_PAGE || self.noted >= MAX_RUNS_PER_PAGE {
             return;
         }
-        let near = (REPEAT_SHARE * size).max(MIN_REPEAT_DISTANCE);
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        match self.starts.entry(hasher.finish()) {
-            Entry::Occupied(mut entry) => {
-                if entry.get().iter().any(|start| {
-                    (start[0] - at[0]).abs() <= near && (start[1] - at[1]).abs() <= near
-                }) {
-                    self.repeats.push(Repeat { at, size });
-                    return;
+        let share = if shows.glyphs() >= 2 {
+            REPEAT_SHARE_GLYPHS
+        } else {
+            REPEAT_SHARE
+        };
+        let near = (share * size).max(MIN_REPEAT_DISTANCE);
+        let within =
+            |start: &[f64; 2]| (start[0] - at[0]).abs() <= near && (start[1] - at[1]).abs() <= near;
+        let key = |tag: u8, shown: &[u8]| {
+            let mut hasher = DefaultHasher::new();
+            (tag, shown).hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut keys = vec![key(b'b', &shows.bytes)];
+        keys.extend(shows.text.as_ref().map(|text| key(b't', text.as_bytes())));
+        let mut repeated = false;
+        for key in keys {
+            match self.starts.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    repeated |= entry.get().iter().any(within);
+                    entry.get_mut().push(at);
                 }
-                entry.get_mut().push(at);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(vec![at]);
+                Entry::Vacant(entry) => {
+                    entry.insert(vec![at]);
+                }
             }
         }
+        if repeated {
+            self.repeat(at, size, &shows);
+            return;
+        }
         self.noted += 1;
+        // A run beginning one that starts near it repeats it.
+        let square = |value: f64| (value / REPEAT_SQUARE).floor() as i64;
+        let reach = (near / REPEAT_SQUARE).ceil() as i64;
+        if shows.bytes.len() < MIN_BEGINNING_BYTES || reach > MAX_REPEAT_SQUARES {
+            return;
+        }
+        let (column, row) = (square(at[0]), square(at[1]));
+        for x in column - reach..=column + reach {
+            for y in row - reach..=row + reach {
+                let begun = self.squares.get(&(x, y)).is_some_and(|filed| {
+                    filed
+                        .iter()
+                        .any(|(start, other)| within(start) && shows.begins(&self.shown[*other]))
+                });
+                if begun {
+                    self.repeat(at, size, &shows);
+                    return;
+                }
+            }
+        }
+        self.squares
+            .entry((column, row))
+            .or_default()
+            .push((at, self.shown.len()));
+        self.shown.push(shows);
     }
+
+    fn repeat(&mut self, at: [f64; 2], size: f64, shows: &Shows) {
+        if self.repeats.len() < MAX_REPEATS_PER_PAGE {
+            self.repeats.push(Repeat {
+                at,
+                size,
+                text: shows.text.clone(),
+            });
+        }
+    }
+}
+
+/// The string a `TJ` array shows again right after stepping back, as an
+/// overstrike paints it over itself.
+fn overstruck(text: Option<&Object>) -> Option<&[u8]> {
+    let Some(Object::Array(elements)) = text else {
+        return None;
+    };
+    let (mut last, mut travel): (Option<&[u8]>, f64) = (None, 0.0);
+    for element in elements {
+        match element {
+            Object::Integer(offset) => travel += *offset as f64,
+            Object::Real(offset) => travel += f64::from(*offset),
+            Object::String(bytes, _) if !bytes.is_empty() => {
+                if last == Some(bytes.as_slice())
+                    && travel >= REWIND_TRAVEL
+                    && bytes.iter().any(|&byte| byte != b' ')
+                {
+                    return Some(bytes);
+                }
+                (last, travel) = (Some(bytes.as_slice()), 0.0);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A string whose spacing pdf-inspector and its fix read differently,
@@ -253,8 +395,8 @@ struct Pending {
 
 impl Pending {
     /// Whether `text`, the next run, shown at `text_matrix`, starts where
-    /// the spacing is taken back. A run placed anew on the same baseline,
-    /// with the pen unknown, may.
+    /// the spacing is taken back. With the pen unknown, a run placed anew
+    /// decides nothing.
     fn taken_back(&self, state: State, text_matrix: [f64; 6], text: &Object) -> bool {
         let travel = f64::from(leading_travel(text, state.size as f32));
         if !self.moved {
@@ -281,7 +423,7 @@ impl Pending {
                 let along = (dx * self.unit[0] + dy * self.unit[1]) / scale;
                 self.candidate.taken_back(-along as f32)
             }
-            None => true,
+            None => false,
         }
     }
 }
@@ -397,7 +539,7 @@ impl PageText {
         let known = placed && at.iter().chain(&em).all(|value| value.is_finite());
         let font = state
             .glyph_font
-            .filter(|_| state.font && state.render_mode != 3);
+            .filter(|_| state.font && state.read_mode != 3);
         match (font, known) {
             (Some(font), true) => match self.glyph_fonts.one_glyph(font, bytes) {
                 Some(reading) => words.glyph(Glyph {
@@ -413,13 +555,19 @@ impl PageText {
         }
     }
 
-    /// Note a visible run whose start the text matrix says.
-    fn note_run(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], plain: bool) {
-        let Some(runs) = self.runs.as_mut() else {
-            return;
-        };
-        if !state.font
-            || matches!(state.render_mode, 3 | 7)
+    /// Note a visible run whose start the text matrix says, and the string
+    /// it strikes over itself, if any.
+    fn note_run(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        bytes: &[u8],
+        plain: bool,
+        overstruck: Option<&[u8]>,
+    ) {
+        if self.runs.is_none()
+            || !state.font
+            || matches!(state.read_mode, 3 | 7)
             || !bytes.iter().any(|&byte| byte != b' ')
         {
             return;
@@ -430,12 +578,30 @@ impl PageText {
             matrix[3] * state.rise + matrix[5],
         ];
         let size = state.size.abs() * matrix[2].hypot(matrix[3]);
-        if at.iter().all(|value| value.is_finite()) && size.is_finite() {
-            if runs.placed.len() < MAX_RUNS_PER_PAGE {
-                runs.placed.push((at, plain));
-            }
-            runs.note(bytes, at, size);
+        if !at.iter().all(|value| value.is_finite()) || !size.is_finite() {
+            return;
         }
+        // A run of one byte is matched by its bytes alone: text read through
+        // the font adds nothing but its cost for a page shown glyph by glyph.
+        let mut shows = |bytes: &[u8]| Shows {
+            bytes: bytes.to_vec(),
+            text: state
+                .glyph_font
+                .filter(|_| bytes.len() >= 2)
+                .and_then(|font| self.glyph_fonts.text(font, bytes)),
+        };
+        let run = shows(bytes);
+        let struck = overstruck.map(shows);
+        let Some(runs) = self.runs.as_mut() else {
+            return;
+        };
+        if runs.placed.len() < MAX_RUNS_PER_PAGE {
+            runs.placed.push((at, plain));
+        }
+        if let Some(struck) = struck {
+            runs.repeat(at, size, &struck);
+        }
+        runs.note(run, at, size);
     }
 
     fn draw_image(&mut self, ctm: [f64; 6], page_box: [f64; 4]) {
@@ -643,6 +809,7 @@ fn scan_page(
         // Streams are concatenated as if one, separated by white space.
         content.push(b'\n');
     }
+    let content = without_comments(&content);
     let mut page = PageText {
         runs: check_twice.then(Runs::default),
         gap_fonts: std::mem::take(gap_fonts),
@@ -693,7 +860,7 @@ fn scan_page(
                     .into_iter()
                     .map(|repeat| Repeat {
                         at: [repeat.at[0] - page_box[0], repeat.at[1] - page_box[1]],
-                        size: repeat.size,
+                        ..repeat
                     })
                     .collect()
             })
@@ -729,14 +896,30 @@ fn execute<'a>(
     // text, and a string there waiting on the next run.
     let mut in_text = false;
     let mut pending: Option<Pending> = None;
+    // How far the pen has travelled since the text was last placed, in
+    // unscaled text space units, while every run shown since is in a font
+    // whose widths the scan reads.
+    let mut travelled: Option<f64> = Some(0.0);
+    // The marked-content spans open, and whether each gives the text its
+    // glyphs stand for, which pdf-inspector reads in place of the glyphs.
+    let mut spans: Vec<bool> = Vec::new();
     for operation in &content.operations {
         let operands = &operation.operands;
         let operator = operation.operator.as_str();
-        // `'` and `"` move to the next line before they show text.
+        // `'` and `"` move to the next line before they show text; with no
+        // leading set, pdf-inspector moves by 1.2 times the font size.
         if matches!(operator, "T*" | "'" | "\"") {
-            line_matrix = multiply([1.0, 0.0, 0.0, 1.0, 0.0, -state.leading], line_matrix);
+            let leading = if state.leading != 0.0 {
+                state.leading
+            } else {
+                1.2 * state.size
+            };
+            line_matrix = multiply([1.0, 0.0, 0.0, 1.0, 0.0, -leading], line_matrix);
             text_matrix = line_matrix;
             placed = true;
+        }
+        if matches!(operator, "T*" | "'" | "\"" | "Td" | "TD" | "Tm" | "BT") {
+            travelled = Some(0.0);
         }
         if matches!(operator, "T*" | "'" | "\"" | "Td" | "TD" | "Tm") {
             if let Some(pending) = pending.as_mut() {
@@ -768,7 +951,22 @@ fn execute<'a>(
             "Tr" => {
                 if let Some(mode) = operands.first().and_then(|mode| integer(document, mode)) {
                     state.render_mode = mode;
+                    state.read_mode = mode;
                 }
+            }
+            "BMC" => spans.push(false),
+            "BDC" => spans.push(
+                operands
+                    .get(1)
+                    .and_then(|properties| match properties {
+                        Object::Dictionary(properties) => Some(properties),
+                        Object::Reference(id) => document.get_dictionary(*id).ok(),
+                        _ => None,
+                    })
+                    .is_some_and(gives_actual_text),
+            ),
+            "EMC" => {
+                spans.pop();
             }
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
@@ -778,13 +976,13 @@ fn execute<'a>(
                     state.gaps = name
                         .as_name()
                         .ok()
-                        .filter(|_| page.runs.is_some())
+                        .filter(|_| page.runs.is_some() && state.fonts)
                         .and_then(|name| font(document, resources, name))
                         .and_then(|font| page.gap_fonts.font(document, font));
                     state.glyph_font = name
                         .as_name()
                         .ok()
-                        .filter(|_| page.glyph_words.is_some())
+                        .filter(|_| page.glyph_words.is_some() && state.fonts)
                         .and_then(|name| font(document, resources, name))
                         .and_then(|font| page.glyph_fonts.font(document, font));
                     if let Some(size) = number(document, size) {
@@ -823,6 +1021,7 @@ fn execute<'a>(
                 placed = true;
                 in_text = true;
                 pending = None;
+                state.read_mode = 0;
             }
             "ET" => {
                 page.text_object_ended();
@@ -869,8 +1068,13 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
-                page.note_glyph(state, text_matrix, &bytes, placed && in_text);
-                if let Some(text) = text.filter(|_| in_text && !page.gaps_misread) {
+                // Inside a span giving the text its glyphs stand for,
+                // pdf-inspector reads that text and not the glyphs.
+                let glyphs_read = !spans.contains(&true);
+                page.note_glyph(state, text_matrix, &bytes, placed && in_text && glyphs_read);
+                let before = travelled;
+                travelled = None;
+                if let Some(text) = text.filter(|_| in_text && glyphs_read && !page.gaps_misread) {
                     // A run that shows glyphs decides for the string before.
                     if shows_glyphs(text) {
                         if let Some(waiting) = pending.take() {
@@ -878,8 +1082,7 @@ fn execute<'a>(
                         }
                     }
                     // pdf-inspector reads all but mode 3 text.
-                    if let Some(font) = state.gaps.filter(|_| state.font && state.render_mode != 3)
-                    {
+                    if let Some(font) = state.gaps.filter(|_| state.font && state.read_mode != 3) {
                         let matrix = multiply(text_matrix, state.ctm);
                         let shown = Shown {
                             size: state.size as f32,
@@ -889,19 +1092,23 @@ fn execute<'a>(
                         };
                         let judged = page.gap_fonts.judge(font, text, shown);
                         page.gaps_misread |= judged.misjudged;
+                        let advance = f64::from(judged.advance);
+                        travelled = before.map(|travelled| travelled + advance);
                         if let Some(candidate) = judged.candidate {
                             let unit = [
                                 matrix[0] * state.horizontal_scale,
                                 matrix[1] * state.horizontal_scale,
                             ];
                             let origin = [matrix[4], matrix[5]];
-                            let advance = f64::from(judged.advance);
                             pending = Some(Pending {
                                 candidate,
                                 origin,
                                 unit,
-                                pen: placed.then(|| {
-                                    [origin[0] + advance * unit[0], origin[1] + advance * unit[1]]
+                                pen: travelled.map(|travelled| {
+                                    [
+                                        origin[0] + travelled * unit[0],
+                                        origin[1] + travelled * unit[1],
+                                    ]
                                 }),
                                 moved: false,
                             });
@@ -911,7 +1118,7 @@ fn execute<'a>(
                 // After a run, the next starts where it ended, which the
                 // glyph widths decide.
                 if placed {
-                    page.note_run(state, text_matrix, &bytes, plain(text));
+                    page.note_run(state, text_matrix, &bytes, plain(text), overstruck(text));
                 }
                 placed = false;
             }
@@ -957,8 +1164,16 @@ fn execute<'a>(
                             Some(own) => vec![own],
                             None => resources.to_vec(),
                         };
+                        // pdf-inspector reads a form's text from no font and
+                        // no spacing, with the fonts of its own resources.
                         let inner = State {
                             ctm: multiply(form_matrix, state.ctm),
+                            fonts: stream.dict.has(b"Resources"),
+                            gaps: None,
+                            glyph_font: None,
+                            char_spacing: 0.0,
+                            word_spacing: 0.0,
+                            leading: 0.0,
                             ..state
                         };
                         // A form runs in a saved state of its own.
@@ -986,6 +1201,79 @@ fn execute<'a>(
         }
     }
     Ok(())
+}
+
+/// A page's content with each comment, from a `%` outside a string to the
+/// end of its line, read as a space, as pdf-inspector reads a page's
+/// content before decoding it: lopdf stops at a comment between an
+/// operator's operands. A form's content it decodes as it stands.
+fn without_comments(content: &[u8]) -> Vec<u8> {
+    if !content.contains(&b'%') {
+        return content.to_vec();
+    }
+    let mut kept = Vec::with_capacity(content.len());
+    // How deep in parentheses a literal string is, and whether a hex string
+    // is open.
+    let (mut depth, mut hex) = (0usize, false);
+    let mut index = 0;
+    while index < content.len() {
+        let byte = content[index];
+        match byte {
+            b'\\' if depth > 0 => {
+                kept.push(byte);
+                if let Some(&next) = content.get(index + 1) {
+                    kept.push(next);
+                    index += 1;
+                }
+            }
+            b'(' if !hex => {
+                depth += 1;
+                kept.push(byte);
+            }
+            b')' if !hex && depth > 0 => {
+                depth -= 1;
+                kept.push(byte);
+            }
+            b'<' if depth == 0 && !hex => {
+                hex = true;
+                kept.push(byte);
+            }
+            b'>' if hex => {
+                hex = false;
+                kept.push(byte);
+            }
+            b'%' if depth == 0 && !hex => {
+                while index < content.len() && !matches!(content[index], b'\n' | b'\r') {
+                    index += 1;
+                }
+                kept.push(b' ');
+                continue;
+            }
+            _ => kept.push(byte),
+        }
+        index += 1;
+    }
+    kept
+}
+
+/// Whether a marked-content span's properties give the text its glyphs
+/// stand for, as pdf-inspector reads it: an `/ActualText` string that
+/// decodes without the replacement character.
+fn gives_actual_text(properties: &Dictionary) -> bool {
+    let Ok(Object::String(bytes, _)) = properties.get(b"ActualText") else {
+        return false;
+    };
+    let text = match bytes.as_slice() {
+        [0xFE, 0xFF, rest @ ..] => {
+            let units: Vec<u16> = rest
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        bytes => bytes.iter().map(|&byte| char::from(byte)).collect(),
+    };
+    !text.contains('\u{FFFD}')
 }
 
 /// The product of two PDF matrices `[a b c d e f]`, `first` applied first.
@@ -1215,6 +1503,12 @@ pub(crate) mod tests {
 
     /// A one-page document whose `/F1` is the given font.
     fn scan_pdf_in(page: &str, form: &str, font: &str) -> Vec<u8> {
+        scan_pdf_with(page, form, font, "/Resources << /Font << /F1 4 0 R >> >>")
+    }
+
+    /// A one-page document whose `/F1` is the given font, and whose form
+    /// has the given entries.
+    fn scan_pdf_with(page: &str, form: &str, font: &str, form_entries: &str) -> Vec<u8> {
         let pixels = vec![200u8; 64 * 64];
         let objects: Vec<Vec<u8>> = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
@@ -1231,8 +1525,7 @@ pub(crate) mod tests {
                 &pixels,
             ),
             stream(
-                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
-                 /Resources << /Font << /F1 4 0 R >> >>",
+                &format!("/Type /XObject /Subtype /Form /BBox [0 0 612 792] {form_entries}"),
                 form.as_bytes(),
             ),
         ];
@@ -1432,6 +1725,49 @@ pub(crate) mod tests {
         for next in ["(oday) Tj", "20 0 Td (oday) Tj", "0 -12 Td (oday) Tj", ""] {
             assert!(spaced(next).is_empty(), "{next}");
         }
+        // With no leading set, `T*` moves as pdf-inspector moves it, a line
+        // down, where nothing is taken back.
+        let content = "BT /F1 10 Tf 60 700 Td 0 1.05 (dt) \" T* (oday) Tj ET";
+        assert!(gaps(&subset("26 /space", 0, 288), content).is_empty());
+        // The pen is followed over a run shown after the string, so a run
+        // placed far on decides nothing, as pdf-inspector reads it.
+        let label =
+            "BT /F1 10 Tf 60 700 Td 2 Tc (TOTAL\\032) Tj (DUE) Tj 0 Tc 260 0 Td (1,234.56) Tj ET";
+        assert!(gaps(&subset("26 /space", 0, 288), label).is_empty());
+    }
+
+    #[test]
+    fn text_is_read_as_pdf_inspector_reads_it() {
+        let subset = "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+SubsetSans /FirstChar 26 \
+             /LastChar 57 /Widths [288 556 556 556 556 556 0 556 556 556 556 556 556 556 556 556 \
+             556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 556] /Encoding << \
+             /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [26 /space] >> >>";
+        let found = |page: &str, form: &str, form_entries: &str| {
+            let pdf = scan_pdf_with(page, form, subset, form_entries);
+            scan(&pdf, &HashSet::new(), Some(&HashSet::new()), None)
+        };
+        let own = "/Resources << /Font << /F1 4 0 R >> >>";
+        let kerned = "[(8) -106 (5,000) -108 (.00)] TJ";
+        // A comment between an operator's operands, which pdf-inspector
+        // strips from a page's content, hides nothing after it.
+        let commented = format!("BT /F1 % the body font\n10 Tf 60 700 Td {kerned} ET");
+        assert_eq!(found(&commented, "", own).gaps_misread, vec![1]);
+        // pdf-inspector starts each text object in render mode 0, so text
+        // after `3 Tr` set outside one is read.
+        let hidden_before = format!("3 Tr BT /F1 10 Tf 60 700 Td {kerned} ET");
+        assert_eq!(found(&hidden_before, "", own).gaps_misread, vec![1]);
+        // Glyphs in a span giving their text are not read.
+        let span = format!(
+            "/Span << /ActualText (85,000.00) >> BDC BT /F1 10 Tf 60 700 Td {kerned} ET EMC"
+        );
+        assert!(found(&span, "", own).gaps_misread.is_empty());
+        // A form reads its text from its own fonts, with none carried in:
+        // without resources, it finds none.
+        let form = format!("BT 60 700 Td {kerned} ET");
+        let page = "BT /F1 10 Tf ET /Fm1 Do";
+        assert!(found(page, &form, "").gaps_misread.is_empty());
+        let own_font = format!("BT /F1 10 Tf 60 700 Td {kerned} ET");
+        assert_eq!(found(page, &own_font, own).gaps_misread, vec![1]);
     }
 
     #[test]
@@ -1481,6 +1817,29 @@ pub(crate) mod tests {
         // Adjacent narrow glyphs are a tenth of their size apart or more.
         assert!(!repeated(
             "BT /F1 12 Tf 1 0 0 1 72 700 Tm (l) Tj 1 0 0 1 74.66 700 Tm (l) Tj ET",
+            ""
+        ));
+        // A shadow a fifth of the size off, a second paint split in two
+        // strings, and a `TJ` stepping back to show its string again.
+        assert!(repeated(&format!("{} {}", line(74.2), line(72.0)), ""));
+        assert!(repeated(
+            &format!(
+                "{} BT /F1 11 Tf 1 0 0 1 72.3 700 Tm (Total amount due: ) Tj ($1,234.56) Tj ET",
+                line(72.0)
+            ),
+            ""
+        ));
+        assert!(repeated(
+            "BT /F1 11 Tf 1 0 0 1 72 700 Tm [(Total due 1,234.56) 8309 (Total due 1,234.56)] TJ ET",
+            ""
+        ));
+        assert!(repeated(
+            "BT /F1 11 Tf 1 0 0 1 72 700 Tm [(T) 611 (T) (O) 778 (O)] TJ ET",
+            ""
+        ));
+        // Kerning between two glyphs alike steps back too little.
+        assert!(!repeated(
+            "BT /F1 11 Tf 1 0 0 1 72 700 Tm [(te) 15 (l) 20 (l)] TJ ET",
             ""
         ));
         // A page checked only for the layer is not checked for repeats.

@@ -16,7 +16,9 @@
 //! counts where it stands as the detector leaves it: on a line of its own,
 //! after a label or a line of form fields ("Acct: 5678 Period: April 2025"),
 //! which the detector keeps out of a table, or as a whole emphasized span;
-//! a sentence that restates the first row does not. A cell holding two
+//! a row of three amounts or more counts wherever it ends the text, as
+//! after the heading words the detector left there too. A sentence that
+//! restates a shorter first row does not. A cell holding two
 //! amounts is a candidate, which the page's positioned text decides (see
 //! `merged_on_one_line`): amounts of separate runs on one baseline were
 //! merged, while amounts stacked one above the other, or written as one
@@ -47,10 +49,15 @@ pub(crate) struct MergedCell {
 /// Merged-cell candidates read per document.
 const MAX_MERGED_CELLS: usize = 256;
 
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+
 use crate::text_paints::Placed;
 
 /// The least length, in characters, of a row whose repeat counts.
 const MIN_REPEATED_ROW_CHARS: usize = 8;
+/// Amounts a repeated row holds to count wherever it ends the text.
+const MIN_REPEATED_AMOUNTS: usize = 3;
 /// The most words a row of form fields before a repeat may hold.
 const MAX_FORM_TOKENS: usize = 24;
 
@@ -119,11 +126,20 @@ pub(crate) fn check(markdown: &str) -> TableFindings {
 
 /// Whether the text block ends with `repeat` where the detector leaves a
 /// row it misreads: starting a line, after a label ending in a colon, or
-/// as a whole emphasized span at the end of the last line.
+/// as a whole emphasized span at the end of the last line; or anywhere, for
+/// a row of `MIN_REPEATED_AMOUNTS` amounts or more.
 fn repeats_as_detected(paragraph: &[&str], repeat: &str) -> bool {
     let before = normalize(&paragraph.join(" "));
     if !ends_with_words(&before, repeat) {
         return false;
+    }
+    if repeat
+        .split_whitespace()
+        .filter(|token| is_amount(token))
+        .count()
+        >= MIN_REPEATED_AMOUNTS
+    {
+        return true;
     }
     let prefix = before[..before.len() - repeat.len()].trim_end();
     // The text of the block's first lines, line by line.
@@ -251,84 +267,260 @@ pub(crate) struct Run<'a> {
     pub(crate) size: f64,
 }
 
-/// Where the page sets a candidate's amounts, from the positioned text of
-/// the pages read and the runs their content places (see `Placed`). Two
-/// consecutive amounts as separate runs on one baseline, the second to the
-/// right of the first, were merged by the detector; so were amounts on two
-/// lines when another cell of the row joins text from both, as the detector
-/// merges rows, and amounts read as one item that a second placed run
-/// starts inside, as pdf-inspector joins close runs. Amounts stacked on two
-/// lines otherwise, or one plain run, stand as the page sets them. Anything
-/// else, such as one run with a word gap between its strings, is unread.
+/// Steps placing candidates may take per document; past them, a candidate
+/// is unread.
+const MAX_PLACEMENT_STEPS: usize = 4_000_000;
+
+/// The positioned text of the pages read, indexed for placing candidates:
+/// runs by their text, a word they hold, and their line, the text runs that
+/// may head a column, and the placed run starts by line.
+pub(crate) struct Layout<'a> {
+    runs: &'a [Run<'a>],
+    /// Each run's words.
+    words: Vec<Vec<&'a str>>,
+    /// Runs by their text, by page and baseline.
+    by_text: HashMap<&'a str, Vec<usize>>,
+    /// Runs by page and text, by baseline.
+    by_page_text: HashMap<(u32, &'a str), Vec<usize>>,
+    /// Runs by the first word they hold, by page and baseline.
+    by_word: HashMap<&'a str, Vec<usize>>,
+    /// Runs by page, by baseline.
+    lines: HashMap<u32, Vec<usize>>,
+    /// Runs holding more than amounts, by page, by left edge.
+    headings: HashMap<u32, Vec<usize>>,
+    /// Placed run starts by page, by baseline.
+    placed: HashMap<u32, Vec<Placed>>,
+    steps: Cell<usize>,
+}
+
+impl<'a> Layout<'a> {
+    pub(crate) fn new(runs: &'a [Run<'a>], placed: &[Placed]) -> Self {
+        let words: Vec<Vec<&'a str>> = runs.iter().map(|run| words(run.text)).collect();
+        let mut order: Vec<usize> = (0..runs.len()).collect();
+        order.sort_by(|&a, &b| {
+            (runs[a].page, runs[a].y)
+                .partial_cmp(&(runs[b].page, runs[b].y))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut layout = Layout {
+            runs,
+            words,
+            by_text: HashMap::new(),
+            by_page_text: HashMap::new(),
+            by_word: HashMap::new(),
+            lines: HashMap::new(),
+            headings: HashMap::new(),
+            placed: HashMap::new(),
+            steps: Cell::new(0),
+        };
+        let mut firsts: HashSet<&str> = HashSet::new();
+        for &index in &order {
+            let run = &runs[index];
+            let text = run.text.trim();
+            layout.by_text.entry(text).or_default().push(index);
+            layout
+                .by_page_text
+                .entry((run.page, text))
+                .or_default()
+                .push(index);
+            firsts.clear();
+            for &word in &layout.words[index] {
+                if firsts.insert(word) {
+                    layout.by_word.entry(word).or_default().push(index);
+                }
+            }
+            layout.lines.entry(run.page).or_default().push(index);
+            if amount_count(run.text) == 0 && !text.is_empty() {
+                layout.headings.entry(run.page).or_default().push(index);
+            }
+        }
+        for headings in layout.headings.values_mut() {
+            headings.sort_by(|&a, &b| {
+                runs[a]
+                    .x
+                    .partial_cmp(&runs[b].x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        for start in placed {
+            layout.placed.entry(start.page).or_default().push(*start);
+        }
+        for starts in layout.placed.values_mut() {
+            starts.sort_by(|a, b| {
+                a.at[1]
+                    .partial_cmp(&b.at[1])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        layout
+    }
+
+    /// Take a step, while steps are left.
+    fn step(&self) -> bool {
+        let steps = self.steps.get() + 1;
+        self.steps.set(steps);
+        steps <= MAX_PLACEMENT_STEPS
+    }
+
+    /// The runs of `indices`, ordered by baseline, from `low` to `high`.
+    fn band<'b>(&self, indices: &'b [usize], low: f64, high: f64) -> &'b [usize] {
+        let from = indices.partition_point(|&index| self.runs[index].y < low);
+        let to = indices.partition_point(|&index| self.runs[index].y <= high);
+        &indices[from..to.max(from)]
+    }
+
+    /// Where the page sets a candidate's amounts. Two consecutive amounts
+    /// as separate runs on one baseline, the second to the right of the
+    /// first, were merged by the detector where a line above heads a column
+    /// over the second (see `heads_column`); so were amounts on two lines
+    /// when another cell of the row joins text from both, as the detector
+    /// merges rows, and amounts read as one item that a second placed run
+    /// starts inside, as pdf-inspector joins close runs, under such a
+    /// heading. Without the heading, runs side by side are unread: an amount
+    /// with its percentage in parentheses is one cell's text. Amounts
+    /// stacked on two lines otherwise, or one plain run, stand as the page
+    /// sets them. Anything else, such as one run with a word gap between its
+    /// strings, is unread, as is every candidate once the steps run out.
+    pub(crate) fn placement(&self, cell: &MergedCell) -> Placement {
+        let mut stacked = false;
+        let mut beside = false;
+        for pair in cell.amounts.windows(2) {
+            for &left_index in self.by_text.get(pair[0].as_str()).into_iter().flatten() {
+                let left = &self.runs[left_index];
+                let size = left.size.abs().max(1.0);
+                let near = 0.25 * size;
+                let Some(rights) = self.by_page_text.get(&(left.page, pair[1].as_str())) else {
+                    continue;
+                };
+                for &right_index in self.band(rights, left.y - 4.0 * size, left.y + 4.0 * size) {
+                    if !self.step() {
+                        return Placement::Unread;
+                    }
+                    let right = &self.runs[right_index];
+                    let across = (right.y - left.y).abs();
+                    if across <= near {
+                        if right.x < left.x + left.width - near {
+                            continue;
+                        }
+                        let second = [right.x, right.x + right.width];
+                        if self.heads_column(left.page, left.y, left.x + left.width, second, near) {
+                            return Placement::OneLine;
+                        }
+                        beside = true;
+                    } else {
+                        if self.rows_merged(cell, left, right.y) {
+                            return Placement::OneLine;
+                        }
+                        stacked = true;
+                    }
+                }
+            }
+        }
+        let first = cell.amounts.first().map(String::as_str).unwrap_or_default();
+        let amounts: Vec<&str> = cell.amounts.iter().map(String::as_str).collect();
+        let mut as_written = false;
+        for &index in self.by_word.get(first).into_iter().flatten() {
+            if !self.step() {
+                return Placement::Unread;
+            }
+            if !contains_words(&self.words[index], &amounts) {
+                continue;
+            }
+            let run = &self.runs[index];
+            let size = run.size.abs().max(1.0);
+            let near = 0.25 * size;
+            let starts = self
+                .placed
+                .get(&run.page)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let from = starts.partition_point(|start| start.at[1] < run.y - near);
+            for start in &starts[from..] {
+                if start.at[1] > run.y + near || !self.step() {
+                    break;
+                }
+                let inside = start.at[0] > run.x + near && start.at[0] < run.x + run.width - near;
+                if inside {
+                    // The first amount ends a word gap or so before the
+                    // second starts.
+                    let second = [start.at[0], run.x + run.width];
+                    if self.heads_column(run.page, run.y, start.at[0] - size, second, near) {
+                        return Placement::OneLine;
+                    }
+                    beside = true;
+                }
+                as_written |= start.plain && (start.at[0] - run.x).abs() <= near;
+            }
+        }
+        if beside {
+            Placement::Unread
+        } else if stacked || as_written {
+            Placement::AsSet
+        } else {
+            Placement::Unread
+        }
+    }
+
+    /// Whether a line above the line at `y` heads a column over the second
+    /// of two amounts: text, not amounts alone, that starts past the end of
+    /// the first (`first_end`), before the second's right edge, and reaches
+    /// over the second, as a 1099-B's "Wash sale" heads its column.
+    fn heads_column(&self, page: u32, y: f64, first_end: f64, second: [f64; 2], near: f64) -> bool {
+        let Some(headings) = self.headings.get(&page) else {
+            return false;
+        };
+        let from = headings.partition_point(|&index| self.runs[index].x < first_end - near);
+        for &index in &headings[from..] {
+            let run = &self.runs[index];
+            if run.x >= second[1] || !self.step() {
+                break;
+            }
+            if run.y > y + near && run.x + run.width > second[0] {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether another cell of a candidate's row joins text from the line of
+    /// `left` and the line at `other`: rows the detector merged. The text
+    /// from each line must be a different part of the cell, so a cell of one
+    /// word, such as a fee of "0.00" on every row, joins nothing.
+    fn rows_merged(&self, cell: &MergedCell, left: &Run<'_>, other: f64) -> bool {
+        let near = 0.25 * left.size.abs().max(1.0);
+        let Some(line) = self.lines.get(&left.page) else {
+            return false;
+        };
+        cell.row.iter().any(|text| {
+            let cell_words = words(text);
+            // Where the runs on the line at `y` fall in the cell's words.
+            let parts = |y: f64| -> Vec<(usize, usize)> {
+                self.band(line, y - near, y + near)
+                    .iter()
+                    .filter(|_| self.step())
+                    .flat_map(|&index| {
+                        let part = &self.words[index];
+                        positions(&cell_words, part)
+                            .into_iter()
+                            .map(move |start| (start, start + part.len()))
+                    })
+                    .collect()
+            };
+            let (here, there) = (parts(left.y), parts(other));
+            here.iter()
+                .any(|a| there.iter().any(|b| a.1 <= b.0 || b.1 <= a.0))
+        })
+    }
+}
+
+/// Where the page sets a candidate's amounts (see [`Layout::placement`]).
+#[cfg(test)]
 pub(crate) fn merged_on_one_line(
     cell: &MergedCell,
     runs: &[Run<'_>],
     placed: &[Placed],
 ) -> Placement {
-    let mut stacked = false;
-    for pair in cell.amounts.windows(2) {
-        for left in runs.iter().filter(|run| run.text.trim() == pair[0]) {
-            let size = left.size.abs().max(1.0);
-            let near = 0.25 * size;
-            for right in runs
-                .iter()
-                .filter(|run| run.page == left.page && run.text.trim() == pair[1])
-            {
-                let across = (right.y - left.y).abs();
-                if across <= near && right.x >= left.x + left.width - near {
-                    return Placement::OneLine;
-                }
-                if across > near && across <= 4.0 * size {
-                    if rows_merged(cell, runs, left, right.y) {
-                        return Placement::OneLine;
-                    }
-                    stacked = true;
-                }
-            }
-        }
-    }
-    let joined = cell.amounts.join(" ");
-    let mut as_written = false;
-    for run in runs
-        .iter()
-        .filter(|run| words(run.text).join(" ").contains(&joined))
-    {
-        let near = 0.25 * run.size.abs().max(1.0);
-        let on_line =
-            |start: &&Placed| start.page == run.page && (start.at[1] - run.y).abs() <= near;
-        let starts: Vec<&Placed> = placed.iter().filter(on_line).collect();
-        if starts
-            .iter()
-            .any(|start| start.at[0] > run.x + near && start.at[0] < run.x + run.width - near)
-        {
-            return Placement::OneLine;
-        }
-        as_written |= starts
-            .iter()
-            .any(|start| start.plain && (start.at[0] - run.x).abs() <= near);
-    }
-    if stacked || as_written {
-        Placement::AsSet
-    } else {
-        Placement::Unread
-    }
-}
-
-/// Whether another cell of a candidate's row joins text from the line of
-/// `left` and the line at `other`: rows the detector merged.
-fn rows_merged(cell: &MergedCell, runs: &[Run<'_>], left: &Run<'_>, other: f64) -> bool {
-    let near = 0.25 * left.size.abs().max(1.0);
-    cell.row.iter().any(|text| {
-        let cell_words = words(text);
-        let on = |y: f64| {
-            runs.iter().any(|run| {
-                run.page == left.page
-                    && (run.y - y).abs() <= near
-                    && contains_words(&cell_words, &words(run.text))
-            })
-        };
-        on(left.y) && on(other)
-    })
+    Layout::new(runs, placed).placement(cell)
 }
 
 /// A text's words.
@@ -339,6 +531,19 @@ fn words(text: &str) -> Vec<&str> {
 /// Whether `words` holds `part`, non-empty, as consecutive words.
 fn contains_words(words: &[&str], part: &[&str]) -> bool {
     !part.is_empty() && words.windows(part.len()).any(|window| window == part)
+}
+
+/// Where `words` holds `part`, non-empty, as consecutive words.
+fn positions(words: &[&str], part: &[&str]) -> Vec<usize> {
+    if part.is_empty() {
+        return Vec::new();
+    }
+    words
+        .windows(part.len())
+        .enumerate()
+        .filter(|(_, window)| *window == part)
+        .map(|(start, _)| start)
+        .collect()
 }
 
 fn is_table_row(line: &str) -> bool {
@@ -458,6 +663,10 @@ mod tests {
         assert!(check(labelled).row_repeated);
         let sentence = "One Form W-2 was received from Example Manufacturing Inc. 52,000.00\n\n|Example Manufacturing Inc.|52,000.00|\n|---|---|\n|Total wages|52,000.00|\n";
         assert!(!check(sentence).row_repeated);
+        // A row of three amounts or more repeats wherever it ends the text,
+        // as after the heading words of upstream #531's equity statement.
+        let headed = "STATEMENT OF CHANGES IN EQUITY Share capital Total equity Balance at the start of the period 2,848 2,000 848 0 2,406 2,000 406 0\n\n|Balance at the start of the period|2,848|2,000|848||0|2,406|2,000|406||0|\n|---|---|---|---|---|---|---|---|---|---|---|\n|Total equity|3,394|2,000|1,394||0|2,848|2,000|848||0|\n";
+        assert!(check(headed).row_repeated);
     }
 
     /// The amounts of the candidates a table's Markdown holds, and whether
@@ -523,8 +732,12 @@ mod tests {
             in_table: false,
         };
         let basis = cell(&["2,610.25", "205.25"]);
-        // Two columns' runs on one baseline were merged.
+        // Two columns' runs on one baseline, under a heading over the second,
+        // were merged; without the heading they are unread.
+        let heading = |x: f64| run("Wash sale", x, 701.0, 42.0);
         let columns = [
+            run("Cost basis", 352.5, 701.0, 42.0),
+            heading(419.5),
             run("2,610.25", 365.0, 685.0, 35.0),
             run("205.25", 434.5, 685.0, 27.5),
         ];
@@ -532,6 +745,19 @@ mod tests {
             merged_on_one_line(&basis, &columns, &[]),
             Placement::OneLine
         );
+        assert_eq!(
+            merged_on_one_line(&basis, &columns[2..], &[]),
+            Placement::Unread
+        );
+        // An amount with its percentage, both under one heading, is one
+        // cell's text.
+        let gain = cell(&["1,234.56", "(9.02%)"]);
+        let percent = [
+            run("Gain/loss (percent)", 430.0, 712.0, 76.0),
+            run("1,234.56", 430.0, 698.0, 35.0),
+            run("(9.02%)", 468.0, 698.0, 31.5),
+        ];
+        assert_eq!(merged_on_one_line(&gain, &percent, &[]), Placement::Unread);
         // Stacked one above the other, or written as one run, they stand as
         // the page sets them.
         let stacked = [
@@ -552,9 +778,13 @@ mod tests {
             ),
             Placement::AsSet
         );
-        // One item that a second run starts inside was joined from two; one
-        // plain run is as written, and one with a word gap in it unread.
-        let joined = [run("2,610.25 205.25", 308.9, 686.0, 59.1)];
+        // One item that a second run starts inside, under a heading over
+        // the second, was joined from two; one plain run is as written, and
+        // one with a word gap in it unread.
+        let joined = [
+            run("2,610.25 205.25", 308.9, 686.0, 59.1),
+            run("Wash", 347.5, 700.0, 21.0),
+        ];
         let start = |x: f64, plain: bool| Placed {
             page: 1,
             at: [x, 686.0],
@@ -563,6 +793,14 @@ mod tests {
         assert_eq!(
             merged_on_one_line(&basis, &joined, &[start(308.9, true), start(343.5, true)]),
             Placement::OneLine
+        );
+        assert_eq!(
+            merged_on_one_line(
+                &basis,
+                &joined[..1],
+                &[start(308.9, true), start(343.5, true)]
+            ),
+            Placement::Unread
         );
         assert_eq!(
             merged_on_one_line(&basis, &joined, &[start(308.9, true)]),
@@ -587,6 +825,20 @@ mod tests {
             merged_on_one_line(&rows, &merged_rows, &[]),
             Placement::OneLine
         );
+        // A cell of one word on both lines, such as a fee of "0.00" on every
+        // row, joins nothing: the amounts stand stacked.
+        let zeros = MergedCell {
+            row: vec!["Sample Fund A".to_string(), "0.00".to_string()],
+            ..cell(&["0.00", "0.00"])
+        };
+        let fees = [
+            run("Sample Fund A", 72.0, 702.0, 110.0),
+            run("0.00", 330.0, 702.0, 17.5),
+            run("0.00 0.00", 400.0, 702.0, 37.5),
+            run("Sample Fund B", 72.0, 689.0, 110.0),
+            run("0.00", 330.0, 689.0, 17.5),
+        ];
+        assert_eq!(merged_on_one_line(&zeros, &fees, &[]), Placement::AsSet);
         // Amounts the runs do not show are unread; so is the second amount
         // left of the first.
         assert_eq!(merged_on_one_line(&basis, &[], &[]), Placement::Unread);

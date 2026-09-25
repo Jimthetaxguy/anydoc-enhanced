@@ -287,8 +287,8 @@ impl GapFont {
                     None => (word_gap, word_gap * COLUMN_GAP_WORD_GAPS),
                 }
             };
-            separations(elements, bounds(self.read), metrics)
-                != separations(elements, bounds(self.fixed), metrics)
+            separations(elements, bounds(self.read), metrics, horizontal)
+                != separations(elements, bounds(self.fixed), metrics, horizontal)
         })
     }
 }
@@ -603,27 +603,41 @@ pub(crate) fn shows_glyphs(text: &Object) -> bool {
     }
 }
 
-/// Whether pdf-inspector separates the text on either side of each
-/// junction between two strings of a `TJ` array, by a word gap and a
-/// sub-run-ending gap: with a space, or by ending the sub-run, which it
-/// rejoins with one, or by a space the text already has there. An offset
+/// How pdf-inspector's Markdown shows the text on either side of a junction
+/// between two strings of a `TJ` array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Junction {
+    Joined,
+    Spaced,
+    /// In items of their own, which the line sets apart as columns.
+    Apart,
+}
+
+/// How pdf-inspector shows each junction between two strings of a `TJ`
+/// array, by a word gap and a sub-run-ending gap. A word gap, or a space the
+/// text already has there, puts a space between. A sub-run-ending gap
+/// starts an item of its own, which the line joins back without a space
+/// before closing punctuation, sets apart as a column between digits, or on
+/// a baseline not along x, and joins with a space otherwise. An offset
 /// after the sub-run ends, or after a space, adds nothing.
 fn separations(
     elements: &[Object],
     (word_gap, split_gap): (f32, f32),
     metrics: &Metrics,
-) -> Vec<bool> {
+    horizontal: bool,
+) -> Vec<Junction> {
     let mut separations = Vec::new();
-    let (mut started, mut text, mut spaced, mut separated) = (false, false, false, false);
+    let (mut started, mut text, mut spaced, mut split) = (false, false, false, false);
+    let mut last: Option<u8> = None;
     for element in elements {
         if let Some(offset) = offset(element) {
             if !text {
                 continue;
             }
             if -offset > split_gap {
-                (text, separated) = (false, true);
+                (text, split) = (false, true);
             } else if -offset > word_gap && !spaced {
-                (spaced, separated) = (true, true);
+                spaced = true;
             }
             continue;
         }
@@ -634,12 +648,37 @@ fn separations(
             continue;
         }
         if started {
-            separations.push(separated || metrics.starts_with_space(raw));
+            let junction = if spaced || metrics.starts_with_space(raw) {
+                Junction::Spaced
+            } else if split {
+                let before = last
+                    .and_then(|code| metrics.reading(code))
+                    .and_then(|text| text.chars().last());
+                let after = metrics.reading(raw[0]).and_then(|text| text.chars().next());
+                let digits = before.is_some_and(|character| character.is_ascii_digit())
+                    && after.is_some_and(|character| character.is_ascii_digit());
+                if after.is_some_and(|character| {
+                    matches!(
+                        character,
+                        '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '\''
+                    )
+                }) {
+                    Junction::Joined
+                } else if digits || !horizontal {
+                    Junction::Apart
+                } else {
+                    Junction::Spaced
+                }
+            } else {
+                Junction::Joined
+            };
+            separations.push(junction);
         }
         started = true;
         text = true;
         spaced = metrics.ends_in_space(raw);
-        separated = spaced;
+        split = false;
+        last = raw.last().copied();
     }
     separations
 }
