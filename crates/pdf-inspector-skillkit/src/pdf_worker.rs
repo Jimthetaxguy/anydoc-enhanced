@@ -119,15 +119,7 @@ pub async fn run(
     // paths rather than their bytes.
     let permit = document::pdf_worker_permit().await?;
     if !document::worker_available() {
-        // The blocking parse cannot be cancelled; it keeps its slot until it
-        // finishes, even when the caller has timed out.
-        return tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let buffer = crate::read_validated(&canonical)?;
-            execute_operation(operation, &buffer, &regions)
-        })
-        .await
-        .map_err(|_| PdfToolError::Processing)?;
+        return run_in_process(operation, canonical, regions, permit).await;
     }
 
     let params = if operation.takes_regions() {
@@ -188,6 +180,27 @@ pub async fn run(
     }
 }
 
+/// The route for hosts without the worker sandbox. `slot` bounds the
+/// requests being served. An in-process parse cannot be cancelled: when its
+/// caller times out, the slot is released with the caller and the parse
+/// finishes unattended, as every in-process parse did before the worker
+/// route existed, so a few slow files cannot hold every PDF tool.
+async fn run_in_process<Slot: Send>(
+    operation: PdfOperation,
+    canonical: std::path::PathBuf,
+    regions: OwnedRegions,
+    slot: Slot,
+) -> Result<Box<RawValue>, PdfToolError> {
+    let result = tokio::task::spawn_blocking(move || {
+        let buffer = crate::read_validated(&canonical)?;
+        execute_operation(operation, &buffer, &regions)
+    })
+    .await
+    .map_err(|_| PdfToolError::Processing)?;
+    drop(slot);
+    result
+}
+
 /// Markdown for a local PDF through the bounded route, for the domain tools.
 pub async fn markdown(path: impl AsRef<Path>) -> Result<String, PdfToolError> {
     #[derive(serde::Deserialize)]
@@ -195,9 +208,14 @@ pub async fn markdown(path: impl AsRef<Path>) -> Result<String, PdfToolError> {
         markdown: Option<String>,
     }
     let json = run(PdfOperation::Markdown, path, &[]).await?;
-    let parsed: MarkdownOnly =
-        serde_json::from_str(json.get()).map_err(|_| PdfToolError::Protocol)?;
-    Ok(parsed.markdown.unwrap_or_default())
+    // A response can reach MAX_PDF_RESPONSE_BYTES; decode it off the executor.
+    tokio::task::spawn_blocking(move || {
+        serde_json::from_str::<MarkdownOnly>(json.get())
+            .map(|parsed| parsed.markdown.unwrap_or_default())
+            .map_err(|_| PdfToolError::Protocol)
+    })
+    .await
+    .map_err(|_| PdfToolError::Processing)?
 }
 
 /// Worker side: run a PDF operation frame. Returns `None` for codes that
@@ -326,6 +344,43 @@ mod tests {
         frame.extend_from_slice(params);
         frame.extend_from_slice(buffer);
         frame
+    }
+
+    #[tokio::test]
+    async fn in_process_parse_frees_its_slot_when_the_caller_stops_waiting() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = slots.clone().acquire_owned().await.expect("slot");
+        let path = crate::validate_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-corpus/source/sample-2.pdf"
+        ))
+        .expect("public fixture");
+        let call = run_in_process(PdfOperation::Markdown, path, Vec::new(), slot);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), call)
+                .await
+                .is_err(),
+            "converting the fixture takes longer than the caller waits"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a caller that stopped waiting holds no slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_route_returns_the_facade_result() {
+        let path = crate::validate_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-corpus/source/sample-1.pdf"
+        ))
+        .expect("public fixture");
+        let json = run_in_process(PdfOperation::Classify, path, Vec::new(), ())
+            .await
+            .expect("classify");
+        let value: serde_json::Value = serde_json::from_str(json.get()).expect("JSON");
+        assert_eq!(value["pdf_type"], "TextBased");
     }
 
     #[test]

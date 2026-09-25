@@ -1269,6 +1269,13 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
         // scripts/build-anydoc-hardening-corpus.py).
         ("docx/symbol-checkbox.docx", "incomplete_conversion"),
         ("docx/legacy-form-checkbox.docx", "incomplete_conversion"),
+        ("docx/utf16-footnote-symbol.docx", "incomplete_conversion"),
+        ("pptx/fragment-slide-target.pptx", "incomplete_conversion"),
+        (
+            "pptx/case-variant-presentation-rels.pptx",
+            "incomplete_conversion",
+        ),
+        ("epub/encoded-chapter-href.epub", "incomplete_conversion"),
         ("xlsx/oversized-number-format.xlsx", "resource_limit"),
     ] {
         let fixture = format!(
@@ -1302,19 +1309,31 @@ fn docx_external_relationship_is_contained_and_reported() {
 
 #[test]
 fn docx_hidden_text_is_converted_and_disclosed() {
-    let fixture = format!(
-        "{}/../../test-corpus/docx/hidden-text.docx",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let document = run_document_tool(fixture, "docx-hidden-integration-test");
-    assert_eq!(document["completeness"], "complete");
-    let markdown = document["markdown"].as_str().expect("markdown");
-    assert!(markdown.contains("HIDDEN-RUN") && markdown.contains("HARDENING-END"));
-    assert!(document["warnings"]
-        .as_array()
-        .expect("warning array")
-        .iter()
-        .any(|warning| warning["code"] == "hidden_content_preserved"));
+    // Hidden directly on a run, and through a style in a UTF-16 styles part.
+    for (fixture, marker) in [
+        ("hidden-text.docx", "HIDDEN-RUN"),
+        ("utf16-hidden-style.docx", "STYLED-HIDDEN"),
+    ] {
+        let path = format!(
+            "{}/../../test-corpus/docx/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let document = run_document_tool(path, "docx-hidden-integration-test");
+        assert_eq!(document["completeness"], "complete", "{fixture}");
+        let markdown = document["markdown"].as_str().expect("markdown");
+        assert!(
+            markdown.contains(marker) && markdown.contains("HARDENING-END"),
+            "{fixture}"
+        );
+        assert!(
+            document["warnings"]
+                .as_array()
+                .expect("warning array")
+                .iter()
+                .any(|warning| warning["code"] == "hidden_content_preserved"),
+            "{fixture}"
+        );
+    }
 }
 
 #[test]

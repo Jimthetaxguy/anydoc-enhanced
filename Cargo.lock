@@ -979,6 +979,7 @@ name = "pdf-inspector-skillkit"
 version = "0.1.0"
 dependencies = [
  "anydoc",
+ "encoding_rs",
  "libc",
  "log",
  "pdf-inspector",

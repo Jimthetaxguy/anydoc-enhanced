@@ -50,6 +50,16 @@ pub(crate) const MAX_WORKER_PARAMS_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREFLIGHT_PART_BYTES: u64 = 4 * 1024 * 1024;
+/// AnyDoc 0.2.4's own XML bounds (`package::limits`): a part nested deeper,
+/// or holding more nodes, fails its conversion with a resource limit. The
+/// streamed checks stop at the same bounds.
+const MAX_XML_DEPTH: usize = 256;
+const MAX_XML_NODES: usize = 2_000_000;
+/// Word styles the DOCX checks keep per document, and the longest style id.
+/// Real documents carry hundreds of short ids; the caps bound what the
+/// supervisor holds for a hostile styles part.
+const MAX_DOCX_STYLES: usize = 16_384;
+const MAX_STYLE_ID_BYTES: usize = 1024;
 // JSON can encode each control byte in a Markdown string as a six-byte
 // control-character escape. Keep the IPC frame bound independent of the 8 MiB
 // public Markdown contract and leave room for the typed response envelope.
@@ -612,7 +622,7 @@ fn ooxml_variant(bytes: &[u8]) -> Option<DocumentVariant> {
     if content.len() as u64 > MAX_PREFLIGHT_PART_BYTES {
         return None;
     }
-    let content = String::from_utf8_lossy(&content).to_ascii_lowercase();
+    let content = String::from_utf8_lossy(&anydoc_xml_utf8(content)).to_ascii_lowercase();
     if content.contains("wordprocessingml.document.macroenabled.main") {
         Some(DocumentVariant::Docm)
     } else if content.contains("wordprocessingml.document.main") {
@@ -679,11 +689,98 @@ fn xml_local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
 }
 
+/// An attribute's value by local name, with character references decoded
+/// (`Q&#117;iet` is `Quiet`); a value that cannot be decoded is returned raw.
+/// The first match wins, as in AnyDoc's `attr_any`.
 fn xml_attribute_value(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> Option<String> {
-    event.attributes().flatten().find_map(|attribute| {
-        (xml_local_name(attribute.key.as_ref()) == wanted)
-            .then(|| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
-    })
+    xml_attribute_values(event, wanted).into_iter().next()
+}
+
+/// Every value of the attributes with this local name, in any namespace.
+/// Where AnyDoc picks one of several by namespace (`w:val` before `val`),
+/// checking them all covers its pick.
+fn xml_attribute_values(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> Vec<String> {
+    event
+        .attributes()
+        .flatten()
+        .filter(|attribute| xml_local_name(attribute.key.as_ref()) == wanted)
+        .map(|attribute| {
+            attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map(|value| value.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
+        })
+        .collect()
+}
+
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// The encoding AnyDoc 0.2.4 transcodes an XML part from before parsing it
+/// (`package::xml::to_utf8`), judged from the part's first bytes: a UTF-16
+/// byte order mark, or an `encoding="…"` anywhere in the first 200 bytes that
+/// names something other than UTF-8. `None` means the part is parsed as
+/// UTF-8.
+fn anydoc_xml_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    match bytes {
+        [0xFF, 0xFE, ..] => Some(encoding_rs::UTF_16LE),
+        [0xFE, 0xFF, ..] => Some(encoding_rs::UTF_16BE),
+        [0xEF, 0xBB, 0xBF, ..] => None,
+        _ => declared_xml_encoding(&bytes[..bytes.len().min(200)])
+            .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+            .filter(|encoding| *encoding != encoding_rs::UTF_8),
+    }
+}
+
+/// The value after the first `encoding` in a prefix that is valid UTF-8.
+fn declared_xml_encoding(head: &[u8]) -> Option<&str> {
+    let head = std::str::from_utf8(head).ok()?;
+    let rest = &head[head.find("encoding")? + "encoding".len()..];
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let rest = &rest[1..];
+    Some(&rest[..rest.find(quote)?])
+}
+
+/// An XML part as the UTF-8 AnyDoc parses. Every check reads this, so a part
+/// cannot show one document to the checks and another to the parser.
+fn anydoc_xml_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
+    match anydoc_xml_encoding(&bytes) {
+        Some(encoding) => encoding.decode(&bytes).0.into_owned().into_bytes(),
+        None => {
+            if bytes.starts_with(UTF8_BOM) {
+                bytes.drain(..UTF8_BOM.len());
+            }
+            bytes
+        }
+    }
+}
+
+/// Open an archive part for a streamed check, decoded as AnyDoc decodes it.
+/// A part AnyDoc transcodes is decoded in memory under the preflight part
+/// cap; any other part streams unchanged.
+fn open_xml_stream<'a>(
+    mut part: impl Read + 'a,
+) -> Result<Box<dyn std::io::BufRead + 'a>, DocumentError> {
+    let mut head = Vec::with_capacity(200);
+    (&mut part)
+        .take(200)
+        .read_to_end(&mut head)
+        .map_err(|_| DocumentError::Malformed)?;
+    if anydoc_xml_encoding(&head).is_some() {
+        let mut bytes = head;
+        part.take(MAX_PREFLIGHT_PART_BYTES + 1 - bytes.len() as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| DocumentError::Malformed)?;
+        if bytes.len() as u64 > MAX_PREFLIGHT_PART_BYTES {
+            return Err(DocumentError::ResourceLimit);
+        }
+        return Ok(Box::new(Cursor::new(anydoc_xml_utf8(bytes))));
+    }
+    let mut head = Cursor::new(head);
+    if head.get_ref().starts_with(UTF8_BOM) {
+        head.set_position(UTF8_BOM.len() as u64);
+    }
+    Ok(Box::new(std::io::BufReader::new(Read::chain(head, part))))
 }
 
 fn xml_has_odf_spreadsheet(bytes: &[u8]) -> bool {
@@ -1086,7 +1183,8 @@ fn xml_has_odt_unsupported_content(bytes: &[u8]) -> bool {
     }
 }
 
-/// What one Word story part (body, footnotes, or endnotes) carries.
+/// What a document's Word story parts (body, footnotes, and endnotes) carry,
+/// accumulated across the parts.
 #[derive(Default)]
 struct DocxStoryScan {
     /// Content the pinned AnyDoc parser drops without a diagnostic: a symbol
@@ -1098,44 +1196,67 @@ struct DocxStoryScan {
     /// A run formatted hidden directly (`w:r/w:rPr/w:vanish`), which the
     /// pinned parser converts as ordinary text.
     hidden_run: bool,
-    /// Character and paragraph styles the part applies.
+    /// Character, paragraph, and table styles applied to content.
     styles_used: HashSet<String>,
 }
 
-/// Whether an on/off property element such as `w:vanish` is switched off.
-fn xml_toggle_off(event: &quick_xml::events::BytesStart<'_>) -> bool {
-    xml_attribute_value(event, b"val").is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "false" | "0" | "off"
-        )
-    })
+fn xml_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "on"
+    )
 }
 
-/// Scan a Word story part. Parse errors fail closed as malformed; end tags
-/// are not matched against start tags by prefix, as AnyDoc does not.
-fn scan_docx_story(bytes: &[u8]) -> Result<DocxStoryScan, DocumentError> {
+fn xml_false(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "off"
+    )
+}
+
+/// Whether an on/off property element such as `w:vanish` is switched off:
+/// only when every `val` it carries says so.
+fn xml_toggle_off(event: &quick_xml::events::BytesStart<'_>) -> bool {
+    let values = xml_attribute_values(event, b"val");
+    !values.is_empty() && values.iter().all(|value| xml_false(value))
+}
+
+/// Whether the open elements end with `suffix`, compared by local name.
+fn xml_path_ends_with(stack: &[Vec<u8>], suffix: &[&[u8]]) -> bool {
+    stack.len() >= suffix.len()
+        && stack[stack.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(open, wanted)| open.as_slice() == *wanted)
+}
+
+/// Scan one Word story part into `scan`. Parse errors fail closed as
+/// malformed; end tags are not matched against start tags by prefix, as
+/// AnyDoc does not match them either.
+fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut scan = DocxStoryScan::default();
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event)) => {
+                if stack.len() >= MAX_XML_DEPTH {
+                    return Err(DocumentError::ResourceLimit);
+                }
                 let local = xml_local_name(event.name().as_ref()).to_vec();
-                scan_docx_element(&event, &local, &stack, &mut scan);
+                scan_docx_element(&event, &local, &stack, scan)?;
                 stack.push(local);
             }
             Ok(quick_xml::events::Event::Empty(event)) => {
                 let local = xml_local_name(event.name().as_ref()).to_vec();
-                scan_docx_element(&event, &local, &stack, &mut scan);
+                scan_docx_element(&event, &local, &stack, scan)?;
             }
             Ok(quick_xml::events::Event::End(_)) => {
                 stack.pop();
             }
-            Ok(quick_xml::events::Event::Eof) => return Ok(scan),
+            Ok(quick_xml::events::Event::Eof) => return Ok(()),
             Ok(_) => {}
             Err(_) => return Err(DocumentError::Malformed),
         }
@@ -1148,38 +1269,81 @@ fn scan_docx_element(
     local: &[u8],
     stack: &[Vec<u8>],
     scan: &mut DocxStoryScan,
-) {
+) -> Result<(), DocumentError> {
+    // Properties apply to content only in these positions: the same element
+    // under a paragraph mark (`w:pPr/w:rPr`) or in revision history
+    // (`w:rPrChange/w:rPr`, `w:pPrChange/w:pPr`) formats nothing visible.
+    let run_property = xml_path_ends_with(stack, &[b"r", b"rPr"]);
     match local {
         // Tracked deletions are omitted from the output, symbols included.
         b"sym" | b"checkBox" | b"ddList" if !stack.iter().any(|name| name == b"del") => {
             scan.dropped = true;
         }
-        // Only a run's own properties hide text: the same element under a
-        // paragraph mark (`w:pPr/w:rPr`) or in revision history
-        // (`w:rPrChange/w:rPr`) does not.
-        b"vanish" if stack.ends_with(&[b"r".to_vec(), b"rPr".to_vec()]) => {
-            scan.hidden_run |= !xml_toggle_off(event);
-        }
-        b"rStyle" | b"pStyle" => {
-            if let Some(style) = xml_attribute_value(event, b"val") {
-                scan.styles_used.insert(style);
-            }
+        b"vanish" if run_property => scan.hidden_run |= !xml_toggle_off(event),
+        b"rStyle" if run_property => record_style(event, scan)?,
+        b"pStyle" if xml_path_ends_with(stack, &[b"p", b"pPr"]) => record_style(event, scan)?,
+        b"tblStyle" if xml_path_ends_with(stack, &[b"tbl", b"tblPr"]) => {
+            record_style(event, scan)?;
         }
         _ => {}
     }
+    Ok(())
 }
 
-/// Style ids whose run properties hide text, following `basedOn`, and whether
-/// the document defaults hide all text.
-fn docx_hidden_styles(bytes: &[u8]) -> Result<(HashSet<String>, bool), DocumentError> {
-    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+fn record_style(
+    event: &quick_xml::events::BytesStart<'_>,
+    scan: &mut DocxStoryScan,
+) -> Result<(), DocumentError> {
+    for style in xml_attribute_values(event, b"val") {
+        if style.len() > MAX_STYLE_ID_BYTES {
+            return Err(DocumentError::ResourceLimit);
+        }
+        if scan.styles_used.len() >= MAX_DOCX_STYLES && !scan.styles_used.contains(&style) {
+            return Err(DocumentError::ResourceLimit);
+        }
+        scan.styles_used.insert(style);
+    }
+    Ok(())
+}
+
+/// One `w:style` definition as the hidden-text check sees it.
+#[derive(Default)]
+struct DocxStyleDefinition {
+    ids: Vec<String>,
+    bases: Vec<String>,
+    /// `Some(true)` when any `w:vanish` in the style's run properties is on,
+    /// `Some(false)` when every one present is off.
+    vanish: Option<bool>,
+    default: bool,
+}
+
+impl DocxStyleDefinition {
+    fn set_vanish(&mut self, on: bool) {
+        self.vanish = Some(self.vanish.unwrap_or(false) || on);
+    }
+}
+
+/// Style ids whose run properties can hide text, following `basedOn`, and
+/// whether text no style names can be hidden: by the document defaults or by
+/// a default style (`w:default="1"`), which applies to every unstyled
+/// paragraph, run, or table. Streamed under AnyDoc's depth and node bounds.
+///
+/// Every reading AnyDoc or Word could take counts: a style defined twice is
+/// hidden if either definition hides it, and an attribute repeated under
+/// another prefix counts in each spelling.
+fn docx_hidden_styles(
+    reader: impl std::io::BufRead,
+) -> Result<(HashSet<String>, bool), DocumentError> {
+    let mut reader = quick_xml::Reader::from_reader(reader);
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut current: Option<String> = None;
-    let mut explicit: HashMap<String, bool> = HashMap::new();
-    let mut based_on: HashMap<String, String> = HashMap::new();
+    let mut nodes = 0usize;
+    let mut definitions: Vec<DocxStyleDefinition> = Vec::new();
+    // Open definitions, innermost last: a style nested in another (invalid,
+    // but parseable) must not discard its parent's properties.
+    let mut open: Vec<DocxStyleDefinition> = Vec::new();
     let mut defaults_hidden = false;
     loop {
         let (event, start) = match reader.read_event_into(&mut buffer) {
@@ -1187,41 +1351,83 @@ fn docx_hidden_styles(bytes: &[u8]) -> Result<(HashSet<String>, bool), DocumentE
             Ok(quick_xml::events::Event::Empty(event)) => (event, false),
             Ok(quick_xml::events::Event::End(_)) => {
                 if stack.pop().as_deref() == Some(b"style".as_slice()) {
-                    current = None;
+                    definitions.extend(open.pop());
                 }
                 buffer.clear();
                 continue;
             }
-            Ok(quick_xml::events::Event::Eof) => break,
+            // AnyDoc closes elements left open at the end of a part, so a
+            // truncated definition still applies.
+            Ok(quick_xml::events::Event::Eof) => {
+                definitions.append(&mut open);
+                break;
+            }
+            Ok(
+                quick_xml::events::Event::Text(_)
+                | quick_xml::events::Event::GeneralRef(_)
+                | quick_xml::events::Event::CData(_),
+            ) => {
+                nodes += 1;
+                if nodes > MAX_XML_NODES {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                buffer.clear();
+                continue;
+            }
             Ok(_) => {
                 buffer.clear();
                 continue;
             }
             Err(_) => return Err(DocumentError::Malformed),
         };
+        nodes += 1;
+        if nodes > MAX_XML_NODES || (start && stack.len() >= MAX_XML_DEPTH) {
+            return Err(DocumentError::ResourceLimit);
+        }
         let local = xml_local_name(event.name().as_ref()).to_vec();
         match local.as_slice() {
-            b"style" => current = xml_attribute_value(&event, b"styleId"),
-            b"basedOn" if stack.ends_with(&[b"style".to_vec()]) => {
-                if let (Some(style), Some(base)) =
-                    (current.clone(), xml_attribute_value(&event, b"val"))
-                {
-                    based_on.insert(style, base);
+            b"style" => {
+                if definitions.len() + open.len() >= MAX_DOCX_STYLES {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                let ids = xml_attribute_values(&event, b"styleId");
+                if ids.iter().any(|id| id.len() > MAX_STYLE_ID_BYTES) {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                let definition = DocxStyleDefinition {
+                    ids,
+                    default: xml_attribute_values(&event, b"default")
+                        .iter()
+                        .any(|value| xml_true(value)),
+                    ..DocxStyleDefinition::default()
+                };
+                // An empty `<w:style/>` defines nothing that can hide text.
+                if start {
+                    open.push(definition);
                 }
             }
-            b"vanish" if stack.ends_with(&[b"style".to_vec(), b"rPr".to_vec()]) => {
-                if let Some(style) = current.clone() {
-                    explicit.insert(style, !xml_toggle_off(&event));
+            b"basedOn" if xml_path_ends_with(&stack, &[b"style"]) => {
+                if let Some(definition) = open.last_mut() {
+                    for base in xml_attribute_values(&event, b"val") {
+                        if base.len() > MAX_STYLE_ID_BYTES {
+                            return Err(DocumentError::ResourceLimit);
+                        }
+                        definition.bases.push(base);
+                    }
                 }
             }
+            // Run properties of the style, or of a conditional table region
+            // (`w:tblStylePr`, such as a header row).
             b"vanish"
-                if stack.ends_with(&[
-                    b"docDefaults".to_vec(),
-                    b"rPrDefault".to_vec(),
-                    b"rPr".to_vec(),
-                ]) =>
+                if xml_path_ends_with(&stack, &[b"style", b"rPr"])
+                    || xml_path_ends_with(&stack, &[b"style", b"tblStylePr", b"rPr"]) =>
             {
-                defaults_hidden = !xml_toggle_off(&event);
+                if let Some(definition) = open.last_mut() {
+                    definition.set_vanish(!xml_toggle_off(&event));
+                }
+            }
+            b"vanish" if xml_path_ends_with(&stack, &[b"docDefaults", b"rPrDefault", b"rPr"]) => {
+                defaults_hidden |= !xml_toggle_off(&event);
             }
             _ => {}
         }
@@ -1230,37 +1436,53 @@ fn docx_hidden_styles(bytes: &[u8]) -> Result<(HashSet<String>, bool), DocumentE
         }
         buffer.clear();
     }
-    let mut hidden = HashSet::new();
-    for style in explicit.keys().chain(based_on.keys()) {
-        let mut cursor = style.as_str();
-        // The first explicit setting up the chain decides; cycles and
-        // unreasonably deep chains stop the walk.
-        for _ in 0..32 {
-            if let Some(value) = explicit.get(cursor) {
-                if *value {
-                    hidden.insert(style.clone());
+    // A style is hidden when its own run properties hide text, or when it
+    // sets nothing and a style it is based on is hidden; walk outward from
+    // the styles that hide text directly. Cycles end at visited styles.
+    let mut hidden: HashSet<String> = HashSet::new();
+    let mut derived: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for definition in &definitions {
+        match definition.vanish {
+            Some(true) => pending.extend(definition.ids.iter().map(String::as_str)),
+            Some(false) => {}
+            None => {
+                for base in &definition.bases {
+                    derived
+                        .entry(base.as_str())
+                        .or_default()
+                        .extend(definition.ids.iter().map(String::as_str));
                 }
-                break;
-            }
-            match based_on.get(cursor) {
-                Some(base) => cursor = base,
-                None => break,
             }
         }
     }
+    while let Some(style) = pending.pop() {
+        if hidden.insert(style.to_string()) {
+            pending.extend(derived.get(style).into_iter().flatten().copied());
+        }
+    }
+    defaults_hidden |= definitions
+        .iter()
+        .filter(|definition| definition.default)
+        .flat_map(|definition| &definition.ids)
+        .any(|id| hidden.contains(id));
     Ok((hidden, defaults_hidden))
 }
 
-/// One package relationship, read with the XML reader.
+/// One package relationship, read with the XML reader. Its target mode is
+/// not kept: the checks treat every target as a part AnyDoc might load.
 struct OoxmlRelationship {
+    id: String,
     kind: String,
     target: String,
-    external: bool,
 }
 
+/// Every `Relationship` element in a rels part, in any namespace: reading
+/// more than AnyDoc reads can only make the checks below stricter.
 fn ooxml_relationships(bytes: &[u8]) -> Result<Vec<OoxmlRelationship>, DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     let mut relationships = Vec::new();
     loop {
@@ -1269,26 +1491,11 @@ fn ooxml_relationships(bytes: &[u8]) -> Result<Vec<OoxmlRelationship>, DocumentE
             | Ok(quick_xml::events::Event::Empty(event))
                 if xml_local_name(event.name().as_ref()) == b"Relationship" =>
             {
-                let mut relationship = OoxmlRelationship {
-                    kind: String::new(),
-                    target: String::new(),
-                    external: false,
-                };
-                for attribute in event.attributes().flatten() {
-                    let value = attribute
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .map(|value| value.into_owned())
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&attribute.value).into_owned());
-                    match xml_local_name(attribute.key.as_ref()) {
-                        b"Type" => relationship.kind = value,
-                        b"Target" => relationship.target = value,
-                        b"TargetMode" => {
-                            relationship.external = value.trim().eq_ignore_ascii_case("external");
-                        }
-                        _ => {}
-                    }
-                }
-                relationships.push(relationship);
+                relationships.push(OoxmlRelationship {
+                    id: xml_attribute_value(&event, b"Id").unwrap_or_default(),
+                    kind: xml_attribute_value(&event, b"Type").unwrap_or_default(),
+                    target: xml_attribute_value(&event, b"Target").unwrap_or_default(),
+                });
             }
             Ok(quick_xml::events::Event::Eof) => return Ok(relationships),
             Ok(_) => {}
@@ -1296,6 +1503,74 @@ fn ooxml_relationships(bytes: &[u8]) -> Result<Vec<OoxmlRelationship>, DocumentE
         }
         buffer.clear();
     }
+}
+
+/// Resolve a package reference exactly as AnyDoc 0.2.4 does
+/// (`package::path::resolve`): drop the fragment and query, start from the
+/// base part's directory, clamp `..` at the root, and percent-decode each
+/// segment after splitting. `None` where AnyDoc refuses the reference: a
+/// decoded segment that would add structure.
+fn anydoc_resolve(base_part: &str, reference: &str) -> Option<String> {
+    let reference = reference
+        .split_once('#')
+        .map_or(reference, |(path, _)| path);
+    let reference = reference
+        .split_once('?')
+        .map_or(reference, |(path, _)| path);
+    if reference.is_empty() {
+        return Some(base_part.to_string());
+    }
+    let mut segments: Vec<String> = Vec::new();
+    if !reference.starts_with('/') {
+        if let Some((directory, _)) = base_part.rsplit_once('/') {
+            segments.extend(
+                directory
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    for raw in reference.split('/') {
+        match raw {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            raw => {
+                let decoded = percent_decode(raw);
+                if decoded.contains(['/', '\\']) || decoded == "." || decoded == ".." {
+                    return None;
+                }
+                segments.push(decoded);
+            }
+        }
+    }
+    Some(segments.join("/"))
+}
+
+/// Percent-decode one reference segment as AnyDoc does: a `%` without two hex
+/// digits passes through, and invalid UTF-8 degrades lossily.
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if let Some(value) = segment
+                .get(index + 1..index + 3)
+                .filter(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                decoded.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// The relationships part for a package part: `word/document.xml` has
@@ -1307,17 +1582,14 @@ fn ooxml_rels_part(part: &str) -> String {
     }
 }
 
-/// Internal parts named by `type_suffix` relationships in `rels_part`,
-/// resolved against `base_part` as AnyDoc resolves them. A missing rels part
-/// names nothing; an unreadable one is malformed.
-fn ooxml_related_parts(
+/// Read a bounded XML part as AnyDoc decodes it; a missing part reads as
+/// `None`.
+fn read_optional_xml_part(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
-    rels_part: &str,
-    base_part: &str,
-    type_suffix: &str,
-) -> Result<Vec<String>, DocumentError> {
-    let Ok(entry) = archive.by_name(rels_part) else {
-        return Ok(Vec::new());
+    part: &str,
+) -> Result<Option<Vec<u8>>, DocumentError> {
+    let Ok(entry) = archive.by_name(part) else {
+        return Ok(None);
     };
     if entry.size() > MAX_PREFLIGHT_PART_BYTES {
         return Err(DocumentError::ResourceLimit);
@@ -1327,15 +1599,25 @@ fn ooxml_related_parts(
         .take(MAX_PREFLIGHT_PART_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| DocumentError::Malformed)?;
-    Ok(ooxml_relationships(&bytes)?
-        .into_iter()
-        .filter(|relationship| !relationship.external && relationship.kind.ends_with(type_suffix))
-        .filter_map(|relationship| resolve_package_target(base_part, &relationship.target))
-        .collect())
+    if bytes.len() as u64 > MAX_PREFLIGHT_PART_BYTES {
+        return Err(DocumentError::ResourceLimit);
+    }
+    Ok(Some(anydoc_xml_utf8(bytes)))
 }
 
-/// Parts a conversion reads, located through the package relationships the
-/// way the pinned parser locates them.
+fn read_relationships(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    rels_part: &str,
+) -> Result<Vec<OoxmlRelationship>, DocumentError> {
+    match read_optional_xml_part(archive, rels_part)? {
+        Some(bytes) => ooxml_relationships(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Parts a conversion may read, located through the package relationships.
+/// Each set holds every part AnyDoc could read for its role plus the
+/// conventional name, so a check that covers the set covers AnyDoc's choice.
 #[derive(Default)]
 struct OoxmlLayout {
     /// DOCX body, footnotes, and endnotes.
@@ -1356,52 +1638,80 @@ fn ooxml_layout(
         DocumentKind::Xlsx => "xl/workbook.xml",
         _ => return Ok(OoxmlLayout::default()),
     };
-    // Every check here reads the conventional main part. AnyDoc converts the
-    // part the package's officeDocument relationship names, so a package
-    // naming any other part is refused rather than converted unseen.
-    if let Some(declared) = ooxml_related_parts(archive, "_rels/.rels", "", "/officeDocument")?
+    // Every check reads the conventional main part, while AnyDoc converts the
+    // part the officeDocument relationship names (lowest id first). A package
+    // with such a relationship naming any other part is refused rather than
+    // converted from a part the checks never saw.
+    let declared: Vec<OoxmlRelationship> = read_relationships(archive, "_rels/.rels")?
         .into_iter()
-        .next()
+        .filter(|relationship| relationship.kind.ends_with("/officeDocument"))
+        .collect();
+    if !declared
+        .iter()
+        .all(|relationship| anydoc_resolve("", &relationship.target).as_deref() == Some(main))
     {
-        if declared != main {
-            return Err(DocumentError::Malformed);
-        }
+        return Err(DocumentError::Malformed);
     }
-    let rels = ooxml_rels_part(main);
-    let mut layout = OoxmlLayout::default();
-    // AnyDoc reads the first typed relationship, else the conventional sibling.
-    let mut first_or = |suffix: &str, fallback: &str| -> Result<String, DocumentError> {
-        Ok(ooxml_related_parts(archive, &rels, main, suffix)?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| fallback.to_string()))
+    let relationships = read_relationships(archive, &ooxml_rels_part(main))?;
+    let typed = |suffix: &str| -> Vec<String> {
+        relationships
+            .iter()
+            .filter(|relationship| relationship.kind.ends_with(suffix))
+            .filter_map(|relationship| anydoc_resolve(main, &relationship.target))
+            .collect()
     };
+    let mut layout = OoxmlLayout::default();
     match kind {
         DocumentKind::Docx => {
             layout.story_parts.insert(main.to_string());
-            layout
-                .story_parts
-                .insert(first_or("/footnotes", "word/footnotes.xml")?);
-            layout
-                .story_parts
-                .insert(first_or("/endnotes", "word/endnotes.xml")?);
-            layout
-                .styles_parts
-                .insert(first_or("/styles", "word/styles.xml")?);
+            layout.story_parts.insert("word/footnotes.xml".to_string());
+            layout.story_parts.insert("word/endnotes.xml".to_string());
+            layout.story_parts.extend(typed("/footnotes"));
+            layout.story_parts.extend(typed("/endnotes"));
+            layout.styles_parts.insert("word/styles.xml".to_string());
+            layout.styles_parts.extend(typed("/styles"));
         }
         DocumentKind::Xlsx => {
-            // The styles guard is a resource bound: check both candidates.
             layout.styles_parts.insert("xl/styles.xml".to_string());
-            layout
-                .styles_parts
-                .extend(ooxml_related_parts(archive, &rels, main, "/styles")?);
-            layout
-                .worksheet_parts
-                .extend(ooxml_related_parts(archive, &rels, main, "/worksheet")?);
+            layout.styles_parts.extend(typed("/styles"));
+            // AnyDoc loads each `<sheet r:id>` through the workbook
+            // relationships whatever their type.
+            if let Some(workbook) = read_optional_xml_part(archive, main)? {
+                let ids = xlsx_sheet_relationship_ids(&workbook);
+                layout.worksheet_parts.extend(
+                    relationships
+                        .iter()
+                        .filter(|relationship| ids.contains(&relationship.id))
+                        .filter_map(|relationship| anydoc_resolve(main, &relationship.target)),
+                );
+            }
         }
         _ => {}
     }
     Ok(layout)
+}
+
+/// The relationship ids of a workbook's `<sheet r:id="…">` entries, in
+/// every spelling a sheet carries.
+fn xlsx_sheet_relationship_ids(workbook: &[u8]) -> HashSet<String> {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(workbook));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut ids = HashSet::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event))
+                if xml_local_name(event.name().as_ref()) == b"sheet" =>
+            {
+                ids.extend(xml_attribute_values(&event, b"id"));
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return ids,
+            Ok(_) => {}
+        }
+        buffer.clear();
+    }
 }
 
 /// Longest spreadsheet number-format code converted. AnyDoc 0.2.4 expands
@@ -1509,12 +1819,8 @@ fn xml_odf_internal_references(bytes: &[u8]) -> Vec<String> {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                for attribute in event.attributes().flatten() {
-                    if matches!(xml_local_name(attribute.key.as_ref()), b"href" | b"src") {
-                        references
-                            .push(String::from_utf8_lossy(attribute.value.as_ref()).into_owned());
-                    }
-                }
+                references.extend(xml_attribute_values(&event, b"href"));
+                references.extend(xml_attribute_values(&event, b"src"));
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::Eof) => return references,
@@ -1524,13 +1830,16 @@ fn xml_odf_internal_references(bytes: &[u8]) -> Vec<String> {
     }
 }
 
-fn odf_internal_target(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() || value.starts_with('#') || is_external_uri(value) {
-        return None;
+/// Whether an internal reference names a part the package lacks. The part
+/// is the one AnyDoc loads (`path::resolve` against `content.xml`, on the
+/// value as written); a reference it cannot resolve is dropped by AnyDoc and
+/// counts as missing. External and fragment-only references name no part.
+fn odf_reference_missing(value: &str, archive_names: &HashSet<String>) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || is_external_uri(trimmed) {
+        return false;
     }
-    let path = value.split_once('#').map_or(value, |(path, _)| path);
-    resolve_package_target("content.xml", path)
+    anydoc_resolve("content.xml", value).is_none_or(|part| !archive_names.contains(&part))
 }
 
 fn xml_has_hidden_slide(bytes: &[u8]) -> bool {
@@ -1608,26 +1917,6 @@ fn xml_is_well_formed(bytes: &[u8]) -> bool {
     }
 }
 
-fn xml_element_tags<'a>(xml: &'a str, element_name: &str) -> Vec<&'a str> {
-    let needle = format!("<{element_name}");
-    let mut tags = Vec::new();
-    let mut cursor = 0;
-    while let Some(offset) = xml[cursor..].find(&needle) {
-        let start = cursor + offset;
-        let end = match xml[start..].find('>') {
-            Some(end) => start + end + 1,
-            None => break,
-        };
-        let after_name = xml.as_bytes().get(start + needle.len()).copied();
-        if after_name.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'>' || byte == b'/')
-        {
-            tags.push(&xml[start..end]);
-        }
-        cursor = end;
-    }
-    tags
-}
-
 fn ooxml_external_target(value: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
     value.starts_with("//")
@@ -1640,12 +1929,15 @@ fn ooxml_external_target(value: &str) -> bool {
         || value.starts_with("mailto:")
 }
 
-fn xml_has_ooxml_external_relationship(bytes: &[u8]) -> bool {
-    if !xml_is_well_formed(bytes) {
-        return false;
-    }
+/// Whether a relationships part declares an external target, read as AnyDoc
+/// reads it: end tags are not matched by prefix and values are decoded
+/// (`Ext&#101;rnal` is external). Names match in any case, which only finds
+/// more. A part no reader can parse is malformed, since AnyDoc would drop
+/// every relationship in it without a diagnostic.
+fn xml_has_ooxml_external_relationship(bytes: &[u8]) -> Result<bool, DocumentError> {
     let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -1655,44 +1947,26 @@ fn xml_has_ooxml_external_relationship(bytes: &[u8]) -> bool {
             {
                 let external = event.attributes().flatten().any(|attribute| {
                     let name = xml_local_name(attribute.key.as_ref());
-                    let value = String::from_utf8_lossy(attribute.value.as_ref());
+                    let value = attribute
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .map(|value| value.into_owned())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&attribute.value).into_owned());
                     (name.eq_ignore_ascii_case(b"TargetMode")
                         && value.trim().eq_ignore_ascii_case("External"))
                         || (name.eq_ignore_ascii_case(b"Target") && ooxml_external_target(&value))
                 });
                 if external {
-                    return true;
+                    return Ok(true);
                 }
-                buffer.clear();
             }
-            Ok(quick_xml::events::Event::Eof) => return false,
-            Ok(_) => buffer.clear(),
-            Err(_) => return false,
+            Ok(quick_xml::events::Event::Eof) => return Ok(false),
+            Ok(_) => {}
+            Err(_) => return Err(DocumentError::Malformed),
         }
+        buffer.clear();
     }
 }
 
-fn xml_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let mut search = 0;
-    while let Some(offset) = tag[search..].find(name) {
-        let start = search + offset;
-        search = start + name.len();
-        // A whole attribute name, optionally spaced around `=` as XML allows.
-        if !tag[..start].ends_with(|c: char| c.is_ascii_whitespace()) {
-            continue;
-        }
-        let Some(rest) = tag[search..].trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
-            continue;
-        };
-        let value = &rest[1..];
-        return value.find(quote).map(|end| &value[..end]);
-    }
-    None
-}
 fn resolve_package_target(base_part: &str, target: &str) -> Option<String> {
     if target.contains('\\') || target.contains(char::from(0)) {
         return None;
@@ -1717,6 +1991,12 @@ fn resolve_package_target(base_part: &str, target: &str) -> Option<String> {
     (!components.is_empty()).then(|| components.join("/"))
 }
 
+/// Whether a listed slide is missing from the parts the checks read.
+///
+/// AnyDoc loads each `<p:sldId r:id="…">` from the relationship with that id,
+/// whatever its type, resolving the target its own way (`path::resolve`
+/// drops a fragment before any `..` is applied). Every part it could load
+/// for a listed slide must be a slide that was checked.
 fn validate_pptx_slide_targets(
     presentation: &[u8],
     presentation_rels: &[u8],
@@ -1725,49 +2005,65 @@ fn validate_pptx_slide_targets(
     if !xml_is_well_formed(presentation) || !xml_is_well_formed(presentation_rels) {
         return Err(DocumentError::Malformed);
     }
-    let presentation = String::from_utf8_lossy(presentation);
-    let presentation_rels = String::from_utf8_lossy(presentation_rels);
-    let mut slide_relationships = HashMap::new();
-    for tag in xml_element_tags(&presentation_rels, "Relationship") {
-        let Some(id) = xml_attribute(tag, "Id") else {
-            continue;
-        };
-        let Some(rel_type) = xml_attribute(tag, "Type") else {
-            continue;
-        };
-        if rel_type.ends_with("/slide") {
-            if let Some(target) = xml_attribute(tag, "Target") {
-                slide_relationships.insert(id.to_string(), target.to_string());
-            }
-        }
-    }
-
-    let mut slide_tags = xml_element_tags(&presentation, "p:sldId");
-    if slide_tags.is_empty() {
-        slide_tags = xml_element_tags(&presentation, "sldId");
-    }
-    if slide_tags.is_empty() {
+    let relationships = ooxml_relationships(presentation_rels)?;
+    let slides = pptx_slide_relationship_ids(presentation);
+    if slides.is_empty() {
         return Err(DocumentError::Malformed);
     }
     let mut incomplete = false;
-    for tag in slide_tags {
-        let Some(relation_id) = xml_attribute(tag, "r:id") else {
-            incomplete = true;
-            continue;
-        };
-        let Some(target) = slide_relationships.get(relation_id) else {
-            incomplete = true;
-            continue;
-        };
-        let Some(part) = resolve_package_target("ppt/presentation.xml", target) else {
-            incomplete = true;
-            continue;
-        };
-        if !slide_parts.contains(&part) {
-            incomplete = true;
+    for ids in slides {
+        let mut targets = relationships
+            .iter()
+            .filter(|relationship| ids.contains(&relationship.id))
+            .peekable();
+        incomplete |= targets.peek().is_none();
+        for relationship in targets {
+            match anydoc_resolve("ppt/presentation.xml", &relationship.target) {
+                Some(part) if slide_parts.contains(&part) => {}
+                _ => incomplete = true,
+            }
         }
     }
     Ok(incomplete)
+}
+
+/// The relationship ids of each listed slide: every prefixed `id` attribute
+/// of a `sldId` (the unprefixed `id` is the slide's number).
+fn pptx_slide_relationship_ids(presentation: &[u8]) -> Vec<HashSet<String>> {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(presentation));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut slides = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event))
+                if xml_local_name(event.name().as_ref()) == b"sldId" =>
+            {
+                slides.push(
+                    event
+                        .attributes()
+                        .flatten()
+                        .filter(|attribute| {
+                            let key = attribute.key.as_ref();
+                            key.contains(&b':') && xml_local_name(key) == b"id"
+                        })
+                        .map(|attribute| {
+                            attribute
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .map(|value| value.into_owned())
+                                .unwrap_or_else(|_| {
+                                    String::from_utf8_lossy(attribute.value.as_ref()).into_owned()
+                                })
+                        })
+                        .collect(),
+                );
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return slides,
+            Ok(_) => {}
+        }
+        buffer.clear();
+    }
 }
 
 struct EpubManifestItem {
@@ -1794,16 +2090,19 @@ fn epub_is_external_uri(value: &str) -> bool {
         || value.starts_with("javascript:")
 }
 
+/// The part a local reference names, resolved exactly as AnyDoc resolves it,
+/// or `None` for a reference the local policy refuses: empty, fragment-only,
+/// external, or carrying a query or a package-absolute path.
 fn epub_resolve_local(base_part: &str, value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() || value.starts_with('#') || epub_is_external_uri(value) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || epub_is_external_uri(trimmed) {
         return None;
     }
-    let path = value.split_once('#').map_or(value, |(path, _)| path);
+    let path = trimmed.split_once('#').map_or(trimmed, |(path, _)| path);
     if path.is_empty() || path.contains('?') || path.starts_with('/') {
         return None;
     }
-    resolve_package_target(base_part, path)
+    anydoc_resolve(base_part, value)
 }
 
 fn epub_check_reference(
@@ -1850,6 +2149,14 @@ fn epub_read_part(
         return Err(DocumentError::ResourceLimit);
     }
     Ok(content)
+}
+
+/// Read an EPUB XML part as AnyDoc decodes it.
+fn epub_read_xml_part(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    name: &str,
+) -> Result<Vec<u8>, DocumentError> {
+    epub_read_part(archive, name).map(anydoc_xml_utf8)
 }
 
 fn epub_rootfile_paths(bytes: &[u8]) -> Result<Vec<String>, DocumentError> {
@@ -2221,16 +2528,20 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
         return Err(DocumentError::Encrypted);
     }
 
-    let container = epub_read_part(&mut archive, "META-INF/container.xml")?;
+    let container = epub_read_xml_part(&mut archive, "META-INF/container.xml")?;
     let roots = epub_rootfile_paths(&container)?;
     if roots.len() != 1 || roots[0].starts_with('/') {
         return Err(DocumentError::Malformed);
     }
-    let opf_path = resolve_package_target("", &roots[0]).ok_or(DocumentError::Malformed)?;
-    if !archive_names.contains(&opf_path) {
+    // AnyDoc opens `full-path` as a part name without resolving it, so only
+    // a path already in canonical form names the part checked here.
+    let opf_path = roots[0].clone();
+    if resolve_package_target("", &opf_path).as_deref() != Some(opf_path.as_str())
+        || !archive_names.contains(&opf_path)
+    {
         return Err(DocumentError::Malformed);
     }
-    let opf = epub_read_part(&mut archive, &opf_path)?;
+    let opf = epub_read_xml_part(&mut archive, &opf_path)?;
     let EpubPackageMetadata {
         manifest,
         spine,
@@ -2297,7 +2608,7 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
             continue;
         }
         spine_targets.push(target.clone());
-        match epub_read_part(&mut archive, &target)
+        match epub_read_xml_part(&mut archive, &target)
             .and_then(|chapter| epub_inspect_chapter(&chapter, &target, &archive_names))
         {
             Ok(chapter_result) => {
@@ -2321,7 +2632,7 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
             if !archive_names.contains(&nav_target) {
                 result.missing_required_content = true;
             } else {
-                match epub_read_part(&mut archive, &nav_target).and_then(|nav| {
+                match epub_read_xml_part(&mut archive, &nav_target).and_then(|nav| {
                     epub_nav_spine_mismatch(
                         &nav,
                         &nav_target,
@@ -2394,8 +2705,7 @@ fn preflight_package(
     let mut odf_references = Vec::new();
 
     let layout = ooxml_layout(&mut archive, kind)?;
-    let mut docx_scans = Vec::new();
-    let mut docx_styles = None;
+    let mut docx_scan = DocxStoryScan::default();
     let mut result = PackagePreflight::default();
     let mut ppt_presentation = None;
     let mut ppt_presentation_rels = None;
@@ -2511,8 +2821,7 @@ fn preflight_package(
                 && (lower_name == "ppt/presentation.xml"
                     || lower_name == "ppt/_rels/presentation.xml.rels"
                     || (lower_name.starts_with("ppt/slides/") && lower_name.ends_with(".xml"))))
-            || (matches!(kind, DocumentKind::Docx)
-                && (layout.story_parts.contains(&name) || layout.styles_parts.contains(&name)));
+            || (matches!(kind, DocumentKind::Docx) && layout.story_parts.contains(&name));
         if inspect_xml {
             if declared > MAX_PREFLIGHT_PART_BYTES {
                 return Err(DocumentError::ResourceLimit);
@@ -2525,6 +2834,7 @@ fn preflight_package(
             if content.len() as u64 > MAX_PREFLIGHT_PART_BYTES {
                 return Err(DocumentError::ResourceLimit);
             }
+            let content = anydoc_xml_utf8(content);
             let lower_content = String::from_utf8_lossy(&content).to_ascii_lowercase();
             if matches!(kind, DocumentKind::Docx)
                 && lower_name == "word/document.xml"
@@ -2532,13 +2842,8 @@ fn preflight_package(
             {
                 return Err(DocumentError::Malformed);
             }
-            if matches!(kind, DocumentKind::Docx) {
-                if layout.story_parts.contains(&name) {
-                    docx_scans.push(scan_docx_story(&content)?);
-                }
-                if layout.styles_parts.contains(&name) {
-                    docx_styles = Some(content.clone());
-                }
+            if matches!(kind, DocumentKind::Docx) && layout.story_parts.contains(&name) {
+                scan_docx_story(&content, &mut docx_scan)?;
             }
             if matches!(
                 kind,
@@ -2595,7 +2900,7 @@ fn preflight_package(
                 }
             }
             if lower_name.ends_with(".rels") {
-                result.external_relationships |= xml_has_ooxml_external_relationship(&content);
+                result.external_relationships |= xml_has_ooxml_external_relationship(&content)?;
             }
             if lower_content.contains("macroenabled") {
                 result.active_content = true;
@@ -2610,9 +2915,11 @@ fn preflight_package(
                 }
             }
             if matches!(kind, DocumentKind::Pptx) {
-                if lower_name == "ppt/presentation.xml" {
+                // AnyDoc reads these by exact name; a case variant is only a
+                // decoy and must not stand in for the part it converts.
+                if name == "ppt/presentation.xml" {
                     ppt_presentation = Some(content.clone());
-                } else if lower_name == "ppt/_rels/presentation.xml.rels" {
+                } else if name == "ppt/_rels/presentation.xml.rels" {
                     ppt_presentation_rels = Some(content.clone());
                 } else if lower_name.starts_with("ppt/slides/") && lower_name.ends_with(".xml") {
                     if !xml_is_well_formed(&content) || !xml_has_pptx_shape_tree(&content) {
@@ -2643,18 +2950,9 @@ fn preflight_package(
         }
         odf_content.ok_or(DocumentError::Malformed)?;
         if matches!(kind, DocumentKind::Odt | DocumentKind::Odp) {
-            for reference in odf_references {
-                let reference = reference.trim();
-                if reference.is_empty() || reference.starts_with('#') {
-                    continue;
-                }
-                let Some(target) = odf_internal_target(reference) else {
-                    continue;
-                };
-                if !archive_names.contains(&target) {
-                    result.missing_required_content = true;
-                }
-            }
+            result.missing_required_content |= odf_references
+                .iter()
+                .any(|reference| odf_reference_missing(reference, &archive_names));
         }
         if let Some(manifest) = odf_manifest {
             if xml_has_odf_encryption_data(&manifest) {
@@ -2671,26 +2969,32 @@ fn preflight_package(
             let Ok(entry) = archive.by_name(part) else {
                 continue;
             };
-            if styles_have_oversized_number_format(entry.take(MAX_ARCHIVE_ENTRY_BYTES))? {
+            if styles_have_oversized_number_format(open_xml_stream(
+                entry.take(MAX_ARCHIVE_ENTRY_BYTES),
+            )?)? {
                 return Err(DocumentError::ResourceLimit);
             }
         }
     }
     if matches!(kind, DocumentKind::Docx) {
-        let (hidden_styles, defaults_hidden) = docx_styles
-            .as_deref()
-            .map(docx_hidden_styles)
-            .transpose()?
-            .unwrap_or_default();
-        for scan in &docx_scans {
-            result.unsupported_content |= scan.dropped;
-            result.hidden_content |= scan.hidden_run
-                || defaults_hidden
-                || scan
-                    .styles_used
-                    .iter()
-                    .any(|style| hidden_styles.contains(style));
+        let mut hidden_styles = HashSet::new();
+        let mut defaults_hidden = false;
+        for part in &layout.styles_parts {
+            let Ok(entry) = archive.by_name(part) else {
+                continue;
+            };
+            let (styles, defaults) =
+                docx_hidden_styles(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
+            hidden_styles.extend(styles);
+            defaults_hidden |= defaults;
         }
+        result.unsupported_content |= docx_scan.dropped;
+        result.hidden_content |= docx_scan.hidden_run
+            || defaults_hidden
+            || docx_scan
+                .styles_used
+                .iter()
+                .any(|style| hidden_styles.contains(style));
     }
     if !matches!(variant, DocumentVariant::Docx) && matches!(kind, DocumentKind::Docx) {
         result.active_content = true;
@@ -2817,10 +3121,18 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
     if !classification.enabled {
         return Err(DocumentError::Unsupported);
     }
-    let preflight = if kind == DocumentKind::Csv {
-        PackagePreflight::default()
+    let (bytes, preflight) = if kind == DocumentKind::Csv {
+        (bytes, PackagePreflight::default())
     } else {
-        preflight_package(&bytes, kind, variant)?
+        // Decompressing and scanning parts is blocking work; keep it off the
+        // async executor that serves the other tools.
+        let (bytes, preflight) = tokio::task::spawn_blocking(move || {
+            let preflight = preflight_package(&bytes, kind, variant);
+            (bytes, preflight)
+        })
+        .await
+        .map_err(|_| DocumentError::ConversionFailed)?;
+        (bytes, preflight?)
     };
     if let Some(error) = preflight_rejection(kind, &preflight) {
         return Err(error);
@@ -3629,50 +3941,71 @@ const EXTERNAL_URL_MARKER: &str = "[external URL removed]";
 const LOCAL_PATH_MARKER: &str = "[local path removed]";
 
 fn sanitize_markdown(markdown: &str) -> (String, bool) {
-    static URL: OnceLock<Regex> = OnceLock::new();
-    static PATH: OnceLock<Regex> = OnceLock::new();
     static HTML: OnceLock<Regex> = OnceLock::new();
-    // Bare URLs with an authority, `www.` hosts that GFM links on its own,
-    // and the schemes that act without an authority.
+    let html = HTML.get_or_init(|| Regex::new(r"</?[A-Za-z][^>]*>").expect("HTML regex"));
+    // Redact, strip HTML, then redact again: removing a tag can join `]` and
+    // `(` into a new link, while a path is easiest to delimit before the tag
+    // next to it disappears. Markers contain nothing either pass rewrites.
+    let redacted = redact_destinations_and_paths(markdown);
+    let stripped = html.replace_all(&redacted, "");
+    let sanitized = redact_destinations_and_paths(&stripped);
+    let changed = sanitized != markdown;
+    (sanitized, changed)
+}
+
+fn redact_destinations_and_paths(markdown: &str) -> String {
+    static URL: OnceLock<Regex> = OnceLock::new();
+    static WWW: OnceLock<Regex> = OnceLock::new();
+    static PATH: OnceLock<Regex> = OnceLock::new();
+    // Bare URLs with an authority, and the schemes that act without one.
     let url = URL.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(?:[a-z][a-z0-9+.\-]*://|www\.|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>]+",
+            r"(?i)\b(?:[a-z][a-z0-9+.\-]*://|(?:mailto|data|javascript|vbscript|file|tel|sms|callto):)[^\s)\]>]+",
         )
         .expect("URL regex")
     });
+    // `www.` hosts where GFM links them on its own: at a line start or after
+    // whitespace, `*`, `_`, `~`, or `(`. Inside `Text/www.index.xhtml` it is
+    // part of a relative path.
+    let www =
+        WWW.get_or_init(|| Regex::new(r"(?im)(^|[\s*_~(])www\.[^\s<)\]>]*").expect("www regex"));
     // Home directories, temporary and private roots, Windows profiles, and
-    // UNC shares, starting a token: `Text/home/ch1.xhtml` is a relative link,
-    // not a home directory.
+    // UNC shares, unless a path or word character precedes them:
+    // `Text/home/ch1.xhtml` is a relative link, not a home directory.
     let path = PATH.get_or_init(|| {
         Regex::new(
-            r#"(^|[\s(\["'=,;])((?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|[A-Za-z]:\\(?i:users)\\)[^\s)\]>]*)"#,
+            r"(^|[^A-Za-z0-9._/\\\-])((?:(?:/Users|/home|/root|/private|/tmp|/var/folders)/|\\\\[A-Za-z0-9._$\-]+\\|[A-Za-z]:\\(?i:users)\\)[^\s)\]>]*)",
         )
         .expect("path regex")
     });
-    let html = HTML.get_or_init(|| Regex::new(r"</?[A-Za-z][^>]*>").expect("HTML regex"));
-    let sanitized = neutralize_destinations(markdown);
-    let sanitized = url.replace_all(&sanitized, EXTERNAL_URL_MARKER);
-    let sanitized = path.replace_all(&sanitized, format!("${{1}}{LOCAL_PATH_MARKER}"));
-    let sanitized = html.replace_all(&sanitized, "").into_owned();
-    let changed = sanitized != markdown;
-    (sanitized, changed)
+    let rewritten = neutralize_destinations(markdown);
+    let rewritten = url.replace_all(&rewritten, EXTERNAL_URL_MARKER);
+    let rewritten = www.replace_all(&rewritten, format!("${{1}}{EXTERNAL_URL_MARKER}"));
+    path.replace_all(&rewritten, format!("${{1}}{LOCAL_PATH_MARKER}"))
+        .into_owned()
 }
 
 /// Replace link and image destinations that leave the package: a scheme, a
 /// host, a drive, or an absolute or UNC path. Relative and fragment
 /// destinations stay; they name parts of the same package. Destinations are
-/// read as a CommonMark renderer reads them, one line and no unbracketed
-/// whitespace, after backslash escapes and character references are decoded,
-/// so `https&#58;//…` and `https\://…` are recognized.
+/// read as a CommonMark renderer reads them, after at most one line ending
+/// and with no unbracketed whitespace or brackets, and are decoded
+/// (backslash escapes, character references) before classification, so
+/// `https&#58;//…` and `https\://…` are recognized.
 fn neutralize_destinations(markdown: &str) -> String {
     static INLINE: OnceLock<Regex> = OnceLock::new();
     static REFERENCE: OnceLock<Regex> = OnceLock::new();
     let inline = INLINE.get_or_init(|| {
-        Regex::new(r"\]\([ \t]*(<[^<>\n]*>|[^\s()<>]+)").expect("inline destination regex")
+        Regex::new(r"\]\([ \t]*(?:\n[ \t]*)?(<[^<>\n]*>|[^\s()<>\[\]]+)")
+            .expect("inline destination regex")
     });
+    // A link reference definition: the destination ends the line or is
+    // followed only by a title. `[^1]: …` is a footnote, not a definition.
     let reference = REFERENCE.get_or_init(|| {
-        Regex::new(r"(?m)^[ ]{0,3}\[[^\]\n]+\]:[ \t]*(<[^<>\n]*>|\S+)")
-            .expect("reference destination regex")
+        Regex::new(
+            r#"(?m)^[ ]{0,3}\[[^\]\n^][^\]\n]*\]:[ \t]*(<[^<>\n]*>|\S+)[ \t]*(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\))?[ \t]*$"#,
+        )
+        .expect("reference destination regex")
     });
     let rewritten = replace_destinations(markdown, inline, true);
     replace_destinations(&rewritten, reference, false)
@@ -3927,6 +4260,94 @@ mod tests {
     }
 
     #[test]
+    fn sanitizer_examines_every_link_after_stray_brackets() {
+        for input in [
+            "Details ]([here](//attacker.example.invalid/p)",
+            "[click here\\](](//attacker.example.invalid/p)",
+            "Details ]([here](https&#58;//attacker.example.invalid/q)",
+            "[x](\n//attacker.example.invalid/p)",
+        ] {
+            let (output, changed) = sanitize_markdown(input);
+            assert!(changed, "{input}");
+            assert!(!output.contains("attacker"), "{input} -> {output}");
+        }
+    }
+
+    #[test]
+    fn sanitizer_leaves_footnotes_and_non_definitions_alone() {
+        for input in [
+            "[^1]: Note: see line 3.",
+            "[^2]: See: Treas. Reg. 1.61-1.",
+            "[1]: Note: see line 3",
+            "[^3]: 10:30 am meeting.",
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (input.to_string(), false),
+                "{input}"
+            );
+        }
+        let (output, _) = sanitize_markdown("[2]: https://example.invalid/x \"Title\"");
+        assert_eq!(output, "[2]: [external URL removed] \"Title\"");
+    }
+
+    #[test]
+    fn sanitizer_redacts_paths_after_any_delimiter_and_after_tags() {
+        // Assembled so the repository hygiene scan does not flag the literals.
+        let home = ["/", "home/alice/.ssh/id_rsa"].concat();
+        let mac = ["/", "Users/alice/secret.docx"].concat();
+        let windows = [r"C:\", r"Users\alice\Documents\w2.pdf"].concat();
+        for input in [
+            format!("`{home}`"),
+            format!("**{mac}**"),
+            format!("`{windows}`"),
+            format!("| line1<br>{home} |"),
+            format!("> {home}"),
+        ] {
+            let (output, changed) = sanitize_markdown(&input);
+            assert!(changed, "{input}");
+            assert!(
+                output.contains("[local path removed]"),
+                "{input} -> {output}"
+            );
+            assert!(!output.contains("alice"), "{input} -> {output}");
+        }
+    }
+
+    #[test]
+    fn sanitizer_rechecks_links_joined_by_tag_removal() {
+        for input in [
+            "Claim[^1]<a id=\"bm\"></a>(//attacker.example.invalid/p)",
+            "[x](<b>//attacker.example.invalid/p)",
+        ] {
+            let (output, changed) = sanitize_markdown(input);
+            assert!(changed, "{input}");
+            assert!(!output.contains("attacker"), "{input} -> {output}");
+        }
+    }
+
+    #[test]
+    fn sanitizer_applies_the_gfm_www_rule() {
+        assert_eq!(
+            sanitize_markdown("[a](Text/www.index.xhtml)"),
+            ("[a](Text/www.index.xhtml)".to_string(), false)
+        );
+        for (input, expected) in [
+            (
+                "see www.example.invalid today",
+                "see [external URL removed] today",
+            ),
+            ("(www.example.invalid)", "([external URL removed])"),
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (expected.to_string(), true),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn sanitizer_keeps_relative_links_and_ordinary_prose() {
         for input in [
             "[next chapter](Text/ch2.xhtml#s1)",
@@ -4103,14 +4524,186 @@ mod tests {
 
     #[test]
     fn ooxml_relationship_parser_handles_spacing_and_arbitrary_external_targets() {
-        assert!(xml_has_ooxml_external_relationship(
+        let external = |rels: &[u8]| xml_has_ooxml_external_relationship(rels);
+        assert!(external(
             br#"<Relationships><Relationship Id='rId1' TargetMode = 'External' Target='slide-link.bin'/></Relationships>"#
-        ));
-        assert!(xml_has_ooxml_external_relationship(
+        )
+        .unwrap());
+        assert!(external(
             br#"<Relationships><Relationship Id="rId2" Target="https://example.invalid/image.png"/></Relationships>"#
-        ));
-        assert!(!xml_has_ooxml_external_relationship(
+        )
+        .unwrap());
+        assert!(!external(
             br#"<Relationships><Relationship Id="rId3" Target="slides/slide1.xml"/></Relationships>"#
+        )
+        .unwrap());
+        // Read as AnyDoc reads it: values decoded, end tags unmatched.
+        assert!(external(
+            br#"<Relationships><Relationship Id="rId4" TargetMode="Ext&#101;rnal" Target="a.bin"/></Relationships>"#
+        )
+        .unwrap());
+        assert!(external(
+            br#"<pr:Relationships xmlns:pr="urn:pr"><pr:Relationship Id="rId5" TargetMode="External" Target="a.bin"/></x:Relationships>"#
+        )
+        .unwrap());
+        // A part no reader can parse hides what it references.
+        assert!(matches!(
+            external(br#"<Relationships><Relationship Id="rId6" Target="#),
+            Err(DocumentError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn pptx_slides_resolve_as_anydoc_resolves_them() {
+        let with_rels = |rels: &[u8], extra: &[(&str, &[u8])]| {
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("[Content_Types].xml", PPTX_TYPES),
+                ("ppt/presentation.xml", PPTX_PRESENTATION),
+                ("ppt/_rels/presentation.xml.rels", rels),
+                ("ppt/slides/slide1.xml", PPTX_SLIDE),
+            ];
+            entries.extend_from_slice(extra);
+            preflight_package(
+                &zip_entries(&entries),
+                DocumentKind::Pptx,
+                DocumentVariant::Pptx,
+            )
+            .unwrap()
+            .missing_required_content
+        };
+        let target = |target: &str| {
+            format!(
+                r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/slide" Target="{target}"/></Relationships>"#
+            )
+            .into_bytes()
+        };
+        // AnyDoc drops the fragment before applying `..`, so this names a
+        // part outside the checked slides.
+        let hidden = br#"<p:sld show="0"><p:cSld><p:spTree/></p:cSld></p:sld>"#;
+        assert!(with_rels(
+            &target("../other/slide.xml#/../../ppt/slides/slide1.xml"),
+            &[("other/slide.xml", hidden)],
+        ));
+        // Spellings of the checked slide AnyDoc resolves to it are accepted.
+        for accepted in [
+            "slides/slide1.xml",
+            "slides/slide%31.xml",
+            "../../ppt/slides/slide1.xml",
+            "slides/slide1.xml?v=1#top",
+        ] {
+            assert!(!with_rels(&target(accepted), &[]), "{accepted}");
+        }
+        // A case-variant decoy does not stand in for the part AnyDoc reads.
+        let decoy = target("slides/slide1.xml");
+        assert!(with_rels(
+            &target("../other/slide.xml"),
+            &[
+                ("PPT/_rels/presentation.xml.rels", &decoy),
+                ("other/slide.xml", hidden),
+            ],
+        ));
+    }
+
+    #[test]
+    fn epub_chapters_resolve_as_anydoc_resolves_them() {
+        let scripted = br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head/><body><script>run()</script><p>Chapter.</p></body></html>"#;
+        let opf_for = |href: &str| {
+            format!(
+                r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="ch1" href="{href}" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine><itemref idref="ch1"/></spine></package>"#
+            )
+        };
+        let package = |href: &str, container: &[u8], extra: &[(&str, &[u8])]| {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("mimetype", stored).unwrap();
+            writer.write_all(b"application/epub+zip").unwrap();
+            let opf = opf_for(href);
+            let nav = br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head/><body><nav type="toc"><ol><li><a href="Text/ch1.xhtml">One</a></li></ol></nav></body></html>"#;
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("META-INF/container.xml", container),
+                ("OPS/package.opf", opf.as_bytes()),
+                ("OPS/nav.xhtml", nav),
+            ];
+            entries.extend_from_slice(extra);
+            for (name, bytes) in entries {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            preflight_package(
+                &writer.finish().unwrap().into_inner(),
+                DocumentKind::Epub,
+                DocumentVariant::Epub,
+            )
+        };
+        // AnyDoc percent-decodes the href: the chapter it converts is the
+        // decoded name, not a decoy stored under the encoded one.
+        let result = package(
+            "Text/ch%31.xhtml",
+            EPUB_CONTAINER,
+            &[
+                ("OPS/Text/ch%31.xhtml", EPUB_CHAPTER_TWO),
+                ("OPS/Text/ch1.xhtml", scripted),
+            ],
+        )
+        .unwrap();
+        assert!(result.active_content, "the decoded chapter is checked");
+        // Whitespace is part of the name AnyDoc looks up.
+        let result = package(
+            " Text/ch1.xhtml",
+            EPUB_CONTAINER,
+            &[("OPS/Text/ch1.xhtml", EPUB_CHAPTER_TWO)],
+        )
+        .unwrap();
+        assert!(result.missing_required_content);
+        // AnyDoc opens the container's path as written.
+        let dotted = String::from_utf8(EPUB_CONTAINER.to_vec())
+            .unwrap()
+            .replace("OPS/package.opf", "OPS/./package.opf");
+        assert!(matches!(
+            package(
+                "Text/ch1.xhtml",
+                dotted.as_bytes(),
+                &[("OPS/Text/ch1.xhtml", EPUB_CHAPTER_TWO)]
+            ),
+            Err(DocumentError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn odt_references_resolve_as_anydoc_resolves_them() {
+        let with_image = |href: &str, extra: &[(&str, &[u8])]| {
+            let content = format!(
+                r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:text><text:p>Body<draw:frame><draw:image xlink:href="{href}"/></draw:frame></text:p></office:text></office:body></office:document-content>"#
+            );
+            preflight_package(
+                &odt_package(content.as_bytes(), extra),
+                DocumentKind::Odt,
+                DocumentVariant::Odt,
+            )
+            .unwrap()
+            .missing_required_content
+        };
+        assert!(!with_image("Pictures/a.png", &[("Pictures/a.png", b"png")]));
+        assert!(!with_image(
+            "Pictures/%61.png",
+            &[("Pictures/a.png", b"png")]
+        ));
+        assert!(!with_image(
+            "Pictures/a&#46;png",
+            &[("Pictures/a.png", b"png")]
+        ));
+        // The decoded name is the part AnyDoc loads, not an encoded decoy.
+        assert!(with_image(
+            "Pictures/%61.png",
+            &[("Pictures/%61.png", b"png")]
+        ));
+        // A reference AnyDoc cannot resolve is dropped, so it counts as missing.
+        assert!(with_image(
+            "Pictures%2Fa.png",
+            &[("Pictures/a.png", b"png")]
         ));
     }
 
@@ -4368,31 +4961,424 @@ mod tests {
             Err(DocumentError::ResourceLimit)
         ));
 
-        let workbook = br#"<workbook><sheets><sheet name="Data"/></sheets></workbook>"#;
-        let sheet_rels = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="data/s1.xml"/></Relationships>"#;
         let sheet =
             br#"<worksheet><sheetData><row><c r="A1"><f>1+1</f></c></row></sheetData></worksheet>"#;
-        let bytes = zip_entries(&[
-            ("[Content_Types].xml", XLSX_TYPES),
-            ("xl/workbook.xml", workbook),
-            ("xl/_rels/workbook.xml.rels", sheet_rels),
-            ("xl/data/s1.xml", sheet),
-        ]);
-        let preflight =
-            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx).unwrap();
+        let relocated = |sheet_attributes: &str, relationship_type: &str| {
+            let workbook = format!(
+                r#"<workbook xmlns:r="{REL_NS}" xmlns:x="urn:decoy"><sheets><sheet name="Data" sheetId="1" {sheet_attributes}/></sheets></workbook>"#
+            );
+            let rels = format!(
+                r#"<Relationships><Relationship Id="rDecoy" Type="{REL_NS}/worksheet" Target="decoy.xml"/><Relationship Id="rId1" Type="{REL_NS}/{relationship_type}" Target="data/s1.xml"/></Relationships>"#
+            );
+            let bytes = zip_entries(&[
+                ("[Content_Types].xml", XLSX_TYPES),
+                ("xl/workbook.xml", workbook.as_bytes()),
+                ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                ("xl/data/s1.xml", sheet),
+            ]);
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx)
+                .unwrap()
+                .missing_formula_cache
+        };
         assert!(
-            preflight.missing_formula_cache,
+            relocated(r#"r:id="rId1""#, "worksheet"),
             "relocated worksheets are checked"
+        );
+        // AnyDoc loads a sheet's target whatever its relationship type.
+        assert!(relocated(r#"r:id="rId1""#, "chartsheet"));
+        // Every spelling of the id is followed, not only the first.
+        assert!(relocated(r#"x:id="rDecoy" r:id="rId1""#, "worksheet"));
+        // A sheet with no relationship id is skipped by AnyDoc and here.
+        assert!(!relocated(r#"name2="rId1""#, "worksheet"));
+    }
+
+    const REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    fn docx_result(entries: &[(&str, &[u8])]) -> Result<PackagePreflight, DocumentError> {
+        let mut all: Vec<(&str, &[u8])> = vec![("[Content_Types].xml", DOCX_TYPES)];
+        all.extend_from_slice(entries);
+        preflight_package(
+            &zip_entries(&all),
+            DocumentKind::Docx,
+            DocumentVariant::Docx,
+        )
+    }
+
+    fn footnotes_rels(target: &str) -> Vec<u8> {
+        format!(
+            r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rId7" Type="{REL_NS}/footnotes" Target="{target}"/></Relationships>"#
+        )
+        .into_bytes()
+    }
+
+    fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        let mut bytes = if little_endian {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little_endian {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn main_part_guard_accepts_only_references_to_the_checked_part() {
+        let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let with_root = |rels: &str| {
+            docx_result(&[
+                ("_rels/.rels", rels.as_bytes()),
+                ("word/document.xml", &body),
+                ("word/main.xml", &body),
+            ])
+        };
+        let relationship = |id: &str, target: &str| {
+            format!(r#"<Relationship Id="{id}" Type="{REL_NS}/officeDocument" Target="{target}"/>"#)
+        };
+        let rels = |inner: String| {
+            format!(r#"<Relationships xmlns="{PACKAGE_RELS_NS}">{inner}</Relationships>"#)
+        };
+        // Spellings AnyDoc resolves to the conventional part are accepted.
+        for target in [
+            "word/document.xml",
+            "../word/document.xml",
+            "word/./document.xml",
+            "word/%64ocument.xml",
+            "word/document.xml?v=1#top",
+        ] {
+            assert!(
+                with_root(&rels(relationship("rId1", target))).is_ok(),
+                "{target}"
+            );
+        }
+        // A second relationship naming another part is refused whatever its
+        // id, since AnyDoc takes the lowest.
+        for (first, second) in [("rId1", "rId2"), ("rId2", "rId1")] {
+            let both = rels(
+                relationship(first, "word/document.xml") + &relationship(second, "word/main.xml"),
+            );
+            assert!(
+                matches!(with_root(&both), Err(DocumentError::Malformed)),
+                "{first} {second}"
+            );
+        }
+        // Encoded structure and traversal out of the conventional part fail.
+        for target in ["word%2Fdocument.xml", "word/main.xml", "../main.xml"] {
+            assert!(
+                matches!(
+                    with_root(&rels(relationship("rId1", target))),
+                    Err(DocumentError::Malformed)
+                ),
+                "{target}"
+            );
+        }
+        // AnyDoc does not match end-tag prefixes; neither does the guard.
+        let mismatched = format!(
+            r#"<pr:Relationships xmlns:pr="{PACKAGE_RELS_NS}"><pr:Relationship Id="rId1" Type="{REL_NS}/officeDocument" Target="word/document.xml"/></x:Relationships>"#
+        );
+        assert!(with_root(&mismatched).is_ok());
+    }
+
+    #[test]
+    fn docx_notes_targets_resolve_as_anydoc_resolves_them() {
+        let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let symbol = word_part(
+            "footnotes",
+            r#"<w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p>"#,
+        );
+        for (target, part) in [
+            ("notes/fn.xml?v=1", "word/notes/fn.xml"),
+            ("f%6E.xml", "word/fn.xml"),
+            ("../../word/fn2.xml", "word/fn2.xml"),
+            ("/extra/notes.xml#part", "extra/notes.xml"),
+        ] {
+            let rels = footnotes_rels(target);
+            let preflight = docx_preflight(&[
+                ("word/document.xml", &body),
+                ("word/_rels/document.xml.rels", &rels),
+                (part, &symbol),
+            ]);
+            assert!(preflight.unsupported_content, "{target}");
+        }
+    }
+
+    #[test]
+    fn docx_style_checks_cover_every_reading_of_the_styles() {
+        let hidden_with = |styles_body: &str, document_body: &str| {
+            let styles =
+                format!(r#"<w:styles {WORD_NS} xmlns:x="urn:decoy">{styles_body}</w:styles>"#);
+            let document = format!(
+                r#"<w:document {WORD_NS} xmlns:x="urn:decoy"><w:body>{document_body}</w:body></w:document>"#
+            );
+            docx_preflight(&[
+                ("word/document.xml", document.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .hidden_content
+        };
+        let run = |style: &str| {
+            format!(
+                r#"<w:p><w:r><w:rPr><w:rStyle w:val="{style}"/></w:rPr><w:t>Text</w:t></w:r></w:p>"#
+            )
+        };
+        let quiet =
+            r#"<w:style w:type="character" w:styleId="Quiet"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+        let unstyled = "<w:p><w:r><w:t>Text</w:t></w:r></w:p>";
+
+        // A hidden default style hides every unstyled paragraph.
+        assert!(hidden_with(
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            unstyled,
+        ));
+        assert!(!hidden_with(
+            r#"<w:style w:type="paragraph" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            unstyled,
+        ));
+        // Character references in ids decode on both sides.
+        assert!(hidden_with(
+            r#"<w:style w:type="character" w:styleId="Q&#117;iet"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            &run("Quiet"),
+        ));
+        assert!(hidden_with(quiet, &run("Q&#x75;iet")));
+        // Table styles, including a conditional region such as a header row.
+        let table = |style: &str| {
+            format!(
+                r#"<w:tbl><w:tblPr><w:tblStyle w:val="{style}"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+            )
+        };
+        assert!(hidden_with(
+            r#"<w:style w:type="table" w:styleId="Grid"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            &table("Grid"),
+        ));
+        assert!(hidden_with(
+            r#"<w:style w:type="table" w:styleId="Grid"><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style>"#,
+            &table("Grid"),
+        ));
+        // A style reference formats content only on a run, paragraph, or table.
+        for position in [
+            r#"<w:p><w:pPr><w:rPr><w:rStyle w:val="Quiet"/></w:rPr></w:pPr><w:r><w:t>Shown</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:rPr><w:rPrChange><w:rPr><w:rStyle w:val="Quiet"/></w:rPr></w:rPrChange></w:rPr><w:t>Shown</w:t></w:r></w:p>"#,
+        ] {
+            assert!(!hidden_with(quiet, position), "{position}");
+        }
+        // A style defined twice is hidden if either definition hides it.
+        assert!(hidden_with(
+            &format!(
+                r#"{quiet}<w:style w:styleId="Twice"><w:basedOn w:val="Quiet"/></w:style><w:style w:styleId="Twice"><w:rPr><w:vanish w:val="0"/></w:rPr></w:style>"#
+            ),
+            &run("Twice"),
+        ));
+        // An attribute repeated under another prefix counts in each spelling.
+        assert!(hidden_with(
+            quiet,
+            r#"<w:p><w:r><w:rPr><w:rStyle x:val="Plain" w:val="Quiet"/></w:rPr><w:t>Text</w:t></w:r></w:p>"#,
+        ));
+        assert!(hidden_with(
+            r#"<w:style w:type="character" x:styleId="Decoy" w:styleId="Quiet"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            &run("Quiet"),
+        ));
+        assert!(hidden_with(
+            r#"<w:style w:type="character" w:styleId="Quiet"><w:rPr><w:vanish x:val="0" w:val="1"/></w:rPr></w:style>"#,
+            &run("Quiet"),
+        ));
+        // Base chains of any length and cycles are followed to the end.
+        let chain: String = (0..40)
+            .map(|index| {
+                format!(
+                    r#"<w:style w:styleId="S{}"><w:basedOn w:val="S{index}"/></w:style>"#,
+                    index + 1
+                )
+            })
+            .collect();
+        assert!(hidden_with(
+            &format!(r#"<w:style w:styleId="S0"><w:rPr><w:vanish/></w:rPr></w:style>{chain}"#),
+            &run("S40"),
+        ));
+        assert!(!hidden_with(
+            r#"<w:style w:styleId="A"><w:basedOn w:val="B"/></w:style><w:style w:styleId="B"><w:basedOn w:val="A"/></w:style>"#,
+            &run("A"),
+        ));
+        // A nested or unterminated definition keeps its own properties.
+        assert!(hidden_with(
+            r#"<w:style w:styleId="Quiet"><w:style w:styleId="Inner"/><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            &run("Quiet"),
+        ));
+        let document = word_part("document", &run("Quiet"));
+        let unterminated =
+            format!(r#"<w:styles {WORD_NS}><w:style w:styleId="Quiet"><w:rPr><w:vanish/>"#);
+        assert!(
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/styles.xml", unterminated.as_bytes()),
+            ])
+            .hidden_content
         );
     }
 
     #[test]
-    fn string_attribute_reader_tolerates_spacing_and_whole_names() {
-        let tag = r#"<Relationship TargetMode = "External" Target = 'x.xml' Id="r1"/>"#;
-        assert_eq!(xml_attribute(tag, "Target"), Some("x.xml"));
-        assert_eq!(xml_attribute(tag, "TargetMode"), Some("External"));
-        assert_eq!(xml_attribute(tag, "Mode"), None);
-        assert_eq!(xml_attribute(tag, "Id"), Some("r1"));
+    fn docx_style_checks_stay_within_their_bounds() {
+        let document = word_part(
+            "document",
+            r#"<w:p><w:r><w:rPr><w:rStyle w:val="Quiet"/></w:rPr><w:t>Text</w:t></w:r></w:p>"#,
+        );
+        let with_styles = |styles: &[u8]| {
+            docx_result(&[
+                ("word/document.xml", &document),
+                ("word/styles.xml", styles),
+            ])
+        };
+        // Larger than the in-memory part cap, and still read to the end.
+        let padding = "x".repeat(MAX_PREFLIGHT_PART_BYTES as usize + 1024);
+        let large = format!(
+            r#"<w:styles {WORD_NS}><!--{padding}--><w:style w:styleId="Quiet"><w:rPr><w:vanish/></w:rPr></w:style></w:styles>"#
+        );
+        assert!(
+            with_styles(large.as_bytes())
+                .expect("large styles")
+                .hidden_content
+        );
+
+        let deep = format!(
+            "<w:styles {WORD_NS}>{}</w:styles>",
+            "<w:x>".repeat(MAX_XML_DEPTH)
+        );
+        assert!(matches!(
+            with_styles(deep.as_bytes()),
+            Err(DocumentError::ResourceLimit)
+        ));
+        let many: String = (0..=MAX_DOCX_STYLES)
+            .map(|index| format!(r#"<w:style w:styleId="S{index}"><w:name/></w:style>"#))
+            .collect();
+        let many = format!("<w:styles {WORD_NS}>{many}</w:styles>");
+        assert!(matches!(
+            with_styles(many.as_bytes()),
+            Err(DocumentError::ResourceLimit)
+        ));
+        let long_id = format!(
+            r#"<w:styles {WORD_NS}><w:style w:styleId="{}"/></w:styles>"#,
+            "S".repeat(MAX_STYLE_ID_BYTES + 1)
+        );
+        assert!(matches!(
+            with_styles(long_id.as_bytes()),
+            Err(DocumentError::ResourceLimit)
+        ));
+        let nodes = format!(
+            "<w:styles {WORD_NS}>{}</w:styles>",
+            "<w:x/>".repeat(MAX_XML_NODES)
+        );
+        assert!(matches!(
+            with_styles(nodes.as_bytes()),
+            Err(DocumentError::ResourceLimit)
+        ));
+
+        let deep_story = word_part(
+            "document",
+            &format!(
+                "{}<w:r><w:t>Text</w:t></w:r>{}",
+                "<w:p>".repeat(MAX_XML_DEPTH),
+                "</w:p>".repeat(MAX_XML_DEPTH)
+            ),
+        );
+        assert!(matches!(
+            docx_result(&[("word/document.xml", &deep_story)]),
+            Err(DocumentError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn xml_parts_are_checked_as_anydoc_decodes_them() {
+        assert_eq!(anydoc_xml_utf8(b"\xEF\xBB\xBF<a/>".to_vec()), b"<a/>");
+        assert_eq!(anydoc_xml_utf8(utf16("<a/>", true)), b"<a/>");
+        assert_eq!(anydoc_xml_utf8(utf16("<a/>", false)), b"<a/>");
+        // A declaration is honored only when the first 200 bytes are UTF-8.
+        let padding = " ".repeat(200);
+        assert_eq!(
+            anydoc_xml_utf8(
+                [
+                    format!("<?xml encoding='windows-1252'?><a>{padding}").into_bytes(),
+                    b"\xE9</a>".to_vec(),
+                ]
+                .concat()
+            ),
+            format!("<?xml encoding='windows-1252'?><a>{padding}\u{e9}</a>").into_bytes()
+        );
+        // UTF-8 by name, a prefix that is not UTF-8, or a declaration past
+        // the first 200 bytes leave the part as it is.
+        for unchanged in [
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>".to_vec(),
+            b"<?xml encoding='windows-1252'?><a>\xE9</a>".to_vec(),
+            b"\xE9<?xml encoding='utf-16le'?><a/>".to_vec(),
+            [
+                " ".repeat(200).into_bytes(),
+                b"<?xml encoding='utf-16le'?><a/>".to_vec(),
+            ]
+            .concat(),
+        ] {
+            assert_eq!(anydoc_xml_utf8(unchanged.clone()), unchanged);
+        }
+
+        let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let symbol = format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?><w:footnotes {WORD_NS}><w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p></w:footnotes>"#
+        );
+        for little_endian in [true, false] {
+            let notes = utf16(&symbol, little_endian);
+            let preflight =
+                docx_preflight(&[("word/document.xml", &body), ("word/footnotes.xml", &notes)]);
+            assert!(preflight.unsupported_content, "UTF-16 notes");
+
+            let document = utf16(
+                &format!(
+                    r#"<w:document {WORD_NS}><w:body><w:p><w:r><w:rPr><w:rStyle w:val="Quiet"/></w:rPr><w:t>Text</w:t></w:r></w:p></w:body></w:document>"#
+                ),
+                little_endian,
+            );
+            let styles = utf16(
+                &format!(
+                    r#"<w:styles {WORD_NS}><w:style w:styleId="Quiet"><w:rPr><w:vanish/></w:rPr></w:style></w:styles>"#
+                ),
+                little_endian,
+            );
+            let rels = utf16(
+                &String::from_utf8(footnotes_rels("moved/fn.xml")).unwrap(),
+                little_endian,
+            );
+            let preflight = docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/styles.xml", &styles),
+                ("word/_rels/document.xml.rels", &rels),
+                ("word/moved/fn.xml", &notes),
+            ]);
+            assert!(preflight.hidden_content, "UTF-16 styles");
+            assert!(preflight.unsupported_content, "UTF-16 relationships");
+
+            let oversized = utf16(
+                &String::from_utf8(styles_with_code(&"0".repeat(MAX_NUMBER_FORMAT_BYTES + 1)))
+                    .unwrap(),
+                little_endian,
+            );
+            let bytes = xlsx_with_styles("xl/styles.xml", &oversized, None);
+            assert!(matches!(
+                preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
+                Err(DocumentError::ResourceLimit)
+            ));
+        }
+
+        // A UTF-8 prefix that declares UTF-16 is decoded as UTF-16 whole.
+        let mut declared = br#"<?xml version="1.0" encoding="UTF-16LE"?> "#.to_vec();
+        assert_eq!(declared.len() % 2, 0);
+        declared.extend(utf16(&symbol, true).split_off(2));
+        let preflight = docx_preflight(&[
+            ("word/document.xml", &body),
+            ("word/footnotes.xml", &declared),
+        ]);
+        assert!(preflight.unsupported_content, "declared UTF-16 notes");
     }
 
     fn xlsx_with_styles(styles_name: &str, styles: &[u8], rels: Option<&[u8]>) -> Vec<u8> {
