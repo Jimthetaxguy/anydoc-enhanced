@@ -25,12 +25,15 @@
 //! on separate lines. For that the reader model reads how boxes flow:
 //! `display` (inline-level, block-level, or laying children out as flex or
 //! grid items), `float` and `position`, and `::before` and `::after` boxes
-//! that are blocks or keep a line feed. The chapter walk mirrors AnyDoc's
-//! inline runs, including the way it flattens a link's blocks into the text
-//! around it. Text runs together where a word, or a number, meets another
-//! with nothing between; closing punctuation joins the word before it as
-//! written. A break only a rule the walk cannot settle gives counts where
-//! digits meet, which the Markdown reads as one number.
+//! that are blocks or keep a line feed. Flex items in a row may touch; in
+//! a column, with a gap, spread along the line, or with a margin or padding
+//! between them they stand apart, as grid items do. The chapter walk
+//! mirrors AnyDoc's inline runs, including the way it flattens a link's
+//! blocks into the text around it. Text runs together where a word, or a
+//! number, meets another with nothing between; closing punctuation joins
+//! the word before it as written. A break only a rule the walk cannot
+//! settle gives counts where digits meet, which the Markdown reads as one
+//! number.
 //!
 //! Text a `::before` or `::after` box shows is text AnyDoc drops: flagged
 //! when it holds letters or digits, and for a sign an amount reads by
@@ -50,8 +53,9 @@ const MAX_SELECTOR_NESTING: usize = 8;
 /// `@import` statements one stylesheet may carry.
 pub(super) const MAX_IMPORTS_PER_SHEET: usize = 256;
 /// Style rules that set `display`, `visibility`, `content-visibility`,
-/// `float`, or `position`, or style `::before` and `::after` boxes, across a
-/// package's stylesheets. Real books carry a few dozen.
+/// `float`, or `position`, how flex items stand, or a margin or padding, or
+/// style `::before` and `::after` boxes, across a package's stylesheets.
+/// Real books carry far fewer.
 pub(super) const MAX_STYLE_RULES: usize = 16_384;
 /// Compound-selector evaluations across a package: one element tested
 /// against one rule costs one per compound it reaches, and one when the
@@ -602,6 +606,61 @@ enum Property {
     WhiteSpace,
     /// Whether a `::before` or `::after` box is transparent (`opacity: 0`).
     Opacity,
+    /// For a flex box: whether its items stand in a column, or a row in
+    /// reverse (`flex-direction`).
+    FlexDirection,
+    /// For a flex box: whether its items may wrap onto more lines.
+    FlexWrap,
+    /// For an old flexible box (`-webkit-box`): whether its items stand in
+    /// a column (`-webkit-box-orient`).
+    BoxOrient,
+    /// For a flex box: whether `justify-content` spreads its items along
+    /// the line (`space-between`, `space-around`, `space-evenly`).
+    JustifyContent,
+    /// For a flex or grid box: whether a gap stands between its columns
+    /// (`column-gap`, `gap`).
+    ColumnGap,
+    /// For an old flexible box: whether it clamps its lines
+    /// (`-webkit-line-clamp`), which lays its children out as lines.
+    LineClamp,
+    /// Whether a box's left or right margin or padding is wider than none,
+    /// setting it apart from the flex or grid items beside it, or the text
+    /// beside an inline box laying out items.
+    MarginLeft,
+    MarginRight,
+    PaddingLeft,
+    PaddingRight,
+}
+
+impl Property {
+    /// A margin or padding, which only a flex or grid item, and an inline
+    /// box laying such items out, is read for.
+    fn spaces(self) -> bool {
+        matches!(
+            self,
+            Property::MarginLeft
+                | Property::MarginRight
+                | Property::PaddingLeft
+                | Property::PaddingRight
+        )
+    }
+}
+
+/// How a box lays out its children, as `display` sets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// In lines and blocks.
+    Flow,
+    /// As flex items.
+    Flex,
+    /// As the items of an old flexible box (`-webkit-box`).
+    Box,
+    /// As grid items.
+    Grid,
+    /// It has no box; its children take its place (`contents`).
+    Contents,
+    /// Not known until run time.
+    Unknown,
 }
 
 /// What a `content` declaration makes a `::before` or `::after` box show.
@@ -653,12 +712,12 @@ struct Declaration {
     important: bool,
     /// How the box flows: for `display`, whether it is inline-level; for
     /// `float`, whether it floats; for `position`, whether it leaves the
-    /// flow. `Maybe` for a value not known until run time; `None` for a
-    /// declaration a reader ignores.
+    /// flow; for a property of flex or grid items, or a margin or padding,
+    /// what it says (see [`Property`]). `Maybe` for a value not known until
+    /// run time; `None` for a declaration a reader ignores.
     flow: Option<Tri>,
-    /// For `display`, whether the box lays its children out as flex or
-    /// grid items, each a block of its own.
-    items: Option<Tri>,
+    /// For `display`, how the box lays out its children.
+    layout: Option<Layout>,
     /// For `float`, whether the box floats to the start of the line (`left`
     /// or `inline-start`), where a drop cap stands.
     side: Option<Tri>,
@@ -667,23 +726,23 @@ struct Declaration {
     generated: Option<Generated>,
 }
 
-/// `display` keywords that lay a box's children out as flex or grid items.
-const ITEM_DISPLAY_KEYWORDS: [&str; 14] = [
+/// `display` keywords that lay a box's children out as flex items, as the
+/// items of an old flexible box, and as grid items.
+const FLEX_DISPLAY_KEYWORDS: [&str; 6] = [
     "flex",
-    "grid",
     "inline-flex",
-    "inline-grid",
-    "-webkit-box",
-    "-webkit-inline-box",
     "-webkit-flex",
     "-webkit-inline-flex",
-    "-moz-box",
-    "-moz-inline-box",
     "-ms-flexbox",
     "-ms-inline-flexbox",
-    "-ms-grid",
-    "-ms-inline-grid",
 ];
+const BOX_DISPLAY_KEYWORDS: [&str; 4] = [
+    "-webkit-box",
+    "-webkit-inline-box",
+    "-moz-box",
+    "-moz-inline-box",
+];
+const GRID_DISPLAY_KEYWORDS: [&str; 4] = ["grid", "inline-grid", "-ms-grid", "-ms-inline-grid"];
 
 /// Signs an amount reads by, which generated content may add to it: a
 /// minus or plus, parentheses, a percent sign, currency signs (`¢` to `¥`
@@ -952,14 +1011,22 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         }
         // `inherit`, `unset`, and `revert` take the element's value.
         Property::WhiteSpace => Some(Tri::Maybe),
-        Property::Visibility | Property::ContentVisibility | Property::Content => None,
+        // The others set no flow; `parse_declarations` reads those of flex
+        // and grid items, and margins and padding.
+        _ => None,
     };
-    let items = match property {
-        Property::Display if computed => Some(Tri::Maybe),
-        Property::Display if effect == Effect::Show => Some(if has(&ITEM_DISPLAY_KEYWORDS) {
-            Tri::Yes
+    let layout = match property {
+        Property::Display if computed || has(&["inherit"]) => Some(Layout::Unknown),
+        Property::Display if effect == Effect::Show => Some(if has(&["contents"]) {
+            Layout::Contents
+        } else if has(&FLEX_DISPLAY_KEYWORDS) {
+            Layout::Flex
+        } else if has(&BOX_DISPLAY_KEYWORDS) {
+            Layout::Box
+        } else if has(&GRID_DISPLAY_KEYWORDS) {
+            Layout::Grid
         } else {
-            Tri::No
+            Layout::Flow
         }),
         _ => None,
     };
@@ -985,10 +1052,231 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         effect,
         important,
         flow,
-        items,
+        layout,
         side,
         generated,
     })
+}
+
+/// The declarations a token run holds that the check reads. Most set one
+/// property; `margin`, `padding`, and their inline forms set a box's left
+/// and right, `flex-flow` a flex box's direction and wrapping.
+fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
+    let tokens = trim_whitespace(tokens);
+    let [Token::Ident(name), rest @ ..] = tokens else {
+        return [None, None];
+    };
+    let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
+        return [None, None];
+    };
+    let mut value = trim_whitespace(value);
+    let mut important = false;
+    if let [before @ .., Token::Ident(word)] = value {
+        if word.eq_ignore_ascii_case("important") {
+            if let [before @ .., Token::Delim('!')] = trim_whitespace(before) {
+                important = true;
+                value = trim_whitespace(before);
+            }
+        }
+    }
+    let computed = value.iter().any(|token| {
+        matches!(token, Token::Function(function) if ["var", "env", "attr", "if"]
+            .iter()
+            .any(|name| function.eq_ignore_ascii_case(name)))
+    });
+    let parts = split_top_level(value, &Token::Whitespace);
+    let declare = |property: Property, says: Option<Tri>| {
+        let flow = if computed { Tri::Maybe } else { says? };
+        Some(Declaration {
+            property,
+            effect: Effect::Neutral,
+            important,
+            flow: Some(flow),
+            layout: None,
+            side: None,
+            generated: None,
+        })
+    };
+    // The left and right a list of one to four lengths sets, from the top
+    // clockwise, and those of one or two for the start and the end.
+    let sides = |left: Property, right: Property, clockwise: bool| {
+        let (start, end) = match (clockwise, parts.as_slice()) {
+            (true, [all]) | (false, [all]) => (all, all),
+            (true, [_, across] | [_, across, _]) => (across, across),
+            (true, [_, right, _, left]) => (left, right),
+            (false, [start, end]) => (start, end),
+            _ => return [None, None],
+        };
+        [
+            declare(left, positive_length(start)),
+            declare(right, positive_length(end)),
+        ]
+    };
+    let one = |property: Property, says: fn(&[&[Token]]) -> Option<Tri>| {
+        [declare(property, says(&parts)), None]
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "flex-direction" | "-webkit-flex-direction" => one(Property::FlexDirection, flex_direction),
+        "flex-wrap" | "-webkit-flex-wrap" => one(Property::FlexWrap, flex_wrap),
+        "flex-flow" | "-webkit-flex-flow" => [
+            declare(Property::FlexDirection, flex_direction(&parts)),
+            declare(Property::FlexWrap, flex_wrap(&parts)),
+        ],
+        "-webkit-box-orient" => one(Property::BoxOrient, box_orient),
+        "justify-content" | "-webkit-justify-content" => one(Property::JustifyContent, spreads),
+        // `gap` sets the gap between rows, then between columns.
+        "gap" | "grid-gap" => [
+            declare(
+                Property::ColumnGap,
+                parts.last().and_then(|gap| positive_length(gap)),
+            ),
+            None,
+        ],
+        "column-gap" | "grid-column-gap" => one(Property::ColumnGap, |parts| match parts {
+            [gap] => positive_length(gap),
+            _ => None,
+        }),
+        "-webkit-line-clamp" => one(Property::LineClamp, line_clamp),
+        "margin" => sides(Property::MarginLeft, Property::MarginRight, true),
+        "padding" => sides(Property::PaddingLeft, Property::PaddingRight, true),
+        "margin-inline" => sides(Property::MarginLeft, Property::MarginRight, false),
+        "padding-inline" => sides(Property::PaddingLeft, Property::PaddingRight, false),
+        "margin-left" | "margin-inline-start" | "-webkit-margin-start" => {
+            one(Property::MarginLeft, one_positive_length)
+        }
+        "margin-right" | "margin-inline-end" | "-webkit-margin-end" => {
+            one(Property::MarginRight, one_positive_length)
+        }
+        "padding-left" | "padding-inline-start" | "-webkit-padding-start" => {
+            one(Property::PaddingLeft, one_positive_length)
+        }
+        "padding-right" | "padding-inline-end" | "-webkit-padding-end" => {
+            one(Property::PaddingRight, one_positive_length)
+        }
+        _ => [parse_declaration(tokens), None],
+    }
+}
+
+/// The keyword a value holds, lowercased, if it is one keyword.
+fn keyword(parts: &[&[Token]]) -> Option<String> {
+    match parts {
+        [[Token::Ident(word)]] => Some(word.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Whether a `flex-direction` or `flex-flow` value sets the items in a
+/// column or in reverse: `Maybe` where it takes the parent's.
+fn flex_direction(parts: &[&[Token]]) -> Option<Tri> {
+    let mut direction = Tri::No;
+    for part in parts {
+        let [Token::Ident(word)] = part else {
+            return None;
+        };
+        match word.to_ascii_lowercase().as_str() {
+            "row" | "initial" | "unset" => {}
+            "row-reverse" | "column" | "column-reverse" => direction = Tri::Yes,
+            "inherit" | "revert" | "revert-layer" => direction = Tri::Maybe,
+            "nowrap" | "wrap" | "wrap-reverse" => {}
+            _ => return None,
+        }
+    }
+    Some(direction)
+}
+
+/// Whether a `flex-wrap` or `flex-flow` value lets the items wrap.
+fn flex_wrap(parts: &[&[Token]]) -> Option<Tri> {
+    let mut wraps = Tri::No;
+    for part in parts {
+        let [Token::Ident(word)] = part else {
+            return None;
+        };
+        match word.to_ascii_lowercase().as_str() {
+            "nowrap" | "initial" | "unset" => {}
+            "wrap" | "wrap-reverse" => wraps = Tri::Yes,
+            "inherit" | "revert" | "revert-layer" => wraps = Tri::Maybe,
+            "row" | "row-reverse" | "column" | "column-reverse" => {}
+            _ => return None,
+        }
+    }
+    Some(wraps)
+}
+
+/// Whether a `-webkit-box-orient` value stacks the items.
+fn box_orient(parts: &[&[Token]]) -> Option<Tri> {
+    match keyword(parts)?.as_str() {
+        "horizontal" | "inline-axis" | "initial" | "unset" => Some(Tri::No),
+        "vertical" | "block-axis" => Some(Tri::Yes),
+        "inherit" | "revert" | "revert-layer" => Some(Tri::Maybe),
+        _ => None,
+    }
+}
+
+/// Whether a `justify-content` value spreads the items along the line.
+fn spreads(parts: &[&[Token]]) -> Option<Tri> {
+    let words: Vec<String> = parts
+        .iter()
+        .map(|part| match part {
+            [Token::Ident(word)] => Some(word.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let spread = |word: &str| matches!(word, "space-between" | "space-around" | "space-evenly");
+    if words.iter().any(|word| spread(word)) {
+        Some(Tri::Yes)
+    } else if words
+        .iter()
+        .any(|word| matches!(word.as_str(), "inherit" | "revert" | "revert-layer"))
+    {
+        Some(Tri::Maybe)
+    } else {
+        Some(Tri::No)
+    }
+}
+
+/// Whether a `-webkit-line-clamp` value clamps the lines.
+fn line_clamp(parts: &[&[Token]]) -> Option<Tri> {
+    match parts {
+        [[Token::Numeric(number)]] => {
+            let lines: f64 = number.parse().ok()?;
+            Some(if lines > 0.0 { Tri::Yes } else { Tri::No })
+        }
+        _ => match keyword(parts)?.as_str() {
+            "none" | "initial" | "unset" => Some(Tri::No),
+            "inherit" | "revert" | "revert-layer" => Some(Tri::Maybe),
+            _ => None,
+        },
+    }
+}
+
+/// Whether a margin, padding, or gap is wider than none: a positive length
+/// or percentage; `Maybe` for `auto`, which a flex item's free space may
+/// fill, and for a value computed from others (`calc()`).
+fn positive_length(part: &[Token]) -> Option<Tri> {
+    match part {
+        [Token::Numeric(number)] => {
+            let split = number
+                .find(|character: char| character.is_ascii_alphabetic() || character == '%')
+                .unwrap_or(number.len());
+            let width: f64 = number[..split].parse().ok()?;
+            Some(if width > 0.0 { Tri::Yes } else { Tri::No })
+        }
+        [Token::Ident(word)] => match word.to_ascii_lowercase().as_str() {
+            "normal" | "initial" | "unset" => Some(Tri::No),
+            "auto" | "inherit" | "revert" | "revert-layer" => Some(Tri::Maybe),
+            _ => None,
+        },
+        [Token::Function(_), ..] => Some(Tri::Maybe),
+        _ => None,
+    }
+}
+
+/// [`positive_length`] for a value that must be one length.
+fn one_positive_length(parts: &[&[Token]]) -> Option<Tri> {
+    match parts {
+        [part] => positive_length(part),
+        _ => None,
+    }
 }
 
 /// Whether an `opacity` value makes a box transparent: zero, or less, as a
@@ -1014,7 +1302,7 @@ fn inline_declarations(style: &str) -> Result<Vec<Declaration>, DocumentError> {
     let tokens = tokenize(style)?;
     Ok(split_top_level(&tokens, &Token::Semicolon)
         .into_iter()
-        .filter_map(parse_declaration)
+        .flat_map(|tokens| parse_declarations(tokens).into_iter().flatten())
         .collect())
 }
 
@@ -2245,16 +2533,20 @@ impl AncestorKeys {
 
 /// A stylesheet reduced to what the check reads: its rules that set
 /// `display`, `visibility`, or `content-visibility` where their media
-/// apply, and the stylesheets it imports for a screen, in order.
+/// apply, and the stylesheets it imports for a screen, in order. Rules that
+/// set a margin or padding are kept apart as well, and counted where they
+/// set nothing else.
 #[derive(Debug, Default)]
 pub(super) struct Stylesheet {
     rules: Vec<Rc<StyleRule>>,
+    spacing: Vec<Rc<StyleRule>>,
+    spacing_only: usize,
     pub(super) imports: Vec<String>,
 }
 
 impl Stylesheet {
     pub(super) fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rules.len() + self.spacing_only
     }
 }
 
@@ -2432,7 +2724,11 @@ fn parse_style_block(
                     parse_style_block(&block[start..index], inner, media, sheet, nesting + 1)?;
                     index = end;
                 } else {
-                    declarations.extend(parse_declaration(&block[start..index]));
+                    declarations.extend(
+                        parse_declarations(&block[start..index])
+                            .into_iter()
+                            .flatten(),
+                    );
                     index += 1;
                 }
             }
@@ -2444,29 +2740,52 @@ fn parse_style_block(
         // lines, which its `display`, `content`, `float`, `position`, and
         // `white-space` decide, and for the text it shows, which its
         // `visibility` and `opacity` may keep unseen. An element's own
-        // `content`, `white-space`, and `opacity` are not read.
-        let lays_out = declarations
-            .iter()
-            .any(|declaration| !matches!(declaration.property, Property::ContentVisibility));
-        let styles_element = declarations.iter().any(|declaration| {
-            !matches!(
+        // `content`, `white-space`, and `opacity` are not read, and its
+        // margins and padding only for flex and grid items (see
+        // [`Cascade::spacing`]).
+        let lays_out = declarations.iter().any(|declaration| {
+            matches!(
                 declaration.property,
-                Property::Content | Property::WhiteSpace | Property::Opacity
+                Property::Display
+                    | Property::Content
+                    | Property::Float
+                    | Property::Position
+                    | Property::WhiteSpace
+                    | Property::Visibility
+                    | Property::Opacity
             )
         });
+        let styles_element = declarations.iter().any(|declaration| {
+            !declaration.property.spaces()
+                && !matches!(
+                    declaration.property,
+                    Property::Content | Property::WhiteSpace | Property::Opacity
+                )
+        });
+        let spaces = declarations
+            .iter()
+            .any(|declaration| declaration.property.spaces());
         for selector in parse_selector_list(selectors, 0) {
             let kept = match selector.pseudo_element {
                 PseudoElement::None => styles_element,
                 PseudoElement::Before | PseudoElement::After => lays_out,
                 PseudoElement::Other => false,
             };
-            if kept {
+            let spacing = spaces && selector.pseudo_element == PseudoElement::None;
+            if kept || spacing {
                 let ancestor_keys = ancestor_keys(&selector, selector.compounds.len() - 1);
-                sheet.rules.push(Rc::new(StyleRule {
+                let rule = Rc::new(StyleRule {
                     selector,
                     declarations: declarations.clone(),
                     ancestor_keys,
-                }));
+                });
+                if spacing {
+                    sheet.spacing.push(rule.clone());
+                    sheet.spacing_only += usize::from(!kept);
+                }
+                if kept {
+                    sheet.rules.push(rule);
+                }
             }
         }
     }
@@ -2553,11 +2872,32 @@ pub(super) struct ReaderStyle {
     /// Whether it is positioned out of the flow (`absolute`, `fixed`),
     /// apart from the lines around it.
     positioned: Tri,
-    /// Whether it lays its children out as flex or grid items.
+    /// Whether it lays its children out as flex or grid items, and how
+    /// they stand.
     items: Tri,
+    item_layout: ItemLayout,
+    /// Whether it certainly has no box, its children taking its place
+    /// (`display: contents`).
+    contents: bool,
     /// Its `::before` and `::after` boxes.
     before: PseudoBox,
     after: PseudoBox,
+}
+
+/// How a box lays its children out as flex or grid items, as its style
+/// says: each `Yes` where it certainly does, `Maybe` where it may.
+#[derive(Clone, Copy, Debug, Default)]
+struct ItemLayout {
+    /// The items stand in a column or in reverse, or in a grid's tracks,
+    /// which stretch across a block and stack in an inline box without
+    /// columns: apart from each other, and the last not beside what
+    /// follows an inline box.
+    turned: Tri,
+    /// A gap, or `justify-content` spreading them along a block's line,
+    /// stands between them.
+    spaced: Tri,
+    /// They may wrap onto more lines.
+    wraps: Tri,
 }
 
 /// What a `::before` or `::after` box does, as far as the check reads it.
@@ -2729,6 +3069,14 @@ pub(super) struct Cascade {
     /// requires, and those that require none.
     steps_by_key: HashMap<u64, Vec<u32>>,
     steps_anywhere: Vec<u32>,
+    /// Rules that set a margin or padding, each with its place among them,
+    /// by an id, class, or element name their rightmost compound requires,
+    /// and those that require none (see [`Cascade::spacing`]); and how many
+    /// of them set nothing else.
+    spacing_rules: Vec<(Rc<StyleRule>, u32)>,
+    spacing_by_key: HashMap<u64, Vec<usize>>,
+    spacing_anywhere: Vec<usize>,
+    spacing_only: usize,
 }
 
 /// A rule in a chapter's cascade: its place in the cascade order, and the
@@ -2816,10 +3164,115 @@ impl Cascade {
                 recorded,
             });
         }
+        for rule in &sheet.spacing {
+            let index = self.spacing_rules.len();
+            match rule.selector.compounds.last().and_then(rarest_key) {
+                Some(key) => self.spacing_by_key.entry(key).or_default().push(index),
+                None => self.spacing_anywhere.push(index),
+            }
+            self.spacing_rules.push((rule.clone(), index as u32 + 1));
+        }
+        self.spacing_only += sheet.spacing_only;
     }
 
     pub(super) fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rules.len() + self.spacing_only
+    }
+
+    /// Whether the left and the right margin or padding of the element at
+    /// the top of the tree certainly set it apart from what stands beside
+    /// it: read only for flex and grid items, and for an inline box laying
+    /// them out, from the rules that set a margin or padding and its inline
+    /// style.
+    fn spacing(
+        &self,
+        tree: &Tree,
+        ancestors: &AncestorKeys,
+        work: &mut u64,
+    ) -> Result<(Tri, Tri), DocumentError> {
+        let element = tree.stack.last().expect("an element to style");
+        let mut candidates: Vec<usize> = element
+            .keys
+            .iter()
+            .filter_map(|key| self.spacing_by_key.get(key))
+            .flatten()
+            .chain(&self.spacing_anywhere)
+            .copied()
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        // The left margin, the right margin, the left padding, and the
+        // right padding.
+        let mut sides: [Vec<(Precedence, Tri, Tri)>; 4] = Default::default();
+        let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
+            let slot = match declaration.property {
+                Property::MarginLeft => 0,
+                Property::MarginRight => 1,
+                Property::PaddingLeft => 2,
+                Property::PaddingRight => 3,
+                _ => return,
+            };
+            if let Some(wide) = declaration.flow {
+                sides[slot].push((precedence, certainty, wide));
+            }
+        };
+        for index in candidates {
+            let (rule, order) = &self.spacing_rules[index];
+            if !ancestors.hold(&rule.ancestor_keys) {
+                *work += 1;
+                continue;
+            }
+            let certainty = match_complex(&rule.selector, &[], tree, work);
+            if certainty == Tri::No {
+                continue;
+            }
+            for declaration in rule.declarations.iter() {
+                let tier = if declaration.important {
+                    TIER_AUTHOR_IMPORTANT
+                } else {
+                    TIER_AUTHOR
+                };
+                add(
+                    declaration,
+                    Precedence {
+                        tier,
+                        specificity: rule.selector.specificity,
+                        order: *order,
+                    },
+                    certainty,
+                );
+            }
+        }
+        if *work > MAX_MATCH_WORK {
+            return Err(DocumentError::ResourceLimit);
+        }
+        for (prefixed, style) in element.values("style") {
+            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
+            for declaration in inline_declarations(style)? {
+                let tier = if declaration.important {
+                    TIER_INLINE_IMPORTANT
+                } else {
+                    TIER_INLINE
+                };
+                let precedence = Precedence {
+                    tier,
+                    specificity: (0, 0, 0),
+                    order: 0,
+                };
+                add(&declaration, precedence, certainty);
+            }
+        }
+        // A reader's own margins and padding (HTML's rendering section): a
+        // definition's, a quote's, and a figure's margins, and a list's
+        // padding at the start of its lines.
+        let defaults = match element.lower.as_str() {
+            "dd" => [true, false, false, false],
+            "blockquote" | "figure" => [true, true, false, false],
+            "ul" | "ol" | "menu" | "dir" => [false, false, true, false],
+            _ => [false; 4],
+        };
+        let side = |slot: usize| resolve_flow(&sides[slot], defaults[slot]);
+        Ok((side(0).max(side(2)), side(1).max(side(3))))
     }
 
     /// Record how the element that has just ended among the siblings at
@@ -2924,10 +3377,15 @@ impl Cascade {
         candidates.dedup();
 
         let mut applied: [Vec<Applied>; 3] = Default::default();
-        // Whether the box is inline-level, floats, lays its children out as
-        // items, is positioned out of the flow, and floats to the start of
-        // the line.
-        let mut flows: [Vec<(Precedence, Tri, Tri)>; 5] = Default::default();
+        // Whether the box is inline-level, floats, is positioned out of the
+        // flow, and floats to the start of the line; how it lays out its
+        // children; and, for flex items, whether they stand in a column or
+        // in reverse, may wrap, stand in a column of an old flexible box,
+        // are spread along the line, and have a gap between them, and
+        // whether an old flexible box clamps its lines.
+        let mut flows: [Vec<(Precedence, Tri, Tri)>; 4] = Default::default();
+        let mut layouts: Vec<(Precedence, Tri, Layout)> = Vec::new();
+        let mut item_flags: [Vec<(Precedence, Tri, Tri)>; 6] = Default::default();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
             let slot = match declaration.property {
                 Property::Display => 0,
@@ -2936,24 +3394,51 @@ impl Cascade {
                 Property::Float | Property::Position => {
                     let flow_slot = match declaration.property {
                         Property::Float => 1,
-                        _ => 3,
+                        _ => 2,
                     };
                     if let Some(flow) = declaration.flow {
                         flows[flow_slot].push((precedence, certainty, flow));
                     }
                     if let Some(side) = declaration.side {
-                        flows[4].push((precedence, certainty, side));
+                        flows[3].push((precedence, certainty, side));
                     }
                     return;
                 }
-                // What only `::before` and `::after` boxes read.
-                Property::Content | Property::WhiteSpace | Property::Opacity => return,
+                Property::FlexDirection
+                | Property::FlexWrap
+                | Property::BoxOrient
+                | Property::JustifyContent
+                | Property::ColumnGap
+                | Property::LineClamp => {
+                    let flag = match declaration.property {
+                        Property::FlexDirection => 0,
+                        Property::FlexWrap => 1,
+                        Property::BoxOrient => 2,
+                        Property::JustifyContent => 3,
+                        Property::ColumnGap => 4,
+                        _ => 5,
+                    };
+                    if let Some(says) = declaration.flow {
+                        item_flags[flag].push((precedence, certainty, says));
+                    }
+                    return;
+                }
+                // What only `::before` and `::after` boxes read, and margins
+                // and padding, read only for flex and grid items (see
+                // [`Cascade::spacing`]).
+                Property::Content
+                | Property::WhiteSpace
+                | Property::Opacity
+                | Property::MarginLeft
+                | Property::MarginRight
+                | Property::PaddingLeft
+                | Property::PaddingRight => return,
             };
             if let (Property::Display, Some(flow)) = (declaration.property, declaration.flow) {
                 flows[0].push((precedence, certainty, flow));
             }
-            if let (Property::Display, Some(items)) = (declaration.property, declaration.items) {
-                flows[2].push((precedence, certainty, items));
+            if let (Property::Display, Some(layout)) = (declaration.property, declaration.layout) {
+                layouts.push((precedence, certainty, layout));
             }
             applied[slot].push(Applied {
                 precedence,
@@ -3127,7 +3612,7 @@ impl Cascade {
                     effect,
                     important: false,
                     flow: None,
-                    items: None,
+                    layout: None,
                     side: None,
                     generated: None,
                 },
@@ -3149,7 +3634,7 @@ impl Cascade {
                     effect,
                     important: false,
                     flow: None,
-                    items: None,
+                    layout: None,
                     side: None,
                     generated: None,
                 },
@@ -3192,7 +3677,7 @@ impl Cascade {
                     effect: Effect::Hide,
                     important: false,
                     flow: None,
-                    items: None,
+                    layout: None,
                     side: None,
                     generated: None,
                 },
@@ -3259,15 +3744,54 @@ impl Cascade {
             }
         };
         let (before, after) = (pseudo(0), pseudo(1));
+        // How the box lays out its children. Flex items stand apart in a
+        // column or in reverse, and with a gap or spread along a block's
+        // line; in an inline box, which is as wide as they are, nothing
+        // spreads them. An old flexible box in a column keeps its inline
+        // children in lines as a block does, as Blink and WebKit lay it out,
+        // and one that clamps its lines is a block. A grid's tracks stretch
+        // across a block, and stack in an inline box without columns: its
+        // items stand apart.
+        let inline = resolve_flow(&flows[0], !reader_block_by_default(element));
+        let flag = |slot: usize| resolve_flow(&item_flags[slot], false);
+        let (layout, contested) = resolve_value(&layouts, Layout::Flow);
+        let (items, item_layout) = match layout {
+            _ if contested => (Tri::Maybe, ItemLayout::default()),
+            Layout::Flow | Layout::Contents => (Tri::No, ItemLayout::default()),
+            Layout::Unknown => (Tri::Maybe, ItemLayout::default()),
+            Layout::Flex => {
+                let spread = if inline == Tri::Yes { Tri::No } else { flag(3) };
+                let item_layout = ItemLayout {
+                    turned: flag(0),
+                    spaced: flag(4).max(spread),
+                    wraps: flag(1),
+                };
+                (Tri::Yes, item_layout)
+            }
+            Layout::Box => (
+                all_three(flag(2).not(), flag(5).not(), Tri::Yes),
+                ItemLayout::default(),
+            ),
+            Layout::Grid => {
+                let item_layout = ItemLayout {
+                    turned: Tri::Yes,
+                    spaced: Tri::Yes,
+                    wraps: Tri::No,
+                };
+                (Tri::Yes, item_layout)
+            }
+        };
         Ok(ReaderStyle {
             display: resolve(&applied[0]),
             visibility: resolve(&applied[1]),
             content_visibility: resolve(&applied[2]),
-            inline: resolve_flow(&flows[0], !reader_block_by_default(element)),
+            inline,
             floats: resolve_flow(&flows[1], false),
-            floats_to_start: resolve_flow(&flows[4], false),
-            positioned: resolve_flow(&flows[3], false),
-            items: resolve_flow(&flows[2], false),
+            floats_to_start: resolve_flow(&flows[3], false),
+            positioned: resolve_flow(&flows[2], false),
+            items,
+            item_layout,
+            contents: layout == Layout::Contents && !contested,
             before,
             after,
         })
@@ -3500,11 +4024,92 @@ struct Open {
     /// The font size an SVG element's attributes or inline style set, on it
     /// or on an element around it inside the image.
     svg_font: Option<f64>,
-    /// Children are laid out as flex or grid items.
+    /// Children are laid out as flex or grid items, and how they stand so
+    /// far.
     items: Tri,
+    row: Row,
+    /// The element is one of its parent's items.
+    item: bool,
+    /// It is an inline box laying out items, which stands in the line with
+    /// the text around it.
+    inline_items: bool,
+    /// For an item, or an inline box laying out items: whether its left
+    /// and its right margin or padding set it apart from what stands
+    /// beside it (see [`Cascade::spacing`]).
+    edges: (Tri, Tri),
+    /// It has no box (`display: contents`): its children stand among its
+    /// parent's items, as its text does.
+    passes_row: bool,
     exempt: Exempt,
     /// What the element does to AnyDoc's inline run as it ends.
     effects: Effects,
+}
+
+/// The flex or grid items of a box as the walk goes through them (see
+/// [`ItemLayout`]). Each child element in the flow is an item, and so is
+/// each run of text straight inside, which a reader wraps in an item of its
+/// own.
+#[derive(Clone, Copy, Default)]
+struct Row {
+    layout: ItemLayout,
+    /// The items so far.
+    count: u32,
+    /// Whether the last item's right margin or padding, or the lines of its
+    /// own items, set it apart from the next.
+    last_right: Tri,
+    /// Text straight inside came last: text after it goes on its item.
+    text: bool,
+}
+
+impl Row {
+    /// Take in the next item, whose left margin or padding is `left`, and
+    /// tell whether a reader sets it apart from the one before: `Yes` where
+    /// the layout or the spacing certainly does; otherwise the two may
+    /// touch, which counts where digits meet. The first item starts where
+    /// the box does, as far along as its own left edge sets it.
+    fn next(&mut self, left: Tri) -> Tri {
+        let apart = match self.count {
+            0 => left,
+            _ => match self
+                .layout
+                .turned
+                .max(self.layout.spaced)
+                .max(self.last_right)
+                .max(left)
+            {
+                Tri::Yes => Tri::Yes,
+                _ => Tri::Maybe,
+            },
+        };
+        self.count += 1;
+        self.text = false;
+        self.last_right = Tri::No;
+        apart
+    }
+
+    /// Take in text straight inside the box: an item of its own, unless it
+    /// goes on the text before it.
+    fn text(&mut self) -> Tri {
+        if self.text {
+            return Tri::No;
+        }
+        let apart = self.next(Tri::No);
+        self.text = true;
+        apart
+    }
+
+    /// Whether the last item stands apart from what follows the box: where
+    /// the items stand in a column or a grid, or may wrap, the last does not
+    /// end the box's first line, which the text after an inline box goes on.
+    fn trailing(&self) -> Tri {
+        let lines = match (self.count, self.layout.turned, self.layout.wraps) {
+            (0 | 1, _, _) => Tri::No,
+            (_, Tri::Yes, _) => Tri::Yes,
+            (_, Tri::Maybe, _) | (_, _, Tri::Yes | Tri::Maybe) => Tri::Maybe,
+            _ => Tri::No,
+        };
+        lines.max(self.last_right)
+    }
 }
 
 /// What an element does to AnyDoc's inline run (see [`Run`]) as it ends.
@@ -4479,10 +5084,11 @@ fn meet_run(
     } = *meeting;
     let local = element.local.as_str();
     let spliced = !run.splices.is_empty();
-    // How a reader lays the element out beside the text around it. A flex
-    // or grid item is a block of its own, as is each text label of an SVG
-    // image; otherwise its style decides, or, where it was not read (the
-    // element holds no text), the reader's defaults.
+    // How a reader lays the element out beside the text around it. Each
+    // text label of an SVG image is a block of its own, and a flex or grid
+    // item stands where its row sets it (see [`Row`]), floated or not;
+    // otherwise its style decides, or, where it was not read (the element
+    // holds no text), the reader's defaults.
     let own = match style {
         Some(style) => style.flow(),
         None if reader_block_by_default(element) => Flow::Block,
@@ -4502,8 +5108,10 @@ fn meet_run(
         }
     }
     let flow = match (parent_items, own) {
-        (Tri::Yes, _) | (_, Flow::Block) => Flow::Block,
         _ if in_svg && local == "text" => Flow::Block,
+        (Tri::Yes, Flow::Positioned) => Flow::Positioned,
+        (Tri::Yes, _) => Flow::Inline,
+        (_, Flow::Block) => Flow::Block,
         (Tri::Maybe, _) => Flow::MaybeApart,
         _ => own,
     };
@@ -4698,6 +5306,32 @@ fn end_element(effects: &Effects, runs: &mut Vec<Run>, glyphs: (u64, u64)) -> bo
     lost_sign
 }
 
+/// End an element: an item's right edge, and the lines of its own items,
+/// stand before the next item; those of an inline box laying out items,
+/// before the text after it. Then apply what it does to AnyDoc's inline run
+/// (see [`end_element`]).
+fn close_element(
+    open: &mut [Open],
+    mut closed: Open,
+    runs: &mut Vec<Run>,
+    glyphs: (u64, u64),
+) -> bool {
+    let trailing = match closed.items {
+        Tri::Yes => closed.row.trailing(),
+        _ => Tri::No,
+    };
+    let right = closed.edges.1.max(trailing);
+    match open.last_mut() {
+        Some(parent) if closed.passes_row => parent.row = closed.row,
+        Some(parent) if closed.item => parent.row.last_right = right,
+        _ => {}
+    }
+    if closed.inline_items && !closed.item {
+        closed.effects.boundary_after = closed.effects.boundary_after.max(right);
+    }
+    end_element(&closed.effects, runs, glyphs)
+}
+
 /// How a chapter's text fares between a reading system and AnyDoc.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ChapterText {
@@ -4754,7 +5388,7 @@ pub(super) fn chapter_text(
                     }
                 }
                 if let Some(closed) = open.pop() {
-                    found.drops_shown |= end_element(&closed.effects, &mut runs, glyphs);
+                    found.drops_shown |= close_element(&mut open, closed, &mut runs, glyphs);
                 }
                 buffer.clear();
                 continue;
@@ -4780,6 +5414,20 @@ pub(super) fn chapter_text(
             }
         };
         if let Some(text) = text {
+            // Text straight inside a box laying out items stands as an item
+            // of its own, unless it goes on the text before it; white space
+            // alone a reader leaves out.
+            let apart = match open.last_mut() {
+                Some(state)
+                    if state.items == Tri::Yes
+                        && !text
+                            .chars()
+                            .all(|character| character.is_ascii_whitespace()) =>
+                {
+                    state.row.text()
+                }
+                _ => Tri::No,
+            };
             if let (Some(state), Some(run)) = (open.last(), runs.last_mut()) {
                 // `pre` text, or a display formula's, inside a link joins the
                 // run around it.
@@ -4790,6 +5438,7 @@ pub(super) fn chapter_text(
                     _ => None,
                 };
                 if let Some(taken) = taken {
+                    run.mark(apart);
                     count_glyphs(&mut glyphs, taken);
                     found.fuses_blocks |= run.add(taken);
                     found.drops_shown |= std::mem::take(&mut run.lost_sign);
@@ -4956,6 +5605,37 @@ pub(super) fn chapter_text(
         let svg_font = (parent_in_svg || element.lower == "svg")
             .then(|| svg_font_size(element).or(open.last().and_then(|parent| parent.svg_font)))
             .flatten();
+        // A flex or grid item meets the item before it as its row sets it
+        // (see [`Row`]), and an inline box laying out items meets the text
+        // before it as its own left edge does. A positioned child leaves the
+        // row, and one without a box (`display: contents`) passes it on to
+        // what it holds.
+        let item = parent_items == Tri::Yes
+            && style
+                .as_ref()
+                .is_none_or(|style| style.flow() != Flow::Positioned && !style.contents);
+        let inline_items = !parent_in_svg
+            && element.lower != "svg"
+            && style
+                .as_ref()
+                .is_some_and(|style| style.items == Tri::Yes && style.inline == Tri::Yes);
+        let edges = if item || inline_items {
+            let tree = Tree {
+                stack: &elements,
+                earlier: &earlier,
+            };
+            reader.spacing(&tree, &ancestors, work)?
+        } else {
+            (Tri::No, Tri::No)
+        };
+        let apart = match open.last_mut() {
+            Some(parent) if item => parent.row.next(edges.0),
+            _ if inline_items => edges.0,
+            _ => Tri::No,
+        };
+        if let Some(run) = runs.last_mut() {
+            run.mark(apart);
+        }
         let mut effects = match (parent_reach, reach, runs.last_mut()) {
             (Some(Reach::Root), Reach::Walk, _) => Effects {
                 opens_run: true,
@@ -5032,6 +5712,11 @@ pub(super) fn chapter_text(
                 switch_taken,
                 svg_font,
                 items: Tri::No,
+                row: Row::default(),
+                item,
+                inline_items: false,
+                edges,
+                passes_row: false,
                 exempt: Exempt::None,
                 effects,
             },
@@ -5046,6 +5731,17 @@ pub(super) fn chapter_text(
                     }
                     _ if element.lower == "rp" => Exempt::RubyParenthesis,
                     _ => Exempt::None,
+                };
+                let (items, row) = match parent {
+                    Some(parent) if style.contents => (parent.items, parent.row),
+                    _ if children_in_svg => (Tri::No, Row::default()),
+                    _ => {
+                        let row = Row {
+                            layout: style.item_layout,
+                            ..Row::default()
+                        };
+                        (style.items, row)
+                    }
                 };
                 Open {
                     reach,
@@ -5065,7 +5761,12 @@ pub(super) fn chapter_text(
                     svg_text,
                     switch_taken,
                     svg_font,
-                    items: style.items,
+                    items,
+                    row,
+                    item,
+                    inline_items,
+                    edges,
+                    passes_row: style.contents,
                     exempt,
                     effects,
                 }
@@ -5113,9 +5814,9 @@ pub(super) fn chapter_text(
                     reader.note_sibling(&elements, &mut earlier, &ancestors, work);
                 }
             }
-            effects.opens_run = false;
+            state.effects.opens_run = false;
             found.drops_shown |= mark_sign(&mut runs);
-            found.drops_shown |= end_element(&effects, &mut runs, glyphs);
+            found.drops_shown |= close_element(&mut open, state, &mut runs, glyphs);
             buffer.clear();
             continue;
         }
@@ -5910,29 +6611,16 @@ mod tests {
     }
 
     #[test]
-    fn items_floats_links_and_svg_text_keep_their_own_lines() {
+    fn floats_links_and_svg_text_keep_their_own_lines() {
         let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
         let math = r#"xmlns="http://www.w3.org/1998/Math/MathML""#;
         let svg = r#"xmlns="http://www.w3.org/2000/svg""#;
         for (sheets, body) in [
-            // Each flex or grid item is a block, text straight inside too.
-            (
-                &[".s { display: flex; flex-direction: column }"][..],
-                r#"<div class="s"><span>Balance due</span><span>1,250.00</span></div>"#.to_string(),
-            ),
-            (
-                &[".s { display: grid }"],
-                r#"<div class="s"><span>Item</span><span>1,250.00</span></div>"#.into(),
-            ),
-            (
-                &[],
-                r#"<div style="display:flex">Balance due<span>1,250.00</span></div>"#.into(),
-            ),
             // A floated or positioned box holding digits is no drop cap,
             // unless a single figure floated to open its paragraph.
             (
-                &[".f { float: left }"],
-                r#"<p><span class="f">10</span>250 units received</p>"#.into(),
+                &[".f { float: left }"][..],
+                r#"<p><span class="f">10</span>250 units received</p>"#.to_string(),
             ),
             (
                 &[".f { float: left }"],
@@ -6058,14 +6746,12 @@ mod tests {
             assert!(fuses(sheets, &body), "{body}");
         }
         for (sheets, body) in [
-            // AnyDoc keeps white space between items, a line break beside
-            // other text in a link, and an inline formula's delimiters.
+            // AnyDoc keeps a line break, beside other text in a link too,
+            // and an inline formula's delimiters.
             (
-                &[".s { display: flex }"][..],
-                r#"<div class="s"><span>Balance due</span> <span>1,250.00</span></div>"#
-                    .to_string(),
+                &[][..],
+                "<p>Balance due<span><br/></span>1,250.00</p>".to_string(),
             ),
-            (&[], "<p>Balance due<span><br/></span>1,250.00</p>".into()),
             (&[], "<p>x<a>Balance due<br/></a>1,250.00</p>".into()),
             (
                 &[],
@@ -6135,6 +6821,126 @@ mod tests {
             &[r#".amt::before { content: "\A" }"#],
             r#"<p>Units 12<span class="amt">50</span></p>"#
         ));
+    }
+
+    #[test]
+    fn flex_and_grid_items_stand_where_their_box_sets_them() {
+        let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
+        for (sheets, body) in [
+            // Flex items set apart in a column, by a gap, spread along the
+            // line, or by a margin or padding, a reader's own among them;
+            // grid items; and text straight inside, an item of its own. In
+            // a row, digits that meet.
+            (
+                &[".s { display: flex; flex-direction: column }"][..],
+                r#"<div class="s"><span>Balance due</span><span>1,250.00</span></div>"#.to_string(),
+            ),
+            (
+                &[".s { display: grid }"],
+                r#"<div class="s"><span>Item</span><span>1,250.00</span></div>"#.into(),
+            ),
+            (
+                &[".s { display: flex; gap: .4em }"],
+                r#"<div class="s">Balance due<span>1,250.00</span></div>"#.into(),
+            ),
+            (
+                &[".s { display: flex; justify-content: space-between }"],
+                r#"<div class="s"><span>Balance due</span><span>1,250.00</span></div>"#.into(),
+            ),
+            (
+                &[".s { display: flex } .s > .l { margin: 0 1em 0 0 }"],
+                r#"<div class="s"><span class="l">Balance due</span><span>1,250.00</span></div>"#
+                    .into(),
+            ),
+            (
+                &[],
+                r#"<div style="display:flex">Balance due<span style="padding-left:6px">1,250.00</span></div>"#
+                    .into(),
+            ),
+            (
+                &["dl { display: flex }"],
+                "<dl><dt>Basis</dt><dd>what you paid</dd></dl>".into(),
+            ),
+            (
+                &[],
+                r#"<div style="display:flex"><span>Units 12</span><span>50</span></div>"#.into(),
+            ),
+            // An inline box laying out items stands apart from the text
+            // around it by its own padding, or its first or last item's,
+            // and its last item in a column from the text after it; a box
+            // without one of its own passes what it holds to its parent's
+            // items.
+            (
+                &[".amt { display: inline-flex; padding: 0 .3em }"],
+                r#"<p><span class="amt"><span>Total due</span></span>1,250.00</p>"#.into(),
+            ),
+            (
+                &[".amt { display: inline-flex }"],
+                r#"<p>Total due<span class="amt"><span style="padding-left:6px">1,250.00</span></span></p>"#
+                    .into(),
+            ),
+            (
+                &[".r { display: inline-flex; flex-direction: column }"],
+                r#"<p>Rates <span class="r"><span>12</span> <span>15</span></span>and more</p>"#
+                    .into(),
+            ),
+            (
+                &[],
+                r#"<div style="display:flex;flex-direction:column"><span style="display:contents"><b>Balance due</b><b>1,250.00</b></span></div>"#
+                    .into(),
+            ),
+            (
+                &[],
+                r#"<div style="display:flex;flex-direction:column"><span style="display:contents"><b>Balance due</b></span><b>1,250.00</b></div>"#
+                    .into(),
+            ),
+        ] {
+            assert!(fuses(sheets, &body), "{body}");
+        }
+        for (sheets, body) in [
+            // AnyDoc keeps white space between items.
+            (
+                &[".s { display: flex }"][..],
+                r#"<div class="s"><span>Balance due</span> <span>1,250.00</span></div>"#
+                    .to_string(),
+            ),
+            // Flex items in a row touch as a reader sets them, and may where
+            // they may wrap; an inline box laying out items touches the text
+            // around it, however it spreads them; an old flexible box in a
+            // column, or clamping its lines, keeps its text in lines.
+            (
+                &[],
+                r#"<div style="display:flex">Balance due<span>1,250.00</span></div>"#.into(),
+            ),
+            (
+                &["h2.ct { display: flex; justify-content: center }"],
+                r##"<h2 class="ct">The Long Winter<a href="#n1">1</a></h2>"##.into(),
+            ),
+            (
+                &["p.term { display: flex; flex-wrap: wrap }"],
+                r#"<p class="term">(<em>basis</em>) the amount paid.</p>"#.into(),
+            ),
+            (
+                &[".amt { display: inline-flex; justify-content: space-between }"],
+                r#"<p>Total due:<span class="amt"><span>$</span><span>1,250.00</span></span> by May.</p>"#
+                    .into(),
+            ),
+            (
+                &[".r { display: inline-flex; flex-direction: column }"],
+                r#"<p>Rates <span class="r"><span>12</span></span>50 more</p>"#.into(),
+            ),
+            (
+                &[".b { display: -webkit-box; -webkit-box-orient: vertical }"],
+                r#"<div class="b"><span>Units 12</span><span>50</span></div>"#.into(),
+            ),
+            (
+                &[".c { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3 }"],
+                r##"<p class="c">The return lists income<a href="#n1">1</a> and credits.</p>"##
+                    .into(),
+            ),
+        ] {
+            assert!(!fuses(sheets, &body), "{body}");
+        }
     }
 
     #[test]
