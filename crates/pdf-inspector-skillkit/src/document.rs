@@ -5700,10 +5700,27 @@ fn sanitize_markdown(markdown: &str) -> (String, bool) {
     (sanitized, changed)
 }
 
-/// Remove HTML tags, but not text AnyDoc escaped: `\<Client name>` is a
-/// literal `<` and words, as a Markdown renderer reads it. A tag may still
-/// start after the escaped `<`, so the search resumes just past it.
+/// Remove HTML tags, except what is text or a line break. AnyDoc escapes a
+/// literal `<` (`\<Client name>` is a `<` and words, as a Markdown renderer
+/// reads it); a tag may still start after an escaped `<`, so the search
+/// resumes just past it. Code spans and fenced code blocks show `<` as
+/// written, so nothing in them is a tag. AnyDoc's own `<br>` separates the
+/// lines of a table cell; without it, "52,000" over "1,250" would read as
+/// one number.
 fn strip_html_tags(text: &str, html: &Regex) -> String {
+    let code = markdown_code_ranges(text);
+    let in_code = |position: usize| {
+        code.binary_search_by(|&(start, end)| {
+            if end <= position {
+                std::cmp::Ordering::Less
+            } else if start > position {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+    };
     let mut output = String::with_capacity(text.len());
     let mut copied = 0;
     let mut position = 0;
@@ -5713,16 +5730,110 @@ fn strip_html_tags(text: &str, html: &Regex) -> String {
             .rev()
             .take_while(|&byte| byte == b'\\')
             .count();
-        if escapes % 2 == 1 {
+        if escapes % 2 == 1 || in_code(tag.start()) {
             position = tag.start() + 1;
+            continue;
+        }
+        position = tag.end();
+        if tag.as_str() == "<br>" {
             continue;
         }
         output.push_str(&text[copied..tag.start()]);
         copied = tag.end();
-        position = tag.end();
     }
     output.push_str(&text[copied..]);
     output
+}
+
+/// The byte ranges of fenced code blocks and code spans, in order and not
+/// overlapping, as CommonMark pairs backtick strings. Fences may sit in a
+/// list item or block quote.
+fn markdown_code_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    // Fenced blocks, line by line: (marker, length) of the open fence.
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut prose: Vec<(usize, usize)> = Vec::new();
+    let mut prose_start = 0;
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let body = line.trim_start_matches([' ', '>']);
+        let marker = body
+            .bytes()
+            .next()
+            .filter(|byte| matches!(byte, b'`' | b'~'));
+        let run = marker.map_or(0, |marker| {
+            body.bytes().take_while(|&b| b == marker).count()
+        });
+        match (fence, marker) {
+            (None, Some(marker)) if run >= 3 && !(marker == b'`' && body[run..].contains('`')) => {
+                prose.push((prose_start, line_start));
+                fence = Some((marker, run, line_start));
+            }
+            (Some((open, length, start)), Some(marker))
+                if marker == open && run >= length && body[run..].trim().is_empty() =>
+            {
+                ranges.push((start, line_end));
+                fence = None;
+                prose_start = line_end;
+            }
+            _ => {}
+        }
+        line_start = line_end;
+    }
+    match fence {
+        Some((_, _, start)) => ranges.push((start, text.len())),
+        None => prose.push((prose_start, text.len())),
+    }
+    // Code spans in the prose between fences: a backtick string not escaped
+    // opens one, closed by the next string of the same length before a
+    // blank line.
+    for (start, end) in prose {
+        let bytes = &text.as_bytes()[start..end];
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'`' {
+                index += 1;
+                continue;
+            }
+            let run = bytes[index..].iter().take_while(|&&b| b == b'`').count();
+            let escapes = bytes[..index]
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b'\\')
+                .count();
+            if escapes % 2 == 1 {
+                index += 1;
+                continue;
+            }
+            let mut search = index + run;
+            let mut closed = None;
+            while search < bytes.len() {
+                if bytes[search..].starts_with(b"\n\n") {
+                    break;
+                }
+                if bytes[search] == b'`' {
+                    let length = bytes[search..].iter().take_while(|&&b| b == b'`').count();
+                    if length == run {
+                        closed = Some(search + length);
+                        break;
+                    }
+                    search += length;
+                } else {
+                    search += 1;
+                }
+            }
+            match closed {
+                Some(close) => {
+                    ranges.push((start + index, start + close));
+                    index = close;
+                }
+                None => index += run,
+            }
+        }
+    }
+    ranges.sort_unstable();
+    ranges
 }
 
 fn redact_destinations_and_paths(markdown: &str) -> String {
@@ -6121,6 +6232,48 @@ mod tests {
             sanitize_markdown("\\<a <script>x</script>"),
             ("\\<a x".to_string(), true)
         );
+    }
+
+    #[test]
+    fn sanitizer_keeps_cell_line_breaks_and_code() {
+        // AnyDoc joins a cell's lines with `<br>`; without it the amounts
+        // would read as one number.
+        let cell = "| Wages<br>Interest | 52,000<br>1,250 |";
+        assert_eq!(sanitize_markdown(cell), (cell.to_string(), false));
+        // Other spellings are not AnyDoc's and are removed.
+        assert_eq!(
+            sanitize_markdown("a<br onclick=\"x()\">b<BR>c"),
+            ("abc".to_string(), true)
+        );
+        // Code shows what is written; the anchor AnyDoc emits still goes.
+        for input in [
+            "Use `<Client Name>` in the salutation.",
+            "```\nDear <Client Name>,\nDue if AGI<threshold and credit>0\n```\n",
+            "- item\n\n  ~~~~\n  <b>kept</b>\n  ~~~~\n",
+            "`` a ` <b> ``",
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (input.to_string(), false),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            sanitize_markdown("<a id=\"m\"></a>Target `<x>`"),
+            ("Target `<x>`".to_string(), true)
+        );
+        // An escaped or unmatched backtick opens no span.
+        assert_eq!(
+            sanitize_markdown("\\`<b>x</b>`"),
+            ("\\`x`".to_string(), true)
+        );
+        assert_eq!(
+            sanitize_markdown("`open <b>x</b>\n\nlater`"),
+            ("`open x\n\nlater`".to_string(), true)
+        );
+        // An unclosed fence runs to the end.
+        let unclosed = "text\n```\n<b>code</b>";
+        assert_eq!(sanitize_markdown(unclosed), (unclosed.to_string(), false));
     }
 
     #[test]
