@@ -2413,9 +2413,9 @@ struct DocxStoryScan {
     /// letters) and the state of a legacy form checkbox or drop-down
     /// (`w:checkBox`, `w:ddList`). An open upstream change
     /// (firecrawl/anydoc#177) renders four Wingdings checkbox codes; every
-    /// other symbol stays dropped there too. So is the text of
-    /// `mc:AlternateContent` of which AnyDoc takes no branch while Word
-    /// shows one.
+    /// other symbol stays dropped there too. So is text Word shows in
+    /// `mc:AlternateContent` that AnyDoc does not convert from it: where
+    /// AnyDoc takes no branch, or a branch holding other text.
     dropped: bool,
     /// A run formatted hidden directly (`w:r/w:rPr/w:vanish`), which the
     /// pinned parser converts as ordinary text.
@@ -2608,6 +2608,11 @@ const WORDPROCESSINGML_NAMESPACES: [&[u8]; 2] = [
 ];
 const MARKUP_COMPATIBILITY_NAMESPACE: &[u8] =
     b"http://schemas.openxmlformats.org/markup-compatibility/2006";
+/// Office Math's namespace, Transitional and Strict.
+const MATH_NAMESPACES: [&[u8]; 2] = [
+    b"http://schemas.openxmlformats.org/officeDocument/2006/math",
+    b"http://purl.oclc.org/ooxml/officeDocument/math",
+];
 
 /// The vocabulary of an element in a Word story part, as far as AnyDoc's
 /// walker distinguishes it.
@@ -2615,6 +2620,7 @@ const MARKUP_COMPATIBILITY_NAMESPACE: &[u8] =
 enum WordVocabulary {
     Word,
     MarkupCompatibility,
+    Math,
     Other,
 }
 
@@ -2630,6 +2636,11 @@ impl WordVocabulary {
                 if namespace.as_ref() == MARKUP_COMPATIBILITY_NAMESPACE =>
             {
                 Self::MarkupCompatibility
+            }
+            quick_xml::name::ResolveResult::Bound(namespace)
+                if MATH_NAMESPACES.contains(&namespace.as_ref()) =>
+            {
+                Self::Math
             }
             _ => Self::Other,
         }
@@ -2661,9 +2672,10 @@ struct WordNode {
     /// For a `w:p`, and an element of its mark: AnyDoc reads it, the first
     /// of its kind among the children of an element AnyDoc reads.
     anydoc_mark: bool,
-    /// For `mc:AlternateContent`: Word shows text in a branch AnyDoc does
-    /// not take.
-    word_text: bool,
+    /// For `mc:AlternateContent` outside any other: the text Word shows in
+    /// it, and the text AnyDoc converts from it.
+    word_shown: DocxShownText,
+    anydoc_shown: DocxShownText,
 }
 
 impl WordNode {
@@ -2681,7 +2693,8 @@ impl WordNode {
             anydoc_first: false,
             paragraphs_before,
             anydoc_mark: false,
-            word_text: false,
+            word_shown: DocxShownText::default(),
+            anydoc_shown: DocxShownText::default(),
         }
     }
 
@@ -3006,18 +3019,20 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
                     if closed.is(WordVocabulary::MarkupCompatibility, b"AlternateContent") {
                         stand_in_for_word_branch(&mut scan.list_paragraphs, closed);
                         // AnyDoc takes no branch, and drops the text Word
-                        // shows in its own.
-                        scan.dropped |= closed.word_text && closed.anydoc_branches == 0;
+                        // shows in its own, or takes one holding other text.
+                        scan.dropped |= !closed.word_shown.same(&closed.anydoc_shown);
                     }
                 }
             }
             quick_xml::events::Event::Text(text) => {
-                if text.iter().any(|byte| !byte.is_ascii_whitespace()) {
-                    note_branch_text(&mut stack);
-                }
+                note_branch_text(&mut stack, &String::from_utf8_lossy(text.as_ref()));
             }
-            quick_xml::events::Event::GeneralRef(_) | quick_xml::events::Event::CData(_) => {
-                note_branch_text(&mut stack);
+            quick_xml::events::Event::CData(text) => {
+                note_branch_text(&mut stack, &String::from_utf8_lossy(text.as_ref()));
+            }
+            quick_xml::events::Event::GeneralRef(reference) => {
+                let name = String::from_utf8_lossy(reference.as_ref());
+                note_branch_text(&mut stack, &anydoc_entity_text(&name));
             }
             quick_xml::events::Event::Eof => {
                 // A paragraph left open ends with its part.
@@ -3032,33 +3047,65 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
     }
 }
 
-/// Note text of a `w:t` that Word shows in a branch AnyDoc does not take,
-/// on the outermost such branch's alternate content: where AnyDoc takes
-/// another branch, that one holds the text for it; where it takes none,
-/// the text is lost. Text AnyDoc would not reach anyway, deleted or in a
-/// drawing outside its text boxes, is left to the checks of that content.
-fn note_branch_text(stack: &mut [WordNode]) {
-    if !stack
-        .last()
-        .is_some_and(|node| node.is(WordVocabulary::Word, b"t"))
-        || word_content_omitted(stack)
-        || word_drawing_search(stack)
-        || stack.iter().any(|node| {
-            node.word_skips
-                || (node.vocabulary == WordVocabulary::Word
-                    && matches!(node.local.as_slice(), b"del" | b"moveFrom"))
-        })
+/// Note text inside `mc:AlternateContent` on the outermost alternate
+/// content, as Word shows it and as AnyDoc converts it, for the two to be
+/// compared when it ends: where AnyDoc takes another branch than Word, or
+/// none, that branch must hold the text Word's does. The text of `w:t` and
+/// of math (`m:t`) counts, not white space; Word does not show deleted
+/// text, and text AnyDoc's walker never reaches, or that sits in a drawing
+/// outside its text boxes, is left to the checks of that content.
+fn note_branch_text(stack: &mut [WordNode], text: &str) {
+    if !stack.last().is_some_and(|node| {
+        node.is(WordVocabulary::Word, b"t") || node.is(WordVocabulary::Math, b"t")
+    }) || word_drawing_search(stack)
     {
         return;
     }
-    let Some(branch) = stack
+    let Some(outermost) = stack
         .iter()
-        .position(|node| node.is_branch() && node.anydoc_skips)
+        .position(|node| node.is(WordVocabulary::MarkupCompatibility, b"AlternateContent"))
     else {
         return;
     };
-    if let Some(alternate) = branch.checked_sub(1).map(|parent| &mut stack[parent]) {
-        alternate.word_text = true;
+    let word = !stack.iter().any(|node| {
+        node.word_skips
+            || (node.vocabulary == WordVocabulary::Word
+                && matches!(node.local.as_slice(), b"del" | b"moveFrom"))
+    });
+    let anydoc = !stack.iter().any(|node| node.anydoc_skips) && !word_content_omitted(stack);
+    let alternate = &mut stack[outermost];
+    for character in text.chars().filter(|character| !character.is_whitespace()) {
+        if word {
+            alternate.word_shown.push(character);
+        }
+        if anydoc {
+            alternate.anydoc_shown.push(character);
+        }
+    }
+}
+
+/// Text one side shows in compatibility content, as far as comparing it
+/// with the other side's needs: its characters, hashed in order, and how
+/// many there are.
+#[derive(Default)]
+struct DocxShownText {
+    hasher: std::collections::hash_map::DefaultHasher,
+    characters: u64,
+}
+
+impl DocxShownText {
+    fn push(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        std::hash::Hasher::write(
+            &mut self.hasher,
+            character.encode_utf8(&mut encoded).as_bytes(),
+        );
+        self.characters += 1;
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        self.characters == other.characters
+            && std::hash::Hasher::finish(&self.hasher) == std::hash::Hasher::finish(&other.hasher)
     }
 }
 
@@ -10700,7 +10747,7 @@ mod tests {
         // the branch Word shows, as a block or in a run.
         let alternate = |branches: &str| {
             format!(
-                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">{branches}</mc:AlternateContent>"#
+                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">{branches}</mc:AlternateContent>"#
             )
         };
         let dropped_text = |body: String| {
@@ -10725,6 +10772,60 @@ mod tests {
         )));
         assert!(!dropped_text(alternate(
             r#"<mc:Choice xmlns:zz="urn:zz" Requires="zz"><w:p><w:r><w:t>Unread</w:t></w:r></w:p></mc:Choice>"#
+        )));
+        // Math is text too, in a choice AnyDoc does not read or one
+        // requiring math itself, which AnyDoc does not support.
+        let math = r#"<m:oMath><m:r><m:t>r=0.07</m:t></m:r></m:oMath>"#;
+        for requires in ["w14", "m"] {
+            assert!(
+                dropped_text(format!(
+                    r#"<w:p><w:r><w:t xml:space="preserve">The rate is </w:t></w:r>{}</w:p>"#,
+                    alternate(&format!(
+                        r#"<mc:Choice Requires="{requires}">{math}</mc:Choice>"#
+                    ))
+                )),
+                "{requires}"
+            );
+        }
+        assert!(dropped_text(alternate(&format!(
+            r#"<mc:Choice Requires="w14"><m:oMathPara>{math}</m:oMathPara></mc:Choice>"#
+        ))));
+        assert!(!dropped_text(format!(
+            r#"<w:p xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">{math}</w:p>"#
+        )));
+        // A fallback holding other text than Word's branch converts text
+        // Word does not show; the same text, split and spaced otherwise,
+        // is the same.
+        let run = |text: &str| format!(r#"<w:r><w:t xml:space="preserve">{text}</w:t></w:r>"#);
+        let branches = |choice: &str, fallback: &str| {
+            format!(
+                "<w:p>{}</w:p>",
+                alternate(&format!(
+                    r#"<mc:Choice Requires="w14">{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback>"#
+                ))
+            )
+        };
+        assert!(dropped_text(branches(
+            &run("Pay 100 USD by March 1"),
+            &run("Pay 900 USD by March 9")
+        )));
+        assert!(dropped_text(branches(&run("Pay 100 USD"), "")));
+        assert!(!dropped_text(branches(
+            &format!("{}{}", run("Pay 100 "), run("USD")),
+            &run("Pay 100  USD")
+        )));
+        assert!(!dropped_text(branches(
+            &run("Pay &amp; go"),
+            &run("Pay &#38; go")
+        )));
+        // Deleted text is shown by neither.
+        assert!(!dropped_text(branches(
+            &format!(
+                r#"<w:del w:id="1" w:author="a">{}</w:del>{}"#,
+                run("Old"),
+                run("New")
+            ),
+            &run("New")
         )));
     }
 
