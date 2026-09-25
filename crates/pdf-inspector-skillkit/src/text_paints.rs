@@ -19,8 +19,8 @@
 //! pdf-inspector keeps every paint, so its Markdown repeats the text:
 //! "TToottaall", or "84.19 84.19" (open upstream #317, #377). The scan notes
 //! where each visible run starts when its position was just set, and
-//! reports a page on which a run in the same font with the same bytes
-//! starts again within a tenth of its size of an earlier one.
+//! reports a page on which a run with the same bytes starts again within a
+//! tenth of its size of an earlier one, in whatever font.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -102,20 +102,13 @@ impl Budget {
     }
 }
 
-/// A font as the repeat check tells fonts apart: its object, or, for a
-/// font dictionary written in place, its resource name.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum FontKey {
-    Object(ObjectId),
-    Name(u64),
-}
-
 /// The graphics state the scan follows, with the text state in it.
 #[derive(Clone, Copy)]
 struct State {
     ctm: [f64; 6],
     render_mode: i64,
-    font: Option<FontKey>,
+    /// Whether `Tf` has set a font; text shown before shows nothing.
+    font: bool,
     size: f64,
     leading: f64,
     rise: f64,
@@ -125,31 +118,33 @@ impl State {
     const START: State = State {
         ctm: IDENTITY,
         render_mode: 0,
-        font: None,
+        font: false,
         size: 0.0,
         leading: 0.0,
         rise: 0.0,
     };
 }
 
-/// Where the visible runs of one page start, by font and a hash of their
-/// bytes.
+/// Where the visible runs of one page start, by a hash of their bytes. The
+/// font is left out: pdf-inspector keeps the text of every paint, whichever
+/// font object draws it, so a second paint in an identical font object, or
+/// another font, repeats the text all the same.
 #[derive(Default)]
 struct Runs {
-    starts: HashMap<(FontKey, u64), Vec<[f64; 2]>>,
+    starts: HashMap<u64, Vec<[f64; 2]>>,
     noted: usize,
     repeated: bool,
 }
 
 impl Runs {
-    fn note(&mut self, font: FontKey, text: &[u8], at: [f64; 2], size: f64) {
+    fn note(&mut self, text: &[u8], at: [f64; 2], size: f64) {
         if self.repeated || self.noted >= MAX_RUNS_PER_PAGE {
             return;
         }
         let near = (REPEAT_SHARE * size).max(MIN_REPEAT_DISTANCE);
         let mut hasher = DefaultHasher::new();
         text.hash(&mut hasher);
-        match self.starts.entry((font, hasher.finish())) {
+        match self.starts.entry(hasher.finish()) {
             Entry::Occupied(mut entry) => {
                 if entry.get().iter().any(|start| {
                     (start[0] - at[0]).abs() <= near && (start[1] - at[1]).abs() <= near
@@ -259,10 +254,10 @@ impl PageText {
         let Some(runs) = self.runs.as_mut() else {
             return;
         };
-        let Some(font) = state.font else {
-            return;
-        };
-        if matches!(state.render_mode, 3 | 7) || !bytes.iter().any(|&byte| byte != b' ') {
+        if !state.font
+            || matches!(state.render_mode, 3 | 7)
+            || !bytes.iter().any(|&byte| byte != b' ')
+        {
             return;
         }
         let matrix = multiply(text_matrix, state.ctm);
@@ -272,7 +267,7 @@ impl PageText {
         ];
         let size = state.size.abs() * matrix[2].hypot(matrix[3]);
         if at.iter().all(|value| value.is_finite()) && size.is_finite() {
-            runs.note(font, bytes, at, size);
+            runs.note(bytes, at, size);
         }
     }
 
@@ -511,10 +506,7 @@ fn execute<'a>(
             }
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
-                    state.font = name
-                        .as_name()
-                        .ok()
-                        .map(|name| font_key(document, resources, name));
+                    state.font = name.as_name().is_ok();
                     if let Some(size) = number(document, size) {
                         state.size = size;
                     }
@@ -708,28 +700,6 @@ fn page_resources(document: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
                 .filter_map(|id| document.get_dictionary(id).ok()),
         )
         .collect()
-}
-
-/// The key the repeat check tells a font by: the object its resource name
-/// binds in the first resource dictionary naming it, or the name itself.
-fn font_key(document: &Document, resources: &[&Dictionary], name: &[u8]) -> FontKey {
-    for resources in resources {
-        let Some(fonts) = resources
-            .get(b"Font")
-            .ok()
-            .and_then(|fonts| dictionary(document, fonts))
-        else {
-            continue;
-        };
-        match fonts.get(name) {
-            Ok(Object::Reference(id)) => return FontKey::Object(*id),
-            Ok(_) => break,
-            Err(_) => continue,
-        }
-    }
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    FontKey::Name(hasher.finish())
 }
 
 /// The named XObject from the first resource dictionary that binds it, with
@@ -1033,13 +1003,18 @@ pub(crate) mod tests {
             .map(|(glyph, x)| format!("BT /F1 12 Tf 1 0 0 1 {x} 700 Tm ({glyph}) Tj ET "))
             .collect();
         assert!(repeated(&format!("{glyphs}{glyphs}"), ""));
+        // In another font object, as a producer's per-run fonts are.
+        assert!(repeated(
+            &format!("{} {}", line(72.0), line(72.0).replace("/F1", "/F2")),
+            ""
+        ));
         // Within one text object, placed by Td, and in a form drawn twice.
         assert!(repeated(
             "BT /F1 9 Tf 40 698 Td (84.19) Tj 0 0 Td (84.19) Tj ET",
             ""
         ));
         assert!(repeated("/Fm1 Do /Fm1 Do", &line(72.0)));
-        // Different places, text, or fonts, text a run leaves unplaced, and
+        // Different places or text, text a run leaves unplaced, and
         // invisible text are not repeats.
         assert!(!repeated(&format!("{} {}", line(72.0), line(90.0)), ""));
         assert!(!repeated(

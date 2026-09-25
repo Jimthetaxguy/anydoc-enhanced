@@ -4215,19 +4215,33 @@ fn xml_odf_internal_references(bytes: &[u8]) -> Vec<String> {
 /// is the one AnyDoc loads (`path::resolve` against `content.xml`, on the
 /// value as written); a reference it cannot resolve is dropped by AnyDoc and
 /// counts as missing. External and fragment-only references name no part.
-fn odf_reference_missing(value: &str, archive_names: &HashSet<String>) -> bool {
+fn odf_reference_missing(
+    value: &str,
+    archive_names: &HashSet<String>,
+    archive_directories: &HashSet<&str>,
+) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || is_external_uri(trimmed) {
         return false;
     }
     // An embedded object is a directory of parts.
     anydoc_resolve("content.xml", value).is_none_or(|part| {
-        let directory = format!("{}/", part.trim_end_matches('/'));
-        !archive_names.contains(&part)
-            && !archive_names
-                .iter()
-                .any(|name| name.starts_with(&directory))
+        !archive_names.contains(&part) && !archive_directories.contains(part.trim_end_matches('/'))
     })
+}
+
+/// Every directory an entry name sits in, at any depth: `Object 1` and
+/// `Object 1/Pictures` for `Object 1/Pictures/a.png`.
+fn archive_directories(archive_names: &HashSet<String>) -> HashSet<&str> {
+    let mut directories = HashSet::new();
+    for name in archive_names {
+        for (index, _) in name.match_indices('/') {
+            if index > 0 {
+                directories.insert(&name[..index]);
+            }
+        }
+    }
+    directories
 }
 
 /// Whether a slide or notes slide hides content AnyDoc 0.2.4 converts: the
@@ -5938,9 +5952,10 @@ fn preflight_package(
         }
         odf_content.ok_or(DocumentError::Malformed)?;
         if matches!(kind, DocumentKind::Odt | DocumentKind::Odp) {
+            let directories = archive_directories(&archive_names);
             result.missing_required_content |= odf_references
                 .iter()
-                .any(|reference| odf_reference_missing(reference, &archive_names));
+                .any(|reference| odf_reference_missing(reference, &archive_names, &directories));
         }
         if let Some(manifest) = &odf_manifest {
             if xml_has_odf_encryption_data(manifest) {
