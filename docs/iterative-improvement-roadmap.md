@@ -267,27 +267,69 @@ came back clean. The evidence and dispositions are in
 | 6 | DOCX inline content: refuse ruby text and imported chunks; report dropped non-breaking hyphens as `partial` with a warning | Three fixtures; the DOCX lane emits `partial` for the first time |
 | 7 | Optional region `frame` (`sheet` default, `display` for rendered-page boxes) from pdf-inspector 1.24 | A generated `/Rotate 90` page: each frame's rectangle finds the text only in that frame |
 | Review 3 | Parse what the checks look for, in every lane, as AnyDoc reads it: namespace declarations, decoded values, CSS, drawing-page styles, walker positions, binary workbooks | 43 reproduced bypasses now fail closed or are disclosed; the Sections regression is fixed; a quadratic slide match is linear |
+| Review 4 | Main parts by exact name, EPUB CSS modeled for a reader and for AnyDoc, PPTX notes by relationship, DOCX cells and marks, formula caches as AnyDoc renders them, ODF walkers | 95 reproduced bypasses now fail closed or are disclosed, with two documented decisions; EPUB false refusals on common publisher CSS fixed; CSS parsing linear (16,000 imports: 9.3 s and 2.2 GiB down to 0.01 s and 13 MiB) |
+| 8 | EPUB text a reader shows and AnyDoc drops, from AnyDoc's HTML walker pull requests (#147, #149) | Lists and tables keep only the children AnyDoc reads; the Kindle stylesheet pair had dropped `.kf8-only` text from a book reported complete |
+| 9 | Scanned PDF pages whose invisible OCR layer pdf-inspector drops (open upstream #479, #501) | A stamped scan read as text at confidence 1.0 with only its Bates number is now reported for OCR with `invisible_text_layer`; 1–5 ms per call |
+| 10 | Spreadsheet number formats and drawings, from AnyDoc's #72 and #151 | Negatives marked only in red (−25,000 read as 25,000), values a format hides, unresolved locale dates, and text boxes are refused; no producer-shaped workbook changed |
+| 11 | DOCX list numbers AnyDoc renders differently from Word (#129) | Shared definitions, deleted numbered paragraphs, and ordinal or word formats convert as `partial` with `list_numbering_differs`; AnyDoc's own upstream fixture shows 1 where Word shows 5 |
+| Sanitizer | Keep what the Markdown sanitizer removed wrongly | Cell line breaks (`<br>`) kept, which had fused "52,000" and "1,250" into "52,0001,250" in six lanes; escaped `\<Client name>` placeholders and code kept |
 
 ## Next slices
 
-1. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
+1. **EPUB inline containers that fuse text.** AnyDoc 0.2.4 walks a `div`,
+   `section`, `figure`, or `figcaption` without block children inline, so
+   minified markup such as `<div>Balance due</div><div>1,250.00</div>` reads
+   "Balance due1,250.00" (upstream #4). A check needs the walker model to know
+   whether a container has block children before it closes.
+2. **DOCX inline-content oracle, remaining elements.** Ruby text, imported
    chunks, and non-breaking hyphens are handled. Elements AnyDoc 0.2.4's walker
    also skips, which are candidates to confirm with fixtures: `w:contentPart`
    ink, and date or page-number fields placed in the body (`w:pgNum`,
    `w:dayShort` and related elements). Master-document `w:subDoc` links
    reference files outside the package and are reported as external
    relationships.
-2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
-   non-exhaustive `Format` arms, the four Wingdings codes from #177, and a
-   re-check of the ported `to_utf8` and `path::resolve`.
-3. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
+3. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
+   non-exhaustive `Format` arms, the four Wingdings codes from #177, a
+   re-check of the ported `to_utf8` and `path::resolve`, and the walker,
+   numbering, and format models, which mirror 0.2.4's behavior.
+4. **Next pdf-inspector release.** If #479 or #501 lands, compare its
+   invisible-layer handling with the local scan before removing either; if
+   #578 lands, PDF Markdown gains link destinations and must pass through the
+   sanitizer.
+5. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
    external relationship, including an ordinary hyperlink, while DOCX converts
    and removes the destination with a warning. Hyperlink relationships could
    follow the DOCX policy, since the sanitizer already removes their
    destinations. This is a policy change for the owners to decide.
-4. **Non-Linux containment.** PDF and document parsing still lack a memory
+6. **Non-Linux containment.** PDF and document parsing still lack a memory
    ceiling on macOS and fall back to in-process parsing where no sandbox
    exists; filesystem isolation remains open on every platform.
+
+## Decisions for the owners
+
+Each of these is a policy choice the checks make one way today:
+
+- **Refuse or disclose.** EPUB, PPTX, XLSX, ODS, ODT, and ODP refuse hidden or
+  dropped content, while DOCX discloses hidden text and dropped hyphens. A
+  lane could disclose instead, converting with a warning, where the Markdown
+  would still be usable, such as a spreadsheet with one text box, or a book
+  using the Kindle stylesheet pair.
+- **Spreadsheet values under a merge.** A value in a cell a merge covers is
+  hidden by Excel and LibreOffice alike, and AnyDoc omits it; it converts
+  without notice, unlike hidden rows, which are refused.
+- **Currency symbols.** A format AnyDoc cannot parse, such as `£#,##0.00`,
+  renders as General: the value and its sign survive, the symbol and rounding
+  do not. It converts without notice.
+- **Comments and notes.** DOCX comments, XLSX notes, and ODS annotations are
+  not converted and are not disclosed.
+- **ODP speaker notes in shapes.** LibreOffice writes notes converted from
+  PowerPoint as shapes, which AnyDoc does not read, so such decks are refused;
+  they could convert as `partial` instead.
+- **EPUB page numbers and navigation.** Page numbers hidden through attribute
+  or descendant selectors (Project Gutenberg's `.pagenum`) refuse the book, as
+  AnyDoc converts them; books whose navigation does not list every spine
+  chapter, as pandoc and InDesign write them, are refused.
+- **External hyperlinks** outside DOCX, as in the next slices.
 
 ## Go/no-go rules
 

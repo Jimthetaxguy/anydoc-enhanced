@@ -10,8 +10,13 @@ into local fail-closed checks:
   parsing now runs inside the bounded worker, and the new upstream signals are
   reported additively.
 - AnyDoc stays at 0.2.4, which is still the latest release; `main` is
-  README-only after it. Seventeen open pull requests were reviewed against the
-  pinned parser, and each is dispositioned below.
+  README-only after it. All 58 open pull requests were reviewed against the
+  pinned parser: the 20 opened since the previous audit, and the 38 older ones,
+  of which those touching an enabled lane were reproduced. Each is
+  dispositioned below.
+- pdf-inspector's open pull requests (111) were scanned for defects in
+  1.24.0 that reach this repository's PDF tools. Two confirmed one: a scanned
+  page whose OCR text layer 1.24.0 drops without a signal.
 - `rmcp` moves from 3.1.4 to 3.4.1, and every tool declares read-only MCP
   annotations. Tool names and input schemas are unchanged.
 - The document lanes gain checks for AnyDoc 0.2.4 behaviors that the local
@@ -24,7 +29,8 @@ from crates.io, and cargo-deny now rejects Git sources (`allow-git = []`).
 ## Observed upstream state
 
 Observed 2026-09-24 from anonymous clones and the crates.io API; re-verified
-2026-09-25 with no change.
+2026-09-25, twice, with no change: crates.io still lists AnyDoc 0.2.4 and
+pdf-inspector 1.24.0, and neither `main` has moved.
 
 | Upstream | Local before | Local after | Latest release | `main` |
 |---|---|---|---|---|
@@ -79,6 +85,19 @@ Median `classify_pdf` time rises from 4.3 to 7.7 ms on sample 1 and from 55.8 to
 `batch_classify` over 24 files of 40 MiB drops the server's high-water mark
 from 1,015 to 192 MiB, because callers take a slot before reading bytes.
 
+### Open pull requests after 1.24.0
+
+pdf-inspector had 111 open pull requests on 2026-09-25. The recent ones that
+reach this repository:
+
+| PR | Subject | Local disposition |
+|---|---|---|
+| #479, #501 | Recover an invisible OCR layer on text-based documents | Reproduced on 1.24.0: a scan whose OCR text sits in an invisible layer, with a visible header and Bates number on top, classifies as text at confidence 1.0 and returns only the stamps, with no page listed for OCR. A local scan now reports such pages for OCR (`invisible_text_layer`); see the verification below. |
+| #506 | Bound a cubic cost on dense rectangle clusters | Bounded here by the PDF worker's 25-second deadline, which returns `resource_limit`. |
+| #583 | Explicit invisible-text inclusion in positioned extraction | Not exposed; the region tools keep upstream's default. |
+| #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
+| #531, #532 | Statement-style layouts; space width from `/Differences` | Extraction quality in brokerage-statement layouts; adopt with the release that carries them. |
+
 Disposition: **adopted.** The new fields are additive. `layout` and `cmap_gaps`
 are omitted when a mode did not compute them, so absence is never reported as
 "no tables" or "no gaps". Only creation and modification dates matching the PDF
@@ -88,25 +107,47 @@ document-controlled free text and are not copied into responses.
 
 ## AnyDoc open pull requests
 
-AnyDoc has no release after 0.2.4. Each open pull request was fetched from its
-`refs/pull/*/head` ref and compared with the pinned parser.
+AnyDoc has no release after 0.2.4. It had 58 open pull requests on 2026-09-25.
+Each was fetched from its `refs/pull/*/head` ref and compared with the pinned
+parser. The table below lists them by their titles; an earlier revision of
+this audit named some by their latest commit, and listed #160, closed on
+2026-09-05, as open.
 
-| PR | Subject | Local disposition |
+| PR | Title | Local disposition |
 |---|---|---|
-| #177 | fix(docx): preserve symbol checkbox states; reject malformed symbol codes | The pinned parser drops every `w:sym`. The local DOCX preflight refuses symbols, legacy form checkboxes, and drop-downs outside tracked deletions (`incomplete_conversion`). The PR renders four Wingdings / Wingdings 2 checkbox codes; after adoption the refusal can relax for exactly those. |
-| #176 | fix(doc): preserve symbol checkbox states | Legacy `.doc` only; that lane is disabled. |
-| #148 | fix: bound parser paths reachable from a crafted document | The number-format part is reproduced locally: an 8 MiB `formatCode` in a 10.6 KB workbook peaked at 855 MiB. The XLSX preflight refuses codes over 4,096 bytes with `resource_limit`. The legacy DOC, PPT, and RTF parts do not apply because those lanes are disabled. |
+| #177 | fix(docx): preserve symbol checkbox states | The pinned parser drops every `w:sym`. The local DOCX preflight refuses symbols, legacy form checkboxes, and drop-downs outside tracked deletions (`incomplete_conversion`). The PR renders four Wingdings / Wingdings 2 checkbox codes; after adoption the refusal can relax for exactly those. |
+| #176, #174 | fix(doc): preserve symbol checkbox states; omit deleted revision text | Legacy `.doc` only; that lane is disabled. |
+| #175 | fix(pdf): bump pdf-inspector to 1.20.0 so RTL text extracts in logical order | Superseded: this repository calls pdf-inspector 1.24.0 directly for PDFs. |
 | #171 | fix(markdown): preserve link and image destinations | Upstream output will carry more destinations, so the local sanitizer now decodes each destination before classifying it. It removes every external or local-path destination, including `mailto:`, `file:`, `data:`, `tel:`, UNC, and `www.` forms, and survives stray brackets and joined tags. |
 | #169 | fix(package): classify recoverable allocation failures as resource limits | Already local: a worker killed by SIGABRT, SIGKILL, SIGSEGV, or SIGBUS maps to `resource_limit`. |
-| #158 | fix(xml): keep a part whose text carries a bare ampersand | Already fail-closed: a bare `&` in the DOCX body is `malformed`, and in a footnote the recovery diagnostic yields `incomplete_conversion`. |
-| #154 | docs: clarify the `#[non_exhaustive]` migration requirement | The next AnyDoc bump needs wildcard arms on `Format`; unknown formats must map to unrecognized or disabled, never to an enabled lane. |
-| #175 | fix(pdf): bump pdf-inspector to 1.20.0 for right-to-left text | Superseded: this repository calls pdf-inspector 1.24.0 directly for PDFs. |
-| #174 | fix(doc): omit deleted revision text | Legacy `.doc` only; disabled lane. |
-| #153 | feat(pdf): convert the readable pages when others need OCR | Not applicable: PDFs never reach AnyDoc here. |
+| #168 | feat(python): ship the anydoc CLI as a console script | Packaging only. |
+| #166, #153 | fix(pdf): do not discard a text-based document over one confirmed OCR page; convert the readable pages when others need OCR | PDFs never reach AnyDoc here; the PDF tools already return the readable text and list the pages that need OCR, with reasons. |
+| #164 | feat(eml): read RFC 5322 email messages | Email lanes are not enabled. |
+| #163 | feat(sheet): preserve spreadsheet provenance | Sheet names and cell origins only; no cell text is lost. |
 | #161 | feat: OCR scanned PDFs with a vision model via LiteLLM | Out of scope: the MCP boundary stays offline. |
-| #147, #149 | HTML tree-builder end-tag and scope fixes | Not reachable from the enabled lanes; EPUB chapters are parsed as XML. Revisit with the next release. |
-| #160, #164 | `.msg` code page and `.eml` edge cases | Email lanes are not enabled. |
-| #163, #166 | Documentation and review follow-ups | No production change. |
+| #158 | fix(xml): keep a part whose text carries a bare ampersand | Already fail-closed: a bare `&` in the DOCX body is `malformed`, and in a footnote the recovery diagnostic yields `incomplete_conversion`. |
+| #154 | api: mark Format as `#[non_exhaustive]` | The next AnyDoc bump needs wildcard arms on `Format`; unknown formats must map to unrecognized or disabled, never to an enabled lane. |
+| #151 | fix(xlsx): retain embedded worksheet images | 0.2.4 never follows a worksheet's drawings, so text boxes over a sheet were lost too. XLSX text boxes and shapes with text, and ODS drawings over the grid, are now refused; pictures and charts are a documented limitation. |
+| #147, #149 | feat: add standalone HTML support; feat: add MHTML support | New formats, not enabled. Both change the HTML walker EPUB uses: 0.2.4 reads only `li` children of a list, so text or a paragraph placed directly in a list was lost from EPUB chapters. EPUB now refuses text a reader shows and AnyDoc drops. |
+| #148 | fix: bound parser paths reachable from a crafted document | The number-format part is reproduced locally: an 8 MiB `formatCode` in a 10.6 KB workbook peaked at 855 MiB. The XLSX preflight refuses codes over 4,096 bytes with `resource_limit`. The legacy DOC, PPT, and RTF parts do not apply because those lanes are disabled. |
+| #150, #152 | Documentation | No production change. |
+
+### Older open pull requests
+
+| PR | Title | Local disposition |
+|---|---|---|
+| #129 | fix(docx): continue counters across numIds that share an abstract | Reproduced. 0.2.4 keeps one counter per list instance, where Word keeps one per definition; its own upstream fixture shows "1. Two-one independent counter" where LibreOffice shows 5. It also numbers deleted paragraphs and renders ordinals and words as decimals. Such documents now convert as `partial` with `list_numbering_differs`. |
+| #72 | fix(sheet): render xlsx number formats | Superseded by 0.2.4's own format engine. Three cases it still renders differently are refused: a negative marked only by a colour (−25,000 read as 25,000), a value a format hides, and a date format it cannot resolve (a serial number). |
+| #39, #90 | Skip hidden worksheets; omit hidden rows and columns | Superseded: 0.2.4 omits both. The local preflight refuses them. |
+| #16 | Preserve merged-cell spans past the used range | Superseded: 0.2.4 widens the grid. A merge over a whole row pads to 16,384 columns and returns `resource_limit`. |
+| #17 | Unwrap single-cell tables that wrap a nested table | 0.2.4 flattens the nested table into `<br>`-joined lines. The local sanitizer removed those `<br>` tags, fusing "52,000" and "1,250" into "52,0001,250" in six lanes; it now keeps them. |
+| #4 | EPUB metadata and figure captions | A container without block children is walked inline, so minified markup fuses words ("Balance due1,250.00"). Documented as a known limitation and a next slice. |
+| #46 | Keep delimiters from pairing across runs | Superseded: 0.2.4 looks ahead across the paragraph. |
+| #54 | Fix invalid EPUB spine references | 0.2.4 drops such entries; the local preflight refuses them. |
+| #44 | Parse each package part once, and bound the total | Parts re-parsed per reference: 20,000 chart references are refused by the part cap, and 9,000 return `resource_limit` from the worker in 3.5 s. |
+| #103, #130 | Accept passwords for encrypted OOXML files | Feature only. Their encrypted fixtures were refused as `malformed`, because the check read the stream names in ASCII; they are now reported as `encrypted`. |
+| #19, #32, #69, #95, #126 | Heading fidelity, slide separators and anchors, sheet origins | Structure and metadata; no text is lost. |
+| #7, #29, #30, #40, #42, #47, #48, #53, #55, #56, #61, #66, #70, #75, #83, #88, #89, #91, #98, #107, #145 | Bindings, CLI, packaging, documentation, PDF, OCR, legacy and new formats, CSV and RTF | Outside the enabled lanes. CSV and RTF stay unexposed per issue #104. |
 
 ## AnyDoc 0.2.4 behaviors the local contract does not inherit
 
@@ -133,9 +174,23 @@ assert the local result.
 | `path::resolve` drops a fragment before applying `..`, so a slide target can leave `ppt/slides/` | `incomplete_conversion` | `pptx/fragment-slide-target.pptx` |
 | Parts are read by exact name, so a case-variant decoy could stand in for them | `incomplete_conversion` | `pptx/case-variant-presentation-rels.pptx` |
 | Spine hrefs are percent-decoded, so a decoy can sit under the encoded name | `incomplete_conversion` | `epub/encoded-chapter-href.epub` |
+| Main parts are found by exact name, so a case-variant `XL/workbook.xml` sends AnyDoc to its binary reader | `malformed` | `xlsx/xlsb-fallback-decoy.xlsx` |
+| A formula's cached value renders only when it parses for its cell type | `incomplete_conversion` | `xlsx/unrendered-formula-cache.xlsx`, `ods/untyped-formula-value.ods` |
+| Speaker notes are reached through the slide's relationship, wherever stored | `incomplete_conversion` for hidden notes | `pptx/relocated-notes.pptx` |
+| A table cell inside `mc:AlternateContent` is dropped by the row walker | `incomplete_conversion` | `docx/cell-in-compatibility-block.docx` |
+| ODF walkers skip page-anchored frames and frames inside `draw:a` | `incomplete_conversion` | `odt/page-anchored-frame.odt`, `odp/linked-frame.odp` |
+| An escaped CSS selector hides text a reader hides and AnyDoc converts | `incomplete_conversion` | `epub/escaped-selector.epub` |
+| The HTML walker keeps only `li` children of a list, and its stylesheet split applies a media block's second rule everywhere | `incomplete_conversion` | `epub/list-text-outside-items.epub`, `epub/kindle-media-pair.epub` |
+| A negative marked only by a colour renders unsigned | `incomplete_conversion` | `xlsx/negative-sign-by-colour.xlsx`, `ods/negative-sign-by-colour.ods` |
+| A value its format hides is still held; ODS converts it in place of the empty display | `incomplete_conversion` | `xlsx/format-hidden-value.xlsx`, `ods/format-hidden-value.ods` |
+| A locale date format outside its table renders as a serial number | `incomplete_conversion` | `xlsx/locale-date-format.xlsx` |
+| Drawings over a sheet are never read | `incomplete_conversion` | `xlsx/drawing-text-box.xlsx`, `ods/cell-anchored-text-box.ods` |
+| List counters are kept per instance, where Word keeps them per definition | `partial` with `list_numbering_differs` | `docx/shared-list-definition.docx` |
 
-Before this refresh, the last five packages each converted as `complete`, with
-no warning, while carrying content the policy refuses or discloses.
+Each of these converted as `complete`, with no warning, before the check that
+now refuses or discloses it. Four fixtures must convert: `pptx/section-list.pptx`,
+`epub/display-none-omitted.epub`, `epub/web-address-in-text.epub`, and
+`xlsx/red-parenthesized-negative.xlsx`.
 
 The package checks now mirror AnyDoc's own reading:
 
@@ -145,6 +200,18 @@ The package checks now mirror AnyDoc's own reading:
 - DOCX notes, styles, and XLSX sheets follow AnyDoc's relationship lookup;
   sheets use any relationship type.
 - The officeDocument relationship must name the part the checks read.
+- Main parts are found by exact name, and an ODF package's lane by the first
+  `office:body` in the office namespace.
+- EPUB chapters are walked twice over: by a model of a reading system (CSS
+  tokenizer, media queries, full selectors, cascade, user-agent rules) and by
+  a port of AnyDoc's walker and stylesheet subset. Text one shows and the
+  other hides or drops is refused (`epub_css`).
+- ODF content is walked as AnyDoc's walkers walk it, frame by frame and cell
+  by cell (`odf_walk`).
+- XLSX number formats are read with AnyDoc's format grammar, section by
+  section, against each cell's value (`xlsx_numfmt`).
+- DOCX list numbering is counted per instance, as AnyDoc counts, and per
+  definition, as Word counts.
 
 Where AnyDoc picks one of several candidates (lowest id, a namespace-qualified
 attribute), the checks cover every candidate. That can only make them stricter.
@@ -180,17 +247,33 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 182 tests pass (134 skillkit unit, 13
-  skillkit integration, 26 document-tool and 6 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 228 tests pass (176 skillkit unit, 13
+  skillkit integration, 29 document-tool and 7 PDF-tool MCP integration, 3
   MCP unit)
+- `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
+  minimum, also run in CI
 - A third review round reproduced 43 packages that passed the checks while
   AnyDoc converted refused or undisclosed content, and a regression that
   refused decks using PowerPoint Sections. All 43 now fail closed or are
   disclosed, and 34 producer-shaped packages (Word, Excel, PowerPoint,
   LibreOffice, Sigil, and Calibre layouts) convert as before
-- `bash scripts/check-public-hygiene.sh`
+- A fourth round reproduced 95 more bypasses. All fail closed or are
+  disclosed, except two documented decisions: a closed `<details>` and SVG
+  descriptions, which a reader shows on request, are treated like alt text
+- Across 303 documents (the public corpus, 39 LibreOffice conversions, the
+  round-four regression corpus, AnyDoc's 34 upstream fixtures, and the
+  pull-request reproductions), every outcome change was traced to a check
+  and confirmed against LibreOffice or a reader. Among them, the round-four
+  Kindle-pair sample and three upstream DOCX fixtures had converted with
+  missing text or wrong list numbers.
+- An oracle over the 30 EPUBs that convert as complete finds every text node
+  a reader shows in the Markdown, apart from web addresses the sanitizer
+  removes by design
+- `bash scripts/check-public-hygiene.sh` and `cargo deny check`
 - Golden comparison of every tool over the public corpus against the previous
-  review build: 113 calls, no changed output, identical tool list
+  build: 132 calls, no changed output, identical tool list
+- The scanned-page check adds 1–5 ms to PDF calls on the public corpus and
+  about 0.1 s for a 42 MB file, with the same peak memory
 - `scripts/evaluate-upstream-abuse.py` against the AnyDoc mirror: 7/7
   `resource_limit`, recorded in `docs/resource-evidence.md`
 
@@ -207,6 +290,18 @@ When AnyDoc publishes a release after 0.2.4:
 4. Re-run the hardening corpus and the golden comparison, and re-check the
    ported `to_utf8` and `path::resolve` against the new source. Any change
    there must be mirrored in the local checks before adoption.
+5. Re-check the walker and format models against the new source: the HTML
+   walker (#147, #149 keep a list's other children), the numbering counters
+   (#129), the number-format grammar, and worksheet drawings (#151). Each
+   model mirrors 0.2.4 and would refuse or disclose what a fixed release
+   converts correctly.
+
+When pdf-inspector publishes a release after 1.24.0:
+
+1. If #479 or #501 is included, run the scanned-page fixtures through it and
+   keep the local invisible-layer scan until they agree.
+2. If #578 is included, route PDF Markdown through the sanitizer before
+   adoption, since link destinations will appear in it.
 
 ## Sources
 

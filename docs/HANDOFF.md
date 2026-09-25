@@ -1,6 +1,6 @@
 # anydoc-enhanced — public handoff
 
-**Last reconciled:** 2026-09-24
+**Last reconciled:** 2026-09-25
 **Repository:** <https://github.com/Jimthetaxguy/anydoc-enhanced>
 **Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.24.0, and every PDF tool runs in the bounded worker; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion. The 2026-09-24 upstream refresh is recorded in [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md).
 
@@ -42,6 +42,10 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 | `crates/pdf-inspector-skillkit/src/lib.rs` | PDF facade, validation, and serialized result types |
 | `crates/pdf-inspector-skillkit/src/pdf_worker.rs` | PDF operations framed for the bounded worker, and the in-process route for hosts without a sandbox |
 | `crates/pdf-inspector-skillkit/src/document.rs` | Document contract, package preflight that reads each package as AnyDoc reads it, worker supervisor and containment, and Markdown sanitizer |
+| `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters seen by a reading system (CSS, cascade, user-agent rules) and by AnyDoc's walker and stylesheet subset |
+| `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content walked as AnyDoc's walkers walk it, including spreadsheet cells and drawings |
+| `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats read with AnyDoc's grammar, against each cell's value |
+| `crates/pdf-inspector-skillkit/src/hidden_text_layer.rs` | Scanned PDF pages whose invisible OCR layer pdf-inspector 1.24.0 does not read |
 | `crates/pdf-inspector-skillkit/src/domain/` | Tax, IRC, SEC, and synthetic review logic |
 | `crates/pdf-inspector-mcp/src/main.rs` | MCP schemas, worker mode, tool registration, dispatch, and timeout response handling |
 | `scripts/check-public-hygiene.sh` | Candidate-text obvious-identifier heuristic used locally and in CI |
@@ -138,9 +142,13 @@ exact tool-name set. When parser dependencies change, also assert that
    hostile-resource, filesystem, and cross-platform gates remain.
 
 5. Finish the DOCX inline-content oracle. Ruby text and imported chunks fail
-   closed, and dropped non-breaking hyphens are reported as `partial`; confirm
-   the remaining elements the pinned walker skips (roadmap "Next slices").
+   closed, and dropped non-breaking hyphens and list numbers that differ from
+   Word's are reported as `partial`; confirm the remaining elements the pinned
+   walker skips (roadmap "Next slices").
 6. Adopt the next AnyDoc release only through the checklist in the
-   2026-09-24 audit, re-checking the ported `to_utf8` and `path::resolve`.
+   2026-09-24 audit, re-checking the ported `to_utf8` and `path::resolve` and
+   the walker, numbering, and number-format models.
+7. Put the refuse-or-disclose decisions listed in the roadmap to the owners
+   before widening any lane.
 
 The detailed ordering remains in [`docs/anydoc-integration-plan.md`](anydoc-integration-plan.md). Do not skip parser convergence or expose upstream AnyDoc model types directly through MCP.

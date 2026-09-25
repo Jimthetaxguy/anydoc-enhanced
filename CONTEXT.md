@@ -30,6 +30,8 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | **parser convergence** | One resolved `pdf-inspector` version shared by the skillkit and AnyDoc; required before integration |
 | **document service** | Provider-neutral contract above the PDF facade and bounded AnyDoc worker |
 | **public fixture** | Redistributable, provenance-recorded test input containing no PII or private source material |
+| **preflight model** | A local reading of a package as AnyDoc 0.2.4 reads it (walker positions, CSS, number formats, list counters) beside what Word, Excel, LibreOffice, or a reading system shows; where the two differ the lane refuses or discloses |
+| **`partial`** | Completeness for a DOCX conversion whose text is usable but altered: a dropped non-breaking hyphen (`characters_omitted`) or list numbers that differ from Word's (`list_numbering_differs`) |
 
 ## Module map
 
@@ -37,6 +39,11 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 |------|------|
 | `crates/pdf-inspector-skillkit/` | Domain + extraction helpers (library) |
 | `crates/pdf-inspector-skillkit/src/domain/` | `tax.rs`, `irc`, `sec`, `sweet` |
+| `crates/pdf-inspector-skillkit/src/document.rs` | Document contract, package preflight, worker supervisor, Markdown sanitizer |
+| `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters as a reader and as AnyDoc see them |
+| `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content as AnyDoc's walkers read it |
+| `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats as AnyDoc renders them |
+| `crates/pdf-inspector-skillkit/src/hidden_text_layer.rs` | Scanned PDF pages whose invisible OCR layer pdf-inspector 1.24.0 skips |
 | `crates/pdf-inspector-mcp/` | MCP server binary, worker mode, and tool registration |
 | `docs/` | Handoff, Sweet demo notes |
 | `docs/anydoc-integration-plan.md` | Dependency-ordered AnyDoc architecture and acceptance gates |
@@ -73,6 +80,9 @@ CI: GitHub Actions badge on README.
 - Bank-direct 1099-INTs often `Unknown` for form id
 - IRC parsing covers U.S. Code Title 26; Treasury Regulation numbering is not parsed
 - DOCX non-breaking hyphens are dropped by AnyDoc 0.2.4; the result is reported as `partial` with a `characters_omitted` warning, and the Markdown shows the joined words
+- DOCX list numbers that AnyDoc 0.2.4 counts differently from Word (a list continuing another, a deleted numbered paragraph, ordinals or words) are reported as `partial` with a `list_numbering_differs` warning; the Markdown shows AnyDoc's numbers
+- Spreadsheet pictures, charts, comments, and notes are not converted; a currency symbol AnyDoc's format parser rejects is dropped; text boxes, values a format hides, colour-only negatives, and unresolved dates are refused
+- Scanned PDF pages with an invisible OCR layer are listed for OCR; their text is not returned
 - Sweet tools are demo/synthetic until real packages wired
 
 ## Non-goals

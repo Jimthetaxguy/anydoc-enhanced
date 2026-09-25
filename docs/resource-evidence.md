@@ -70,6 +70,34 @@ A `batch_classify` over 24 files of 40 MiB lowers the server's high-water mark
 from 1,015 MiB to 192 MiB, because each call takes a slot before it reads its
 file.
 
+## Preflight model observations, 2026-09-25
+
+The EPUB, ODF, spreadsheet, and PDF checks added in review round four and
+loops 8–11 run before conversion. Their bounds, measured with the release
+build on Linux x86-64:
+
+| Input | Before | After |
+|---|---|---|
+| EPUB stylesheet with 16,000 unterminated `@import` rules | 9.27 s, 2,208 MiB | 0.01 s, 13 MiB |
+| Same with 64,000 | server killed at 32,000 | 0.03 s |
+| 200,000 imports fanned out 400 times | 7.09 s | 0.17 s, `resource_limit` |
+| 16,000 selectors matched against 16,000 elements | 3.54 s | 0.27 s |
+| 1.39 million selectors in one sheet | 182 MiB | 61 MiB, `resource_limit` at the token cap |
+
+The EPUB model caps tokens (500,000 per sheet), rules, imports, import depth,
+sheet applications, and matching work (50 million steps). The ODF walker stops
+at AnyDoc's depth bound, and the DOCX numbering reader at its depth and node
+bounds. The
+spreadsheet format check keeps at most 262,144 style and value pairs, which a
+workbook cannot exceed within Excel's 64,000 formats.
+
+The scanned-page check loads each PDF a second time with `lopdf`, decoding at
+most 32 MiB per content stream and 128 MiB and 10 million operations per
+document, with form nesting capped at 12. It adds 1.1 ms to `classify_pdf` on
+`source/sample-1.pdf`, 4.5 ms on `source/sample-2.pdf`, and about 96 ms on a
+42 MB file (230 to 327 ms), with peak memory unchanged (50 to 51 MiB). A page
+that binds no image is not decoded.
+
 ## Boundary and interpretation
 
 The document lanes enforce an 8 MiB Markdown cap and a 15-second deadline.
