@@ -15,6 +15,11 @@
 //! write it if it read it right, with the pages its widgets sit on. The
 //! Markdown decides: a value it shows was not lost, as when the page itself
 //! draws the value.
+//!
+//! A dynamic XFA form, which its catalog marks as needing rendering, keeps
+//! its whole content in XFA, which a viewer lays out; its pages hold only
+//! the notice a viewer without XFA shows, "Please wait...". pdf-inspector
+//! reads no XFA, so such a form converts to that notice alone.
 
 use std::collections::{HashMap, HashSet};
 
@@ -255,6 +260,27 @@ impl Walk<'_> {
     }
 }
 
+/// Whether `document` is a dynamic XFA form: its catalog says it needs
+/// rendering.
+pub(crate) fn needs_rendering(document: &Document) -> bool {
+    document
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|root| match root {
+            Object::Reference(id) => document.get_dictionary(*id).ok(),
+            Object::Dictionary(dictionary) => Some(dictionary),
+            _ => None,
+        })
+        .and_then(|root| root.get(b"NeedsRendering").ok())
+        .and_then(|needs| match needs {
+            Object::Reference(id) => document.get_object(*id).ok(),
+            needs => Some(needs),
+        })
+        .and_then(|needs| needs.as_bool().ok())
+        .unwrap_or(false)
+}
+
 /// The field values pdf-inspector misreads or passes over in the form of
 /// `document`, if it has one.
 pub(crate) fn misread(document: &Document) -> Vec<FormValue> {
@@ -469,6 +495,12 @@ mod tests {
         let catalog = document.add_object(dictionary! { "Type" => "Catalog" });
         document.trailer.set("Root", catalog);
         assert!(misread(&document).is_empty());
+        assert!(!needs_rendering(&document));
+        let mut dynamic = Document::with_version("1.7");
+        let catalog =
+            dynamic.add_object(dictionary! { "Type" => "Catalog", "NeedsRendering" => true });
+        dynamic.trailer.set("Root", catalog);
+        assert!(needs_rendering(&dynamic));
         assert!(garbled("S\u{FFFD}o", "São"));
         assert!(!garbled("José", "Jos\u{e9}"));
         assert_eq!(written("", "x"), "x");

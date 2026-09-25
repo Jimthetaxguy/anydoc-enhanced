@@ -96,6 +96,8 @@ pub const PDF_WARNING_HEADER_FOOTER_DROPPED: &str = "header_footer_dropped";
 pub const PDF_WARNING_FORM_VALUES_MISREAD: &str = "form_values_misread";
 /// Text an annotation shows on the page is missing from the Markdown.
 pub const PDF_WARNING_ANNOTATION_TEXT_UNREAD: &str = "annotation_text_unread";
+/// A dynamic XFA form's content is not in the Markdown.
+pub const PDF_WARNING_XFA_FORM_UNREAD: &str = "xfa_form_unread";
 
 /// Pages read again for lines dropped as running headers and footers, how
 /// many are read at a time and grouped into lines at a time, and the time
@@ -685,6 +687,13 @@ impl PdfInfo {
         self.check_form_values(&values, only);
         let annotations = std::mem::take(&mut found.annotation_texts);
         self.check_annotation_texts(&annotations);
+        if found.xfa_dynamic {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_XFA_FORM_UNREAD,
+                "This is a dynamic XFA form: its content and filled values are kept in XFA, which a viewer lays out and pdf-inspector 1.24.0 does not read, so the Markdown shows only what its pages hold without XFA, such as a \"Please wait...\" notice; read the form another way.",
+                Vec::new(),
+            ));
+        }
         if found.hidden_layer.is_empty() {
             return found;
         }

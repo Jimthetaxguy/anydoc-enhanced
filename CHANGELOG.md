@@ -51,9 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PDF results carry a `warnings` list, absent when empty, naming text the
   Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
   form text it does not read, pages that lose a line it takes for a running
-  header, form values it garbles or leaves out, annotation text it never
-  reads, and tables whose amounts may sit in the wrong row or column or
-  after the table (see Fixed). A full run that yields no Markdown for a text PDF
+  header, form values it garbles or leaves out, annotation text and dynamic
+  XFA forms it never reads, and tables whose amounts may sit in the wrong
+  row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -194,6 +194,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- A dynamic XFA form, whose content pdf-inspector 1.24.0 never reads, is
+  reported. Such a form, marked as needing rendering, keeps its fields and
+  filled values in XFA, which a viewer lays out; its pages hold only the
+  notice a viewer without XFA shows. A filled return made so converted as
+  "Please wait... If this message is not eventually replaced…" alone, at
+  confidence 1.0, with the taxpayer's wages nowhere in it. It now carries
+  the new `xfa_form_unread` warning; the Markdown is not changed. A form
+  with XFA that draws its own pages, as the IRS's static forms do, is not
+  reported: its values are read from its fields (see `form_values_misread`).
 - Text shown in annotations, which pdf-inspector 1.24.0 never reads, is
   reported. A PDF shows text in annotations besides its page content: a
   text box a reviewer types onto the page (FreeText), such as "Adjusted

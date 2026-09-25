@@ -287,6 +287,7 @@ came back clean. The evidence and dispositions are in
 | 20 | PDF lines pdf-inspector drops as running headers or footers though they differ from the line it keeps (upstream issue #483) | `header_footer_dropped`; a consolidated statement whose second and third accounts lost their account numbers, and a payroll register whose later employees lost their IDs, are reported, while headers repeated as they are or numbering their pages are not; no corpus, fixture, review, or fuzz PDF among 4,521 is named |
 | 21 | PDF form values pdf-inspector reads as UTF-8 or never reads (upstream issue #504) | `form_values_misread`; a UTF-16 payee name that read as "��\0J\0o\0s…", an accented city, and a radio group's filing status that the Markdown left out are reported, while plain values on their own widgets are not |
 | 22 | PDF annotation text pdf-inspector never reads (text boxes, stamps and watermarks drawn in text) | `annotation_text_unread`; a reviewer's "Adjusted basis 12,500.00 per preparer" text box and a "RECEIVED APR 15 2025" stamp, missing from the Markdown, are reported, and the same text set in the page's own content is not |
+| 23 | PDF dynamic XFA forms pdf-inspector never reads | `xfa_form_unread`; a filled return made in dynamic XFA, converted as its "Please wait..." notice alone at confidence 1.0, is reported, and a static XFA form is not |
 
 ## Next slices
 

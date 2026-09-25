@@ -737,6 +737,9 @@ pub(crate) struct Findings {
     /// Text annotations show that pdf-inspector never reads, when the pages
     /// are read for repeats (see `annotations`).
     pub(crate) annotation_texts: Vec<crate::annotations::AnnotationText>,
+    /// Whether the document is a dynamic XFA form, whose content
+    /// pdf-inspector never reads, when the pages are read for repeats.
+    pub(crate) xfa_dynamic: bool,
 }
 
 /// Words shown glyph by glyph kept across a document.
@@ -769,6 +772,7 @@ pub(crate) fn scan(
     if twice_skip.is_some() {
         found.form_values = crate::form_fields::misread(&document);
         found.annotation_texts = crate::annotations::unread(&document, only);
+        found.xfa_dynamic = crate::form_fields::needs_rendering(&document);
     }
     // Words shown glyph by glyph, by page and font, and the fonts seen
     // painting their spaces on any page.

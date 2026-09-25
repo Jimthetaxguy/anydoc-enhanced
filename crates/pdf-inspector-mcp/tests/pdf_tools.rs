@@ -1045,6 +1045,62 @@ fn annotation_text_pdf_inspector_never_reads_is_reported() {
     assert_eq!(reported(&results[1]), None, "{}", results[1]);
 }
 
+/// A filled tax form made in XFA, whose page holds only the notice a
+/// viewer without XFA shows; `dynamic` marks it as needing rendering.
+fn xfa_form_pdf(dynamic: bool) -> Vec<u8> {
+    let needs = if dynamic { " /NeedsRendering true" } else { "" };
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R{needs} /AcroForm << /Fields [] /XFA [(template) 6 0 R (datasets) 7 0 R] >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 10 Tf 36 740 Td (Please wait... If this message is not eventually replaced by the proper contents of the document, your PDF viewer may not be able to display this type of document.) Tj ET",
+        ),
+        stream(
+            "",
+            b"<template xmlns=\"http://www.xfa.org/schema/xfa-template/3.3/\"><subform name=\"form1\"><field name=\"Wages\"/></subform></template>",
+        ),
+        stream(
+            "",
+            b"<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data><form1><Wages>85000.00</Wages></form1></xfa:data></xfa:datasets>",
+        ),
+    ])
+}
+
+#[test]
+fn dynamic_xfa_forms_pdf_inspector_cannot_read_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for dynamic in [true, false] {
+        let path = temporary.path().join(format!("xfa-{dynamic}.pdf"));
+        std::fs::write(&path, xfa_form_pdf(dynamic)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| {
+        result["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "xfa_form_unread")
+        })
+    };
+    // pdf-inspector 1.24.0 reads no XFA: the Markdown is the notice alone.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("Please wait") && !markdown.contains("85000.00"),
+        "{markdown}"
+    );
+    assert!(reported(&results[0]), "{}", results[0]);
+    // A form that does not need rendering draws its own pages.
+    assert!(!reported(&results[1]), "{}", results[1]);
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");
