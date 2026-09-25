@@ -600,6 +600,8 @@ enum Property {
     Position,
     /// Whether a `::before` or `::after` box keeps the line feeds it shows.
     WhiteSpace,
+    /// Whether a `::before` or `::after` box is transparent (`opacity: 0`).
+    Opacity,
 }
 
 /// What a `content` declaration makes a `::before` or `::after` box show.
@@ -855,6 +857,7 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         "content" => Property::Content,
         "position" => Property::Position,
         "white-space" | "white-space-collapse" => Property::WhiteSpace,
+        "opacity" => Property::Opacity,
         _ => return None,
     };
     let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
@@ -920,6 +923,7 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
     };
     let flow = match property {
         _ if computed => Some(Tri::Maybe),
+        Property::Opacity => transparent(value),
         _ if other || keywords.is_empty() => None,
         Property::Display if effect != Effect::Show => None,
         Property::Display if has(&INLINE_DISPLAY_KEYWORDS) || has(&["unset"]) => Some(Tri::Yes),
@@ -972,6 +976,24 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         items,
         generated,
     })
+}
+
+/// Whether an `opacity` value makes a box transparent: zero, or less, as a
+/// number or a percentage. `inherit` takes the parent's, not read.
+fn transparent(value: &[Token]) -> Option<Tri> {
+    match value {
+        [Token::Numeric(number)] => number
+            .trim_end_matches('%')
+            .parse::<f64>()
+            .ok()
+            .map(|opacity| if opacity <= 0.0 { Tri::Yes } else { Tri::No }),
+        [Token::Ident(word)] => match word.to_ascii_lowercase().as_str() {
+            "inherit" => Some(Tri::Maybe),
+            "initial" | "unset" | "revert" | "revert-layer" => Some(Tri::No),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The declarations of an inline `style` attribute.
@@ -2406,19 +2428,17 @@ fn parse_style_block(
     if media && !declarations.is_empty() {
         let declarations: Rc<[Declaration]> = declarations.into();
         // A `::before` or `::after` box matters for where a reader breaks
-        // lines, which its `display`, `content`, `position`, and
-        // `white-space` decide, and for the text it shows. An element's own
-        // `content` and `white-space` are not read.
-        let lays_out = declarations.iter().any(|declaration| {
-            matches!(
-                declaration.property,
-                Property::Display | Property::Content | Property::Position | Property::WhiteSpace
-            )
-        });
+        // lines, which its `display`, `content`, `float`, `position`, and
+        // `white-space` decide, and for the text it shows, which its
+        // `visibility` and `opacity` may keep unseen. An element's own
+        // `content`, `white-space`, and `opacity` are not read.
+        let lays_out = declarations
+            .iter()
+            .any(|declaration| !matches!(declaration.property, Property::ContentVisibility));
         let styles_element = declarations.iter().any(|declaration| {
             !matches!(
                 declaration.property,
-                Property::Content | Property::WhiteSpace
+                Property::Content | Property::WhiteSpace | Property::Opacity
             )
         });
         for selector in parse_selector_list(selectors, 0) {
@@ -2518,17 +2538,26 @@ pub(super) struct ReaderStyle {
     floats: Tri,
     /// Whether it lays its children out as flex or grid items.
     items: Tri,
-    /// A `::before` or `::after` box that is a block in the flow, breaking
-    /// the line before or after the element's content.
-    breaks_before: Tri,
-    breaks_after: Tri,
-    /// A `::before` or `::after` box certainly shows text that carries
-    /// meaning, which AnyDoc does not convert.
-    generates_text: bool,
-    /// A sign an amount reads by that a `::before` or `::after` box
-    /// certainly shows, which matters beside a digit.
-    sign_before: Option<Sign>,
-    sign_after: Option<Sign>,
+    /// Its `::before` and `::after` boxes.
+    before: PseudoBox,
+    after: PseudoBox,
+}
+
+/// What a `::before` or `::after` box does, as far as the check reads it.
+#[derive(Clone, Copy, Default)]
+struct PseudoBox {
+    /// It is a block in the flow, or keeps a line feed, and breaks the line
+    /// before or after the element's content.
+    breaks: Tri,
+    /// It certainly shows text that carries meaning, which AnyDoc does not
+    /// convert.
+    text: bool,
+    /// A sign an amount reads by that it certainly shows, which matters
+    /// beside a digit.
+    sign: Option<Sign>,
+    /// Whether its text is certainly unseen (`visibility: hidden`,
+    /// `opacity: 0`); `None` where it takes the element's visibility.
+    unseen: Option<bool>,
 }
 
 /// How a reader lays an element out beside the text around it, as far as
@@ -2893,7 +2922,7 @@ impl Cascade {
                     return;
                 }
                 // What only `::before` and `::after` boxes read.
-                Property::Content | Property::WhiteSpace => return,
+                Property::Content | Property::WhiteSpace | Property::Opacity => return,
             };
             if let (Property::Display, Some(flow)) = (declaration.property, declaration.flow) {
                 flows[0].push((precedence, certainty, flow));
@@ -2909,12 +2938,18 @@ impl Cascade {
         };
         // For each of `::before` and `::after`: whether it is a block box,
         // whether `display: none` removes it, what it shows, whether it
-        // leaves the flow, and whether it keeps line feeds.
+        // leaves the flow by position or float, whether it keeps line
+        // feeds, whether `visibility` hides it (`Maybe` for a value not
+        // known until run time, `None` to take the element's), and whether
+        // it is transparent.
         let mut pseudo_blocks: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_none: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_content: [Vec<(Precedence, Tri, Option<Generated>)>; 2] = Default::default();
         let mut pseudo_out: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_floats: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_line_feeds: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_hidden: [Vec<(Precedence, Tri, Option<Tri>)>; 2] = Default::default();
+        let mut pseudo_clear: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         for index in candidates {
             let CascadeRule {
                 rule,
@@ -2960,8 +2995,27 @@ impl Cascade {
                             pseudo_out[slot].push((precedence, certainty, out));
                             continue;
                         }
+                        (Property::Float, Some(floats)) => {
+                            pseudo_floats[slot].push((precedence, certainty, floats));
+                            continue;
+                        }
                         (Property::WhiteSpace, Some(kept)) => {
                             pseudo_line_feeds[slot].push((precedence, certainty, kept));
+                            continue;
+                        }
+                        (Property::Visibility, computed) => {
+                            let hidden = match declaration.effect {
+                                _ if computed.is_some() => Some(Tri::Maybe),
+                                Effect::Hide => Some(Tri::Yes),
+                                Effect::Show => Some(Tri::No),
+                                Effect::Inherit => None,
+                                Effect::Neutral => continue,
+                            };
+                            pseudo_hidden[slot].push((precedence, certainty, hidden));
+                            continue;
+                        }
+                        (Property::Opacity, Some(clear)) => {
+                            pseudo_clear[slot].push((precedence, certainty, clear));
                             continue;
                         }
                         _ => {}
@@ -3122,7 +3176,9 @@ impl Cascade {
         // it away: what it shows, and whether it breaks the line, as a block
         // in the flow or with a line feed it keeps. Without a `white-space`
         // of its own, it keeps line feeds as the element does, which is not
-        // read.
+        // read. A floated or positioned box leaves the line. Its text is
+        // unseen only where `opacity: 0` or `visibility` certainly keeps
+        // it so.
         let pseudo = |slot: usize| {
             let (content, contested) =
                 resolve_value(&pseudo_content[slot], Some(Generated::Nothing));
@@ -3151,15 +3207,30 @@ impl Cascade {
                 }
                 _ => Tri::No,
             };
+            let out_of_flow = resolve_flow(&pseudo_out[slot], false)
+                .max(resolve_flow(&pseudo_floats[slot], false));
             let breaks = all_three(
                 exists,
                 resolve_flow(&pseudo_blocks[slot], false).max(line_feed),
-                resolve_flow(&pseudo_out[slot], false).not(),
+                out_of_flow.not(),
             );
-            (breaks, text, sign)
+            let unseen = if resolve_flow(&pseudo_clear[slot], false) == Tri::Yes {
+                Some(true)
+            } else {
+                match resolve_value(&pseudo_hidden[slot], None) {
+                    (Some(Tri::Yes), false) => Some(true),
+                    (None, false) => None,
+                    _ => Some(false),
+                }
+            };
+            PseudoBox {
+                breaks,
+                text,
+                sign,
+                unseen,
+            }
         };
-        let (breaks_before, before_text, sign_before) = pseudo(0);
-        let (breaks_after, after_text, sign_after) = pseudo(1);
+        let (before, after) = (pseudo(0), pseudo(1));
         Ok(ReaderStyle {
             display: resolve(&applied[0]),
             visibility: resolve(&applied[1]),
@@ -3168,11 +3239,8 @@ impl Cascade {
             // A box positioned out of the flow sits apart like a float.
             floats: resolve_flow(&flows[1], false).max(resolve_flow(&flows[3], false)),
             items: resolve_flow(&flows[2], false),
-            breaks_before,
-            breaks_after,
-            generates_text: before_text || after_text,
-            sign_before,
-            sign_after,
+            before,
+            after,
         })
     }
 }
@@ -4175,7 +4243,7 @@ fn meet_run(
         _ => own,
     };
     let (breaks_before, breaks_after) = style.map_or((Tri::No, Tri::No), |style| {
-        (style.breaks_before, style.breaks_after)
+        (style.before.breaks, style.after.breaks)
     });
     let keep_in_run = |run: &mut Run, effects: &mut Effects, glyphs: (u64, u64)| match flow {
         // A block `::before` or `::after` box still breaks the line.
@@ -4709,19 +4777,25 @@ pub(super) fn chapter_text(
             }
         };
         // What a shown `::before` or `::after` box adds, which AnyDoc never
-        // converts: text, such as a label, and a sign beside digits. AnyDoc
+        // converts: text, such as a label, and a sign beside digits. A box
+        // takes the element's visibility unless its own settles it. AnyDoc
         // writes a list item with a list marker of its own, which stands in
         // for a sign before or after it.
-        let hidden =
-            state.undisplayed || state.invisible || state.contents_hidden || state.unpainted;
+        let hidden = state.undisplayed || state.contents_hidden || state.unpainted;
         let generated = style
             .as_ref()
             .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
-        found.drops_shown |= generated.is_some_and(|style| style.generates_text);
+        let seen = |pseudo: &PseudoBox| !pseudo.unseen.unwrap_or(state.invisible);
+        found.drops_shown |= generated.is_some_and(|style| {
+            [style.before, style.after]
+                .iter()
+                .any(|pseudo| pseudo.text && seen(pseudo))
+        });
         let list_item = parent_reach == Some(Reach::List) && reach == Reach::Walk && !spliced;
         let signs = generated.filter(|_| !list_item);
-        let sign_before = signs.and_then(|style| style.sign_before);
-        effects.sign_after = signs.and_then(|style| style.sign_after);
+        let sign_before = signs.and_then(|style| style.before.sign.filter(|_| seen(&style.before)));
+        effects.sign_after =
+            signs.and_then(|style| style.after.sign.filter(|_| seen(&style.after)));
         state.effects.sign_after = effects.sign_after;
         // A sign before the element's content sits before the text after
         // it, and after the text the line holds before it.
@@ -5533,6 +5607,11 @@ mod tests {
             &[".br::after { content: ''; display: inline }"],
             r#"<p><span class="br">Balance due</span>1,250.00</p>"#
         ));
+        // A floated block box leaves the line, as a positioned one does.
+        assert!(!fuses(
+            &[".ic::before { content: ''; display: block; float: left }"],
+            r#"<p>Total:<span class="ic">1,250.00</span> due.</p>"#
+        ));
     }
 
     #[test]
@@ -5690,6 +5769,20 @@ mod tests {
                 r#".tip::after { content: attr(title); display: block; position: absolute }"#,
                 r#"<p>See <abbr class="tip" title="adjusted gross income">AGI</abbr>.</p>"#,
             ),
+            // A box whose visibility is not settled, and one visible on an
+            // element that is not.
+            (
+                r#".tip::after { content: attr(title); visibility: var(--tip) }"#,
+                r#"<p>See <abbr class="tip" title="adjusted gross income">AGI</abbr>.</p>"#,
+            ),
+            (
+                r#".tip::after { content: attr(title) } .tip:has(b)::after { opacity: 0 }"#,
+                r#"<p>See <abbr class="tip" title="adjusted gross income">AGI</abbr>.</p>"#,
+            ),
+            (
+                r#".x { visibility: hidden } .x::before { content: "Label"; visibility: visible }"#,
+                r#"<p>Due <span class="x"/></p>"#,
+            ),
             // Signs beside the digits of an amount.
             (
                 r#".neg::before { content: "(" } .neg::after { content: ")" }"#,
@@ -5721,6 +5814,19 @@ mod tests {
             (
                 r#".n::before { content: "\2212"; display: none }"#,
                 r#"<p><span class="n">1,250.00</span></p>"#,
+            ),
+            // A box kept unseen until the pointer rests on its element.
+            (
+                r#".gl::after { content: attr(title); position: absolute; opacity: 0 } .gl:hover::after { opacity: 1 }"#,
+                r#"<p>File the <span class="gl" title="adjusted gross income">AGI</span> worksheet.</p>"#,
+            ),
+            (
+                r#".gl::after { content: attr(title); visibility: hidden } .gl:hover::after { visibility: visible }"#,
+                r#"<p>File the <span class="gl" title="adjusted gross income">AGI</span> worksheet.</p>"#,
+            ),
+            (
+                r#".n { visibility: hidden } .n::before { content: "\2212" }"#,
+                r#"<p><span class="n"/>1,250.00</p>"#,
             ),
             (
                 r#".n { display: none } .n::before { content: "\2212" }"#,
