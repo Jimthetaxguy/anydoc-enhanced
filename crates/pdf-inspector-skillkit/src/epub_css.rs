@@ -3497,6 +3497,9 @@ struct Open {
     /// For an SVG `switch`: whether a child it may render has come, which
     /// leaves the later ones unrendered.
     switch_taken: Option<bool>,
+    /// The font size an SVG element's attributes or inline style set, on it
+    /// or on an element around it inside the image.
+    svg_font: Option<f64>,
     /// Children are laid out as flex or grid items.
     items: Tri,
     exempt: Exempt,
@@ -3545,20 +3548,30 @@ struct FloatStart {
 struct Placement {
     top: f64,
     left: f64,
+    /// The em, and whether the style sets the font size it comes from.
     em: f64,
+    sized: bool,
 }
 
 impl Placement {
     /// Whether a box placed at `next` goes on the line this one starts,
     /// which took in `glyphs`: its top within half an em, as a superscript
     /// stands, and its left further right, no further than the glyphs
-    /// reach at 0.6 em each, a wide average, and an em for a space after
-    /// them. Further on, the box stands apart as words set apart do.
+    /// reach. Further on, the box stands apart as words set apart do.
     fn goes_on(&self, next: &Placement, glyphs: u64) -> bool {
         (next.top - self.top).abs() <= self.em / 2.0
             && next.left > self.left
-            && next.left <= self.left + (glyphs as f64 * 0.6 + 1.0) * self.em
+            && next.left <= self.left + reach(glyphs, self.em, self.sized)
     }
+}
+
+/// How far along a line glyphs set in a font of `em` pixels reach: half an
+/// em each, an average of text, and half an em for a space after them,
+/// where the font's size is set; 0.6 em each and an em where 16 pixels
+/// only stands in for it, which a larger font outgrows.
+fn reach(glyphs: u64, em: f64, sized: bool) -> f64 {
+    let (each, space) = if sized { (0.5, 0.5) } else { (0.6, 1.0) };
+    (glyphs as f64 * each + space) * em
 }
 
 /// A CSS length in pixels: `px`, `pt`, `em` (of `em` pixels), `rem`, or a
@@ -3580,11 +3593,17 @@ fn pixels(number: &str, em: f64) -> Option<f64> {
     Some(value * scale)
 }
 
-/// Where an element's inline style places it (see [`Placement`]); `None`
-/// where it does not set `top` and `left` as lengths.
-fn placement(element: &Element) -> Option<Placement> {
-    let tokens = tokenize(element.first("style")?).ok()?;
-    let mut lengths: [Option<&str>; 3] = [None; 3];
+/// The numbers an element's inline style gives the named properties, as
+/// written ("40px"), the last declaration of each winning; `None` for one
+/// it does not set to a single number.
+fn inline_numbers<const N: usize>(element: &Element, names: [&str; N]) -> [Option<String>; N] {
+    let mut numbers: [Option<String>; N] = std::array::from_fn(|_| None);
+    let Some(tokens) = element
+        .first("style")
+        .and_then(|style| tokenize(style).ok())
+    else {
+        return numbers;
+    };
     for declaration in split_top_level(&tokens, &Token::Semicolon) {
         let [Token::Ident(name), rest @ ..] = trim_whitespace(declaration) else {
             continue;
@@ -3592,25 +3611,132 @@ fn placement(element: &Element) -> Option<Placement> {
         let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
             continue;
         };
-        let slot = match name.to_ascii_lowercase().as_str() {
-            "top" => 0,
-            "left" => 1,
-            "font-size" => 2,
-            _ => continue,
-        };
-        lengths[slot] = match trim_whitespace(value) {
-            [Token::Numeric(number)] => Some(number.as_str()),
+        if let Some(slot) = names
+            .iter()
+            .position(|wanted| name.eq_ignore_ascii_case(wanted))
+        {
+            numbers[slot] = match trim_whitespace(value) {
+                [Token::Numeric(number)] => Some(number.clone()),
+                _ => None,
+            };
+        }
+    }
+    numbers
+}
+
+/// Where an element's inline style places it (see [`Placement`]); `None`
+/// where it does not set `top` and `left` as lengths.
+fn placement(element: &Element) -> Option<Placement> {
+    let [top, left, size] = inline_numbers(element, ["top", "left", "font-size"]);
+    let size = size.and_then(|size| pixels(&size, 16.0));
+    let em = size.unwrap_or(16.0);
+    Some(Placement {
+        top: pixels(&top?, em)?,
+        left: pixels(&left?, em)?,
+        em,
+        sized: size.is_some(),
+    })
+}
+
+/// Where an SVG text chunk starts, in its text element's space: the place
+/// a `text` or `tspan` sets, the glyphs taken in before it, and the em of
+/// its font, and whether an attribute or style sets its size.
+#[derive(Clone, Copy, Debug)]
+struct Pen {
+    x: f64,
+    y: f64,
+    glyphs: u64,
+    em: f64,
+    sized: bool,
+}
+
+/// A single number an SVG attribute gives, in user units or pixels; `None`
+/// for a list, a percentage, or another unit.
+fn svg_number(value: &str) -> Option<f64> {
+    let value = value.trim();
+    value.strip_suffix("px").unwrap_or(value).parse().ok()
+}
+
+/// The font size, in pixels, an SVG element's inline style or attribute
+/// sets.
+fn svg_font_size(element: &Element) -> Option<f64> {
+    let [size] = inline_numbers(element, ["font-size"]);
+    size.and_then(|size| pixels(&size, 16.0))
+        .or_else(|| element.first("font-size").and_then(svg_number))
+}
+
+/// How a reader sets an SVG `text` or `tspan` beside the text before it. A
+/// `text` sets a label of its own, from the place its `x` and `y` give the
+/// pen. A `tspan` placed anew goes on its label's line where it stays on
+/// the line (`y` within half an em) and starts where the glyphs since the
+/// pen reach (0.6 em each and an em for a space), as a kerning pair or a
+/// change of style is set, and may then touch the text before it; set on
+/// another line (a `y` beyond, or a `dy` with it), or further along, as a
+/// separate label is, it stands apart. A `tspan` moved from where the
+/// glyphs before it end stands apart past half an em along the line
+/// (`dx`), and may touch them moved off it as a superscript is (`dy`).
+/// `em` is the element's font's.
+fn svg_text_flow(
+    run: &mut Run,
+    element: &Element,
+    glyphs: u64,
+    font: Option<f64>,
+    own: Flow,
+) -> Flow {
+    let (em, sized) = (font.unwrap_or(16.0), font.is_some());
+    let number = |name: &str| element.first(name).map(svg_number);
+    let (x, y, dx, dy) = (number("x"), number("y"), number("dx"), number("dy"));
+    if element.local == "text" {
+        run.svg_pen = match (x.unwrap_or(Some(0.0)), y.unwrap_or(Some(0.0))) {
+            (Some(x), Some(y)) => Some(Pen {
+                x,
+                y,
+                glyphs,
+                em,
+                sized,
+            }),
             _ => None,
         };
+        return Flow::Block;
     }
-    let em = lengths[2]
-        .and_then(|size| pixels(size, 16.0))
-        .unwrap_or(16.0);
-    Some(Placement {
-        top: pixels(lengths[0]?, em)?,
-        left: pixels(lengths[1]?, em)?,
-        em,
-    })
+    let pen = run.svg_pen.take();
+    if x.is_none() && y.is_none() {
+        return match (dx, dy) {
+            (None, None) => {
+                run.svg_pen = pen;
+                own
+            }
+            (Some(Some(dx)), None) if dx <= 0.0 => own,
+            (Some(Some(dx)), None) if dx <= em / 2.0 => Flow::MaybeApart,
+            (None, Some(Some(_))) => Flow::MaybeApart,
+            _ => Flow::Block,
+        };
+    }
+    let y = match y {
+        None => pen.map(|pen| pen.y),
+        Some(y) => y,
+    };
+    let placed_x = x.flatten().map(|x| x + dx.flatten().unwrap_or(0.0));
+    if let (Some(x), Some(y)) = (placed_x, y) {
+        run.svg_pen = Some(Pen {
+            x,
+            y,
+            glyphs,
+            em,
+            sized,
+        });
+    }
+    let (Some(pen), Some(y)) = (pen, y) else {
+        return Flow::Block;
+    };
+    let same_line = (y - pen.y).abs() <= pen.em / 2.0 && dy.is_none_or(|dy| dy == Some(0.0));
+    let end = pen.x + reach(glyphs - pen.glyphs, pen.em, pen.sized);
+    match (x, placed_x) {
+        // Moved up or down from where the glyphs before it end.
+        (None, _) if same_line => Flow::MaybeApart,
+        (Some(_), Some(x)) if same_line && x > pen.x && x <= end => Flow::MaybeApart,
+        _ => Flow::Block,
+    }
 }
 
 /// One inline run of AnyDoc's walker (a `Builder`): the text it last
@@ -3639,6 +3765,8 @@ struct Run {
     /// taken in these glyphs: what comes next starts a line of its own,
     /// unless it is a sibling placed where that line goes on.
     after_placed: Option<(Placement, u64)>,
+    /// Where the current chunk of an SVG text label starts, where known.
+    svg_pen: Option<Pen>,
     /// A sign a `::before` or `::after` box shows sits before the next
     /// text.
     sign_before: Option<Sign>,
@@ -4324,6 +4452,9 @@ struct Meeting<'a> {
     parent_items: Tri,
     /// The element is inside an SVG image.
     in_svg: bool,
+    /// The size of its font there, where its attributes or inline style,
+    /// or those of an element around it, set it.
+    svg_font: Option<f64>,
 }
 
 /// How an element meets the run it sits in as it starts, and what it will
@@ -4344,27 +4475,35 @@ fn meet_run(
         style,
         parent_items,
         in_svg,
+        svg_font,
     } = *meeting;
     let local = element.local.as_str();
     let spliced = !run.splices.is_empty();
     // How a reader lays the element out beside the text around it. A flex
-    // or grid item is a block of its own, as is each text of an SVG image
-    // and each span of one set at a place of its own; otherwise its style
-    // decides, or, where it was not read (the element holds no text), the
-    // reader's defaults.
+    // or grid item is a block of its own, as is each text label of an SVG
+    // image; otherwise its style decides, or, where it was not read (the
+    // element holds no text), the reader's defaults.
     let own = match style {
         Some(style) => style.flow(),
         None if reader_block_by_default(element) => Flow::Block,
         None => Flow::Inline,
     };
-    let placed = |name: &str| element.first(name).is_some();
+    // A span of an SVG label meets the text before it as its place says
+    // (see [`svg_text_flow`]); the text after it goes on from where its
+    // glyphs end.
+    if in_svg && matches!(local, "text" | "tspan") {
+        let junction = svg_text_flow(run, element, glyphs.0, svg_font, own);
+        if local == "tspan" {
+            run.mark(match junction {
+                Flow::Block => Tri::Yes,
+                Flow::MaybeApart => Tri::Maybe,
+                _ => Tri::No,
+            });
+        }
+    }
     let flow = match (parent_items, own) {
         (Tri::Yes, _) | (_, Flow::Block) => Flow::Block,
-        _ if in_svg && (local == "text" || (local == "tspan" && (placed("x") || placed("y")))) => {
-            Flow::Block
-        }
-        // Moved off the line only by a shift that may be a superscript's.
-        _ if in_svg && local == "tspan" && placed("dy") => Flow::MaybeApart,
+        _ if in_svg && local == "text" => Flow::Block,
         (Tri::Maybe, _) => Flow::MaybeApart,
         _ => own,
     };
@@ -4814,6 +4953,9 @@ pub(super) fn chapter_text(
         let spliced = runs.last().is_some_and(|run| !run.splices.is_empty());
         let parent_items = open.last().map_or(Tri::No, |parent| parent.items);
         let parent_in_svg = open.last().is_some_and(|parent| parent.in_svg);
+        let svg_font = (parent_in_svg || element.lower == "svg")
+            .then(|| svg_font_size(element).or(open.last().and_then(|parent| parent.svg_font)))
+            .flatten();
         let mut effects = match (parent_reach, reach, runs.last_mut()) {
             (Some(Reach::Root), Reach::Walk, _) => Effects {
                 opens_run: true,
@@ -4836,6 +4978,7 @@ pub(super) fn chapter_text(
                     style: style.as_ref(),
                     parent_items,
                     in_svg: parent_in_svg,
+                    svg_font,
                 },
                 &mut glyphs,
                 &mut found,
@@ -4887,6 +5030,7 @@ pub(super) fn chapter_text(
                 unpainted,
                 svg_text,
                 switch_taken,
+                svg_font,
                 items: Tri::No,
                 exempt: Exempt::None,
                 effects,
@@ -4920,6 +5064,7 @@ pub(super) fn chapter_text(
                     unpainted,
                     svg_text,
                     switch_taken,
+                    svg_font,
                     items: style.items,
                     exempt,
                     effects,
@@ -5872,6 +6017,32 @@ mod tests {
                     r#"<svg {svg}><text><tspan x="10" dy="1.2em">Balance due</tspan><tspan x="10" dy="1.2em">1,250.00</tspan></text></svg>"#
                 ),
             ),
+            // Spans of a label set on another line, further along it, or
+            // moved past half an em; on the line, digits that meet.
+            (
+                &[],
+                format!(
+                    r#"<svg {svg}><text x="10" y="30"><tspan x="10" y="30">Collect the forms</tspan><tspan x="10" y="50">Review the totals</tspan></text></svg>"#
+                ),
+            ),
+            (
+                &[],
+                format!(r#"<svg {svg}><text x="20" y="90" font-size="12">Q1<tspan x="90">Q2</tspan></text></svg>"#),
+            ),
+            (
+                &[],
+                format!(
+                    r#"<svg {svg}><text font-size="24">Quarterly W<tspan x="136.4" y="0">orkbook</tspan></text></svg>"#
+                ),
+            ),
+            (
+                &[],
+                format!(r#"<svg {svg}><text x="0" y="20">Balance due<tspan dx="40">1,250.00</tspan></text></svg>"#),
+            ),
+            (
+                &[],
+                format!(r#"<svg {svg}><text>Units 12<tspan x="70" y="0">50</tspan></text></svg>"#),
+            ),
             // A line feed a `::before` box keeps.
             (
                 &[r#".amt::before { content: "\A"; white-space: pre }"#],
@@ -5941,6 +6112,20 @@ mod tests {
             (
                 &[],
                 format!(r#"<svg {svg}><text>Area<tspan dy="-4">2</tspan></text></svg>"#),
+            ),
+            // A label's spans placed where the glyphs before them end, as
+            // a kerning pair or a change of style is set.
+            (
+                &[],
+                format!(
+                    r#"<svg {svg}><text transform="matrix(1 0 0 1 20 40)" font-size="24">T<tspan x="14.06" y="0">ax Year Summary</tspan></text></svg>"#
+                ),
+            ),
+            (
+                &[],
+                format!(
+                    r#"<svg {svg}><g font-size="24"><text><tspan x="0" y="0">Quarterly W</tspan><tspan x="120.01" y="0">orkbook</tspan></text></g></svg>"#
+                ),
             ),
         ] {
             assert!(!fuses(sheets, &body), "{body}");
