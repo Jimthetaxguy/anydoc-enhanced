@@ -1878,6 +1878,11 @@ enum Effect {
     Show,
     /// Takes the parent's value (`visibility: inherit`).
     Inherit,
+    /// Takes the value the user agent's rules give (`revert`).
+    Revert,
+    /// Takes the value the cascade layers below the declaration's give
+    /// (`revert-layer`).
+    RevertLayer,
     /// A value a reader ignores, such as an invalid keyword.
     Neutral,
 }
@@ -2335,8 +2340,18 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
             _ => other = true,
         }
     }
+    // What the layers below give `content` is not read.
+    if property == Property::Content && !other && keywords == ["revert-layer"] {
+        computed = true;
+    }
     let has = |wanted: &[&str]| keywords.iter().any(|word| wanted.contains(&word.as_str()));
+    let hiding = matches!(
+        property,
+        Property::Display | Property::Visibility | Property::ContentVisibility
+    );
     let effect = match property {
+        _ if hiding && !computed && !other && keywords == ["revert"] => Effect::Revert,
+        _ if hiding && !computed && !other && keywords == ["revert-layer"] => Effect::RevertLayer,
         Property::Display if computed || has(&["none"]) => Effect::Hide,
         Property::Display
             if !other
@@ -2364,6 +2379,10 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
         _ if computed => Some(Tri::Maybe),
         Property::Opacity => transparent(value),
         _ if other || keywords.is_empty() => None,
+        // The user agent's rules make the box a block or inline by the
+        // element (see [`Cascade::evaluate`]); the layers below may
+        // make it either.
+        Property::Display if effect == Effect::RevertLayer => Some(Tri::Maybe),
         Property::Display if effect != Effect::Show => None,
         Property::Display if has(&INLINE_DISPLAY_KEYWORDS) || has(&["unset"]) => Some(Tri::Yes),
         Property::Display if has(&BLOCK_DISPLAY_KEYWORDS) => Some(Tri::No),
@@ -2393,7 +2412,10 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
         _ => None,
     };
     let layout = match property {
-        Property::Display if computed || has(&["inherit"]) => Some(Layout::Unknown),
+        Property::Display if computed || has(&["inherit"]) || effect == Effect::RevertLayer => {
+            Some(Layout::Unknown)
+        }
+        Property::Display if effect == Effect::Revert => Some(Layout::Flow),
         Property::Display if effect == Effect::Show => Some(if has(&["contents"]) {
             Layout::Contents
         } else if has(&FLEX_DISPLAY_KEYWORDS) {
@@ -4398,12 +4420,22 @@ pub(super) struct Stylesheet {
     /// properties.
     others: usize,
     pub(super) imports: Vec<(String, Applies)>,
-    /// The cascade layers it declares, in order, each by its names from the
-    /// outermost; an anonymous one by a name no sheet can write.
-    layers: Vec<Box<[String]>>,
+    /// The cascade layers it declares, in the order they are first declared.
+    layers: Vec<SheetLayer>,
     /// The namespace prefixes it declares (`@namespace`), by the names
     /// they are bound to.
     namespaces: Rc<[(String, Rc<str>)]>,
+}
+
+/// A cascade layer a sheet declares: its names from the outermost, an
+/// anonymous one's a name no sheet can write; how the `@media` and
+/// `@supports` conditions around its first declaration hold; and whether
+/// it is declared again after that.
+#[derive(Debug)]
+struct SheetLayer {
+    path: Box<[String]>,
+    declared: Applies,
+    again: bool,
 }
 
 impl Stylesheet {
@@ -4412,18 +4444,36 @@ impl Stylesheet {
     }
 
     /// The layer named `names` inside `parent` (an anonymous one where
-    /// `names` is `None`), declared where it first comes.
-    fn layer(&mut self, parent: Option<u32>, names: Option<Vec<String>>) -> u32 {
-        let mut path: Vec<String> =
-            parent.map_or_else(Vec::new, |parent| self.layers[parent as usize].to_vec());
+    /// `names` is `None`), declared where it first comes; `declared` is how
+    /// the conditions around this declaration hold.
+    fn layer(&mut self, parent: Option<u32>, names: Option<Vec<String>>, declared: Applies) -> u32 {
+        let mut path: Vec<String> = parent.map_or_else(Vec::new, |parent| {
+            self.layers[parent as usize].path.to_vec()
+        });
+        let outer = path.len();
         match names {
             Some(names) => path.extend(names),
             None => path.push(format!(" {}", self.layers.len())),
         }
-        if let Some(known) = self.layers.iter().position(|layer| **layer == *path) {
+        // A layer declared again, and those a dotted name declares on the
+        // way (`a` for `a.b`).
+        for end in outer + 1..=path.len() {
+            if let Some(known) = self
+                .layers
+                .iter_mut()
+                .find(|layer| *layer.path == path[..end])
+            {
+                known.again = true;
+            }
+        }
+        if let Some(known) = self.layers.iter().position(|layer| *layer.path == *path) {
             return known as u32;
         }
-        self.layers.push(path.into_boxed_slice());
+        self.layers.push(SheetLayer {
+            path: path.into_boxed_slice(),
+            declared,
+            again: false,
+        });
         self.layers.len() as u32 - 1
     }
 }
@@ -4436,12 +4486,15 @@ const MAX_LAYERS_PER_SHEET: usize = 256;
 
 /// What the at-rules around a rule say of it: how their conditions hold on
 /// the readers the check follows (`@media`, `@supports`, the size of a
-/// container, which is not read, and a scope's limits); whether it stands
-/// in `@container` or `@scope`; and the cascade layer it belongs to, as an
-/// index into [`Stylesheet::layers`].
+/// container, which is not read, and a scope's limits), and how those of
+/// `@media` and `@supports` alone do, which decide whether the cascade
+/// layers inside are declared; whether it stands in `@container` or
+/// `@scope`; and the cascade layer it belongs to, as an index into
+/// [`Stylesheet::layers`].
 #[derive(Clone, Copy)]
 struct RuleContext {
     condition: Applies,
+    declared: Applies,
     container: bool,
     scoped: bool,
     layer: Option<u32>,
@@ -4453,6 +4506,7 @@ pub(super) fn parse_stylesheet(css: &str) -> Result<Stylesheet, DocumentError> {
     let mut sheet = Stylesheet::default();
     let context = RuleContext {
         condition: Applies::Yes,
+        declared: Applies::Yes,
         container: false,
         scoped: false,
         layer: None,
@@ -4549,12 +4603,16 @@ fn parse_at_rule(
         condition: context.condition.min(condition),
         ..context
     };
+    let declaring = |condition: Applies| RuleContext {
+        declared: context.declared.min(condition),
+        ..within(condition)
+    };
     if end < tokens.len() && tokens[end] == Token::OpenCurly {
         let (block, after) = block_at(tokens, end);
         let mut scope = scope.cloned();
         let inner = match name.as_str() {
-            "media" => Some(within(media_condition(prelude))),
-            "supports" => Some(within(supports_condition(prelude))),
+            "media" => Some(declaring(media_condition(prelude))),
+            "supports" => Some(declaring(supports_condition(prelude))),
             // A container's size is not read: its rules may apply inside a
             // size container (see [`Cascade::rule_applies`]).
             "container" => Some(RuleContext {
@@ -4584,7 +4642,7 @@ fn parse_at_rule(
                         return Err(DocumentError::ResourceLimit);
                     }
                     Some(RuleContext {
-                        layer: Some(sheet.layer(context.layer, names)),
+                        layer: Some(sheet.layer(context.layer, names, context.declared)),
                         ..context
                     })
                 }
@@ -4609,14 +4667,14 @@ fn parse_at_rule(
         }
         return Ok(after);
     }
-    if name == "layer" && context.condition != Applies::No {
+    if name == "layer" && context.declared != Applies::No {
         // `@layer a, b;` declares the layers, in that order.
         for names in split_top_level(prelude, &Token::Comma) {
             if let Ok(Some(names)) = layer_names(names) {
                 if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
                     return Err(DocumentError::ResourceLimit);
                 }
-                sheet.layer(context.layer, Some(names));
+                sheet.layer(context.layer, Some(names), context.declared);
             }
         }
     }
@@ -5127,24 +5185,48 @@ fn lens_value<T: Clone>(
 /// that varies between readers shows the element to those it does not hide
 /// it from. `inherited` is how the parent's value hides it, which
 /// `visibility: inherit` takes, and which holds where nothing decides.
+/// `revert` takes what the user agent's rules give, and `revert-layer` what
+/// the cascade layers below its own give, with the user agent's rules and
+/// presentational hints below every layer.
 fn hidden(applied: &[Applied], inherited: Tri) -> Tri {
+    let mut ranked: Vec<&Applied> = applied
+        .iter()
+        .filter(|entry| entry.effect != Effect::Neutral)
+        .collect();
+    // In cascade order, the later of two that tie last, as it wins.
+    ranked.sort_by_key(|entry| entry.precedence);
     let hides_in = |lens: Lens| {
         let parent = match lens {
             Lens::Surely => inherited != Tri::No,
             Lens::Possibly => inherited == Tri::Yes,
         };
-        let hides = |effect: Effect| match effect {
-            Effect::Hide => true,
-            Effect::Inherit => parent,
-            Effect::Show | Effect::Neutral => false,
-        };
-        applied
-            .iter()
-            .filter(|entry| {
-                entry.effect != Effect::Neutral && lens.admits(entry.applies, !hides(entry.effect))
-            })
-            .max_by_key(|entry| entry.precedence)
-            .map_or(parent, |entry| hides(entry.effect))
+        // Whether what the lens admits so far hides it; what the user
+        // agent's rules give; and what the layers below the current one do.
+        let mut hides = parent;
+        let mut user_agent = parent;
+        let mut below = parent;
+        let mut layer = None;
+        for entry in &ranked {
+            let at = (entry.precedence.tier, entry.precedence.layer);
+            if layer != Some(at) {
+                layer = Some(at);
+                below = hides;
+            }
+            let value = match entry.effect {
+                Effect::Hide => true,
+                Effect::Inherit => parent,
+                Effect::Revert => user_agent,
+                Effect::RevertLayer => below,
+                Effect::Show | Effect::Neutral => false,
+            };
+            if lens.admits(entry.applies, !value) {
+                hides = value;
+            }
+            if entry.precedence.tier == TIER_USER_AGENT {
+                user_agent = hides;
+            }
+        }
+        hides
     };
     match (hides_in(Lens::Surely), hides_in(Lens::Possibly)) {
         (false, _) => Tri::No,
@@ -5414,11 +5496,27 @@ pub(super) struct Cascade {
     /// properties.
     others: usize,
     /// The cascade layers of its sheets, by the names and sublayers of
-    /// each, the unlayered rules' first; and each layer's place, found
-    /// once all the sheets are in (see [`Cascade::layer_order`]).
+    /// each, the unlayered rules' first; how the conditions around each
+    /// one's first declaration hold, and whether readers may place it
+    /// apart, as where it is declared again after a declaration that may
+    /// not hold; and each layer's place, and whether it or a layer it is
+    /// inside may stand apart, found once all the sheets are in (see
+    /// [`Cascade::layer_order`]).
     layer_names: Vec<String>,
     layer_children: Vec<Vec<u32>>,
-    layer_ranks: std::cell::OnceCell<Box<[u32]>>,
+    layer_declared: Vec<Applies>,
+    layer_unsettled: Vec<bool>,
+    layer_ranks: std::cell::OnceCell<Box<[LayerRank]>>,
+}
+
+/// A cascade layer's places among the author rules, for normal declarations
+/// and for `!important` ones (see [`Cascade::layer_order`]), and whether
+/// readers may place it, or a layer it is inside, apart.
+#[derive(Clone, Copy, Default)]
+struct LayerRank {
+    normal: u32,
+    important: u32,
+    unsettled: bool,
 }
 
 /// A rule in a chapter's cascade: its place in the cascade order, its
@@ -5466,7 +5564,7 @@ impl Cascade {
     /// Take in a sheet's rules, their conditions capped by `condition`, how
     /// the link, `style` element, or import applying it holds.
     pub(super) fn push_sheet(&mut self, sheet: &Stylesheet, condition: Applies) {
-        let layers = self.push_layers(sheet);
+        let layers = self.push_layers(sheet, condition);
         let layer = |rule: &StyleRule| rule.layer.map_or(0, |layer| layers[layer as usize]);
         let ranked = |rule: &Rc<StyleRule>, order: u32| Ranked {
             rule: rule.clone(),
@@ -5593,19 +5691,23 @@ impl Cascade {
 
     /// Take in the cascade layers a sheet declares, in its order: a named
     /// layer is the one of that name inside its parent, wherever declared
-    /// before, and an anonymous one is new to this sheet. Their nodes, by
-    /// the sheet's layers.
-    fn push_layers(&mut self, sheet: &Stylesheet) -> Vec<u32> {
+    /// before, and an anonymous one is new to this sheet. `condition` is
+    /// how the link, `style` element, or import applying the sheet holds,
+    /// where it declares them. Their nodes, by the sheet's layers.
+    fn push_layers(&mut self, sheet: &Stylesheet, condition: Applies) -> Vec<u32> {
         if self.layer_children.is_empty() {
             self.layer_names.push(String::new());
             self.layer_children.push(Vec::new());
+            self.layer_declared.push(Applies::Yes);
+            self.layer_unsettled.push(false);
         }
         self.layer_ranks.take();
         let mut anonymous: HashMap<&str, u32> = HashMap::new();
         let mut nodes = Vec::with_capacity(sheet.layers.len());
-        for path in &sheet.layers {
+        for layer in &sheet.layers {
+            let declared = layer.declared.min(condition);
             let mut node = 0u32;
-            for name in path.iter() {
+            for name in layer.path.iter() {
                 let known = if name.starts_with(' ') {
                     anonymous.get(name.as_str()).copied()
                 } else {
@@ -5615,12 +5717,22 @@ impl Cascade {
                         .find(|child| self.layer_names[*child as usize] == *name)
                 };
                 node = match known {
-                    Some(child) => child,
+                    // Declared again: a reader for whom its first
+                    // declaration does not hold places it here.
+                    Some(child) => {
+                        if self.layer_declared[child as usize] != Applies::Yes {
+                            self.layer_unsettled[child as usize] = true;
+                        }
+                        child
+                    }
                     None => {
                         let child = self.layer_names.len() as u32;
                         self.layer_names.push(name.clone());
                         self.layer_children.push(Vec::new());
                         self.layer_children[node as usize].push(child);
+                        self.layer_declared.push(declared);
+                        self.layer_unsettled
+                            .push(declared != Applies::Yes && layer.again);
                         if name.starts_with(' ') {
                             anonymous.insert(name, child);
                         }
@@ -5639,33 +5751,72 @@ impl Cascade {
     /// place wins for normal declarations; for `!important` ones, an
     /// earlier.
     fn layer_order(&self, layer: u32, important: bool) -> u32 {
+        let rank = self.layer_rank(layer);
+        if important {
+            u32::MAX - rank.important
+        } else {
+            rank.normal
+        }
+    }
+
+    fn layer_rank(&self, layer: u32) -> LayerRank {
         let ranks = self.layer_ranks.get_or_init(|| {
-            let mut ranks = vec![0u32; self.layer_children.len().max(1)];
-            let mut next = 1;
-            let mut stack = vec![(0u32, 0usize)];
-            while let Some((node, child)) = stack.pop() {
-                match self
+            let mut ranks = vec![LayerRank::default(); self.layer_children.len().max(1)];
+            // A layer readers may place apart among the others inside its
+            // parent stands last of them for normal declarations and first
+            // for important ones, where its rules win the most; being in
+            // doubt (see [`Cascade::with_layer`]), they then neither hide
+            // nor show where a reader placing it elsewhere would not.
+            for important in [false, true] {
+                let children: Vec<Vec<u32>> = self
                     .layer_children
-                    .get(node as usize)
-                    .and_then(|children| children.get(child))
-                {
-                    Some(&first) => {
-                        stack.push((node, child + 1));
-                        stack.push((first, 0));
-                    }
-                    None => {
-                        ranks[node as usize] = next;
-                        next += 1;
+                    .iter()
+                    .map(|children| {
+                        let mut children = children.clone();
+                        children.sort_by_key(|child| {
+                            self.layer_unsettled[*child as usize] != important
+                        });
+                        children
+                    })
+                    .collect();
+                let mut next = 1;
+                let mut stack = vec![(0u32, 0usize)];
+                while let Some((node, child)) = stack.pop() {
+                    match children
+                        .get(node as usize)
+                        .and_then(|children| children.get(child))
+                    {
+                        Some(&first) => {
+                            ranks[first as usize].unsettled = ranks[node as usize].unsettled
+                                || self.layer_unsettled[first as usize];
+                            stack.push((node, child + 1));
+                            stack.push((first, 0));
+                        }
+                        None => {
+                            let rank = &mut ranks[node as usize];
+                            if important {
+                                rank.important = next;
+                            } else {
+                                rank.normal = next;
+                            }
+                            next += 1;
+                        }
                     }
                 }
             }
             ranks.into_boxed_slice()
         });
-        let rank = ranks.get(layer as usize).copied().unwrap_or(0);
-        if important {
-            u32::MAX - rank
+        ranks.get(layer as usize).copied().unwrap_or_default()
+    }
+
+    /// How a rule's condition holds with its layer's place: in doubt where
+    /// readers may place the layer apart, which may put its rules above or
+    /// below another layer's.
+    fn with_layer(&self, condition: Applies, layer: u32) -> Applies {
+        if self.layer_rank(layer).unsettled {
+            condition.min(Applies::Doubt)
         } else {
-            rank
+            condition
         }
     }
 
@@ -5799,7 +5950,8 @@ impl Cascade {
                     *work += 1;
                     continue;
                 }
-                let certainty = rule_applies(rule, *condition, &[], tree, node, work);
+                let condition = self.with_layer(*condition, *layer);
+                let certainty = rule_applies(rule, condition, &[], tree, node, work);
                 if certainty == Applies::No {
                     continue;
                 }
@@ -5926,7 +6078,8 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty = rule_applies(rule, *condition, &[], tree, tree.top(), work);
+            let condition = self.with_layer(*condition, *layer);
+            let certainty = rule_applies(rule, condition, &[], tree, tree.top(), work);
             if certainty == Applies::No {
                 continue;
             }
@@ -6032,7 +6185,8 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty = rule_applies(rule, *condition, &[], tree, tree.top(), work);
+            let condition = self.with_layer(*condition, *layer);
+            let certainty = rule_applies(rule, condition, &[], tree, tree.top(), work);
             if certainty == Applies::No {
                 continue;
             }
@@ -6236,6 +6390,7 @@ impl Cascade {
         let mut flows: [Vec<(Precedence, Applies, Tri)>; 6] = Default::default();
         let mut layouts: Vec<(Precedence, Applies, Layout)> = Vec::new();
         let mut item_flags: [Vec<(Precedence, Applies, Tri)>; 6] = Default::default();
+        let block_by_default = reader_block_by_default(element);
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Applies| {
             let slot = match declaration.property {
                 Property::Display => 0,
@@ -6297,7 +6452,15 @@ impl Cascade {
                 | Property::PaddingLeft
                 | Property::PaddingRight => return,
             };
-            if let (Property::Display, Some(flow)) = (declaration.property, declaration.flow) {
+            let flow = match (declaration.property, declaration.effect) {
+                // The user agent's rules make the element a block or inline.
+                (Property::Display, Effect::Revert) => {
+                    Some(if block_by_default { Tri::No } else { Tri::Yes })
+                }
+                (Property::Display, _) => declaration.flow,
+                _ => None,
+            };
+            if let Some(flow) = flow {
                 flows[0].push((precedence, certainty, flow));
             }
             if let (Property::Display, Some(layout)) = (declaration.property, declaration.layout) {
@@ -6349,7 +6512,8 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty = rule_applies(rule, *condition, recorded, tree, tree.top(), work);
+            let condition = self.with_layer(*condition, *layer);
+            let certainty = rule_applies(rule, condition, recorded, tree, tree.top(), work);
             if certainty == Applies::No {
                 continue;
             }
@@ -6400,7 +6564,10 @@ impl Cascade {
                                 _ if computed.is_some() => Some(Tri::Maybe),
                                 Effect::Hide => Some(Tri::Yes),
                                 Effect::Show => Some(Tri::No),
-                                Effect::Inherit => None,
+                                // The element's, which the user agent's
+                                // rules leave it.
+                                Effect::Inherit | Effect::Revert => None,
+                                Effect::RevertLayer => Some(Tri::Maybe),
                                 Effect::Neutral => continue,
                             };
                             pseudo_hidden[slot].push((precedence, certainty, hidden));
@@ -6432,7 +6599,9 @@ impl Cascade {
                         (Property::Display, Effect::Hide, None) => Some(Tri::Yes),
                         // A value computed at run time.
                         (Property::Display, Effect::Hide, Some(_)) => Some(Tri::Maybe),
-                        (Property::Display, Effect::Show, _) => Some(Tri::No),
+                        // The user agent's rules show the box.
+                        (Property::Display, Effect::Show | Effect::Revert, _) => Some(Tri::No),
+                        (Property::Display, Effect::RevertLayer, _) => Some(Tri::Maybe),
                         _ => None,
                     };
                     if let Some(none) = none {
@@ -6442,7 +6611,12 @@ impl Cascade {
                         (Property::Display, Some(Tri::No)) => Tri::Yes,
                         (Property::Display, Some(Tri::Yes)) => Tri::No,
                         (Property::Display, Some(Tri::Maybe)) => Tri::Maybe,
-                        (Property::Display, None) if declaration.effect == Effect::Hide => Tri::No,
+                        // An inline box, as the user agent's rules leave it.
+                        (Property::Display, None)
+                            if matches!(declaration.effect, Effect::Hide | Effect::Revert) =>
+                        {
+                            Tri::No
+                        }
                         _ => continue,
                     };
                     pseudo_blocks[slot].push((precedence, certainty, block));
@@ -6568,7 +6742,10 @@ impl Cascade {
                 certainty,
             );
         }
-        // User-agent rules (HTML's rendering section) that hide content.
+        // User-agent rules (HTML's rendering section) that hide content,
+        // and the `hidden` attribute, which Chromium reads as a
+        // presentational hint: every author rule beats it, and `revert`
+        // takes it away.
         let user_agent = Precedence {
             tier: TIER_USER_AGENT,
             layer: 0,
@@ -6577,8 +6754,7 @@ impl Cascade {
             order: 0,
         };
         let has = |name: &str| element.values(name).next().is_some();
-        let hidden_by_user_agent = has("hidden")
-            || (element.lower == "dialog" && !has("open"))
+        let hidden_by_user_agent = (element.lower == "dialog" && !has("open"))
             || (element.lower == "audio" && !has("controls"))
             || matches!(
                 element.lower.as_str(),
@@ -6598,21 +6774,21 @@ impl Cascade {
                     | "template"
                     | "title"
             );
+        let hide = Declaration {
+            property: Property::Display,
+            effect: Effect::Hide,
+            important: false,
+            flow: None,
+            layout: None,
+            side: None,
+            generated: None,
+            var: None,
+        };
         if hidden_by_user_agent {
-            add(
-                &Declaration {
-                    property: Property::Display,
-                    effect: Effect::Hide,
-                    important: false,
-                    flow: None,
-                    layout: None,
-                    side: None,
-                    generated: None,
-                    var: None,
-                },
-                user_agent,
-                Applies::Yes,
-            );
+            add(&hide, user_agent, Applies::Yes);
+        }
+        if has("hidden") {
+            add(&hide, presentation, Applies::Yes);
         }
         // A box exists where `content` gives one and `display` does not take
         // it away: what it shows, and whether it breaks the line, as a block
@@ -6719,7 +6895,7 @@ impl Cascade {
         // and one that clamps its lines is a block. A grid's tracks stretch
         // across a block, and stack in an inline box without columns: its
         // items stand apart.
-        let inline = resolve_flow(&flows[0], !reader_block_by_default(element));
+        let inline = resolve_flow(&flows[0], !block_by_default);
         let flag = |slot: usize| resolve_flow(&item_flags[slot], false);
         let (layout, contested) = resolve_value(&layouts, Layout::Flow);
         let (items, item_layout) = match layout {
@@ -11572,6 +11748,127 @@ mod tests {
             )
             .fuses_blocks
         );
+    }
+
+    #[test]
+    fn revert_goes_back_to_the_user_agent_and_revert_layer_to_the_layers_below() {
+        let refund = r#"<p>Refund due <span class="x">1,250.00</span> by April.</p>"#;
+        // `revert` takes what the user agent's rules give a span, and
+        // `revert-layer` what the layers below the declaration's own give,
+        // or the user agent's rules without them. AnyDoc reads the second
+        // rule in a layer block, not the first.
+        for (sheet, drops) in [
+            (".x { display: none } p > .x { display: revert }", true),
+            (
+                "@layer a { .d { color: red } p > .x { display: inline } } .x { display: none } p > .x { display: revert-layer }",
+                true,
+            ),
+            (
+                "@layer a { .d { color: red } .x { display: none } p > .x { display: revert-layer } }",
+                true,
+            ),
+            (
+                "@layer a { .d { color: red } .x { display: none } } @layer b { .d { color: red } p > .x { display: revert-layer !important } }",
+                false,
+            ),
+        ] {
+            assert_eq!(drops_shown(&[sheet], refund), drops, "{sheet}");
+        }
+        assert!(converts_hidden(
+            &["@layer a { .d { color: red } p > .x { display: none } } .x { display: inline } p > .x { display: revert-layer }"],
+            refund
+        ));
+        // An inline style's `revert-layer` goes back to the author's rules.
+        assert!(converts_hidden(
+            &["@layer a { .d { color: red } .x { display: inline } } p > .x { display: none }"],
+            r#"<p>Refund due <span class="x" style="display: revert-layer">1,250.00</span> by April.</p>"#
+        ));
+        // Chromium reads the `hidden` attribute as a presentational hint,
+        // below every layer, which `revert` takes away; the user agent's
+        // rules that hide a closed dialog stay.
+        let hidden = r#"<p>Refund due <span hidden="" class="x">1,250.00</span> by April.</p>"#;
+        assert!(!converts_hidden(&[".x { display: revert }"], hidden));
+        assert!(converts_hidden(&[".x { display: revert-layer }"], hidden));
+        assert!(!converts_hidden(
+            &["@layer a { .x { display: inline } } .x { display: revert-layer }"],
+            hidden
+        ));
+        assert!(converts_hidden(
+            &[".x { display: block } dialog.x { display: revert }"],
+            r#"<dialog class="x">SECRET</dialog>"#
+        ));
+        // `visibility` has no user agent's rule: `revert` takes the parent's.
+        assert!(!converts_hidden(
+            &[".x { visibility: hidden } p > .x { visibility: revert }"],
+            refund
+        ));
+        assert!(converts_hidden(
+            &["p { visibility: hidden } .x { visibility: revert }"],
+            refund
+        ));
+    }
+
+    #[test]
+    fn layers_placed_apart_on_some_readers_are_in_doubt() {
+        let refund = r#"<p>Refund due <span class="x">1,250.00</span> by April.</p>"#;
+        let layers = |first: &str| {
+            format!(
+                "{first} @layer a {{ .d {{ color: red }} .x {{ display: none }} }} @layer b {{ .d {{ color: red }} p > .x {{ display: inline }} }}"
+            )
+        };
+        // Declared first where a condition holds on every reader, `b` comes
+        // before `a`, whose hide wins; where it holds on none, after.
+        // `@container` and `@scope` do not keep a layer from being declared.
+        for (first, drops) in [
+            (
+                "@media (min-width: 0) { @layer b { .q { color: red } } }",
+                false,
+            ),
+            ("@media print { @layer b { .q { color: red } } }", true),
+            ("@supports (foo: bar) { @layer b; }", true),
+            (
+                "@container (min-width: 99999px) { @layer b { .q { color: red } } }",
+                false,
+            ),
+            (
+                "@scope (.nothing) { @layer b { .q { color: red } } }",
+                false,
+            ),
+        ] {
+            assert_eq!(drops_shown(&[&layers(first)], refund), drops, "{first}");
+        }
+        // Where the condition holds on some readers' screens, those readers
+        // place `b` first and the others after `a`: the text is in doubt,
+        // as where a layer only named after a dot is declared again.
+        for first in [
+            "@media (min-width: 700px) { @layer b { .q { color: red } } }",
+            "@media (min-width: 700px) { @layer b.c; }",
+        ] {
+            assert!(drops_shown(&[&layers(first)], refund), "{first}");
+        }
+        assert!(drops_shown(
+            &["@media (min-width: 700px) { @layer b { .q { color: red } } } @layer a { .d { color: red } .x { display: none } } @layer b.c { .d { color: red } p > .x { display: inline } }"],
+            refund
+        ));
+        // A layer declared only there stands where it is declared.
+        assert!(!drops_shown(
+            &["@media (min-width: 700px) { @layer b { .d { color: red } p > .x { display: inline } } } @layer a { .d { color: red } .x { display: none } }"],
+            refund
+        ));
+        // So too across sheets, a link's media deciding where a sheet
+        // declares its layers.
+        let mut reader = Cascade::default();
+        let mut anydoc = AnyDocCascade::default();
+        for (sheet, condition) in [
+            ("@layer b { .q { color: red } }", Applies::Varies),
+            (layers("").as_str(), Applies::Yes),
+        ] {
+            reader.push_sheet(&parse_stylesheet(sheet).expect("stylesheet"), condition);
+            anydoc.add(sheet);
+        }
+        let mut work = 0;
+        let found = chapter_text(&chapter(refund), &reader, &anydoc, &mut work).expect("walk");
+        assert!(found.drops_shown);
     }
 
     #[test]
