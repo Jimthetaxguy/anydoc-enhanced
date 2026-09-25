@@ -469,6 +469,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round twelve checked loops 26 to 28 and the glyph-by-glyph join:
+  - PDF invisible text (#572): a word or a digit slipped invisibly into a
+    line, as "not" in "The fee is not refundable." or a 9 before
+    "1,250.00", was too short to look for alone and was never reported; a
+    run under six characters is now looked for with the eight characters
+    beside it on its line, as pdf-inspector reads the line left to right.
+    Glyphs shown out of order, or with control codes or visible text shown
+    between them, are read in their line's order, where the join of glyphs
+    set one by one had lost such a case. The render mode is taken as each
+    side takes it: pdf-inspector from `Tr`'s first operand, cut to a whole
+    number, a viewer from its last, and only as one of the eight modes, so
+    `3.0 Tr`, `0 3 Tr`, and a mode 3 left in force under `11 Tr` are
+    reported.
+  - Two crafted files that earlier builds converted, one with 32 MB of
+    invisible text and one with vertical columns set off the page, ran out
+    of the worker's memory. The text kept to look for is now held to 4 MiB
+    a document and looked for 1 MiB at a time; a page whose unseen text
+    does not fit, or overruns its own 64 KiB, is reported without being
+    looked for where that text starts on the page, and columns set off the
+    page, which pdf-inspector leaves out, are no longer read. Both convert
+    in about 7 s within 250 MB. Invisible spaces filling a page's room, or
+    65,536 spaces in a Japanese font, no longer hide the text after them.
+  - A page the scan's work limits never reached is named in the new
+    `pages_unchecked` warning, where 8 MB of no-op operators on the pages
+    before had left page 6's invisible text unreported with no sign. A
+    scan set as an inline image, not an image resource, now counts, so
+    `pdf_to_markdown` lists its page for OCR, where the image had only
+    exempted the page's invisible text.
+  - PDF Japanese, Chinese, and Korean fonts (#573): whether pdf-inspector
+    finds a map is judged as it looks for one, parsing the font's
+    ToUnicode map and embedded program as it does. A `/ToUnicode` that is
+    a name, null, or empty, an encoding given by reference or as a stream
+    of its own, an ordering given by reference, and a program with no
+    usable `cmap` table leave it none, Korean included, and none was
+    reported; an OpenType program with no `/Subtype` gives it one, and
+    was. Widths set mostly past 0x41 make it read each code as the
+    character of its value, kanji as Cyrillic ("一壱溢" as "ҰұҲ"), and
+    UCS-2 codes under `UniJIS-UCS2-H` with no map read byte by byte
+    ("住民税" as "OOlz"); both are reported. A page is reported where the
+    Markdown shows its text as pdf-inspector reads it ("5PUBMXBHFT"), even
+    where the same words stand elsewhere, which had kept it from being
+    reported; white text in a form, which pdf-inspector skips, is not
+    read.
+  - PDF vertical writing (#575): a passage's short last or middle column
+    read before the long one, and a column standing alone that lines of
+    horizontal text run through ("源 Instruction 0... 泉 Instruction 1..."),
+    are reported; ruby beside its base, labels in cells set apart, and
+    columns set off the page no longer are, and labels under a UCS-2
+    vertical CMap with a ToUnicode map are read to confirm them, where
+    they had been reported unconfirmed.
+  Over 4,963 corpus, fixture, and review PDFs no warning changed and none
+  timed out; the review's own files change as above, and its stress files
+  convert as fast as before, the longest vertical one in 186 MB from 486.
 - Review round eleven checked the round-ten fixes and loops 22 to 25:
   - PDF running headers (#483): the gate that decides whether pages are
     read again grouped a page's runs by height to the point, where
@@ -974,20 +1027,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the running-header rule, within the call's time, and pages left
   unread are disclosed as `header_footer_unchecked`. Invisible text is looked for on the pages the repeat
   check reads, but not on a page listed as needing OCR; a page images cover
-  whose text mostly paints nothing is taken for a scan, and invisible text
-  on it is not reported, whatever it says; and text pdf-inspector reads
-  only through its retry of a document with no visible text, or clip-only
-  text (render mode 7), is not reported. Japanese or Chinese text in a font that embeds a TrueType or
-  OpenType program is taken to read through that program's map; text in a
-  font whose ToUnicode map cannot be read, or under a predefined CMap other
-  than `Identity-H` or `Identity-V`, is not checked; and a page whose every
-  such string pdf-inspector marks with U+FFFD is left to its own
-  garbled-text reason. Vertical writing is placed a glyph an em down its
+  whose text mostly paints nothing is reported for OCR as a scan, and
+  invisible text on it is not looked for, whatever it says, while the OCR
+  layer of a small scanned image, such as a receipt set into a letter, is
+  reported as invisible text; text pdf-inspector reads only through its
+  retry of a document with no visible text, clip-only text (render mode
+  7), and invisible glyphs set one by one along a turned line are not
+  reported; and a run too short to look for alone is looked for with the
+  eight characters beside it on its line, so one whose line reads
+  otherwise, as across columns pdf-inspector sets apart, is not reported.
+  A page's unseen text past 64 KiB, or a document's past 4 MiB, is
+  reported without being looked for where it starts on the page, and left
+  out where it starts off it, as pdf-inspector leaves out a neighbouring
+  page's text on an imposed sheet. Past the scan's own limits, the pages
+  it could not reach are disclosed as `pages_unchecked`. A Japanese,
+  Chinese, or Korean font's map is judged as pdf-inspector looks for one,
+  but for the Macintosh glyph order it may read a program by, and a
+  ToUnicode map it parses is taken to read the font however sparse it is;
+  text under a predefined CMap other than an Identity or UCS-2 one is not
+  checked; a page whose every such string pdf-inspector marks with U+FFFD
+  is left to its own garbled-text reason; and a page whose misread text is
+  only digits and marks, which drop out, stands where the Markdown shows
+  them elsewhere. Vertical writing is placed a glyph an em down its
   column, whatever the font's vertical metrics say, and only on upright
-  pages; columns under a CMap the scan cannot read, which is any
-  predefined vertical CMap but `Identity-V` with a ToUnicode map, are
-  reported wherever two stand side by side, without the Markdown to
-  confirm it.
+  pages set in a vertical CMap, so columns emulated in a horizontal font,
+  or turned with the page's space, are not checked; a column's text the
+  Markdown shows elsewhere, as in a table of the same labels, counts as
+  shown; and columns under a CMap the scan cannot read, which is any
+  predefined vertical CMap but `Identity-V` or a UCS-2 one with a
+  ToUnicode map, are reported wherever two stand side by side, without
+  the Markdown to confirm it.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - DOCX list checks follow ECMA-376 where Word and LibreOffice part: a
