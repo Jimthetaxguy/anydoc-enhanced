@@ -5,6 +5,7 @@
 //! the upstream API surface changes.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 // Re-export upstream types that callers need
@@ -200,6 +201,56 @@ impl PdfInfo {
     }
 }
 
+impl PdfInfo {
+    /// Report as needing OCR, with the reason, the pages whose text is
+    /// mostly an invisible layer over a scan, which pdf-inspector reads as
+    /// text when the page also shows a little (see `hidden_text_layer`).
+    /// Pages it already gave a reason are not scanned; a page it listed for
+    /// sparse text alone is, so it gains the reason.
+    fn flag_hidden_text_layers(&mut self, buffer: &[u8], only: Option<&HashSet<u32>>) {
+        let skip: HashSet<u32> = self
+            .ocr_reasons_by_page
+            .iter()
+            .filter(|entry| !entry.reasons.is_empty())
+            .map(|entry| entry.page)
+            .collect();
+        if skip.len() as u64 >= u64::from(self.page_count) {
+            return;
+        }
+        // The scan only adds a signal: if it fails, the result stands as
+        // pdf-inspector gave it.
+        let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hidden_text_layer::pages_with_hidden_text_layer(buffer, &skip, only)
+        }))
+        .unwrap_or_default();
+        if found.is_empty() {
+            return;
+        }
+        let reason = pdf_inspector::OCR_REASON_INVISIBLE_TEXT_LAYER;
+        for page in found {
+            self.pages_needing_ocr.push(page);
+            match self
+                .ocr_reasons_by_page
+                .iter_mut()
+                .find(|entry| entry.page == page)
+            {
+                Some(entry) => {
+                    if !entry.reasons.iter().any(|known| known == reason) {
+                        entry.reasons.push(reason.to_string());
+                    }
+                }
+                None => self.ocr_reasons_by_page.push(PageOcrReasonsOutput {
+                    page,
+                    reasons: vec![reason.to_string()],
+                }),
+            }
+        }
+        self.pages_needing_ocr.sort_unstable();
+        self.pages_needing_ocr.dedup();
+        self.ocr_reasons_by_page.sort_by_key(|entry| entry.page);
+    }
+}
+
 impl From<PdfProcessResult> for PdfInfo {
     /// Treats the result as a full-pipeline run; prefer
     /// [`PdfInfo::from_result`] when the mode is known.
@@ -246,6 +297,7 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 
 pub mod document;
 pub mod domain;
+mod hidden_text_layer;
 pub mod pdf_worker;
 
 /// Errors from the facade layer.
@@ -412,8 +464,11 @@ pub fn process_bytes_with_options(
 ) -> Result<PdfInfo, SkillkitError> {
     check_size(buffer)?;
     let mode = options.mode.clone();
+    let pages = options.page_filter.clone();
     let result = pdf_inspector::process_pdf_mem_with_options(buffer, options)?;
-    Ok(PdfInfo::from_result(result, &mode))
+    let mut info = PdfInfo::from_result(result, &mode);
+    info.flag_hidden_text_layers(buffer, pages.as_ref());
+    Ok(info)
 }
 
 /// Extract text within bounding-box regions from PDF bytes, with rectangles

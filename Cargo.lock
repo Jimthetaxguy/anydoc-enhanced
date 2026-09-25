@@ -982,6 +982,7 @@ dependencies = [
  "encoding_rs",
  "libc",
  "log",
+ "lopdf",
  "pdf-inspector",
  "quick-xml",
  "regex",

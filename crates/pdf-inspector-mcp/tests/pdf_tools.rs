@@ -136,40 +136,16 @@ fn pdf_tools_return_public_fixture_results() {
     assert_eq!(batch[2]["error"], "File not found or inaccessible");
 }
 
-/// A one-page PDF displayed turned by `/Rotate 90`, with `ROTATED-MARKER`
-/// near the top-left of the unturned page and a small ledger table below it.
-fn rotated_page_pdf() -> Vec<u8> {
-    let mut content = String::from("BT /F1 12 Tf 72 700 Td (ROTATED-MARKER) Tj ET");
-    let rows = [
-        ["Account", "Opening", "Closing"],
-        ["Cash", "100", "150"],
-        ["Receivables", "200", "250"],
-        ["Inventory", "300", "350"],
-    ];
-    for (row, cells) in rows.iter().enumerate() {
-        for (cell, x) in cells.iter().zip([72, 200, 300]) {
-            let y = 500 - 15 * row;
-            content.push_str(&format!("\nBT /F1 10 Tf {x} {y} Td ({cell}) Tj ET"));
-        }
-    }
-    let objects = [
-        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 \
-         /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
-            .to_string(),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
-            .to_string(),
-        format!(
-            "<< /Length {} >>\nstream\n{content}\nendstream",
-            content.len()
-        ),
-    ];
+/// A PDF file holding `objects` as objects 1, 2, …, with object 1 as the
+/// catalog.
+fn pdf_file(objects: &[Vec<u8>]) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
     for (index, object) in objects.iter().enumerate() {
         offsets.push(pdf.len());
-        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
     }
     let xref = pdf.len();
     pdf.extend_from_slice(
@@ -186,6 +162,119 @@ fn rotated_page_pdf() -> Vec<u8> {
         .as_bytes(),
     );
     pdf
+}
+
+/// A stream object with `dictionary` entries and `content`.
+fn stream(dictionary: &str, content: &[u8]) -> Vec<u8> {
+    let mut object = format!("<< {dictionary} /Length {} >>\nstream\n", content.len()).into_bytes();
+    object.extend_from_slice(content);
+    object.extend_from_slice(b"\nendstream");
+    object
+}
+
+/// A one-page PDF displayed turned by `/Rotate 90`, with `ROTATED-MARKER`
+/// near the top-left of the unturned page and a small ledger table below it.
+fn rotated_page_pdf() -> Vec<u8> {
+    let mut content = String::from("BT /F1 12 Tf 72 700 Td (ROTATED-MARKER) Tj ET");
+    let rows = [
+        ["Account", "Opening", "Closing"],
+        ["Cash", "100", "150"],
+        ["Receivables", "200", "250"],
+        ["Inventory", "300", "350"],
+    ];
+    for (row, cells) in rows.iter().enumerate() {
+        for (cell, x) in cells.iter().zip([72, 200, 300]) {
+            let y = 500 - 15 * row;
+            content.push_str(&format!("\nBT /F1 10 Tf {x} {y} Td ({cell}) Tj ET"));
+        }
+    }
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 \
+          /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream("", content.as_bytes()),
+    ])
+}
+
+/// A scanned page made searchable: a page-sized image, an invisible text
+/// layer in a form as ocrmypdf writes it, and a visible header and Bates
+/// number stamped on top. pdf-inspector 1.24.0 alone reads it as a text page
+/// holding only the stamps, with no page for OCR: the header is too long
+/// for its sparse-text check.
+fn stamped_scan_pdf() -> Vec<u8> {
+    // A page's worth of lines, so the detector reads the page as text.
+    let lines = [
+        "Form 1040 Individual Income Tax Return",
+        "Wages, salaries, tips 85000",
+        "Taxable interest 1250",
+        "Total income 86250",
+    ];
+    let layer: String = lines
+        .iter()
+        .cycle()
+        .take(24)
+        .enumerate()
+        .map(|(index, line)| format!("1 0 0 1 72 {} Tm ({line}) Tj\n", 740 - 28 * index))
+        .collect();
+    let page = "q 612 0 0 792 0 0 cm /Im1 Do Q q /Fm1 Do Q \
+                BT /F1 9 Tf 1 0 0 1 72 770 Tm (CONFIDENTIAL - PREPARED FOR EXAMINATION - CLIENT COPY) Tj ET \
+                BT /F1 9 Tf 1 0 0 1 480 20 Tm (BATES-000123) Tj ET";
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R /Fm1 7 0 R >> >> \
+          /Contents 5 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream("", page.as_bytes()),
+        stream(
+            "/Type /XObject /Subtype /Image /Width 64 /Height 64 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[200; 64 * 64],
+        ),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >>",
+            format!("BT 3 Tr /F1 11 Tf\n{layer}ET").as_bytes(),
+        ),
+    ])
+}
+
+#[test]
+fn scans_whose_text_layer_is_dropped_are_reported_for_ocr() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let pdf = temporary.path().join("stamped-scan.pdf");
+    std::fs::write(&pdf, stamped_scan_pdf()).expect("write scan");
+    let pdf = pdf.to_str().expect("UTF-8 path").to_string();
+    let results = call_tools(
+        &[
+            ("pdf_to_markdown", serde_json::json!({ "path": pdf })),
+            ("classify_pdf", serde_json::json!({ "path": pdf })),
+        ],
+        None,
+    );
+    for result in &results {
+        assert_eq!(
+            result["pages_needing_ocr"],
+            serde_json::json!([1]),
+            "{result}"
+        );
+        assert_eq!(
+            result["ocr_reasons_by_page"],
+            serde_json::json!([{ "page": 1, "reasons": ["invisible_text_layer"] }]),
+            "{result}"
+        );
+    }
+    // The stamp is the only text read; the layer is never copied out.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(markdown.contains("BATES-000123"), "{markdown}");
+    assert!(!markdown.contains("Taxable interest"), "{markdown}");
 }
 
 #[test]
