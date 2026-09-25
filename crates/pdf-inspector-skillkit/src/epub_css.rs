@@ -36,8 +36,11 @@
 //! number.
 //!
 //! Text a `::before` or `::after` box shows is text AnyDoc drops: flagged
-//! when it holds letters or digits, and for a sign an amount reads by
-//! ("−", "(", "%") when it meets digits.
+//! when it holds letters or digits, for a sign an amount reads by ("−",
+//! "(", "%", "$") when it meets digits, and for anything else it shows, a
+//! space, a comma, or a colon, between digits AnyDoc's text then runs
+//! together. A list item's bullet, which AnyDoc's list marker stands in
+//! for, is not.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -668,9 +671,12 @@ enum Layout {
 enum Generated {
     /// No box (`none`, `normal`).
     Nothing,
-    /// A box without text that carries meaning: empty, white space, quote
-    /// marks, dashes, bullets, and other ornaments, or an image.
+    /// An empty box.
     Plain,
+    /// A box showing what carries no meaning of its own: white space, quote
+    /// marks, bullets, and other ornaments, or an image. Between digits it
+    /// still keeps them apart.
+    Ornament,
     /// Such a box holding a line feed (`"\A"`), which breaks the line where
     /// the box keeps white space (`white-space: pre`).
     LineFeed,
@@ -683,16 +689,33 @@ enum Generated {
     Text,
 }
 
-/// Where a sign that generated content shows reads as part of an amount.
+/// Where what generated content shows reads as part of an amount, or keeps
+/// two numbers apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Sign {
+    /// Anything shown, a space or an ornament, a comma and a space, a slash
+    /// or a colon: between digits, where it keeps two numbers apart ("12,
+    /// 15", "12:30") that run together without it.
+    Between,
     /// A decimal point or thousands separator ending the box: part of a
     /// number where a digit follows it directly, as "1" and ".99" read
     /// "1.99"; after a number, as in "1.", it only closes it.
     Separator,
+    /// Hyphens or dashes alone ("-", "– "), and whether white space leads
+    /// and trails them: a minus beside the digits they touch, as
+    /// [`Sign::Amount`] is, and otherwise a bullet before a list item's
+    /// text, or a separator after a number (see [`PseudoBox`]).
+    Dash { leading: bool, trailing: bool },
     /// A minus or plus, a parenthesis, a percent or currency sign, or a
     /// dash ("−", "(", "%", "$"): beside digits on either side.
     Amount,
+}
+
+impl Sign {
+    /// Whether it reads with the digits of an amount beside it.
+    fn of_amount(self) -> bool {
+        matches!(self, Sign::Dash { .. } | Sign::Amount)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -745,9 +768,10 @@ const BOX_DISPLAY_KEYWORDS: [&str; 4] = [
 const GRID_DISPLAY_KEYWORDS: [&str; 4] = ["grid", "inline-grid", "-ms-grid", "-ms-inline-grid"];
 
 /// Signs an amount reads by, which generated content may add to it: a
-/// minus or plus, parentheses, a percent sign, currency signs (`¢` to `¥`
-/// and the currency block, `€` and `₹` among them), and the hyphens and
-/// dashes set as a minus or between figures.
+/// minus or plus, parentheses, percent and per-mille signs, with their
+/// full-width, small, superscript, and subscript forms, the triangles
+/// Japanese accounts mark a loss with, the hyphens and dashes set as a
+/// minus or between figures, and currency signs.
 fn amount_sign(character: char) -> bool {
     matches!(
         character,
@@ -757,41 +781,154 @@ fn amount_sign(character: char) -> bool {
             | '('
             | ')'
             | '%'
-            | '$'
-            | '\u{a2}'..='\u{a5}'
+            | '\u{b1}'
+            | '\u{2213}'
+            | '\u{2030}'
+            | '\u{2031}'
+            | '\u{66a}'
+            | '\u{2796}'
+            | '\u{207a}'
+            | '\u{207b}'
+            | '\u{207d}'
+            | '\u{207e}'
+            | '\u{208a}'
+            | '\u{208b}'
+            | '\u{208d}'
+            | '\u{208e}'
+            | '\u{fe59}'
+            | '\u{fe5a}'
+            | '\u{fe62}'
+            | '\u{fe63}'
+            | '\u{fe6a}'
+            | '\u{ff05}'
+            | '\u{ff08}'
+            | '\u{ff09}'
+            | '\u{ff0b}'
+            | '\u{ff0d}'
+            | '\u{25b2}'
+            | '\u{25b3}'
             | '\u{2010}'..='\u{2013}'
+    ) || currency_sign(character)
+}
+
+/// Unicode's currency signs (general category Sc): `$`, `¢` to `¥`, the
+/// currency block (`€`, `₹`, and the rest), and the signs of other scripts,
+/// such as `฿` and `֏`, and their full-width and small forms.
+fn currency_sign(character: char) -> bool {
+    matches!(
+        character,
+        '$' | '\u{a2}'..='\u{a5}'
+            | '\u{58f}'
+            | '\u{60b}'
+            | '\u{7fe}'
+            | '\u{7ff}'
+            | '\u{9f2}'
+            | '\u{9f3}'
+            | '\u{9fb}'
+            | '\u{af1}'
+            | '\u{bf9}'
+            | '\u{e3f}'
+            | '\u{17db}'
             | '\u{20a0}'..='\u{20cf}'
+            | '\u{a838}'
+            | '\u{fdfc}'
+            | '\u{fe69}'
+            | '\u{ff04}'
+            | '\u{ffe0}'
+            | '\u{ffe1}'
+            | '\u{ffe5}'
+            | '\u{ffe6}'
+            | '\u{11fdd}'..='\u{11fe0}'
+            | '\u{1e2ff}'
+            | '\u{1ecb0}'
     )
 }
 
-/// What a `content` value shows, from its tokens.
+/// Decimal points and thousands separators: the full stop and comma, their
+/// full-width forms, and the Arabic separators.
+fn decimal_separator(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ',' | '\u{66b}' | '\u{66c}' | '\u{ff0c}' | '\u{ff0e}'
+    )
+}
+
+/// Characters a reader shows nothing for: zero-width spaces and joiners,
+/// directional marks, the word joiner, and the soft hyphen.
+fn invisible(character: char) -> bool {
+    matches!(
+        character,
+        '\u{ad}' | '\u{34f}' | '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
+    )
+}
+
+/// Whether text starts an amount: after white space, a digit, or signs and
+/// a decimal point before one ("$1,250", ".75").
+fn starts_amount(mut text: impl Iterator<Item = char>) -> bool {
+    text.find(|character| {
+        !(character.is_whitespace()
+            || invisible(*character)
+            || amount_sign(*character)
+            || decimal_separator(*character))
+    })
+    .is_some_and(char::is_numeric)
+}
+
+/// What a string in a `content` value shows.
+fn shown_text(text: &str) -> Generated {
+    let visible = || text.chars().filter(|character| !invisible(*character));
+    if text.chars().any(char::is_alphanumeric) {
+        Generated::Text
+    } else if text.chars().any(amount_sign) {
+        let dash = |character: char| matches!(character, '-' | '\u{2010}'..='\u{2013}');
+        let marks: String = visible().collect();
+        let dashes = marks.trim();
+        if !dashes.is_empty() && dashes.chars().all(dash) {
+            Generated::Sign(Sign::Dash {
+                leading: marks.starts_with(char::is_whitespace),
+                trailing: marks.ends_with(char::is_whitespace),
+            })
+        } else {
+            Generated::Sign(Sign::Amount)
+        }
+    } else if visible().next_back().is_some_and(decimal_separator) {
+        Generated::Sign(Sign::Separator)
+    } else if text.contains('\n') {
+        Generated::LineFeed
+    } else if visible().next().is_some() {
+        Generated::Ornament
+    } else {
+        Generated::Plain
+    }
+}
+
+/// What a `content` value shows, from its tokens. A function's arguments
+/// are not shown as text, and text after a `/` is the alternative text of
+/// what comes before, which a reader does not show either.
 fn generated_content(value: &[Token]) -> Option<Generated> {
     let mut generated = Generated::Plain;
-    for token in value {
-        match token {
+    let mut index = 0;
+    while index < value.len() {
+        match &value[index] {
             Token::Ident(word) => match word.to_ascii_lowercase().as_str() {
                 "none" | "normal" => return Some(Generated::Nothing),
                 "initial" | "unset" | "revert" => return Some(Generated::Nothing),
+                "open-quote" | "close-quote" => generated = generated.max(Generated::Ornament),
                 _ => {}
             },
-            Token::Str(text) => {
-                if text.chars().any(char::is_alphanumeric) {
-                    generated = Generated::Text;
-                } else if text.chars().any(amount_sign) {
-                    generated = generated.max(Generated::Sign(Sign::Amount));
-                } else if text.ends_with(['.', ',']) {
-                    generated = generated.max(Generated::Sign(Sign::Separator));
-                } else if text.contains('\n') {
-                    generated = generated.max(Generated::LineFeed);
-                }
-            }
+            Token::Str(text) => generated = generated.max(shown_text(text)),
+            // An image.
+            Token::Url(_) => generated = generated.max(Generated::Ornament),
             Token::Function(function) => match function.to_ascii_lowercase().as_str() {
                 "counter" | "counters" | "attr" => generated = Generated::Text,
                 "var" | "env" | "if" => return None,
-                _ => {}
+                // An image, or a gradient.
+                _ => generated = generated.max(Generated::Ornament),
             },
+            Token::Delim('/') => break,
             _ => {}
         }
+        index = skip_component(value, index);
     }
     Some(generated)
 }
@@ -2811,11 +2948,12 @@ fn parse_style_block(
         let declarations: Rc<[Declaration]> = declarations.into();
         // A `::before` or `::after` box matters for where a reader breaks
         // lines, which its `display`, `content`, `float`, `position`, and
-        // `white-space` decide, and for the text it shows, which its
-        // `visibility` and `opacity` may keep unseen. An element's own
-        // `content`, `white-space`, and `opacity` are not read, and its
-        // margins and padding only for flex and grid items (see
-        // [`Cascade::spacing`]).
+        // `white-space` decide, for the text it shows, which its
+        // `visibility` and `opacity` may keep unseen, and for whether its
+        // margins and padding set a dash apart from the element's content.
+        // An element's own `content`, `white-space`, and `opacity` are not
+        // read, and its margins and padding only for flex and grid items
+        // (see [`Cascade::spacing`]).
         let lays_out = declarations.iter().any(|declaration| {
             matches!(
                 declaration.property,
@@ -2841,7 +2979,7 @@ fn parse_style_block(
         for selector in parse_selector_list(selectors, 0) {
             let kept = match selector.pseudo_element {
                 PseudoElement::None => styles_element,
-                PseudoElement::Before | PseudoElement::After => lays_out,
+                PseudoElement::Before | PseudoElement::After => lays_out || spaces,
                 PseudoElement::Other => false,
             };
             let spacing = spaces && selector.pseudo_element == PseudoElement::None;
@@ -2982,9 +3120,12 @@ struct PseudoBox {
     /// It certainly shows text that carries meaning, which AnyDoc does not
     /// convert.
     text: bool,
-    /// A sign an amount reads by that it certainly shows, which matters
-    /// beside a digit.
+    /// What it certainly shows that matters beside a digit: a sign an
+    /// amount reads by, or anything that keeps two numbers apart.
     sign: Option<Sign>,
+    /// For a `::before` box, whether that sign is hyphens or dashes set
+    /// apart from the element's content, as a bullet stands.
+    bullet: bool,
     /// Whether its text is certainly unseen (`visibility: hidden`,
     /// `opacity: 0`); `None` where it takes the element's visibility.
     unseen: Option<bool>,
@@ -3566,8 +3707,10 @@ impl Cascade {
         // whether `display: none` removes it, what it shows, whether it
         // leaves the flow by position or float, whether it keeps line
         // feeds, whether `visibility` hides it (`Maybe` for a value not
-        // known until run time, `None` to take the element's), and whether
-        // it is transparent.
+        // known until run time, `None` to take the element's), whether it
+        // is transparent, and whether a margin or padding sets it apart
+        // from the element's content (its right for `::before`, its left
+        // for `::after`).
         let mut pseudo_blocks: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_none: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_content: [Vec<(Precedence, Tri, Option<Generated>)>; 2] = Default::default();
@@ -3576,6 +3719,8 @@ impl Cascade {
         let mut pseudo_line_feeds: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_hidden: [Vec<(Precedence, Tri, Option<Tri>)>; 2] = Default::default();
         let mut pseudo_clear: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_margin: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        let mut pseudo_padding: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         // Whether a rule for each box may apply at all.
         let mut pseudo_styled = [false; 2];
         for index in candidates {
@@ -3645,6 +3790,22 @@ impl Cascade {
                         }
                         (Property::Opacity, Some(clear)) => {
                             pseudo_clear[slot].push((precedence, certainty, clear));
+                            continue;
+                        }
+                        (Property::MarginRight, Some(wide)) if slot == 0 => {
+                            pseudo_margin[slot].push((precedence, certainty, wide));
+                            continue;
+                        }
+                        (Property::MarginLeft, Some(wide)) if slot == 1 => {
+                            pseudo_margin[slot].push((precedence, certainty, wide));
+                            continue;
+                        }
+                        (Property::PaddingRight, Some(wide)) if slot == 0 => {
+                            pseudo_padding[slot].push((precedence, certainty, wide));
+                            continue;
+                        }
+                        (Property::PaddingLeft, Some(wide)) if slot == 1 => {
+                            pseudo_padding[slot].push((precedence, certainty, wide));
                             continue;
                         }
                         _ => {}
@@ -3829,10 +3990,6 @@ impl Cascade {
             );
             let certain = !contested && exists == Tri::Yes;
             let text = certain && content == Some(Generated::Text);
-            let sign = match content {
-                Some(Generated::Sign(sign)) if certain => Some(sign),
-                _ => None,
-            };
             let line_feed = match content {
                 Some(Generated::LineFeed) if !contested => {
                     match resolve_value(&pseudo_line_feeds[slot], Tri::Maybe) {
@@ -3844,6 +4001,31 @@ impl Cascade {
             };
             let out_of_flow = resolve_flow(&pseudo_out[slot], false)
                 .max(resolve_flow(&pseudo_floats[slot], false));
+            // Hyphens or dashes set apart from the element's content, by
+            // white space, a margin or padding, or out of the flow: before
+            // it, a bullet; after it, a separator from what follows.
+            // Touching the content, a minus.
+            let apart = |spaced: bool| {
+                spaced
+                    || resolve_flow(&pseudo_margin[slot], false)
+                        .max(resolve_flow(&pseudo_padding[slot], false))
+                        .max(out_of_flow)
+                        == Tri::Yes
+            };
+            let (sign, bullet) = match content {
+                Some(Generated::Sign(Sign::Dash { trailing, .. })) if certain && slot == 0 => {
+                    (Some(Sign::Amount), apart(trailing))
+                }
+                Some(Generated::Sign(Sign::Dash { leading, .. })) if certain && apart(leading) => {
+                    (Some(Sign::Between), false)
+                }
+                Some(Generated::Sign(Sign::Dash { .. })) if certain => (Some(Sign::Amount), false),
+                Some(Generated::Sign(sign)) if certain => (Some(sign), false),
+                Some(Generated::Ornament | Generated::LineFeed) if certain => {
+                    (Some(Sign::Between), false)
+                }
+                _ => (None, false),
+            };
             let breaks = all_three(
                 exists,
                 resolve_flow(&pseudo_blocks[slot], false).max(line_feed),
@@ -3862,6 +4044,7 @@ impl Cascade {
                 breaks,
                 text,
                 sign,
+                bullet,
                 unseen,
             }
         };
@@ -4637,6 +4820,16 @@ impl Run {
         }
     }
 
+    /// Whether the text taken in ends an amount: a digit, or a sign after
+    /// one ("12%").
+    fn ends_amount(&self) -> bool {
+        match self.last {
+            Some(last) if last.is_numeric() => true,
+            Some(last) => amount_sign(last) && self.before_last.is_some_and(char::is_numeric),
+            None => false,
+        }
+    }
+
     /// Add text to the run; whether it runs into the text before it.
     fn add(&mut self, text: &str) -> bool {
         self.take(text, false)
@@ -4653,15 +4846,21 @@ impl Run {
     /// before it where a reader starts a new line. Alt text is not text a
     /// reader shows: where it meets other text, as pandoc 2 figures run an
     /// image's caption into it ("ChartChart"), only digits on both sides,
-    /// which read as one number, count as joined.
+    /// which read as one number, count as joined. Characters a reader shows
+    /// nothing for, which AnyDoc keeps, stand between nothing: digits on
+    /// either side of a word joiner read as one number, and a sign before a
+    /// directional mark meets the digits after it.
     fn take(&mut self, text: &str, alt: bool) -> bool {
-        let kept = || text.chars().filter(|character| anydoc_keeps(*character));
+        let kept = || {
+            text.chars()
+                .filter(|character| anydoc_keeps(*character) && !invisible(*character))
+        };
         let Some(last) = kept().next_back() else {
             return false;
         };
         if kept().all(char::is_whitespace) {
             self.space(' ');
-            if self.sign_before == Some(Sign::Separator) {
+            if matches!(self.sign_before, Some(Sign::Between | Sign::Separator)) {
                 self.sign_before = None;
             }
             return false;
@@ -4673,13 +4872,14 @@ impl Run {
         let at_space = self.at_space();
         let mut from_first = kept().skip_while(|character| at_space && character.is_whitespace());
         let (first, second) = (from_first.next(), from_first.next());
-        // A separator joins only the digits right after it; another sign
-        // reads with the amount after the white space too.
+        // A separator joins only the digits right after it, and what else a
+        // box shows parts only the digits it stands between; a sign reads
+        // with the amount after white space too.
+        let digit_next = || kept().next().is_some_and(char::is_numeric);
         let meets_sign = match self.sign_before.take() {
-            Some(Sign::Separator) => kept().next().is_some_and(char::is_numeric),
-            Some(Sign::Amount) => kept()
-                .find(|character| !character.is_whitespace())
-                .is_some_and(char::is_numeric),
+            Some(Sign::Between) => self.last.is_some_and(char::is_numeric) && digit_next(),
+            Some(Sign::Separator) => digit_next(),
+            Some(Sign::Dash { .. } | Sign::Amount) => starts_amount(kept()),
             None => false,
         };
         self.lost_sign |= meets_sign;
@@ -5431,10 +5631,8 @@ fn meet_run(
 /// glyphs taken in so far; whether a sign its `::after` box shows meets the
 /// digit the text before it ends in, which AnyDoc then shows without it.
 fn end_element(effects: &Effects, runs: &mut Vec<Run>, glyphs: (u64, u64)) -> bool {
-    let lost_sign = effects.sign_after == Some(Sign::Amount)
-        && runs
-            .last()
-            .is_some_and(|run| run.last.is_some_and(char::is_numeric));
+    let lost_sign = effects.sign_after.is_some_and(Sign::of_amount)
+        && runs.last().is_some_and(Run::ends_amount);
     if effects.opens_run {
         runs.pop();
     }
@@ -5939,10 +6137,12 @@ pub(super) fn chapter_text(
             }
         };
         // What a shown `::before` or `::after` box adds, which AnyDoc never
-        // converts: text, such as a label, and a sign beside digits. A box
-        // takes the element's visibility unless its own settles it. AnyDoc
-        // writes a list item with a list marker of its own, which stands in
-        // for a sign before or after it.
+        // converts: text, such as a label, a sign beside digits, and what
+        // keeps digits on either side apart. A box takes the element's
+        // visibility unless its own settles it. AnyDoc writes a list item
+        // with a list marker of its own, which stands in for a bullet the
+        // item's `::before` box shows, a hyphen or dash set apart from the
+        // item's text; any other sign on an item is lost as it is elsewhere.
         let hidden = state.undisplayed || state.contents_hidden || state.unpainted;
         let generated = style
             .as_ref()
@@ -5954,10 +6154,14 @@ pub(super) fn chapter_text(
                 .any(|pseudo| pseudo.text && seen(pseudo))
         });
         let list_item = parent_reach == Some(Reach::List) && reach == Reach::Walk && !spliced;
-        let signs = generated.filter(|_| !list_item);
-        let sign_before = signs.and_then(|style| style.before.sign.filter(|_| seen(&style.before)));
+        let sign_before = generated.and_then(|style| {
+            style
+                .before
+                .sign
+                .filter(|_| seen(&style.before) && !(list_item && style.before.bullet))
+        });
         effects.sign_after =
-            signs.and_then(|style| style.after.sign.filter(|_| seen(&style.after)));
+            generated.and_then(|style| style.after.sign.filter(|_| seen(&style.after)));
         state.effects.sign_after = effects.sign_after;
         // A sign before the element's content sits before the text after
         // it, and after the text the line holds before it.
@@ -5966,9 +6170,7 @@ pub(super) fn chapter_text(
                 return false;
             };
             run.sign_before = run.sign_before.max(sign_before);
-            sign_before == Some(Sign::Amount)
-                && !run.boundary
-                && run.last.is_some_and(char::is_numeric)
+            sign_before.is_some_and(Sign::of_amount) && !run.boundary && run.ends_amount()
         };
         // An empty element holds no text to check.
         if !has_children {
@@ -6812,6 +7014,11 @@ mod tests {
             &[".x { display: inline } .x:has(b) { display: block }"],
             r#"<p>A</p><div class="x">Units 12</div><div class="x">50 shipped</div>"#
         ));
+        // A word joiner a reader shows nothing for does not keep them apart.
+        assert!(fuses(
+            &[".x { display: inline } .x:has(b) { display: block }"],
+            "<p>A</p><div class=\"x\">Units 12\u{2060}</div><div class=\"x\">50 shipped</div>"
+        ));
         assert!(!fuses(
             &[".x { display: inline } .x:has(b) { display: block }"],
             r#"<p>A</p><div class="x">Balance due</div><div class="x">1,250.00</div>"#
@@ -7375,6 +7582,95 @@ mod tests {
                 r#"li + li::before { content: "- " }"#,
                 "<div>Years <a><ul><li>1914</li><li>1918</li></ul></a></div>",
             ),
+            // Currency signs of every script, and signs in their full-width
+            // forms.
+            (
+                r#".s::before { content: "\E3F" }"#,
+                r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#,
+            ),
+            (
+                r#".s::before { content: "\58F" }"#,
+                r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#,
+            ),
+            (
+                r#".s::before { content: "\FFE5" }"#,
+                r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#,
+            ),
+            (
+                r#".s::before { content: "\FF0D" }"#,
+                r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#,
+            ),
+            (
+                r#".s::after { content: "\2030" }"#,
+                r#"<p>Rate <span class="s">12</span> this year.</p>"#,
+            ),
+            (
+                r#".s::after { content: "\66A" }"#,
+                r#"<p>Rate <span class="s">12</span> this year.</p>"#,
+            ),
+            // A sign before an amount that opens with a currency sign or a
+            // decimal point, and after one that ends with a percent sign.
+            (
+                r#".s::before { content: "\2212" }"#,
+                r#"<p>Net change <span class="s">$1,250.00</span> this year.</p>"#,
+            ),
+            (
+                r#".s::before { content: "\2212" }"#,
+                r#"<p>Rate change <span class="s">.75</span> points.</p>"#,
+            ),
+            (
+                r#".s::before { content: "-" }"#,
+                r#"<p>Net change <span class="s">€1.250,00</span> this year.</p>"#,
+            ),
+            (
+                r#".s::after { content: ")" }"#,
+                r#"<p>Change <span class="s">12%</span> this year.</p>"#,
+            ),
+            // Anything a box shows between digits: a raised or Arabic
+            // decimal point, a slash, a colon, a comma and a space between
+            // page references, a space, or a quote mark.
+            (
+                r#".c::before { content: "\B7" }"#,
+                r#"<p>Price 1<span class="c">99</span> due.</p>"#,
+            ),
+            (
+                r#".c::before { content: "\66B" }"#,
+                r#"<p>Price 1<span class="c">99</span> due.</p>"#,
+            ),
+            (
+                r#".c::before { content: "\2044" }"#,
+                r#"<p>Take 1<span class="c">2</span> cup.</p>"#,
+            ),
+            (
+                r#".c::before { content: ":" }"#,
+                r#"<p>At 12<span class="c">30</span> sharp.</p>"#,
+            ),
+            (
+                r#".pg + .pg::before { content: ", " }"#,
+                r##"<p>Deductions, <a href="#p12" class="pg">12</a><a href="#p15" class="pg">15</a></p>"##,
+            ),
+            (
+                r#".c::before { content: " " }"#,
+                r#"<p>Price 1<span class="c">99</span> due.</p>"#,
+            ),
+            (
+                r#"q::before { content: open-quote }"#,
+                "<p>In 2023<q>15 cases</q> closed.</p>",
+            ),
+            // Characters a reader shows nothing for, between a sign and its
+            // digits.
+            (
+                r#".s::before { content: "\2212" }"#,
+                "<p>Net change <span class=\"s\">\u{200e}1,250.00</span> this year.</p>",
+            ),
+            (
+                r#".c::before { content: "." }"#,
+                "<p>Price 1<span class=\"c\">\u{2060}99</span> due.</p>",
+            ),
+            (
+                r#".s::after { content: "%" }"#,
+                "<p>Rate <span class=\"s\">12\u{200e}</span> this year.</p>",
+            ),
         ] {
             assert!(drops_shown(&[sheets], body), "{sheets} {body}");
         }
@@ -7398,21 +7694,75 @@ mod tests {
                 r#".s::after { content: "$" } .s { display: block }"#,
                 r#"<div><span class="s">Total</span> 1,250.00</div>"#,
             ),
-            // A list item's sign: AnyDoc's list marker stands in for it.
+            // A list item's bullet, a hyphen or dash set apart from its
+            // text: AnyDoc's list marker stands in for it.
             (
                 r#"li::before { content: "- " }"#,
                 "<ul><li>2 cups flour</li></ul>",
             ),
             (
+                r#"ul.b { list-style: none } ul.b li::before { content: "\2013\A0" }"#,
+                r#"<ul class="b"><li>2 cups flour</li><li>3 eggs</li></ul>"#,
+            ),
+            (
                 r#"li { display: inline } li + li::before { content: " - " }"#,
                 "<ul><li>2024</li><li>2025</li></ul>",
             ),
+            // What a box shows apart from digits on one side, or beside
+            // characters a reader shows nothing for.
             (
-                r#"li { display: inline } li:not(:last-child)::after { content: " - " }"#,
-                "<ul><li>1914</li><li>1918</li></ul>",
+                r#".pg + .pg::before { content: ", " }"#,
+                r##"<p>See <a href="#a" class="pg">Filing</a><a href="#b" class="pg">12</a></p>"##,
+            ),
+            (
+                r#".c::before { content: "/" }"#,
+                r#"<p>Price 1<span class="c"> each</span></p>"#,
+            ),
+            (
+                r#".c::before { content: "\200B" }"#,
+                r#"<p>Price 1<span class="c">99</span> due.</p>"#,
+            ),
+            (
+                r#".c::before { content: url("rule.png") }"#,
+                r#"<p>Chapter <span class="c">One</span></p>"#,
             ),
         ] {
             assert!(!drops_shown(&[sheets], body), "{sheets} {body}");
+        }
+    }
+
+    #[test]
+    fn a_list_items_signs_are_lost_as_elsewhere() {
+        // AnyDoc's list marker stands in for a list item's bullet, not for
+        // a sign it shows before or after its digits: a minus, parentheses,
+        // a percent or currency sign, or a hyphen or dash touching them.
+        let items = r#"<ul class="ledger"><li>Opening balance</li><li class="neg">1,250.00</li><li class="pct">12</li></ul>"#;
+        for sheet in [
+            r#".neg::before { content: "\2212" }"#,
+            r#".neg::before { content: "(" } .neg::after { content: ")" }"#,
+            r#".pct::after { content: "%" }"#,
+            r#".neg::before { content: "$" }"#,
+            r#".neg::before { content: "-" }"#,
+            r#"ul.ledger { list-style: none } .neg::before { content: "\2212" }"#,
+            r#"ul.ledger { list-style: none } li::before { content: "\2013 " }"#,
+        ] {
+            assert!(drops_shown(&[sheet], items), "{sheet}");
+            let numbered = items.replace("ul", "ol");
+            assert!(drops_shown(&[sheet], &numbered), "{sheet}");
+        }
+        // A hyphen or dash a margin, padding, or white space sets apart
+        // from the item's text is its bullet; one set apart after its
+        // digits, a separator from the next item, which starts a line of
+        // its own in the Markdown.
+        for sheet in [
+            r#"ul.ledger { list-style: none } li::before { content: "-"; margin-right: .5em }"#,
+            r#"ul.ledger { list-style: none } li::before { content: "\2013"; padding-right: 4px }"#,
+            r#"ul.ledger { list-style: none } li::before { content: "-"; position: absolute; margin-left: -1em }"#,
+            r#"ul.ledger { list-style: none } li::before { content: "\2013\A0" }"#,
+            r#"li { display: inline } li:not(:last-child)::after { content: " - " }"#,
+            r#"li { display: inline } li + li::before { content: " \B7 " }"#,
+        ] {
+            assert!(!drops_shown(&[sheet], items), "{sheet}");
         }
     }
 
