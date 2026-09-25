@@ -95,8 +95,17 @@ The scanned-page check loads each PDF a second time with `lopdf`, decoding at
 most 32 MiB per content stream and 128 MiB and 10 million operations per
 document, with form nesting capped at 12. It adds 1.1 ms to `classify_pdf` on
 `source/sample-1.pdf`, 4.5 ms on `source/sample-2.pdf`, and about 96 ms on a
-42 MB file (230 to 327 ms), with peak memory unchanged (50 to 51 MiB). A page
-that binds no image is not decoded.
+42 MB file (230 to 327 ms), with peak memory unchanged (50 to 51 MiB). For the
+invisible-layer check, a page that binds no image is not decoded.
+
+In a full `pdf_to_markdown` run the same scan also reads every text page for
+runs painted twice, under limits of its own (64 MiB and 4 million
+operations; past them only that check stops). Decoding the content is its
+cost: on `source/sample-2.pdf` the document loads in 9 ms and its 278,000
+operations decode in 121 ms. Median `pdf_to_markdown` time goes from 36 to
+48 ms on sample 1, 449 to 578 ms on sample 2, and 275 to 335 ms on sample 3;
+the 42 MB file is unchanged (387 to 370 ms), and classification is not
+affected.
 
 ## Boundary and interpretation
 

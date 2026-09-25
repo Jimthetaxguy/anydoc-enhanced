@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PDF results list a scanned page for OCR, with upstream's
   `invisible_text_layer` reason, when its text is mostly an invisible layer
   that pdf-inspector 1.24.0 does not read (see Fixed).
+- PDF results carry a `warnings` list, absent when empty, naming text the
+  Markdown repeats and tables whose amounts may sit in the wrong row or
+  column (see Fixed). A full run that yields no Markdown for a text PDF
+  reports confidence 0, and a page whose text looks garbled sets
+  `has_encoding_issues`.
 
 ### Security
 - DOCX conversion refuses content the pinned AnyDoc parser drops silently:
@@ -160,7 +165,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `parse_irc_sections` reads the Markdown pdf-inspector renders. It returns
   full provision labels such as `(d)(2)(A)(i)`, flags repealed sections, and
   keeps editorial and statutory notes apart from the operative text.
-- `scripts/build-anydoc-hardening-corpus.py` and thirty-eight synthetic
+- `scripts/build-anydoc-hardening-corpus.py` and forty synthetic
   fixtures that reproduce pinned-AnyDoc behaviors the local contract does not
   inherit, or that must convert.
 - `docs/upstream-drift-audit-2026-09-24.md`: the upstream refresh audit, the
@@ -182,6 +187,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Text pdf-inspector 1.24.0 repeats or merges is reported, from its open pull
+  requests (#317, #377, #406, #424, #443, #531). A run painted twice over
+  itself, for emphasis, as an overprint, or as a replayed row, came out twice
+  ("TToottaall", "84.19 84.19") at confidence 1.0. A compact table's first row
+  also ended the paragraph above it, so a statement's opening balance or first
+  deposit appeared twice; a rate table in the public Title 26 sample shows it.
+  Adjacent columns of amounts, such as a 1099-B's wash-sale adjustment beside
+  the basis, merged into one cell. Each is now a warning,
+  `text_painted_twice` by page, `table_row_repeated`, and
+  `table_values_merged`; the Markdown is not changed. A text PDF whose full
+  run yields no Markdown reported confidence 1.0 and now reports 0.
+- Review round five found missed losses and false refusals in the checks
+  added by loops 8-11; all are fixed, and no outcome among 303 public
+  documents changed:
+  - DOCX list numbers are replayed paragraph by paragraph as Word and AnyDoc
+    count them. Lists that match (a deleted bullet, a "Restart at 1" with
+    letters under it, letters counted across restarts) are no longer
+    reported. A level replaced without a start override is, and so is a
+    restart LibreOffice writes on a list's first paragraph only, which
+    LibreOffice numbers 1, 2, 3 and AnyDoc 1, 4, 5.
+  - Spreadsheets: a currency code holding "CR" or "DR" (IDR, SCR, CRC) no
+    longer passes for an accounting sign, so "IDR 25,000" shown in red for
+    -25,000 is refused. A negative with text of its own ("Refund $830",
+    "▼3.1%"), or too small to show a digit, is not. A colour name no longer
+    reads as a date. Built-in percentages 67 and 68, 15% shown as 0.15, are
+    refused. Connector labels are found, and Excel's compatibility fallbacks
+    for charts and slicers are no longer read as text boxes.
+  - ODS: a formula returning a space or an empty string
+    (`=IF(A2="";"";A2*B2)`) is cached, not missing. Chart and formula objects,
+    which AnyDoc shows as images or converts, are no longer refused as active
+    content; OLE objects, by element or manifest entry, are.
+  - PDF: clip-only text an image or a shading is painted through, as in a
+    heading filled with a picture or a gradient, is visible, so such flyers
+    are no longer listed for OCR.
 - EPUB chapters whose blocks AnyDoc runs together are refused, found from its
   older EPUB pull request (#4). AnyDoc walks a `div`, `section`, `figure`,
   `figcaption`, `dd`, or other container without block children inline, so
@@ -251,6 +290,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `identify_tax_form`: bank-direct 1099-INTs that render as numeric tables only return `Unknown` (no header text in markdown)
 - No OCR engine ships. Scanned pages report that they need OCR and why, and
   return no text for those pages.
+- Other pdf-inspector 1.24.0 defects from its open pull requests are not
+  detected: amounts pushed out of their rows after a table (#424); a receipt
+  with few text operators and a logo read as a scan (#445); forms with
+  indirect or missing resources (#407, #312), reported only through the
+  garbled-text reason where it applies; rotated column headers scattered
+  into cells (#298); a space width read from the wrong code, splitting or
+  fusing amounts (#532); browser-printed words split into letters (#531);
+  and blank pages that turn the sparse-extraction rule on for every page
+  (#339). The table checks read the Markdown and name no page; the repeat
+  check reads runs whose position is set, and stops after 4 million
+  operations per document.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen
@@ -258,7 +308,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and SVG `<title>` and `<desc>`, which read like image alt text, are not
   flagged.
 - Spreadsheet pictures and charts are not converted, and a picture's alt text
-  is not flagged. Text boxes and shapes with text are refused.
+  is not flagged; an ODF chart object converts as its replacement image. Text
+  boxes and shapes with text are refused.
 - A spreadsheet format AnyDoc cannot parse, such as `£#,##0.00`, renders as
   General: the value and its sign are kept, the currency symbol and rounding
   are not. A value in a cell a merge covers is omitted, as Excel and
@@ -279,8 +330,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Project Gutenberg's `.x-ebookmaker .pagenum`, refuse the book, because
   AnyDoc converts them.
 - DOCX: a hidden paragraph mark is disclosed for direct numbering (`w:numPr`)
-  only, not numbering applied through a paragraph style. List numbering
-  follows Word's counters by definition and list style; `w:lvlRestart` and
-  legal numbering (`w:isLgl`) are not compared. Where Word supports
+  only, not numbering applied through a paragraph style. List numbers are
+  compared by each level's own number: a composite label (`%1.%2`) whose
+  shallower number differs, and legal numbering (`w:isLgl`), are not; a
+  paragraph style's own `w:ilvl` is ignored, as AnyDoc and ECMA-376 ignore
+  it. Where Word supports
   a block-level `mc:Choice` that AnyDoc does not, AnyDoc converts the
   `mc:Fallback`; the check assumes the two branches hold the same text.

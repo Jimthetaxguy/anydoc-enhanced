@@ -273,6 +273,8 @@ came back clean. The evidence and dispositions are in
 | 10 | Spreadsheet number formats and drawings, from AnyDoc's #72 and #151 | Negatives marked only in red (−25,000 read as 25,000), values a format hides, unresolved locale dates, and text boxes are refused; no producer-shaped workbook changed |
 | 11 | DOCX list numbers AnyDoc renders differently from Word (#129) | Shared definitions, deleted numbered paragraphs, and ordinal or word formats convert as `partial` with `list_numbering_differs`; AnyDoc's own upstream fixture shows 1 where Word shows 5 |
 | 12 | EPUB blocks AnyDoc runs together, from its older pull request (#4) | Minified `div`s ("Balance due1,250.00") and an image's alt text running into its caption are refused; indented markup converts as before, and only the three reproductions among 303 public documents changed |
+| 13 | PDF text pdf-inspector repeats or merges, from its open pull requests (#317, #377, #406, #424, #443, #531) | `text_painted_twice`, `table_row_repeated`, and `table_values_merged` warnings; confidence 0 for a text PDF with no Markdown; the public Title 26 sample repeats a rate table's first row |
+| Review 5 | Bypass and false-refusal review of loops 8-11, against LibreOffice and AnyDoc's raw output | 4 missed losses and 12 false refusals fixed: list numbers replayed paragraph by paragraph, colour-only negatives told from labels and currency codes, compatibility fallbacks and chart objects read as the applications show them |
 | Sanitizer | Keep what the Markdown sanitizer removed wrongly | Cell line breaks (`<br>`) kept, which had fused "52,000" and "1,250" into "52,0001,250" in six lanes; escaped `\<Client name>` placeholders and code kept |
 
 ## Next slices
@@ -290,14 +292,22 @@ came back clean. The evidence and dispositions are in
    numbering, and format models, which mirror 0.2.4's behavior.
 3. **Next pdf-inspector release.** If #479 or #501 lands, compare its
    invisible-layer handling with the local scan before removing either; if
-   #578 lands, PDF Markdown gains link destinations and must pass through the
-   sanitizer.
-4. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
+   #317, #377, #406, #424, or #443 lands, retire the matching warning once a
+   fixture shows the release reads it right; if #578 lands, PDF Markdown
+   gains link destinations and must pass through the sanitizer.
+4. **PDF defects not yet detected.** From the open pull requests: amounts
+   pushed out of their rows (#424), receipts read as scans (#445), forms with
+   indirect or missing resources (#407, #312), rotated headers (#298), space
+   widths from the wrong code (#532), browser-printed words (#531), and blank
+   pages (#339). Each has a generated fixture and a proposed local check in
+   the drift audit. A leaner content tokenizer would also cut the repeat
+   check's 20-30% share of `pdf_to_markdown`.
+5. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
    external relationship, including an ordinary hyperlink, while DOCX converts
    and removes the destination with a warning. Hyperlink relationships could
    follow the DOCX policy, since the sanitizer already removes their
    destinations. This is a policy change for the owners to decide.
-5. **Non-Linux containment.** PDF and document parsing still lack a memory
+6. **Non-Linux containment.** PDF and document parsing still lack a memory
    ceiling on macOS and fall back to in-process parsing where no sandbox
    exists; filesystem isolation remains open on every platform.
 

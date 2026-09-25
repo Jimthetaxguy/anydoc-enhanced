@@ -96,7 +96,27 @@ reach this repository:
 | #506 | Bound a cubic cost on dense rectangle clusters | Bounded here by the PDF worker's 25-second deadline, which returns `resource_limit`. |
 | #583 | Explicit invisible-text inclusion in positioned extraction | Not exposed; the region tools keep upstream's default. |
 | #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
-| #531, #532 | Statement-style layouts; space width from `/Differences` | Extraction quality in brokerage-statement layouts; adopt with the release that carries them. |
+| #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. Not detected yet; the #406 half of #531 is reported as `table_row_repeated`. |
+
+Thirteen open pull requests that reach the PDF tools were checked against
+1.24.0 with generated fixtures run through the server. Twelve defects are
+still present; #299 is mostly fixed by 1.24.0's superscript handling.
+
+| PR | Defect in 1.24.0 | Local disposition |
+|---|---|---|
+| #377, #317 | Text painted twice over itself is kept twice: "TToottaall aammoouunntt", "84.19 84.19", a line three times where the page shows two | Reported: the page scan notes where each placed visible run starts and adds a `text_painted_twice` warning for a page where the same run starts again within a tenth of its size (overprints, glyph-by-glyph replays, fake bold 0.3 pt off). |
+| #406 | A compact table's first row is also left in the paragraph above it, so amounts appear twice (a 14 pt row gap duplicates, 16 pt does not) | Reported from the Markdown as `table_row_repeated` when the paragraph before a table ends with its first or second row and the row holds a digit. The public Title 26 sample (`sample-2.pdf`) has it in a rate table. |
+| #424 | Adjacent numeric columns merge: a 1099-B's wash-sale column 28 pt from the basis reads "2,610.25 205.25" in one cell; a ruled table puts both years in one cell | Reported as `table_values_merged` when a body cell holds only amounts, two or more. Values pushed out of their rows after the table (30 pt pitch) are not detected. |
+| #443 | A text PDF whose Markdown is dropped as garbage keeps the detector's confidence 1.0 | Confidence 0 for a full run of a text PDF with no Markdown; `has_encoding_issues` set when a page carries `suspected_garbled_text`. |
+| #407, #312 | A form XObject with indirect `/Resources`, or none, loses its fonts' Unicode maps or the text itself | Partly: the garbled-text reason, now also an encoding issue, covers the high-code case. A check for the exact precondition is a next slice. |
+| #445 | A page with a small image and fewer than 10 text operators is read as a scan with no text, though region extraction reads it | Not detected; the page is listed for OCR, so nothing reads as complete. |
+| #339 | Blank pages feed the sparse-extraction rule, which lists every page, text pages included, for OCR without a reason | Not detected; a misleading signal, not lost text. |
+| #298 | Rotated column headers are scattered as single letters across cells | Not detected; numbers stay intact. |
+| #299 | Raised note markers after a table | Mostly fixed by 1.24.0 (#488); the markers print after the table. No action. |
+
+Fixtures and generators for all thirteen are kept with the review notes, not in
+the corpus: they reproduce a dependency's defects, and the repository's own
+tests generate the ones they need.
 
 Disposition: **adopted.** The new fields are additive. `layout` and `cmap_gaps`
 are omitted when a mode did not compute them, so absence is never reported as
@@ -186,11 +206,12 @@ assert the local result.
 | A locale date format outside its table renders as a serial number | `incomplete_conversion` | `xlsx/locale-date-format.xlsx` |
 | Drawings over a sheet are never read | `incomplete_conversion` | `xlsx/drawing-text-box.xlsx`, `ods/cell-anchored-text-box.ods` |
 | List counters are kept per instance, where Word keeps them per definition | `partial` with `list_numbering_differs` | `docx/shared-list-definition.docx` |
+| A container without block children is walked inline, so blocks a reader shows apart run together | `incomplete_conversion` | `epub/minified-blocks.epub` |
 
 Each of these converted as `complete`, with no warning, before the check that
-now refuses or discloses it. Four fixtures must convert: `pptx/section-list.pptx`,
-`epub/display-none-omitted.epub`, `epub/web-address-in-text.epub`, and
-`xlsx/red-parenthesized-negative.xlsx`.
+now refuses or discloses it. Five fixtures must convert: `pptx/section-list.pptx`,
+`epub/display-none-omitted.epub`, `epub/web-address-in-text.epub`,
+`epub/indented-blocks.epub`, and `xlsx/red-parenthesized-negative.xlsx`.
 
 The package checks now mirror AnyDoc's own reading:
 
@@ -210,8 +231,12 @@ The package checks now mirror AnyDoc's own reading:
   by cell (`odf_walk`).
 - XLSX number formats are read with AnyDoc's format grammar, section by
   section, against each cell's value (`xlsx_numfmt`).
-- DOCX list numbering is counted per instance, as AnyDoc counts, and per
-  definition, as Word counts.
+- DOCX list numbers are replayed paragraph by paragraph, per instance as
+  AnyDoc counts and per definition as Word counts, with each side's level
+  formats, restarts, and style bindings.
+- A negative's sign is judged against the number style's own marks: a
+  colour alone is lost, while a minus, parentheses, `CR` or `DR` as words,
+  or text of the negative section's own is kept.
 
 Where AnyDoc picks one of several candidates (lowest id, a namespace-qualified
 attribute), the checks cover every candidate. That can only make them stricter.
@@ -247,8 +272,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 228 tests pass (176 skillkit unit, 13
-  skillkit integration, 29 document-tool and 7 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 236 tests pass (183 skillkit unit, 13
+  skillkit integration, 29 document-tool and 8 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI
@@ -260,6 +285,12 @@ Run on Linux x86-64 with Rust 1.94.1:
 - A fourth round reproduced 95 more bypasses. All fail closed or are
   disclosed, except two documented decisions: a closed `<details>` and SVG
   descriptions, which a reader shows on request, are treated like alt text
+- A fifth round, checked against LibreOffice and AnyDoc's raw output, found
+  4 missed losses and 12 false refusals in the checks added by loops 8-11
+  (list numbers, colour-only negatives, drawings, empty-string formulas,
+  clip-only PDF text), and 2 older false refusals (ODS charts refused as
+  active content, empty-string formulas as uncached). All are fixed; none of
+  the 303 documents below changed outcome.
 - Across 303 documents (the public corpus, 39 LibreOffice conversions, the
   round-four regression corpus, AnyDoc's 34 upstream fixtures, and the
   pull-request reproductions), every outcome change was traced to a check
@@ -271,9 +302,13 @@ Run on Linux x86-64 with Rust 1.94.1:
   removes by design
 - `bash scripts/check-public-hygiene.sh` and `cargo deny check`
 - Golden comparison of every tool over the public corpus against the previous
-  build: 132 calls, no changed output, identical tool list
-- The scanned-page check adds 1–5 ms to PDF calls on the public corpus and
-  about 0.1 s for a 42 MB file, with the same peak memory
+  build: 143 calls, identical tool list; the one changed output is the new
+  `table_row_repeated` warning on the Title 26 sample, whose rate table
+  pdf-inspector repeats
+- The page scan, which in a full run also reads every text page for repeated
+  runs, adds 12-130 ms (20-30%) to `pdf_to_markdown` on the public text PDFs,
+  nothing to classification, and nothing measurable for a 42 MB file, with
+  the same peak memory
 - `scripts/evaluate-upstream-abuse.py` against the AnyDoc mirror: 7/7
   `resource_limit`, recorded in `docs/resource-evidence.md`
 
@@ -302,6 +337,10 @@ When pdf-inspector publishes a release after 1.24.0:
    keep the local invisible-layer scan until they agree.
 2. If #578 is included, route PDF Markdown through the sanitizer before
    adoption, since link destinations will appear in it.
+3. Re-run the thirteen pull-request fixtures. Retire the
+   `text_painted_twice`, `table_row_repeated`, or `table_values_merged`
+   warning only for a defect the release reads right, and update the
+   `sample-2.pdf` expectation in the PDF integration test.
 
 ## Sources
 
