@@ -12596,6 +12596,15 @@ mod tests {
         );
         let zeros = "#,##0;(#,##0);";
         assert!(!workbook(r#"<c r="A1" s="1"><v>0</v></c>"#, zeros).hidden_content);
+        // AnyDoc renders a section naming General beside date letters as
+        // General: the colour alone marked the negative.
+        let general = "General;[Red]General s";
+        assert!(workbook(r#"<c r="A1" s="1"><v>-3.5</v></c>"#, general).unsupported_content);
+        assert!(!workbook(r#"<c r="A1" s="1"><v>3.5</v></c>"#, general).unsupported_content);
+        // A fraction scaled by thousands shows a thousandth of its value.
+        let scaled = "# ?/?,";
+        assert!(workbook(r#"<c r="A1" s="1"><v>0.2</v></c>"#, scaled).unsupported_content);
+        assert!(!workbook(r#"<c r="A1" s="1"><v>0</v></c>"#, scaled).unsupported_content);
         // A locale date id AnyDoc cannot resolve renders a serial number.
         assert!(workbook(r#"<c r="A1" s="2"><v>45762</v></c>"#, red).unsupported_content);
         // A style index past `cellXfs` renders as General.

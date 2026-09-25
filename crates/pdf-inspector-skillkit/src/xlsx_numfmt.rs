@@ -1,7 +1,7 @@
 //! What a workbook's number formats do to the values AnyDoc 0.2.4 converts.
 //!
 //! AnyDoc renders a cell through its format code when it can parse the code
-//! and falls back to General when it cannot (`sheet::numfmt`). Three things
+//! and falls back to General when it cannot (`sheet::numfmt`). Four things
 //! go wrong for a reader of the Markdown, and each converts without a word:
 //!
 //! - A negative value whose format marks it only by a colour, such as
@@ -18,6 +18,9 @@
 //!   number: a built-in locale date format outside AnyDoc's table, or a
 //!   code its parser rejects. So does a built-in percentage outside the
 //!   table (ids 67 and 68), a hundredth of what the format shows.
+//! - A fraction whose format scales it by thousands (`# ?/?,`) renders a
+//!   thousandth of the value, where LibreOffice shows the fraction
+//!   unscaled.
 //!
 //! The parse here follows AnyDoc's grammar closely enough to tell which
 //! codes it rejects, section by section; the number layout inside a section
@@ -160,6 +163,9 @@ struct Section {
     denominator: f64,
     /// Percent signs, each of which scales the value by a hundred.
     percents: i32,
+    /// Scaling commas, those after its last digit placeholder, each of
+    /// which divides the value by a thousand.
+    scaling: i32,
 }
 
 /// A format code as AnyDoc reads it.
@@ -235,6 +241,7 @@ fn parse_section(section: &str) -> Option<Section> {
     let mut tokens = 0usize;
     // Tokens a date section or a text section may not hold.
     let (mut digits, mut exponent, mut bare_digits, mut general) = (false, false, false, false);
+    let mut slash = false;
     // The number's decimals, its trailing (scaling) commas, and percents.
     let (mut after_point, mut placeholders_after_point) = (false, 0i32);
     let (mut commas_after_digit, mut percents) = (0i32, 0i32);
@@ -413,6 +420,7 @@ fn parse_section(section: &str) -> Option<Section> {
             }
             '$' | '-' | '+' | '(' | ')' | ':' | ' ' | '/' => {
                 parsed.sign |= matches!(character, '-' | '(' | ')');
+                slash |= character == '/';
                 // A slash directly after an integer placeholder is a
                 // fraction's bar, part of the number; any other is text the
                 // section shows.
@@ -428,13 +436,26 @@ fn parse_section(section: &str) -> Option<Section> {
         }
         index += 1;
     }
-    if general && (digits || exponent || bare_digits || parsed.text || parsed.date) {
-        return None;
+    // A section naming General renders the value as General, with the
+    // literal text around it and whatever date letters it names ignored;
+    // any other token rejects it.
+    if general {
+        if digits
+            || exponent
+            || bare_digits
+            || parsed.text
+            || slash
+            || commas_after_digit > 0
+            || percents > 0
+        {
+            return None;
+        }
+        parsed.date = false;
     }
     if !general && parsed.date && (parsed.text || exponent || bare_digits) {
         return None;
     }
-    if !general && !parsed.date && parsed.text && (digits || exponent || bare_digits) {
+    if !general && !parsed.date && parsed.text && (digits || exponent || bare_digits || slash) {
         return None;
     }
     // A bar with no denominator after it is rejected.
@@ -445,6 +466,7 @@ fn parse_section(section: &str) -> Option<Section> {
     parsed.decimals = placeholders_after_point + 2 * percents - 3 * commas_after_digit;
     parsed.denominator = fixed_denominator.unwrap_or_else(|| 10f64.powi(denominator_places) - 1.0);
     parsed.percents = percents;
+    parsed.scaling = commas_after_digit;
     Some(parsed)
 }
 
@@ -599,16 +621,21 @@ pub(super) fn loss(id: u32, code: Option<&str>, class: CellClass) -> FormatLoss 
             return FormatLoss::default();
         }
     }
+    // A fraction AnyDoc divides by a thousand for each scaling comma, where
+    // LibreOffice shows it unscaled: 0.2 in `# ?/?,` shows as 0, not 1/5.
+    // A negative value too small to show a fraction either way has passed.
+    let scaled_fraction = section.fraction && section.scaling > 0 && class != CellClass::Zero;
     FormatLoss {
         hidden: section.empty && class != CellClass::Zero,
         // The negative section renders the magnitude with only its own
         // characters: a colour alone marked it negative, with no sign and
         // no text of its own.
-        misrendered: index == 1
-            && section.colour
-            && !section.sign
-            && !section.empty
-            && section.literal == numeric_sections[0].literal,
+        misrendered: scaled_fraction
+            || (index == 1
+                && section.colour
+                && !section.sign
+                && !section.empty
+                && section.literal == numeric_sections[0].literal),
     }
 }
 
@@ -671,6 +698,22 @@ mod tests {
             assert!(!misrendered(code, NEGATIVE), "{code}");
         }
         assert!(misrendered("$#,##0;[Red]$#,##0", NEGATIVE));
+        // AnyDoc renders a section naming General and date letters as
+        // General, so the colour alone marks the negative there too.
+        for code in [
+            "General;[Red]General s",
+            "General;[Red]General A/P",
+            "General;[Red]General a/p",
+            "General;[Red]General d",
+            "General;[Red]General [h]",
+            "0.00;[Red]General s",
+            "#,##0;[Red]General S",
+        ] {
+            assert!(parse(code).parses, "{code}");
+            assert!(misrendered(code, NEGATIVE), "{code}");
+            assert!(!misrendered(code, Positive), "{code}");
+        }
+        assert!(!misrendered("General;[Red]-General s", NEGATIVE));
         // A value too small to show a digit shows as zero either way.
         let class = CellClass::of;
         for (code, value, expected) in [
@@ -718,6 +761,11 @@ mod tests {
             ("0.00;[Red]-# ?/?", -0.2, false),
             ("0.00;[Red]0.0/0", -0.25, false),
             ("?/?;[Red]?/?/", -0.25, false),
+            // A scaling comma shows a fraction a thousandth of its value,
+            // unless it shows zero either way.
+            ("# ?/?,", -0.2, true),
+            ("# ?/?,", -0.0001, false),
+            ("# ?/8,", -1500.0, true),
         ] {
             assert_eq!(
                 loss(164, Some(code), class(value)).misrendered,
@@ -795,6 +843,26 @@ mod tests {
                 );
             }
         }
+        // A section naming General and date letters shows General, as
+        // LibreOffice shows it too.
+        for code in [
+            "General d",
+            "General yyyy",
+            "[h]General",
+            "General h;General",
+        ] {
+            assert!(parse(code).parses, "{code}");
+            assert!(!misrendered(code, Positive), "{code}");
+        }
+        // A fraction scaled by thousands shows a thousandth of any value
+        // but zero; other formats scale alike on both sides.
+        for code in ["# ?/?,", "# ?/?,;[Red]# ?/?,", "?/8,"] {
+            assert!(misrendered(code, Positive), "{code}");
+            assert!(!misrendered(code, Zero), "{code}");
+            assert!(!misrendered(code, Text), "{code}");
+        }
+        assert!(!misrendered("#,##0,", Positive));
+        assert!(!misrendered("# ?/?", Positive));
         // Built-in percentages outside AnyDoc's table show a hundredth.
         for id in [67, 68] {
             assert!(loss(id, None, Positive).misrendered, "{id}");
@@ -814,6 +882,9 @@ mod tests {
             "# ??/16",
             "0.00/",
             "[>=1000]#,##0;0",
+            "General s",
+            "\"x\"General A/P",
+            "_(General_)",
         ] {
             assert!(parse(code).parses, "{code}");
         }
@@ -835,6 +906,12 @@ mod tests {
             "# ?/16 ?",
             "?/?.0",
             "?/?E+0",
+            // General beside any number token, and text beside a slash.
+            "General%",
+            "General,",
+            "General/",
+            "0 General",
+            "@/",
         ] {
             assert!(!parse(code).parses, "{code}");
         }
