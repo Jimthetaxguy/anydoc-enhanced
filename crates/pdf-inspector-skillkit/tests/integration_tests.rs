@@ -1,5 +1,6 @@
 use pdf_inspector_skillkit::{
-    analyze, classify, process, validate_path, PdfInfo, PdfProvenance, SkillkitError,
+    analyze, classify, extract_text_regions_bytes, extract_text_regions_bytes_in_frame, process,
+    validate_path, PdfInfo, PdfProvenance, RegionFrame, SkillkitError,
 };
 use std::path::PathBuf;
 
@@ -189,4 +190,66 @@ fn irc_parser_flags_repealed_placeholders() {
         .map(|section| section.section_number.as_str())
         .collect();
     assert_eq!(repealed, ["§1551", "§1562", "§1564"]);
+}
+
+/// A one-page PDF whose page is displayed turned by `/Rotate 90`, with
+/// `ROTATED-MARKER` set near the top-left of the unturned page.
+fn rotated_page_pdf() -> Vec<u8> {
+    let content = "BT /F1 12 Tf 72 700 Td (ROTATED-MARKER) Tj ET";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 \
+         /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn region_rectangles_can_be_read_on_the_rendered_page() {
+    let pdf = rotated_page_pdf();
+    let found = |rect: [f32; 4], frame: RegionFrame| {
+        let results =
+            extract_text_regions_bytes_in_frame(&pdf, &[(0, vec![rect])], frame).expect("regions");
+        results[0].regions[0].text.contains("ROTATED-MARKER")
+    };
+    // Near the top-left of the page as laid out in the content stream.
+    let sheet_rect = [60.0, 75.0, 260.0, 100.0];
+    // The same text on the page as rendered: `/Rotate 90` turns the top edge
+    // to the right side, so the line runs down the right margin.
+    let display_rect = [690.0, 60.0, 720.0, 260.0];
+    assert!(found(sheet_rect, RegionFrame::Sheet));
+    assert!(!found(sheet_rect, RegionFrame::Display));
+    assert!(found(display_rect, RegionFrame::Display));
+    assert!(!found(display_rect, RegionFrame::Sheet));
+    // The frame-less entry point keeps reading the sheet frame.
+    let default = extract_text_regions_bytes(&pdf, &[(0, vec![sheet_rect])]).expect("regions");
+    assert!(default[0].regions[0].text.contains("ROTATED-MARKER"));
 }

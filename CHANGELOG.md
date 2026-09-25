@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   omits both when a mode did not compute them. Creation and modification dates
   are reported when they match the PDF date grammar. Region extraction reports
   why a region needs OCR.
+- `extract_text_regions` and `extract_table_regions` accept an optional
+  `frame`. `sheet` is the default and the previous behavior: the page as laid
+  out in its content stream, `/Rotate` not applied. `display` reads the
+  rectangles on the rendered page, so boxes from a page image select the right
+  text on rotated pages. This uses pdf-inspector 1.24's region frames.
 - `parse_irc_sections` reads the Markdown pdf-inspector renders. It returns
   full provision labels such as `(d)(2)(A)(i)`, flags repealed sections, and
   keeps editorial and statutory notes apart from the operative text.

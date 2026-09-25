@@ -50,6 +50,11 @@ Changes that reach this repository's surface:
 - Invisible text (render mode 3) is skipped by default. A Mixed PDF with no
   visible text retries with invisible text included.
 - Right-to-left text extracts in logical order (1.20.0).
+- Region extraction reads rectangles in an explicit frame. The default
+  (`PositionFrame::Sheet`) ignores `/Rotate`, so it matches a rendered page
+  image only for unrotated pages. `PositionFrame::Display` reads them on the
+  rendered page. The region tools expose this as an optional `frame`, with
+  `sheet` as the default.
 - New result fields: per-page OCR reasons, CMap gaps, and document information
   (title, author, subject, keywords, creator, producer, creation and
   modification dates). Layout and CMap gaps are empty when a mode did not

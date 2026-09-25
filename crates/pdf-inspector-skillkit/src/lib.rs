@@ -4,7 +4,7 @@
 //! on pdf-inspector directly. This gives us a single file to update when
 //! the upstream API surface changes.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 // Re-export upstream types that callers need
@@ -341,10 +341,34 @@ pub fn analyze(path: impl AsRef<Path>) -> Result<PdfInfo, SkillkitError> {
     analyze_bytes(&read_validated(path)?)
 }
 
+/// The coordinate frame region rectangles are read in. Both use PDF points
+/// with a top-left origin and `y` growing downward, relative to the page's
+/// visible box (`CropBox ∩ MediaBox`, else the MediaBox).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionFrame {
+    /// The page as laid out in its content stream, `/Rotate` not applied.
+    /// Matches a rendered image only for unrotated pages.
+    #[default]
+    Sheet,
+    /// The page as rendered, turned clockwise by its `/Rotate`: the frame a
+    /// layout model working on a page image reports boxes in.
+    Display,
+}
+
+impl From<RegionFrame> for pdf_inspector::PositionFrame {
+    fn from(frame: RegionFrame) -> Self {
+        match frame {
+            RegionFrame::Sheet => Self::Sheet,
+            RegionFrame::Display => Self::Display,
+        }
+    }
+}
+
 /// Extract text within bounding-box regions from a PDF.
 ///
 /// `regions` is `&[(page_0indexed, Vec<[x1, y1, x2, y2]>) ]` in PDF points
-/// with top-left origin.
+/// with top-left origin, read in the [`RegionFrame::Sheet`] frame.
 pub fn extract_text_regions(
     path: impl AsRef<Path>,
     regions: &[(u32, Vec<[f32; 4]>)],
@@ -392,26 +416,50 @@ pub fn process_bytes_with_options(
     Ok(PdfInfo::from_result(result, &mode))
 }
 
-/// Extract text within bounding-box regions from PDF bytes.
+/// Extract text within bounding-box regions from PDF bytes, with rectangles
+/// in the [`RegionFrame::Sheet`] frame.
 pub fn extract_text_regions_bytes(
     buffer: &[u8],
     regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
+    extract_text_regions_bytes_in_frame(buffer, regions, RegionFrame::Sheet)
+}
+
+/// Extract text within bounding-box regions from PDF bytes, with rectangles
+/// read in `frame`.
+pub fn extract_text_regions_bytes_in_frame(
+    buffer: &[u8],
+    regions: &[(u32, Vec<[f32; 4]>)],
+    frame: RegionFrame,
+) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
     check_size(buffer)?;
-    let results = pdf_inspector::extract_text_in_regions_mem(buffer, regions)?;
+    let results =
+        pdf_inspector::extract_text_in_regions_mem_in_frame(buffer, regions, frame.into())?;
     Ok(results
         .into_iter()
         .map(PageRegionResultOutput::from)
         .collect())
 }
 
-/// Extract tables within bounding-box regions from PDF bytes.
+/// Extract tables within bounding-box regions from PDF bytes, with
+/// rectangles in the [`RegionFrame::Sheet`] frame.
 pub fn extract_table_regions_bytes(
     buffer: &[u8],
     regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
+    extract_table_regions_bytes_in_frame(buffer, regions, RegionFrame::Sheet)
+}
+
+/// Extract tables within bounding-box regions from PDF bytes, with
+/// rectangles read in `frame`.
+pub fn extract_table_regions_bytes_in_frame(
+    buffer: &[u8],
+    regions: &[(u32, Vec<[f32; 4]>)],
+    frame: RegionFrame,
+) -> Result<Vec<PageRegionResultOutput>, SkillkitError> {
     check_size(buffer)?;
-    let results = pdf_inspector::extract_tables_in_regions_mem(buffer, regions)?;
+    let results =
+        pdf_inspector::extract_tables_in_regions_mem_in_frame(buffer, regions, frame.into())?;
     Ok(results
         .into_iter()
         .map(PageRegionResultOutput::from)

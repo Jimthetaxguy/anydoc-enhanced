@@ -78,7 +78,13 @@ fn call_tools(
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .expect("tool text result");
-        results.push(serde_json::from_str(text).expect("tool JSON result"));
+        // Arguments the input schema rejects come back as an error result
+        // with a plain-text reason.
+        results.push(if response["result"]["isError"] == true {
+            serde_json::json!({ "is_error": true, "reason": text })
+        } else {
+            serde_json::from_str(text).expect("tool JSON result")
+        });
     }
     drop(stdin);
     assert!(child.wait().expect("wait for MCP server").success());
@@ -128,6 +134,104 @@ fn pdf_tools_return_public_fixture_results() {
     // The batch echoes each supplied path by design; errors stay path-free.
     assert_eq!(batch[2]["path"], "missing.pdf");
     assert_eq!(batch[2]["error"], "File not found or inaccessible");
+}
+
+/// A one-page PDF displayed turned by `/Rotate 90`, with `ROTATED-MARKER`
+/// near the top-left of the unturned page.
+fn rotated_page_pdf() -> Vec<u8> {
+    let content = "BT /F1 12 Tf 72 700 Td (ROTATED-MARKER) Tj ET";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 \
+         /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn region_tools_read_rectangles_in_the_requested_frame() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let pdf = temporary.path().join("rotated.pdf");
+    std::fs::write(&pdf, rotated_page_pdf()).expect("write rotated PDF");
+    let pdf = pdf.to_str().expect("UTF-8 path").to_string();
+    // The text runs down the right margin of the rendered page.
+    let display = serde_json::json!([{ "page": 0, "rects": [[690.0, 60.0, 720.0, 260.0]] }]);
+    let results = call_tools(
+        &[
+            (
+                "extract_text_regions",
+                serde_json::json!({ "path": pdf, "regions": display, "frame": "display" }),
+            ),
+            (
+                "extract_text_regions",
+                serde_json::json!({ "path": pdf, "regions": display }),
+            ),
+            (
+                "extract_table_regions",
+                serde_json::json!({ "path": pdf, "regions": display, "frame": "display" }),
+            ),
+            (
+                "extract_text_regions",
+                serde_json::json!({ "path": pdf, "regions": display, "frame": "rotated" }),
+            ),
+        ],
+        None,
+    );
+    let text = |result: &serde_json::Value| {
+        result[0]["regions"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        text(&results[0]).contains("ROTATED-MARKER"),
+        "{}",
+        results[0]
+    );
+    // Without a frame the rectangles are read on the unturned page.
+    assert!(
+        !text(&results[1]).contains("ROTATED-MARKER"),
+        "{}",
+        results[1]
+    );
+    assert!(
+        results[2][0]["regions"][0]["text"].is_string(),
+        "{}",
+        results[2]
+    );
+    // An unknown frame is rejected, not ignored.
+    assert_eq!(results[3]["is_error"], true, "{}", results[3]);
+    assert!(results[3]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("`sheet` or `display`")));
 }
 
 #[cfg(unix)]
@@ -381,6 +485,19 @@ fn tools_list_keeps_names_and_declares_read_only_annotations() {
             "split_sec_filing",
         ]
     );
+    for name in ["extract_text_regions", "extract_table_regions"] {
+        let schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .expect("region tool")["inputSchema"];
+        assert!(
+            schema["properties"]["frame"].is_object(),
+            "{name} declares its optional frame"
+        );
+        let required = schema["required"].as_array().expect("required list");
+        assert!(!required.iter().any(|field| field == "frame"), "{name}");
+        assert!(required.iter().any(|field| field == "regions"), "{name}");
+    }
     for tool in tools {
         let annotations = &tool["annotations"];
         assert_eq!(annotations["readOnlyHint"], true, "{tool}");

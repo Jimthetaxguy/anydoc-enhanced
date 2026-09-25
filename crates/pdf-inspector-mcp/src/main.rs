@@ -14,6 +14,7 @@
 //! channel and contaminating it would break the MCP protocol.
 
 use pdf_inspector_skillkit::pdf_worker::{self, PdfOperation, PdfToolError};
+use pdf_inspector_skillkit::RegionFrame;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerConfig},
@@ -154,7 +155,16 @@ async fn run_pdf(
     path: String,
     regions: Vec<(u32, Vec<[f32; 4]>)>,
 ) -> Result<String, PdfToolError> {
-    pdf_worker::run(operation, &path, &regions)
+    run_pdf_regions(operation, path, regions, RegionFrame::Sheet).await
+}
+
+async fn run_pdf_regions(
+    operation: PdfOperation,
+    path: String,
+    regions: Vec<(u32, Vec<[f32; 4]>)>,
+    frame: RegionFrame,
+) -> Result<String, PdfToolError> {
+    pdf_worker::run_in_frame(operation, &path, &regions, frame)
         .await
         .map(|json| json.get().to_string())
 }
@@ -260,6 +270,30 @@ struct RegionSpec {
     rects: Vec<[f32; 4]>,
 }
 
+/// The coordinate frame region rectangles are given in.
+#[derive(Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RegionFrameInput {
+    /// The page as laid out in its content stream, `/Rotate` not applied: PDF
+    /// points, top-left origin of the visible page box, `y` down. The default,
+    /// and the frame these tools have always used.
+    #[default]
+    Sheet,
+    /// The page as rendered, turned clockwise by its `/Rotate`, with the same
+    /// origin conventions: use it for boxes taken from a page image, such as a
+    /// layout model's detections on a rotated scan.
+    Display,
+}
+
+impl From<RegionFrameInput> for RegionFrame {
+    fn from(frame: RegionFrameInput) -> Self {
+        match frame {
+            RegionFrameInput::Sheet => Self::Sheet,
+            RegionFrameInput::Display => Self::Display,
+        }
+    }
+}
+
 /// Input for extract_text_regions and extract_table_regions tools.
 #[derive(Deserialize, JsonSchema)]
 struct RegionInput {
@@ -267,6 +301,9 @@ struct RegionInput {
     path: String,
     /// Regions to extract from, specified as (page, rects) pairs.
     regions: Vec<RegionSpec>,
+    /// Frame the rectangles are given in: `sheet` (default) or `display`.
+    #[serde(default)]
+    frame: RegionFrameInput,
 }
 
 /// Input for Sweet package review and memo tools.
@@ -493,7 +530,7 @@ impl PdfInspectorServer {
     /// Each region is defined by a page number (0-indexed) and a list of
     /// bounding rectangles `[x1, y1, x2, y2]` in PDF points with top-left origin.
     #[tool(
-        description = "Extract text from specified rectangular regions of a PDF — returns text per region with OCR hints",
+        description = "Extract text from specified rectangular regions of a PDF — returns text per region with OCR hints. Rects are PDF points, top-left origin; set frame to display for boxes taken from a rendered page image (rotated pages)",
         annotations(
             title = "Extract PDF text regions",
             read_only_hint = true,
@@ -503,11 +540,15 @@ impl PdfInspectorServer {
         )
     )]
     async fn extract_text_regions(&self, params: Parameters<RegionInput>) -> String {
-        let path = params.0.path;
-        let regions = params.0.regions.into_iter().map(|r| (r.page, r.rects));
+        let RegionInput {
+            path,
+            regions,
+            frame,
+        } = params.0;
+        let regions = regions.into_iter().map(|r| (r.page, r.rects)).collect();
         dispatch_pdf(
             "extract_text_regions",
-            run_pdf(PdfOperation::TextRegions, path, regions.collect()),
+            run_pdf_regions(PdfOperation::TextRegions, path, regions, frame.into()),
         )
         .await
     }
@@ -517,7 +558,7 @@ impl PdfInspectorServer {
     /// Similar to extract_text_regions but runs table detection and returns
     /// markdown pipe-tables instead of flat text.
     #[tool(
-        description = "Extract tables from specified rectangular regions of a PDF as markdown pipe-tables",
+        description = "Extract tables from specified rectangular regions of a PDF as markdown pipe-tables. Rects are PDF points, top-left origin; set frame to display for boxes taken from a rendered page image (rotated pages)",
         annotations(
             title = "Extract PDF table regions",
             read_only_hint = true,
@@ -527,11 +568,15 @@ impl PdfInspectorServer {
         )
     )]
     async fn extract_table_regions(&self, params: Parameters<RegionInput>) -> String {
-        let path = params.0.path;
-        let regions = params.0.regions.into_iter().map(|r| (r.page, r.rects));
+        let RegionInput {
+            path,
+            regions,
+            frame,
+        } = params.0;
+        let regions = regions.into_iter().map(|r| (r.page, r.rects)).collect();
         dispatch_pdf(
             "extract_table_regions",
-            run_pdf(PdfOperation::TableRegions, path, regions.collect()),
+            run_pdf_regions(PdfOperation::TableRegions, path, regions, frame.into()),
         )
         .await
     }
@@ -713,6 +758,9 @@ impl ServerHandler for PdfInspectorServer {
              reports which pages need OCR and why. PDF and document parsing \
              runs in a bounded worker process. \
              Also exposes bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion paths. \
+             Document results state their completeness (complete or partial) \
+             and carry fixed warnings; check both before relying on the \
+             Markdown. Content the converter would drop silently fails closed. \
              Includes Sweet tax-review demo tools for deterministic package \
              review, line-item comparison, and Markdown memo rendering.",
             )

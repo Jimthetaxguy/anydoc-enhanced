@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use tokio::io::AsyncReadExt;
 
 use crate::document::{self, DocumentError, WorkerJob, WorkerResponse};
-use crate::SkillkitError;
+use crate::{RegionFrame, SkillkitError};
 
 /// Kill a PDF worker before the MCP tool's 30-second budget expires, so the
 /// caller receives a specific timeout rather than the generic tool timeout.
@@ -103,11 +103,22 @@ impl From<DocumentError> for PdfToolError {
 }
 
 /// Run one PDF operation on a local file and return its serialized result:
-/// the same JSON the in-process facade produces for that operation.
+/// the same JSON the in-process facade produces for that operation. Region
+/// rectangles are read in the [`RegionFrame::Sheet`] frame.
 pub async fn run(
     operation: PdfOperation,
     path: impl AsRef<Path>,
     regions: &PageRegions,
+) -> Result<Box<RawValue>, PdfToolError> {
+    run_in_frame(operation, path, regions, RegionFrame::Sheet).await
+}
+
+/// [`run`], with region rectangles read in `frame`.
+pub async fn run_in_frame(
+    operation: PdfOperation,
+    path: impl AsRef<Path>,
+    regions: &PageRegions,
+    frame: RegionFrame,
 ) -> Result<Box<RawValue>, PdfToolError> {
     let canonical = crate::validate_path(&path)?;
     let regions: OwnedRegions = if operation.takes_regions() {
@@ -119,11 +130,15 @@ pub async fn run(
     // paths rather than their bytes.
     let permit = document::pdf_worker_permit().await?;
     if !document::worker_available() {
-        return run_in_process(operation, canonical, regions, permit).await;
+        return run_in_process(operation, canonical, (regions, frame), permit).await;
     }
 
     let params = if operation.takes_regions() {
-        serde_json::to_vec(&encode_regions(&regions)).map_err(|_| PdfToolError::Protocol)?
+        serde_json::to_vec(&RegionParams {
+            regions: encode_regions(&regions),
+            frame,
+        })
+        .map_err(|_| PdfToolError::Protocol)?
     } else {
         Vec::new()
     };
@@ -188,12 +203,12 @@ pub async fn run(
 async fn run_in_process<Slot: Send>(
     operation: PdfOperation,
     canonical: std::path::PathBuf,
-    regions: OwnedRegions,
+    (regions, frame): (OwnedRegions, RegionFrame),
     slot: Slot,
 ) -> Result<Box<RawValue>, PdfToolError> {
     let result = tokio::task::spawn_blocking(move || {
         let buffer = crate::read_validated(&canonical)?;
-        execute_operation(operation, &buffer, &regions)
+        execute_operation(operation, &buffer, &regions, frame)
     })
     .await
     .map_err(|_| PdfToolError::Processing)?;
@@ -222,11 +237,11 @@ pub async fn markdown(path: impl AsRef<Path>) -> Result<String, PdfToolError> {
 /// belong to the document lanes.
 pub(crate) fn execute(code: u8, frame: &[u8]) -> Option<WorkerResponse> {
     let operation = PdfOperation::from_code(code)?;
-    let result = decode_frame(frame).and_then(|(regions, buffer)| {
+    let result = decode_frame(frame).and_then(|(regions, region_frame, buffer)| {
         if buffer.len() as u64 > crate::document::MAX_DOCUMENT_SIZE {
             return Err(DocumentError::ResourceLimit);
         }
-        execute_operation(operation, buffer, &regions).map_err(|error| match error {
+        execute_operation(operation, buffer, &regions, region_frame).map_err(|error| match error {
             PdfToolError::OutputTooLarge => DocumentError::OutputTooLarge,
             _ => DocumentError::ConversionFailed,
         })
@@ -247,8 +262,16 @@ pub(crate) fn execute(code: u8, frame: &[u8]) -> Option<WorkerResponse> {
     })
 }
 
+/// Region parameters as they travel to the worker.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RegionParams {
+    regions: EncodedRegions,
+    #[serde(default)]
+    frame: RegionFrame,
+}
+
 /// Split a PDF frame into its region parameters and document bytes.
-fn decode_frame(frame: &[u8]) -> Result<(OwnedRegions, &[u8]), DocumentError> {
+fn decode_frame(frame: &[u8]) -> Result<(OwnedRegions, RegionFrame, &[u8]), DocumentError> {
     let (length, rest) = frame
         .split_first_chunk::<4>()
         .ok_or(DocumentError::WorkerProtocol)?;
@@ -257,14 +280,12 @@ fn decode_frame(frame: &[u8]) -> Result<(OwnedRegions, &[u8]), DocumentError> {
         return Err(DocumentError::ResourceLimit);
     }
     let (params, buffer) = rest.split_at(length);
-    let regions = if params.is_empty() {
-        Vec::new()
-    } else {
-        let encoded: EncodedRegions =
-            serde_json::from_slice(params).map_err(|_| DocumentError::WorkerProtocol)?;
-        decode_regions(encoded)
-    };
-    Ok((regions, buffer))
+    if params.is_empty() {
+        return Ok((Vec::new(), RegionFrame::Sheet, buffer));
+    }
+    let params: RegionParams =
+        serde_json::from_slice(params).map_err(|_| DocumentError::WorkerProtocol)?;
+    Ok((decode_regions(params.regions), params.frame, buffer))
 }
 
 /// Regions with coordinates as their exact `f32` bit patterns: JSON has no
@@ -305,17 +326,18 @@ fn execute_operation(
     operation: PdfOperation,
     buffer: &[u8],
     regions: &PageRegions,
+    frame: RegionFrame,
 ) -> Result<Box<RawValue>, PdfToolError> {
     let json = match operation {
         PdfOperation::Classify => to_pretty(&crate::classify_bytes(buffer)?),
         PdfOperation::Markdown => to_pretty(&crate::process_bytes(buffer)?),
         PdfOperation::Analyze => to_pretty(&crate::analyze_bytes(buffer)?),
-        PdfOperation::TextRegions => {
-            to_pretty(&crate::extract_text_regions_bytes(buffer, regions)?)
-        }
-        PdfOperation::TableRegions => {
-            to_pretty(&crate::extract_table_regions_bytes(buffer, regions)?)
-        }
+        PdfOperation::TextRegions => to_pretty(&crate::extract_text_regions_bytes_in_frame(
+            buffer, regions, frame,
+        )?),
+        PdfOperation::TableRegions => to_pretty(&crate::extract_table_regions_bytes_in_frame(
+            buffer, regions, frame,
+        )?),
     }?;
     if json.len() > MAX_PDF_RESPONSE_BYTES {
         return Err(PdfToolError::OutputTooLarge);
@@ -355,7 +377,12 @@ mod tests {
             "/../../test-corpus/source/sample-2.pdf"
         ))
         .expect("public fixture");
-        let call = run_in_process(PdfOperation::Markdown, path, Vec::new(), slot);
+        let call = run_in_process(
+            PdfOperation::Markdown,
+            path,
+            (Vec::new(), RegionFrame::Sheet),
+            slot,
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(1), call)
                 .await
@@ -376,9 +403,14 @@ mod tests {
             "/../../test-corpus/source/sample-1.pdf"
         ))
         .expect("public fixture");
-        let json = run_in_process(PdfOperation::Classify, path, Vec::new(), ())
-            .await
-            .expect("classify");
+        let json = run_in_process(
+            PdfOperation::Classify,
+            path,
+            (Vec::new(), RegionFrame::Sheet),
+            (),
+        )
+        .await
+        .expect("classify");
         let value: serde_json::Value = serde_json::from_str(json.get()).expect("JSON");
         assert_eq!(value["pdf_type"], "TextBased");
     }
@@ -425,13 +457,24 @@ mod tests {
     fn region_parameters_travel_ahead_of_the_document() {
         let buffer = public_fixture();
         let regions: Vec<(u32, Vec<[f32; 4]>)> = vec![(0, vec![[0.0, 0.0, 612.0, 200.0]])];
-        let params = serde_json::to_vec(&encode_regions(&regions)).unwrap();
-        let response = execute(PdfOperation::TextRegions.code(), &frame(&params, &buffer))
-            .expect("PDF operation");
-        let json = response.json.expect("region result");
-        let parsed: serde_json::Value = serde_json::from_str(json.get()).unwrap();
-        assert_eq!(parsed[0]["page"], 0);
-        assert!(parsed[0]["regions"][0]["text"].is_string());
+        for region_frame in [RegionFrame::Sheet, RegionFrame::Display] {
+            let params = serde_json::to_vec(&RegionParams {
+                regions: encode_regions(&regions),
+                frame: region_frame,
+            })
+            .unwrap();
+            let response = execute(PdfOperation::TextRegions.code(), &frame(&params, &buffer))
+                .expect("PDF operation");
+            let json = response.json.expect("region result");
+            let parsed: serde_json::Value = serde_json::from_str(json.get()).unwrap();
+            assert_eq!(parsed[0]["page"], 0);
+            assert!(parsed[0]["regions"][0]["text"].is_string());
+            // The public fixture is unrotated, so both frames agree.
+            let in_process =
+                crate::extract_text_regions_bytes_in_frame(&buffer, &regions, region_frame)
+                    .unwrap();
+            assert_eq!(parsed, serde_json::to_value(in_process).unwrap());
+        }
     }
 
     #[test]

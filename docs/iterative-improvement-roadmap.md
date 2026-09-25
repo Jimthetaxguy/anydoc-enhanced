@@ -265,6 +265,7 @@ came back clean. The evidence and dispositions are in
 | 4 | `rmcp` 3.4.1 with read-only tool annotations | Tool names and schemas unchanged |
 | Review 1–2 | Make every preflight check read what AnyDoc reads: its transcoding, its reference resolution, its exact part names | Five decoy fixtures that converted as complete with no warning now fail closed or disclose |
 | 6 | DOCX inline content: refuse ruby text and imported chunks; report dropped non-breaking hyphens as `partial` with a warning | Three fixtures; the DOCX lane emits `partial` for the first time |
+| 7 | Optional region `frame` (`sheet` default, `display` for rendered-page boxes) from pdf-inspector 1.24 | A generated `/Rotate 90` page: each frame's rectangle finds the text only in that frame |
 
 ## Next slices
 

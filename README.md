@@ -35,7 +35,7 @@ public handoff):
 | `pdf_to_markdown` | Public-fixture test | Asserts expected Title 26 content |
 | `analyze_layout` | Public-fixture MCP test | Layout signals through the worker on the tracked Title 26 PDF |
 | `extract_text_regions` | Public-fixture MCP test | Region text through the worker on the tracked Title 26 PDF |
-| `extract_table_regions` | Compile-tested only | API verified, no live MCP smoke |
+| `extract_table_regions` | MCP test | Display-frame rectangles on a generated `/Rotate 90` page |
 | `batch_classify` | Public-fixture MCP test | Text, scanned, and missing inputs in one call |
 | `identify_tax_form` | Unit-tested | No redistributable positive tax-form fixture yet |
 | `parse_irc_sections` | Public-fixture test | Sections, full provision labels, and repealed placeholders on the tracked Title 26 PDFs |
@@ -74,8 +74,8 @@ the upstream surface stays clean.
 | `classify_pdf` | TextBased / Scanned / ImageBased / Mixed classification with confidence, the pages that need OCR and why, and validated creation/modification dates | stable |
 | `pdf_to_markdown` | Full PDF to clean Markdown with headings, tables, lists | stable |
 | `analyze_layout` | Pages with tables or columns, and fonts whose text may be garbled | beta |
-| `extract_text_regions` | Text from `[x1,y1,x2,y2]` rectangles | beta |
-| `extract_table_regions` | Tables from rectangles as Markdown pipe-tables | beta |
+| `extract_text_regions` | Text from `[x1,y1,x2,y2]` rectangles; `frame: display` reads boxes taken from a rendered page image | beta |
+| `extract_table_regions` | Tables from rectangles as Markdown pipe-tables, with the same optional `frame` | beta |
 | `batch_classify` | Classify many PDFs in one call | beta |
 | `identify_tax_form` | Detect W-2 / 1099 / K-1 / 1040 / 1065 / 1120 / 1120-S / schedules | beta |
 | `parse_irc_sections` | Title 26 IRC sections with full provision labels, repealed flags, and separated notes | beta |
