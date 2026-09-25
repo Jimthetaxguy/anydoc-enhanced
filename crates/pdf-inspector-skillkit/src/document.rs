@@ -7348,12 +7348,13 @@ enum EpubStyleSource {
 
 /// The stylesheets a chapter applies, in document order: as a reading
 /// system applies them (every `rel` and `href` spelling, `<?xml-stylesheet?>`
-/// instructions, and only where their media apply on a screen), and as
-/// AnyDoc applies them (`epub::chapter_stylesheet`: the first `rel` and
-/// `href` of a `link`, and every `style`, whatever their media).
+/// instructions, and only where their media may apply on its screen, each
+/// with how they do), and as AnyDoc applies them (`epub::chapter_stylesheet`:
+/// the first `rel` and `href` of a `link`, and every `style`, whatever
+/// their media).
 #[derive(Default)]
 struct EpubChapterStyles {
-    reader: Vec<EpubStyleSource>,
+    reader: Vec<(EpubStyleSource, epub_css::Applies)>,
     anydoc: Vec<EpubStyleSource>,
 }
 
@@ -7396,9 +7397,9 @@ fn epub_inspect_chapter(
     let mut styles = EpubChapterStyles::default();
     let mut has_html = false;
     let mut has_body = false;
-    // The `<style>` element being read: its text, whether its media apply,
-    // and whether AnyDoc reads it (an exact `style` name).
-    let mut style_text: Option<(String, bool, bool)> = None;
+    // The `<style>` element being read: its text, how its media apply, and
+    // whether AnyDoc reads it (an exact `style` name).
+    let mut style_text: Option<(String, epub_css::Applies, bool)> = None;
     let mut depth = 0usize;
     let mut style_depth = 0usize;
     loop {
@@ -7435,9 +7436,9 @@ fn epub_inspect_chapter(
                 let media = attributes
                     .iter()
                     .filter(|attribute| !attribute.prefixed() && attribute.local() == b"media")
-                    .map(|attribute| epub_css::media_attribute_applies(&attribute.value))
-                    .reduce(|first, second| first || second)
-                    .unwrap_or(true);
+                    .map(|attribute| epub_css::media_attribute(&attribute.value))
+                    .max()
+                    .unwrap_or(epub_css::Applies::Yes);
                 if local == b"link" {
                     let stylesheet = |rel: &str| {
                         rel.split_whitespace()
@@ -7445,7 +7446,7 @@ fn epub_inspect_chapter(
                     };
                     // A reader follows the unprefixed attributes; every
                     // spelling is followed here, which finds more.
-                    if media
+                    if media != epub_css::Applies::No
                         && attributes.iter().any(|attribute| {
                             attribute.local() == b"rel" && stylesheet(&attribute.value)
                         })
@@ -7457,7 +7458,7 @@ fn epub_inspect_chapter(
                                 .filter_map(|attribute| {
                                     anydoc_resolve(chapter_path, &attribute.value)
                                 })
-                                .map(EpubStyleSource::Linked),
+                                .map(|target| (EpubStyleSource::Linked(target), media)),
                         );
                     }
                     // AnyDoc reads the first `rel` and `href` of an exact
@@ -7495,8 +7496,8 @@ fn epub_inspect_chapter(
                         if anydoc {
                             styles.anydoc.push(EpubStyleSource::Embedded(text.clone()));
                         }
-                        if media {
-                            styles.reader.push(EpubStyleSource::Embedded(text));
+                        if media != epub_css::Applies::No {
+                            styles.reader.push((EpubStyleSource::Embedded(text), media));
                         }
                     }
                 }
@@ -7533,13 +7534,16 @@ fn epub_inspect_chapter(
                     let media = attributes
                         .iter()
                         .find(|(name, _)| name == "media")
-                        .is_none_or(|(_, media)| epub_css::media_attribute_applies(media));
+                        .map_or(epub_css::Applies::Yes, |(_, media)| {
+                            epub_css::media_attribute(media)
+                        });
                     for (name, href) in &attributes {
                         if name == "href" {
                             epub_check_reference(href, chapter_path, archive_names, &mut result);
-                            if media {
+                            if media != epub_css::Applies::No {
                                 styles.reader.extend(
-                                    anydoc_resolve(chapter_path, href).map(EpubStyleSource::Linked),
+                                    anydoc_resolve(chapter_path, href)
+                                        .map(|target| (EpubStyleSource::Linked(target), media)),
                                 );
                             }
                         }
@@ -7599,8 +7603,9 @@ fn decode_stylesheet(bytes: &[u8]) -> String {
 /// A linked stylesheet as both models read it.
 struct EpubLoadedSheet {
     reader: epub_css::Stylesheet,
-    /// The local sheets it imports, resolved against it.
-    imports: Vec<String>,
+    /// The local sheets it imports, resolved against it, each with how the
+    /// import's conditions hold.
+    imports: Vec<(String, epub_css::Applies)>,
     /// The text AnyDoc adds: the part read as lossy UTF-8.
     anydoc_text: String,
 }
@@ -7611,7 +7616,11 @@ struct EpubChapterCascade {
     anydoc: epub_css::AnyDocCascade,
 }
 
-type EpubCascadeKey = (String, Vec<EpubStyleSource>, Vec<EpubStyleSource>);
+type EpubCascadeKey = (
+    String,
+    Vec<(EpubStyleSource, epub_css::Applies)>,
+    Vec<EpubStyleSource>,
+);
 
 /// Stylesheets read once per package however many chapters apply them,
 /// and recently built chapter cascades.
@@ -7655,11 +7664,11 @@ impl EpubStylesheets {
                 let reader = epub_css::parse_stylesheet(&text)?;
                 self.count_rules(&reader)?;
                 let mut imports = Vec::new();
-                for target in &reader.imports {
+                for (target, applies) in &reader.imports {
                     if epub_is_external_uri(target) {
                         result.external_relationships = true;
                     } else {
-                        imports.extend(anydoc_resolve(path, target));
+                        imports.extend(anydoc_resolve(path, target).map(|path| (path, *applies)));
                     }
                 }
                 Some(Rc::new(EpubLoadedSheet {
@@ -7686,14 +7695,16 @@ impl EpubStylesheets {
     }
 
     /// Apply a linked sheet to a reader cascade, after the sheets it
-    /// imports, as a reader orders them. An import cycle stops at the
-    /// repeat, as readers stop it.
+    /// imports, as a reader orders them, its rules holding no more surely
+    /// than `condition`, how the link or import applying it holds. An
+    /// import cycle stops at the repeat, as readers stop it.
     #[allow(clippy::too_many_arguments)]
     fn apply_linked(
         &mut self,
         cascade: &mut epub_css::Cascade,
         archive: &mut ZipArchive<Cursor<&[u8]>>,
         path: &str,
+        condition: epub_css::Applies,
         depth: usize,
         visiting: &mut Vec<String>,
         applications: &mut usize,
@@ -7710,11 +7721,12 @@ impl EpubStylesheets {
             return Ok(());
         };
         visiting.push(path.to_string());
-        for import in &loaded.imports {
+        for (import, applies) in &loaded.imports {
             self.apply_linked(
                 cascade,
                 archive,
                 import,
+                condition.min(*applies),
                 depth + 1,
                 visiting,
                 applications,
@@ -7722,7 +7734,7 @@ impl EpubStylesheets {
             )?;
         }
         visiting.pop();
-        cascade.push_sheet(&loaded.reader);
+        cascade.push_sheet(&loaded.reader, condition);
         if cascade.rule_count() > epub_css::MAX_STYLE_RULES {
             return Err(DocumentError::ResourceLimit);
         }
@@ -7746,12 +7758,13 @@ impl EpubStylesheets {
         }
         let mut reader = epub_css::Cascade::default();
         let mut applications = 0usize;
-        for source in &styles.reader {
+        for &(ref source, condition) in &styles.reader {
             match source {
                 EpubStyleSource::Linked(path) => self.apply_linked(
                     &mut reader,
                     archive,
                     path,
+                    condition,
                     0,
                     &mut Vec::new(),
                     &mut applications,
@@ -7759,7 +7772,7 @@ impl EpubStylesheets {
                 )?,
                 EpubStyleSource::Embedded(text) => {
                     let sheet = self.embedded(text)?;
-                    for target in &sheet.imports {
+                    for (target, applies) in &sheet.imports {
                         if epub_is_external_uri(target) {
                             result.external_relationships = true;
                         } else if let Some(path) = anydoc_resolve(chapter_path, target) {
@@ -7767,6 +7780,7 @@ impl EpubStylesheets {
                                 &mut reader,
                                 archive,
                                 &path,
+                                condition.min(*applies),
                                 1,
                                 &mut Vec::new(),
                                 &mut applications,
@@ -7774,7 +7788,8 @@ impl EpubStylesheets {
                             )?;
                         }
                     }
-                    reader.push_sheet(&sheet);
+                    reader.push_sheet(&sheet, condition);
+
                     if reader.rule_count() > epub_css::MAX_STYLE_RULES {
                         return Err(DocumentError::ResourceLimit);
                     }
@@ -11156,9 +11171,10 @@ mod tests {
         let mut stylesheets = EpubStylesheets::default();
         let linked = EpubStyleSource::Linked("OPS/Styles/main.css".to_string());
         let styles = EpubChapterStyles {
-            reader: vec![linked.clone()],
+            reader: vec![(linked.clone(), epub_css::Applies::Yes)],
             anydoc: vec![linked],
         };
+
         let first = stylesheets
             .chapter_cascade(&mut archive, "OPS/Text/ch1.xhtml", &styles, &mut result)
             .unwrap();

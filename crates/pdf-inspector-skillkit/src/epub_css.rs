@@ -5,7 +5,9 @@
 //!
 //! - The reader model follows CSS as reading systems apply it: the CSS
 //!   Syntax 3 tokenizer (comments, escapes, strings), media queries and
-//!   `@supports` conditions, the selector grammar, the cascade with its
+//!   `@supports`, `@scope`, and `@container` conditions as Chromium
+//!   evaluates them on the screens of the readers the check follows (see
+//!   [`VIEWPORT_SIZES`]), the selector grammar, the cascade with its
 //!   layers, and the user-agent rules that hide content. Sibling
 //!   combinators and positions among siblings are matched exactly:
 //!   positions from a pass over the chapter before the walk, `+` from the
@@ -13,9 +15,9 @@
 //!   sibling that fits it, noted as each sibling ends, which costs a lookup
 //!   however far back that sibling is. Where it cannot decide (`:has()`,
 //!   an unknown pseudo-class, a value set through `var()`, a condition on
-//!   the reader's screen or a container's size), it lets a hiding rule
-//!   apply and keeps a showing rule from overriding one, so it errs toward
-//!   finding hidden text.
+//!   a container's size or on a screen only some readers have), it lets a
+//!   hiding rule apply and keeps a showing rule from overriding one, so it
+//!   errs toward finding hidden text.
 //! - The AnyDoc model ports AnyDoc 0.2.4's own subset (`shared::html`):
 //!   `display` from bare `tag`, `.class`, and `tag.class` rules and from
 //!   inline styles, applied only to the elements its walker styles.
@@ -549,70 +551,809 @@ fn split_top_level<'a>(tokens: &'a [Token], separator: &Token) -> Vec<&'a [Token
     parts
 }
 
+/// The component values of a token run, white space between them left out:
+/// a whole block or function, or one token each.
+fn components(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let end = skip_component(tokens, index);
+        if tokens[index] != Token::Whitespace {
+            parts.push(&tokens[index..end]);
+        }
+        index = end;
+    }
+    parts
+}
+
+/// Whether a component value is the keyword `wanted`, in any case.
+fn is_word(part: &[Token], wanted: &str) -> bool {
+    matches!(part, [Token::Ident(word)] if word.eq_ignore_ascii_case(wanted))
+}
+
+/// The contents of a parenthesized block or a function's arguments.
+fn block_contents(part: &[Token]) -> &[Token] {
+    block_at(part, 0).0
+}
+
+// ---------------------------------------------------------------------------
+// The readers the check follows
+
+/// How surely something holds across the readers the check follows (see
+/// [`VIEWPORT_SIZES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Applies {
+    /// On none of them.
+    No,
+    /// The check cannot tell.
+    Doubt,
+    /// On some and not on others, as their screens decide.
+    Varies,
+    /// On all of them.
+    Yes,
+}
+
+impl Applies {
+    /// How a selector's match applies: one the check cannot settle is in
+    /// doubt.
+    fn matched(certainty: Tri) -> Self {
+        match certainty {
+            Tri::Yes => Applies::Yes,
+            Tri::Maybe => Applies::Doubt,
+            Tri::No => Applies::No,
+        }
+    }
+
+    /// Whether it applies on every reader: `Maybe` where that varies or is
+    /// in doubt.
+    fn everywhere(self) -> Tri {
+        match self {
+            Applies::Yes => Tri::Yes,
+            Applies::No => Tri::No,
+            Applies::Doubt | Applies::Varies => Tri::Maybe,
+        }
+    }
+
+    /// Where what it guards fails to apply.
+    fn not(self) -> Self {
+        match self {
+            Applies::Yes => Applies::No,
+            Applies::No => Applies::Yes,
+            other => other,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Media queries
 
-/// Whether a media query list applies on a reading system's screen. An
-/// empty list applies. A query whose media type is `all`, `screen`, or
-/// absent applies, and may apply where it tests features: a reader's
-/// screen size, resolution, and the rest are not known. `print`, `speech`,
-/// the deprecated types, and unknown types such as `amzn-mobi` never match
-/// on a screen. A negated query applies where what it negates does not.
-fn media_condition(tokens: &[Token]) -> Tri {
-    let tokens = trim_whitespace(tokens);
-    if tokens.is_empty() {
-        return Tri::Yes;
-    }
-    split_top_level(tokens, &Token::Comma)
-        .into_iter()
-        .map(|query| {
-            let query = trim_whitespace(query);
-            let mut words = Vec::new();
-            let mut conditions = false;
-            let mut index = 0;
-            while index < query.len() {
-                match &query[index] {
-                    Token::Ident(word) => {
-                        let word = word.to_ascii_lowercase();
-                        if !matches!(word.as_str(), "and" | "or" | "only") {
-                            words.push(word);
-                        }
-                    }
-                    Token::Whitespace => {}
-                    _ => conditions = true,
-                }
-                index = skip_component(query, index);
-            }
-            let features = if conditions { Tri::Maybe } else { Tri::Yes };
-            let kind = |kind: &str| match kind {
-                "all" | "screen" => features,
-                _ => Tri::No,
-            };
-            match words.as_slice() {
-                [not] if not == "not" => features.not(),
-                [not, kind_word, ..] if not == "not" => kind(kind_word).not(),
-                [] => features,
-                [kind_word, ..] => kind(kind_word),
-            }
-        })
-        .max()
-        .unwrap_or(Tri::No)
+/// The readers the check follows, as Chromium reports their screens:
+/// viewports 320 to 1280 CSS pixels wide and as tall, so either way up, at
+/// 1 to 3 device pixels to the CSS pixel, in colour of 8 bits a channel;
+/// with or without a mouse, a touch screen, scripting, a dark scheme,
+/// reduced motion, or forced colours.
+const VIEWPORT_SIZES: (f64, f64) = (320.0, 1280.0);
+const PIXEL_RATIOS: (f64, f64) = (1.0, 3.0);
+const COLOR_BITS: f64 = 8.0;
+/// Viewport sizes one media query list is tried at, and parentheses it may
+/// nest, before it counts as one the check cannot settle.
+const MAX_MEDIA_SAMPLES: usize = 4096;
+const MAX_MEDIA_NESTING: usize = 16;
+
+/// A media query as Media Queries 4 reads it: its media type, which holds
+/// on a screen or not, and the features it tests.
+enum MediaTest {
+    Not(Box<MediaTest>),
+    And(Vec<MediaTest>),
+    Or(Vec<MediaTest>),
+    /// The viewport's width, height, or width over height against a value,
+    /// in CSS pixels or as a ratio.
+    Size(Axis, Comparison, f64),
+    /// Whether the viewport is at least as tall as it is wide.
+    Portrait(bool),
+    /// A test whose outcome does not follow the viewport's size.
+    Fixed(Outcome),
 }
 
-/// Whether a `media` attribute or pseudo-attribute can apply on a screen.
-pub(super) fn media_attribute_applies(value: &str) -> bool {
-    // A media list too long to read counts as applying.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Width,
+    Height,
+    Ratio,
+}
+
+#[derive(Clone, Copy)]
+enum Comparison {
+    Less,
+    AtMost,
+    Equal,
+    AtLeast,
+    Greater,
+}
+
+impl Comparison {
+    fn holds(self, value: f64, bound: f64) -> bool {
+        match self {
+            Comparison::Less => value < bound,
+            Comparison::AtMost => value <= bound,
+            Comparison::Equal => value == bound,
+            Comparison::AtLeast => value >= bound,
+            Comparison::Greater => value > bound,
+        }
+    }
+
+    /// The comparison read from the value's side (`600px < width` as
+    /// `width > 600px`).
+    fn flipped(self) -> Self {
+        match self {
+            Comparison::Less => Comparison::Greater,
+            Comparison::AtMost => Comparison::AtLeast,
+            Comparison::Equal => Comparison::Equal,
+            Comparison::AtLeast => Comparison::AtMost,
+            Comparison::Greater => Comparison::Less,
+        }
+    }
+}
+
+/// What a media test comes to at one viewport size: which of holding,
+/// failing, and unknown (a test Chromium does not know, which fails) it may
+/// come to, and whether more than one because the check cannot tell rather
+/// than because readers of that size differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Outcome {
+    may: u8,
+    doubt: bool,
+}
+
+const HOLDS: u8 = 1;
+const FAILS: u8 = 2;
+const UNKNOWN: u8 = 4;
+
+impl Outcome {
+    const HOLDS: Outcome = Outcome {
+        may: HOLDS,
+        doubt: false,
+    };
+    const FAILS: Outcome = Outcome {
+        may: FAILS,
+        doubt: false,
+    };
+    const UNKNOWN: Outcome = Outcome {
+        may: UNKNOWN,
+        doubt: false,
+    };
+    /// Holds for some readers and fails for others.
+    const VARIES: Outcome = Outcome {
+        may: HOLDS | FAILS,
+        doubt: false,
+    };
+    const DOUBT: Outcome = Outcome {
+        may: HOLDS | FAILS,
+        doubt: true,
+    };
+
+    fn of(holds: bool) -> Self {
+        if holds {
+            Outcome::HOLDS
+        } else {
+            Outcome::FAILS
+        }
+    }
+
+    fn not(self) -> Self {
+        let swapped = [(HOLDS, FAILS), (FAILS, HOLDS), (UNKNOWN, UNKNOWN)]
+            .iter()
+            .filter(|(from, _)| self.may & from != 0)
+            .fold(0, |may, (_, to)| may | to);
+        Outcome {
+            may: swapped,
+            doubt: self.doubt,
+        }
+    }
+
+    /// Both of two tests, or either, three-valued: `and` fails where either
+    /// fails, and is unknown where neither fails and one is unknown; `or`
+    /// the other way about.
+    fn join(self, other: Outcome, and: bool) -> Self {
+        let (decides, keeps) = if and { (FAILS, HOLDS) } else { (HOLDS, FAILS) };
+        let mut may = 0;
+        for first in [HOLDS, FAILS, UNKNOWN] {
+            for second in [HOLDS, FAILS, UNKNOWN] {
+                if self.may & first == 0 || other.may & second == 0 {
+                    continue;
+                }
+                may |= if first == decides || second == decides {
+                    decides
+                } else if first == UNKNOWN || second == UNKNOWN {
+                    UNKNOWN
+                } else {
+                    keeps
+                };
+            }
+        }
+        Outcome {
+            may,
+            doubt: self.doubt || other.doubt,
+        }
+    }
+}
+
+/// Whether a media query list holds on the readers the check follows (see
+/// [`VIEWPORT_SIZES`]): `Yes` where it holds on all of them, as `(min-width:
+/// 0)` does, `No` on none, as `print` and `(max-width: 1px)`, and `Varies`
+/// on some. An empty list holds, and a list where one of its queries does.
+/// A query Chromium rejects, such as `screen screen`, `not only print`, or
+/// an empty one, holds nowhere, and a feature it does not know fails. Each
+/// query is tried at the viewport sizes either side of the widths, heights,
+/// and ratios it names.
+fn media_condition(tokens: &[Token]) -> Applies {
+    let tokens = trim_whitespace(tokens);
+    if tokens.is_empty() {
+        return Applies::Yes;
+    }
+    let queries = split_top_level(tokens, &Token::Comma)
+        .into_iter()
+        .map(|query| {
+            media_query(trim_whitespace(query)).unwrap_or(MediaTest::Fixed(Outcome::FAILS))
+        })
+        .collect();
+    media_applies(&MediaTest::Or(queries))
+}
+
+/// How a `media` attribute or pseudo-attribute applies on the readers the
+/// check follows; a media list too long to read may apply.
+pub(super) fn media_attribute(value: &str) -> Applies {
     match tokenize(value) {
-        Ok(tokens) => media_condition(&tokens) != Tri::No,
-        Err(_) => true,
+        Ok(tokens) => media_condition(&tokens),
+        Err(_) => Applies::Doubt,
+    }
+}
+
+/// How a media test applies, from what it comes to at the viewport sizes
+/// either side of each bound it names.
+fn media_applies(test: &MediaTest) -> Applies {
+    let (low, high) = VIEWPORT_SIZES;
+    let mut widths = vec![low, high];
+    let mut heights = vec![low, high];
+    media_bounds(test, &mut widths, &mut heights);
+    for sizes in [&mut widths, &mut heights] {
+        sizes.retain(|size| (low..=high).contains(size));
+        sizes.sort_by(f64::total_cmp);
+        sizes.dedup();
+    }
+    if widths.len() * heights.len() > MAX_MEDIA_SAMPLES {
+        return Applies::Doubt;
+    }
+    let (mut holds, mut fails, mut doubt) = (false, false, false);
+    for &width in &widths {
+        for &height in &heights {
+            let outcome = media_outcome(test, width, height);
+            let may_hold = outcome.may & HOLDS != 0;
+            let may_fail = outcome.may & (FAILS | UNKNOWN) != 0;
+            doubt |= outcome.doubt && may_hold && may_fail;
+            holds |= may_hold;
+            fails |= may_fail;
+        }
+    }
+    match (doubt, holds, fails) {
+        (true, _, _) => Applies::Doubt,
+        (false, true, false) => Applies::Yes,
+        (false, false, _) => Applies::No,
+        (false, true, true) => Applies::Varies,
+    }
+}
+
+/// Add the viewport sizes at and just either side of each bound a test
+/// names, and for a ratio those that give it at the smallest and largest.
+fn media_bounds(test: &MediaTest, widths: &mut Vec<f64>, heights: &mut Vec<f64>) {
+    let near = |bound: f64| [bound - 0.01, bound, bound + 0.01];
+    match test {
+        MediaTest::Not(inner) => media_bounds(inner, widths, heights),
+        MediaTest::And(tests) | MediaTest::Or(tests) => {
+            for test in tests {
+                media_bounds(test, widths, heights);
+            }
+        }
+        MediaTest::Size(Axis::Width, _, bound) => widths.extend(near(*bound)),
+        MediaTest::Size(Axis::Height, _, bound) => heights.extend(near(*bound)),
+        MediaTest::Size(Axis::Ratio, _, ratio) if *ratio > 0.0 => {
+            let (low, high) = VIEWPORT_SIZES;
+            widths.extend([low * ratio, high * ratio]);
+            heights.extend([low / ratio, high / ratio]);
+        }
+        MediaTest::Size(..) | MediaTest::Portrait(_) | MediaTest::Fixed(_) => {}
+    }
+}
+
+/// What a media test comes to at one viewport size.
+fn media_outcome(test: &MediaTest, width: f64, height: f64) -> Outcome {
+    match test {
+        MediaTest::Not(inner) => media_outcome(inner, width, height).not(),
+        MediaTest::And(tests) | MediaTest::Or(tests) => {
+            let and = matches!(test, MediaTest::And(_));
+            tests
+                .iter()
+                .map(|test| media_outcome(test, width, height))
+                .reduce(|first, second| first.join(second, and))
+                .unwrap_or(Outcome::of(and))
+        }
+        MediaTest::Size(axis, comparison, bound) => {
+            let value = match axis {
+                Axis::Width => width,
+                Axis::Height => height,
+                Axis::Ratio => width / height,
+            };
+            Outcome::of(comparison.holds(value, *bound))
+        }
+        MediaTest::Portrait(portrait) => Outcome::of((height >= width) == *portrait),
+        MediaTest::Fixed(outcome) => *outcome,
+    }
+}
+
+/// One media query: a media condition, or a media type, perhaps after
+/// `not` or `only`, with a condition joined by `and`; `None` where
+/// Chromium rejects it.
+fn media_query(tokens: &[Token]) -> Option<MediaTest> {
+    let parts = components(tokens);
+    let word = |at: usize| match parts.get(at) {
+        Some([Token::Ident(word)]) => Some(word.to_ascii_lowercase()),
+        _ => None,
+    };
+    let (negated, kind_at) = match word(0).as_deref() {
+        Some("not") if word(1).is_some() => (true, 1),
+        Some("not") | None => return media_condition_parts(&parts, true, 0),
+        Some("only") => (false, 1),
+        Some(_) => (false, 0),
+    };
+    let kind = word(kind_at)?;
+    if matches!(kind.as_str(), "only" | "not" | "and" | "or" | "layer") {
+        return None;
+    }
+    // Print, speech, the deprecated types, and types Chromium does not
+    // know, such as `amzn-mobi`, never hold on a screen.
+    let screen = MediaTest::Fixed(Outcome::of(matches!(kind.as_str(), "all" | "screen")));
+    let test = match &parts[kind_at + 1..] {
+        [] => screen,
+        [and, condition @ ..] if is_word(and, "and") => {
+            MediaTest::And(vec![screen, media_condition_parts(condition, false, 0)?])
+        }
+        _ => return None,
+    };
+    Some(if negated {
+        MediaTest::Not(Box::new(test))
+    } else {
+        test
+    })
+}
+
+/// A media condition: `not` before one test in parentheses, or tests joined
+/// all by `and` or all by `or`, which a media type's condition may not use.
+fn media_condition_parts(
+    parts: &[&[Token]],
+    or_allowed: bool,
+    nesting: usize,
+) -> Option<MediaTest> {
+    match parts {
+        [not, operand] if is_word(not, "not") => {
+            Some(MediaTest::Not(Box::new(media_in_parens(operand, nesting)?)))
+        }
+        [first, rest @ ..] if rest.len().is_multiple_of(2) => {
+            let mut tests = vec![media_in_parens(first, nesting)?];
+            let mut and = None;
+            for pair in rest.chunks(2) {
+                let joins_and = if is_word(pair[0], "and") {
+                    true
+                } else if is_word(pair[0], "or") && or_allowed {
+                    false
+                } else {
+                    return None;
+                };
+                if and.is_some_and(|and| and != joins_and) {
+                    return None;
+                }
+                and = Some(joins_and);
+                tests.push(media_in_parens(pair[1], nesting)?);
+            }
+            Some(match and {
+                None => tests.pop()?,
+                Some(true) => MediaTest::And(tests),
+                Some(false) => MediaTest::Or(tests),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A test in parentheses, a condition or a feature; anything else in
+/// parentheses, or a function, is unknown to Chromium and fails.
+fn media_in_parens(part: &[Token], nesting: usize) -> Option<MediaTest> {
+    match part.first()? {
+        Token::OpenParen => {
+            if nesting >= MAX_MEDIA_NESTING {
+                return Some(MediaTest::Fixed(Outcome::DOUBT));
+            }
+            let inner = trim_whitespace(block_contents(part));
+            let parts = components(inner);
+            Some(
+                media_condition_parts(&parts, true, nesting + 1)
+                    .or_else(|| media_feature(inner))
+                    .unwrap_or(MediaTest::Fixed(Outcome::UNKNOWN)),
+            )
+        }
+        Token::Function(_) => Some(MediaTest::Fixed(Outcome::UNKNOWN)),
+        _ => None,
+    }
+}
+
+/// A media feature in parentheses: its name alone, its name and a value
+/// (`min-width: 600px`), or a range (`400px <= width < 900px`).
+fn media_feature(tokens: &[Token]) -> Option<MediaTest> {
+    let mut operands: Vec<&[Token]> = Vec::new();
+    let mut comparisons = Vec::new();
+    let (mut start, mut index) = (0, 0);
+    while index < tokens.len() {
+        let equals = tokens.get(index + 1) == Some(&Token::Delim('='));
+        let comparison = match &tokens[index] {
+            Token::Delim('<') if equals => Comparison::AtMost,
+            Token::Delim('>') if equals => Comparison::AtLeast,
+            Token::Delim('<') => Comparison::Less,
+            Token::Delim('>') => Comparison::Greater,
+            Token::Delim('=') => Comparison::Equal,
+            _ => {
+                index = skip_component(tokens, index);
+                continue;
+            }
+        };
+        operands.push(trim_whitespace(&tokens[start..index]));
+        comparisons.push(comparison);
+        index += if matches!(comparison, Comparison::AtMost | Comparison::AtLeast) {
+            2
+        } else {
+            1
+        };
+        start = index;
+    }
+    operands.push(trim_whitespace(&tokens[start..]));
+    let name = |operand: &[Token]| match operand {
+        [Token::Ident(name)] => Some(name.to_ascii_lowercase()),
+        _ => None,
+    };
+    match (operands.as_slice(), comparisons.as_slice()) {
+        ([feature], []) => {
+            let [Token::Ident(name), rest @ ..] = feature else {
+                return None;
+            };
+            let name = name.to_ascii_lowercase();
+            match trim_whitespace(rest) {
+                [] => Some(media_feature_test(&name, FeatureQuery::Boolean)),
+                [Token::Colon, value @ ..] => {
+                    let value = trim_whitespace(value);
+                    let ranged = [("min-", Comparison::AtLeast), ("max-", Comparison::AtMost)]
+                        .into_iter()
+                        .find_map(|(prefix, comparison)| {
+                            let base = match name.strip_prefix("-webkit-") {
+                                Some(rest) => format!("-webkit-{}", rest.strip_prefix(prefix)?),
+                                None => name.strip_prefix(prefix)?.to_string(),
+                            };
+                            Some((base, comparison))
+                        });
+                    Some(match ranged {
+                        Some((base, comparison)) => {
+                            media_feature_test(&base, FeatureQuery::Range(comparison, value))
+                        }
+                        None => media_feature_test(&name, FeatureQuery::Plain(value)),
+                    })
+                }
+                _ => None,
+            }
+        }
+        ([first, second], [comparison]) => match (name(first), name(second)) {
+            (Some(name), _) => Some(media_feature_test(
+                &name,
+                FeatureQuery::Range(*comparison, second),
+            )),
+            (None, Some(name)) => Some(media_feature_test(
+                &name,
+                FeatureQuery::Range(comparison.flipped(), first),
+            )),
+            (None, None) => None,
+        },
+        ([low, middle, high], [first, second]) => {
+            let name = name(middle)?;
+            let rising = |comparison: &Comparison| {
+                matches!(comparison, Comparison::Less | Comparison::AtMost)
+            };
+            let falling = |comparison: &Comparison| {
+                matches!(comparison, Comparison::Greater | Comparison::AtLeast)
+            };
+            if !(rising(first) && rising(second) || falling(first) && falling(second)) {
+                return None;
+            }
+            Some(MediaTest::And(vec![
+                media_feature_test(&name, FeatureQuery::Range(first.flipped(), low)),
+                media_feature_test(&name, FeatureQuery::Range(*second, high)),
+            ]))
+        }
+        _ => None,
+    }
+}
+
+/// How a media feature is tested: by its name alone, against a value, or
+/// in a range (`min-`, `max-`, or a comparison).
+#[derive(Clone, Copy)]
+enum FeatureQuery<'a> {
+    Boolean,
+    Plain(&'a [Token]),
+    Range(Comparison, &'a [Token]),
+}
+
+/// How a media feature tests the readers the check follows (see
+/// [`VIEWPORT_SIZES`]). A feature Chromium does not know, a value it
+/// rejects, or a range on a feature that takes none is unknown, and fails;
+/// a length the check cannot size (`calc()`, `vw`) is in doubt, as are the
+/// features whose values the check does not follow.
+fn media_feature_test(name: &str, query: FeatureQuery) -> MediaTest {
+    let fixed = MediaTest::Fixed;
+    let keyword = |query: FeatureQuery| match query {
+        FeatureQuery::Plain([Token::Ident(word)]) => Some(word.to_ascii_lowercase()),
+        _ => None,
+    };
+    // A discrete feature: its outcome in a boolean context, and for each
+    // value it takes.
+    let discrete = |boolean: Outcome, values: &[(&str, Outcome)]| match query {
+        FeatureQuery::Boolean => fixed(boolean),
+        FeatureQuery::Range(..) => fixed(Outcome::UNKNOWN),
+        FeatureQuery::Plain(_) => fixed(
+            keyword(query)
+                .and_then(|word| values.iter().find(|(value, _)| *value == word))
+                .map_or(Outcome::UNKNOWN, |(_, outcome)| *outcome),
+        ),
+    };
+    let (comparison, value) = match query {
+        FeatureQuery::Boolean => (Comparison::Equal, None),
+        FeatureQuery::Plain(value) => (Comparison::Equal, Some(value)),
+        FeatureQuery::Range(comparison, value) => (comparison, Some(value)),
+    };
+    let sized = |axis: Axis, size: Result<f64, Outcome>| match size {
+        Ok(size) => MediaTest::Size(axis, comparison, size),
+        Err(outcome) => fixed(outcome),
+    };
+    let between = |bound: Result<f64, Outcome>, (low, high): (f64, f64)| {
+        fixed(match bound {
+            Ok(bound) => match (comparison.holds(low, bound), comparison.holds(high, bound)) {
+                _ if matches!(comparison, Comparison::Equal) => {
+                    if (low..=high).contains(&bound) {
+                        Outcome::VARIES
+                    } else {
+                        Outcome::FAILS
+                    }
+                }
+                (true, true) => Outcome::HOLDS,
+                (false, false) => Outcome::FAILS,
+                _ => Outcome::VARIES,
+            },
+            Err(outcome) => outcome,
+        })
+    };
+    let varies = Outcome::VARIES;
+    match name {
+        "width" | "height" | "device-width" | "device-height" => {
+            let axis = if name.ends_with("width") {
+                Axis::Width
+            } else {
+                Axis::Height
+            };
+            match value {
+                None => fixed(Outcome::HOLDS),
+                Some(value) => sized(axis, media_length(value)),
+            }
+        }
+        "aspect-ratio" | "device-aspect-ratio" => match value {
+            None => fixed(Outcome::HOLDS),
+            Some(value) => sized(Axis::Ratio, media_ratio(value)),
+        },
+        "resolution" | "-webkit-device-pixel-ratio" => match value {
+            None => fixed(Outcome::HOLDS),
+            Some(value) => between(media_resolution(value, name == "resolution"), PIXEL_RATIOS),
+        },
+        "color" | "color-index" | "monochrome" => {
+            let bits = if name == "color" { COLOR_BITS } else { 0.0 };
+            match value {
+                None => fixed(Outcome::of(bits > 0.0)),
+                Some(value) => between(media_integer(value), (bits, bits)),
+            }
+        }
+        "orientation" => match (query, keyword(query).as_deref()) {
+            (FeatureQuery::Boolean, _) => fixed(Outcome::HOLDS),
+            (_, Some("portrait")) => MediaTest::Portrait(true),
+            (_, Some("landscape")) => MediaTest::Portrait(false),
+            _ => fixed(Outcome::UNKNOWN),
+        },
+        "grid" => match (query, media_integer(value.unwrap_or(&[]))) {
+            (FeatureQuery::Boolean, _) => fixed(Outcome::FAILS),
+            (FeatureQuery::Plain(_), Ok(grid)) if grid == 0.0 || grid == 1.0 => {
+                fixed(Outcome::of(grid == 0.0))
+            }
+            _ => fixed(Outcome::UNKNOWN),
+        },
+        "-webkit-transform-3d" => match (query, media_integer(value.unwrap_or(&[]))) {
+            (FeatureQuery::Boolean, _) => fixed(Outcome::HOLDS),
+            (FeatureQuery::Plain(_), Ok(on)) if on == 0.0 || on == 1.0 => {
+                fixed(Outcome::of(on == 1.0))
+            }
+            _ => fixed(Outcome::UNKNOWN),
+        },
+        "hover" | "any-hover" => discrete(varies, &[("none", varies), ("hover", varies)]),
+        "pointer" | "any-pointer" => discrete(
+            varies,
+            &[("none", varies), ("coarse", varies), ("fine", varies)],
+        ),
+        "prefers-reduced-motion" | "prefers-reduced-transparency" => {
+            discrete(varies, &[("no-preference", varies), ("reduce", varies)])
+        }
+        "prefers-contrast" => discrete(
+            varies,
+            &[
+                ("no-preference", varies),
+                ("more", varies),
+                ("less", varies),
+                ("custom", varies),
+            ],
+        ),
+        "prefers-color-scheme" => discrete(Outcome::DOUBT, &[("light", varies), ("dark", varies)]),
+        "forced-colors" => discrete(varies, &[("none", varies), ("active", varies)]),
+        "scripting" => discrete(
+            varies,
+            &[
+                ("none", varies),
+                ("enabled", varies),
+                ("initial-only", Outcome::FAILS),
+            ],
+        ),
+        "update" => discrete(
+            Outcome::HOLDS,
+            &[("none", Outcome::FAILS), ("slow", varies), ("fast", varies)],
+        ),
+        "overflow-block" => discrete(
+            Outcome::HOLDS,
+            &[
+                ("none", Outcome::FAILS),
+                ("scroll", Outcome::HOLDS),
+                ("paged", Outcome::FAILS),
+            ],
+        ),
+        "overflow-inline" => discrete(
+            Outcome::HOLDS,
+            &[("none", Outcome::FAILS), ("scroll", Outcome::HOLDS)],
+        ),
+        "color-gamut" => discrete(
+            Outcome::HOLDS,
+            &[
+                ("srgb", Outcome::HOLDS),
+                ("p3", varies),
+                ("rec2020", varies),
+            ],
+        ),
+        "dynamic-range" => discrete(
+            Outcome::HOLDS,
+            &[("standard", Outcome::HOLDS), ("high", varies)],
+        ),
+        "display-mode" => discrete(
+            Outcome::DOUBT,
+            &[
+                ("browser", varies),
+                ("fullscreen", varies),
+                ("standalone", varies),
+                ("minimal-ui", varies),
+                ("picture-in-picture", varies),
+                ("window-controls-overlay", varies),
+                ("borderless", varies),
+                ("tabbed", varies),
+            ],
+        ),
+        "scan"
+        | "video-dynamic-range"
+        | "prefers-reduced-data"
+        | "horizontal-viewport-segments"
+        | "vertical-viewport-segments"
+        | "device-posture" => fixed(Outcome::DOUBT),
+        _ => fixed(Outcome::UNKNOWN),
+    }
+}
+
+/// A number and its unit, as a numeric token holds them.
+fn numeric_parts(text: &str) -> Option<(f64, String)> {
+    let split = text
+        .find(|character: char| character.is_ascii_alphabetic() || character == '%')
+        .unwrap_or(text.len());
+    let number = text[..split].parse().ok()?;
+    Some((number, text[split..].to_ascii_lowercase()))
+}
+
+/// A length in a media feature, in CSS pixels: absolute units, and ems and
+/// rems of the 16-pixel font a reader starts from. Units that follow the
+/// viewport or the font's shape, and `calc()`, are in doubt; anything else
+/// Chromium rejects.
+fn media_length(value: &[Token]) -> Result<f64, Outcome> {
+    match value {
+        [Token::Numeric(text)] => {
+            let (number, unit) = numeric_parts(text).ok_or(Outcome::UNKNOWN)?;
+            let scale = match unit.as_str() {
+                "" if number == 0.0 => 1.0,
+                "px" => 1.0,
+                "em" | "rem" | "pc" => 16.0,
+                "pt" => 4.0 / 3.0,
+                "in" => 96.0,
+                "cm" => 96.0 / 2.54,
+                "mm" => 96.0 / 25.4,
+                "q" => 96.0 / 101.6,
+                "ex" | "ch" | "ic" | "cap" | "lh" | "rlh" | "rex" | "rch" | "ric" | "rcap" => {
+                    return Err(Outcome::DOUBT)
+                }
+                unit if unit.contains('v') => return Err(Outcome::DOUBT),
+                _ => return Err(Outcome::UNKNOWN),
+            };
+            Ok(number * scale)
+        }
+        [Token::Function(_), ..] => Err(Outcome::DOUBT),
+        _ => Err(Outcome::UNKNOWN),
+    }
+}
+
+/// A ratio in a media feature (`16/9`, or one number).
+fn media_ratio(value: &[Token]) -> Result<f64, Outcome> {
+    let parts: Vec<&Token> = value
+        .iter()
+        .filter(|token| **token != Token::Whitespace)
+        .collect();
+    let number = |token: &Token| match token {
+        Token::Numeric(text) => text.parse::<f64>().ok(),
+        _ => None,
+    };
+    let ratio = match parts.as_slice() {
+        [single] => number(single),
+        [first, Token::Delim('/'), second] => number(first)
+            .zip(number(second))
+            .map(|(first, second)| first / second),
+        _ => None,
+    };
+    ratio
+        .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+        .ok_or(Outcome::UNKNOWN)
+}
+
+/// A resolution in a media feature, in device pixels to the CSS pixel: with
+/// its unit (`2dppx`, `2x`, `192dpi`), or a bare number where the feature
+/// takes one (`-webkit-device-pixel-ratio`).
+fn media_resolution(value: &[Token], units: bool) -> Result<f64, Outcome> {
+    let [Token::Numeric(text)] = value else {
+        return Err(Outcome::UNKNOWN);
+    };
+    let (number, unit) = numeric_parts(text).ok_or(Outcome::UNKNOWN)?;
+    match (units, unit.as_str()) {
+        (true, "dppx" | "x") | (false, "") => Ok(number),
+        (true, "dpi") => Ok(number / 96.0),
+        (true, "dpcm") => Ok(number * 2.54 / 96.0),
+        _ => Err(Outcome::UNKNOWN),
+    }
+}
+
+/// A whole number in a media feature.
+fn media_integer(value: &[Token]) -> Result<f64, Outcome> {
+    match value {
+        [Token::Numeric(text)] => text
+            .parse::<i64>()
+            .map(|number| number as f64)
+            .map_err(|_| Outcome::UNKNOWN),
+        _ => Err(Outcome::UNKNOWN),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Feature queries
 
-/// `display` values every reading system this check follows supports.
-const SUPPORTED_DISPLAY_KEYWORDS: [&str; 34] = [
+/// `display` keywords Chromium accepts alone.
+const CHROMIUM_DISPLAY_KEYWORDS: [&str; 34] = [
     "block",
     "inline",
     "inline-block",
@@ -620,6 +1361,7 @@ const SUPPORTED_DISPLAY_KEYWORDS: [&str; 34] = [
     "inline-flex",
     "grid",
     "inline-grid",
+    "flow",
     "flow-root",
     "contents",
     "none",
@@ -646,91 +1388,106 @@ const SUPPORTED_DISPLAY_KEYWORDS: [&str; 34] = [
     "unset",
     "revert",
     "revert-layer",
-    "block flow",
 ];
 
 /// Parentheses an `@supports` condition may nest before it counts as one
-/// that may hold.
+/// the check cannot settle.
 const MAX_SUPPORTS_NESTING: usize = 16;
 
-/// Whether an `@supports` condition holds on a reading system. It reads
-/// `not`, `and`, and `or` as written, and of the features it tests, only
-/// `display`: a value every reader supports holds, one no reader knows
-/// (`display: bogus`) does not. Anything else may hold.
-fn supports_condition(tokens: &[Token]) -> Tri {
-    supports_condition_within(tokens, 0)
+/// Whether an `@supports` condition holds in Chromium: `not`, `and`, and
+/// `or` as written; a declaration where Chromium knows its property and
+/// takes its value (see [`supports_declaration`]); and `selector()` where it
+/// parses the selector (see [`supports_selector`]). Another function, or
+/// anything else in parentheses, does not hold, and a condition Chromium
+/// cannot parse, such as `(a) and not (b)`, voids its rule.
+fn supports_condition(tokens: &[Token]) -> Applies {
+    supports_condition_within(tokens, 0).unwrap_or(Applies::No)
 }
 
-fn supports_condition_within(tokens: &[Token], nesting: usize) -> Tri {
+fn supports_condition_within(tokens: &[Token], nesting: usize) -> Option<Applies> {
     if nesting >= MAX_SUPPORTS_NESTING {
-        return Tri::Maybe;
+        return Some(Applies::Doubt);
     }
-    let parts: Vec<&[Token]> = {
-        let tokens = trim_whitespace(tokens);
-        let mut parts = Vec::new();
-        let mut index = 0;
-        while index < tokens.len() {
-            let end = skip_component(tokens, index);
-            if tokens[index] != Token::Whitespace {
-                parts.push(&tokens[index..end]);
-            }
-            index = end;
-        }
-        parts
-    };
-    let word = |part: &[Token], wanted: &str| matches!(part, [Token::Ident(word)] if word.eq_ignore_ascii_case(wanted));
+    let parts = components(trim_whitespace(tokens));
     let in_parens = |part: &[Token]| supports_in_parens(part, nesting + 1);
     match parts.as_slice() {
-        [not, part] if word(not, "not") => in_parens(part).not(),
+        [not, part] if is_word(not, "not") => Some(in_parens(part)?.not()),
         [first, rest @ ..] if rest.len().is_multiple_of(2) => {
             let joined_by = |joiner: &str| {
                 rest.chunks(2)
-                    .all(|pair| word(pair[0], joiner) && !word(pair[1], "not"))
+                    .all(|pair| is_word(pair[0], joiner) && !is_word(pair[1], "not"))
             };
-            let operands = std::iter::once(*first)
+            let operands: Option<Vec<Applies>> = std::iter::once(*first)
                 .chain(rest.chunks(2).map(|pair| pair[1]))
-                .map(in_parens);
+                .map(in_parens)
+                .collect();
+            let operands = operands?;
             if rest.is_empty() {
-                in_parens(first)
+                operands.first().copied()
             } else if joined_by("and") {
-                operands.min().unwrap_or(Tri::Maybe)
+                operands.into_iter().min()
             } else if joined_by("or") {
-                operands.max().unwrap_or(Tri::Maybe)
+                operands.into_iter().max()
             } else {
-                Tri::Maybe
+                None
             }
         }
-        _ => Tri::Maybe,
+        _ => None,
     }
 }
 
-/// A parenthesized part of an `@supports` condition: a declaration, or a
-/// condition of its own. A function (`selector()`, `font-tech()`) may hold.
-fn supports_in_parens(part: &[Token], nesting: usize) -> Tri {
-    let [Token::OpenParen, inner @ ..] = part else {
-        return Tri::Maybe;
-    };
-    let inner = match inner {
-        [inner @ .., Token::CloseParen] => inner,
-        inner => inner,
-    };
-    match trim_whitespace(inner) {
-        [Token::Ident(name), rest @ ..] => match trim_whitespace(rest) {
-            [Token::Colon, value @ ..] => supports_declaration(name, value),
-            _ => supports_condition_within(inner, nesting),
-        },
-        _ => supports_condition_within(inner, nesting),
+/// A part of an `@supports` condition: a declaration or a condition in
+/// parentheses, or a function.
+fn supports_in_parens(part: &[Token], nesting: usize) -> Option<Applies> {
+    match part.first()? {
+        Token::OpenParen => {
+            let inner = trim_whitespace(block_contents(part));
+            if let [Token::Ident(name), rest @ ..] = inner {
+                if let [Token::Colon, value @ ..] = trim_whitespace(rest) {
+                    return Some(supports_declaration(name, value));
+                }
+            }
+            Some(supports_condition_within(inner, nesting).unwrap_or(Applies::No))
+        }
+        Token::Function(function) => Some(match function.to_ascii_lowercase().as_str() {
+            "selector" => supports_selector(block_contents(part)),
+            "font-tech" | "font-format" => Applies::Doubt,
+            _ => Applies::No,
+        }),
+        _ => None,
     }
 }
 
-/// Whether a reading system supports a declaration, as far as this check
-/// knows: for `display`, whether every reader supports its value, or none
-/// knows it; otherwise it may.
-fn supports_declaration(name: &str, value: &[Token]) -> Tri {
-    if !name.eq_ignore_ascii_case("display") {
-        return Tri::Maybe;
+/// Whether Chromium supports a declaration: a custom property with any
+/// value, or a property it knows (see [`CHROMIUM_PROPERTIES`]) with a value
+/// it may take. Of the values, only `display`'s are read (see
+/// [`chromium_display`]); a value computed with `var()` is taken.
+fn supports_declaration(name: &str, value: &[Token]) -> Applies {
+    if name.starts_with("--") {
+        return Applies::Yes;
     }
-    let words: Option<Vec<String>> = trim_whitespace(value)
+    let name = name.to_ascii_lowercase();
+    if !CHROMIUM_PROPERTIES.split(' ').any(|known| known == name) {
+        return Applies::No;
+    }
+    let mut value = trim_whitespace(value);
+    if let [before @ .., Token::Ident(word)] = value {
+        if word.eq_ignore_ascii_case("important") {
+            if let [before @ .., Token::Delim('!')] = trim_whitespace(before) {
+                value = trim_whitespace(before);
+            }
+        }
+    }
+    if value.is_empty() {
+        return Applies::No;
+    }
+    let computed = value.iter().any(
+        |token| matches!(token, Token::Function(function) if function.eq_ignore_ascii_case("var")),
+    );
+    if name != "display" || computed {
+        return Applies::Yes;
+    }
+    let words: Option<Vec<String>> = value
         .iter()
         .filter(|token| **token != Token::Whitespace)
         .map(|token| match token {
@@ -738,22 +1495,248 @@ fn supports_declaration(name: &str, value: &[Token]) -> Tri {
             _ => None,
         })
         .collect();
-    let Some(words) = words.filter(|words| !words.is_empty()) else {
-        return Tri::Maybe;
-    };
-    let known = |word: &String| {
-        DISPLAY_KEYWORDS.contains(&word.as_str())
-            || SUPPORTED_DISPLAY_KEYWORDS.contains(&word.as_str())
-            || word.starts_with('-')
-    };
-    if !words.iter().all(known) {
-        Tri::No
-    } else if SUPPORTED_DISPLAY_KEYWORDS.contains(&words.join(" ").as_str()) {
-        Tri::Yes
-    } else {
-        Tri::Maybe
+    match words {
+        Some(words) if chromium_display(&words) => Applies::Yes,
+        _ => Applies::No,
     }
 }
+
+/// Whether Chromium takes a `display` value: one of its keywords, or an
+/// outer display (`block`, `inline`), an inner one (`flow`, `flow-root`,
+/// `table`, `flex`, `grid`, `ruby`, `math`), and `list-item` with a flow
+/// inside, each at most once.
+fn chromium_display(words: &[String]) -> bool {
+    if let [word] = words {
+        return CHROMIUM_DISPLAY_KEYWORDS.contains(&word.as_str());
+    }
+    let (mut outer, mut inner, mut item) = (0, None, 0);
+    for word in words {
+        match word.as_str() {
+            "block" | "inline" => outer += 1,
+            "flow" | "flow-root" | "table" | "flex" | "grid" | "ruby" | "math" => {
+                if inner.replace(word.as_str()).is_some() {
+                    return false;
+                }
+            }
+            "list-item" => item += 1,
+            _ => return false,
+        }
+    }
+    outer <= 1 && item <= 1 && (item == 0 || matches!(inner, None | Some("flow" | "flow-root")))
+}
+
+/// Whether Chromium parses the selector in `selector()`: one complex
+/// selector whose pseudo-classes and pseudo-elements it knows. One with
+/// another engine's prefix (`-moz-`, `-ms-`, `-o-`) it rejects; one this
+/// check does not know it may know.
+fn supports_selector(tokens: &[Token]) -> Applies {
+    let tokens = trim_whitespace(tokens);
+    if tokens.is_empty() || split_top_level(tokens, &Token::Comma).len() > 1 {
+        return Applies::No;
+    }
+    let mut applies = Applies::Yes;
+    for (at, token) in tokens.iter().enumerate() {
+        if *token != Token::Colon || at > 0 && tokens[at - 1] == Token::Colon {
+            continue;
+        }
+        let element = tokens.get(at + 1) == Some(&Token::Colon);
+        let name = match tokens.get(at + if element { 2 } else { 1 }) {
+            Some(Token::Ident(name) | Token::Function(name)) => name.to_ascii_lowercase(),
+            _ => return Applies::No,
+        };
+        let known = if element {
+            name.starts_with("-webkit-")
+                || CHROMIUM_PSEUDO_ELEMENTS
+                    .split(' ')
+                    .any(|known| known == name)
+        } else {
+            CHROMIUM_PSEUDO_CLASSES
+                .split(' ')
+                .any(|known| known == name)
+        };
+        if ["-moz-", "-ms-", "-o-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            return Applies::No;
+        }
+        if !known {
+            applies = Applies::Doubt;
+        }
+    }
+    applies
+}
+
+/// The properties Chromium 141 supports, as `@supports` tests them.
+const CHROMIUM_PROPERTIES: &str = "\
+    -epub-caption-side -epub-text-combine -epub-text-emphasis -epub-text-emphasis-color \
+    -epub-text-emphasis-style -epub-text-orientation -epub-text-transform -epub-word-break \
+    -epub-writing-mode -webkit-align-content -webkit-align-items -webkit-align-self \
+    -webkit-animation -webkit-animation-delay -webkit-animation-direction \
+    -webkit-animation-duration -webkit-animation-fill-mode -webkit-animation-iteration-count \
+    -webkit-animation-name -webkit-animation-play-state -webkit-animation-timing-function \
+    -webkit-app-region -webkit-appearance -webkit-backface-visibility -webkit-background-clip \
+    -webkit-background-origin -webkit-background-size -webkit-border-after \
+    -webkit-border-after-color -webkit-border-after-style -webkit-border-after-width \
+    -webkit-border-before -webkit-border-before-color -webkit-border-before-style \
+    -webkit-border-before-width -webkit-border-bottom-left-radius \
+    -webkit-border-bottom-right-radius -webkit-border-end -webkit-border-end-color \
+    -webkit-border-end-style -webkit-border-end-width -webkit-border-horizontal-spacing \
+    -webkit-border-image -webkit-border-radius -webkit-border-start \
+    -webkit-border-start-color -webkit-border-start-style -webkit-border-start-width \
+    -webkit-border-top-left-radius -webkit-border-top-right-radius \
+    -webkit-border-vertical-spacing -webkit-box-align -webkit-box-decoration-break \
+    -webkit-box-direction -webkit-box-flex -webkit-box-ordinal-group -webkit-box-orient \
+    -webkit-box-pack -webkit-box-reflect -webkit-box-shadow -webkit-box-sizing \
+    -webkit-clip-path -webkit-column-break-after -webkit-column-break-before \
+    -webkit-column-break-inside -webkit-column-count -webkit-column-gap -webkit-column-rule \
+    -webkit-column-rule-color -webkit-column-rule-style -webkit-column-rule-width \
+    -webkit-column-span -webkit-column-width -webkit-columns -webkit-filter -webkit-flex \
+    -webkit-flex-basis -webkit-flex-direction -webkit-flex-flow -webkit-flex-grow \
+    -webkit-flex-shrink -webkit-flex-wrap -webkit-font-feature-settings \
+    -webkit-font-smoothing -webkit-hyphenate-character -webkit-justify-content \
+    -webkit-line-break -webkit-line-clamp -webkit-locale -webkit-logical-height \
+    -webkit-logical-width -webkit-margin-after -webkit-margin-before -webkit-margin-end \
+    -webkit-margin-start -webkit-mask -webkit-mask-box-image -webkit-mask-box-image-outset \
+    -webkit-mask-box-image-repeat -webkit-mask-box-image-slice -webkit-mask-box-image-source \
+    -webkit-mask-box-image-width -webkit-mask-clip -webkit-mask-composite -webkit-mask-image \
+    -webkit-mask-origin -webkit-mask-position -webkit-mask-position-x -webkit-mask-position-y \
+    -webkit-mask-repeat -webkit-mask-size -webkit-max-logical-height \
+    -webkit-max-logical-width -webkit-min-logical-height -webkit-min-logical-width \
+    -webkit-opacity -webkit-order -webkit-padding-after -webkit-padding-before \
+    -webkit-padding-end -webkit-padding-start -webkit-perspective -webkit-perspective-origin \
+    -webkit-perspective-origin-x -webkit-perspective-origin-y -webkit-print-color-adjust \
+    -webkit-rtl-ordering -webkit-ruby-position -webkit-shape-image-threshold \
+    -webkit-shape-margin -webkit-shape-outside -webkit-tap-highlight-color \
+    -webkit-text-combine -webkit-text-decorations-in-effect -webkit-text-emphasis \
+    -webkit-text-emphasis-color -webkit-text-emphasis-position -webkit-text-emphasis-style \
+    -webkit-text-fill-color -webkit-text-orientation -webkit-text-security \
+    -webkit-text-size-adjust -webkit-text-stroke -webkit-text-stroke-color \
+    -webkit-text-stroke-width -webkit-transform -webkit-transform-origin \
+    -webkit-transform-origin-x -webkit-transform-origin-y -webkit-transform-origin-z \
+    -webkit-transform-style -webkit-transition -webkit-transition-delay \
+    -webkit-transition-duration -webkit-transition-property \
+    -webkit-transition-timing-function -webkit-user-drag -webkit-user-modify \
+    -webkit-user-select -webkit-writing-mode accent-color align-content align-items \
+    align-self alignment-baseline all anchor-name anchor-scope animation \
+    animation-composition animation-delay animation-direction animation-duration \
+    animation-fill-mode animation-iteration-count animation-name animation-play-state \
+    animation-range animation-range-end animation-range-start animation-timeline \
+    animation-timing-function app-region appearance aspect-ratio backdrop-filter \
+    backface-visibility background background-attachment background-blend-mode \
+    background-clip background-color background-image background-origin background-position \
+    background-position-x background-position-y background-repeat background-size \
+    baseline-shift baseline-source block-size border border-block border-block-color \
+    border-block-end border-block-end-color border-block-end-style border-block-end-width \
+    border-block-start border-block-start-color border-block-start-style \
+    border-block-start-width border-block-style border-block-width border-bottom \
+    border-bottom-color border-bottom-left-radius border-bottom-right-radius \
+    border-bottom-style border-bottom-width border-collapse border-color \
+    border-end-end-radius border-end-start-radius border-image border-image-outset \
+    border-image-repeat border-image-slice border-image-source border-image-width \
+    border-inline border-inline-color border-inline-end border-inline-end-color \
+    border-inline-end-style border-inline-end-width border-inline-start \
+    border-inline-start-color border-inline-start-style border-inline-start-width \
+    border-inline-style border-inline-width border-left border-left-color border-left-style \
+    border-left-width border-radius border-right border-right-color border-right-style \
+    border-right-width border-spacing border-start-end-radius border-start-start-radius \
+    border-style border-top border-top-color border-top-left-radius border-top-right-radius \
+    border-top-style border-top-width border-width bottom box-decoration-break box-shadow \
+    box-sizing break-after break-before break-inside buffered-rendering caption-side \
+    caret-animation caret-color clear clip clip-path clip-rule color color-interpolation \
+    color-interpolation-filters color-rendering color-scheme column-count column-fill \
+    column-gap column-rule column-rule-color column-rule-style column-rule-width column-span \
+    column-width columns contain contain-intrinsic-block-size contain-intrinsic-height \
+    contain-intrinsic-inline-size contain-intrinsic-size contain-intrinsic-width container \
+    container-name container-type content content-visibility corner-block-end-shape \
+    corner-block-start-shape corner-bottom-left-shape corner-bottom-right-shape \
+    corner-bottom-shape corner-end-end-shape corner-end-start-shape corner-inline-end-shape \
+    corner-inline-start-shape corner-left-shape corner-right-shape corner-shape \
+    corner-start-end-shape corner-start-start-shape corner-top-left-shape \
+    corner-top-right-shape corner-top-shape counter-increment counter-reset counter-set \
+    cursor cx cy d direction display dominant-baseline dynamic-range-limit empty-cells \
+    field-sizing fill fill-opacity fill-rule filter flex flex-basis flex-direction flex-flow \
+    flex-grow flex-shrink flex-wrap float flood-color flood-opacity font font-family \
+    font-feature-settings font-kerning font-optical-sizing font-palette font-size \
+    font-size-adjust font-stretch font-style font-synthesis font-synthesis-small-caps \
+    font-synthesis-style font-synthesis-weight font-variant font-variant-alternates \
+    font-variant-caps font-variant-east-asian font-variant-emoji font-variant-ligatures \
+    font-variant-numeric font-variant-position font-variation-settings font-weight \
+    forced-color-adjust gap grid grid-area grid-auto-columns grid-auto-flow grid-auto-rows \
+    grid-column grid-column-end grid-column-gap grid-column-start grid-gap grid-row \
+    grid-row-end grid-row-gap grid-row-start grid-template grid-template-areas \
+    grid-template-columns grid-template-rows height hyphenate-character hyphenate-limit-chars \
+    hyphens image-orientation image-rendering initial-letter inline-size inset inset-block \
+    inset-block-end inset-block-start inset-inline inset-inline-end inset-inline-start \
+    interactivity interpolate-size isolation justify-content justify-items justify-self left \
+    letter-spacing lighting-color line-break line-height list-style list-style-image \
+    list-style-position list-style-type margin margin-block margin-block-end \
+    margin-block-start margin-bottom margin-inline margin-inline-end margin-inline-start \
+    margin-left margin-right margin-top marker marker-end marker-mid marker-start mask \
+    mask-clip mask-composite mask-image mask-mode mask-origin mask-position mask-repeat \
+    mask-size mask-type math-depth math-shift math-style max-block-size max-height \
+    max-inline-size max-width min-block-size min-height min-inline-size min-width \
+    mix-blend-mode object-fit object-position object-view-box offset offset-anchor \
+    offset-distance offset-path offset-position offset-rotate opacity order orphans outline \
+    outline-color outline-offset outline-style outline-width overflow overflow-anchor \
+    overflow-block overflow-clip-margin overflow-inline overflow-wrap overflow-x overflow-y \
+    overlay overscroll-behavior overscroll-behavior-block overscroll-behavior-inline \
+    overscroll-behavior-x overscroll-behavior-y padding padding-block padding-block-end \
+    padding-block-start padding-bottom padding-inline padding-inline-end padding-inline-start \
+    padding-left padding-right padding-top page page-break-after page-break-before \
+    page-break-inside page-orientation paint-order perspective perspective-origin \
+    place-content place-items place-self pointer-events position position-anchor \
+    position-area position-try position-try-fallbacks position-try-order position-visibility \
+    print-color-adjust quotes r reading-flow reading-order resize right rotate row-gap \
+    ruby-align ruby-position rx ry scale scroll-behavior scroll-initial-target scroll-margin \
+    scroll-margin-block scroll-margin-block-end scroll-margin-block-start \
+    scroll-margin-bottom scroll-margin-inline scroll-margin-inline-end \
+    scroll-margin-inline-start scroll-margin-left scroll-margin-right scroll-margin-top \
+    scroll-marker-group scroll-padding scroll-padding-block scroll-padding-block-end \
+    scroll-padding-block-start scroll-padding-bottom scroll-padding-inline \
+    scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left \
+    scroll-padding-right scroll-padding-top scroll-snap-align scroll-snap-stop \
+    scroll-snap-type scroll-target-group scroll-timeline scroll-timeline-axis \
+    scroll-timeline-name scrollbar-color scrollbar-gutter scrollbar-width \
+    shape-image-threshold shape-margin shape-outside shape-rendering size speak stop-color \
+    stop-opacity stroke stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin \
+    stroke-miterlimit stroke-opacity stroke-width tab-size table-layout text-align \
+    text-align-last text-anchor text-autospace text-box text-box-edge text-box-trim \
+    text-combine-upright text-decoration text-decoration-color text-decoration-line \
+    text-decoration-skip-ink text-decoration-style text-decoration-thickness text-emphasis \
+    text-emphasis-color text-emphasis-position text-emphasis-style text-indent \
+    text-orientation text-overflow text-rendering text-shadow text-size-adjust \
+    text-spacing-trim text-transform text-underline-offset text-underline-position text-wrap \
+    text-wrap-mode text-wrap-style timeline-scope top touch-action transform transform-box \
+    transform-origin transform-style transition transition-behavior transition-delay \
+    transition-duration transition-property transition-timing-function translate unicode-bidi \
+    user-select vector-effect vertical-align view-timeline view-timeline-axis \
+    view-timeline-inset view-timeline-name view-transition-class view-transition-group \
+    view-transition-name visibility white-space white-space-collapse widows width will-change \
+    word-break word-spacing word-wrap writing-mode x y z-index zoom";
+
+/// The pseudo-classes Chromium 141 parses, and the pseudo-elements it
+/// parses after one colon.
+const CHROMIUM_PSEUDO_CLASSES: &str = "\
+    -webkit-any -webkit-any-link -webkit-autofill -webkit-drag -webkit-full-page-media \
+    -webkit-full-screen active active-view-transition after any-link autofill before checked \
+    corner-present decrement default defined dir disabled double-button empty enabled end \
+    first-child first-letter first-line first-of-type focus focus-visible focus-within \
+    fullscreen future has horizontal host host-context hover in-range increment indeterminate \
+    invalid is lang last-child last-of-type link modal no-button not nth-child nth-last-child \
+    nth-last-of-type nth-of-type only-child only-of-type open optional out-of-range past \
+    picture-in-picture placeholder-shown popover-open read-only read-write required root \
+    scope single-button start state target target-current user-invalid user-valid valid \
+    vertical visited where window-inactive xr-overlay";
+
+/// The pseudo-elements Chromium 141 parses, besides its own `-webkit-`
+/// ones.
+const CHROMIUM_PSEUDO_ELEMENTS: &str = "\
+    -webkit-inner-spin-button -webkit-input-placeholder -webkit-meter-bar \
+    -webkit-progress-bar -webkit-scrollbar -webkit-search-cancel-button after backdrop before \
+    checkmark column cue details-content file-selector-button first-letter first-line \
+    grammar-error highlight marker part picker picker-icon placeholder scroll-button \
+    scroll-marker selection slotted spelling-error target-text view-transition";
 
 // ---------------------------------------------------------------------------
 // Declarations
@@ -806,6 +1789,9 @@ enum Property {
     /// gaps that take their size from it: whether it is a length wider
     /// than none.
     Custom,
+    /// Whether a box is a size container, whose size `@container` rules
+    /// query (`container-type`, `container`).
+    Container,
 }
 
 impl Property {
@@ -1516,6 +2502,8 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             Reads::One(Property::PaddingRight, one_positive_length)
         }
         "width" => Reads::One(Property::Width, one_full_line),
+        "container-type" => Reads::One(Property::Container, size_container),
+        "container" => Reads::One(Property::Container, container_shorthand),
         "flex-basis" | "-webkit-flex-basis" => Reads::Basis,
         "flex" | "-webkit-flex" | "-ms-flex" => Reads::Flex,
         _ => return [parse_declaration(&name, rest), None],
@@ -1717,6 +2705,40 @@ fn flex_wrap(parts: &[&[Token]]) -> Option<Tri> {
         }
     }
     Some(wraps)
+}
+
+/// Whether a `container-type` value makes a box a size container.
+fn size_container(parts: &[&[Token]]) -> Option<Tri> {
+    let mut sized = Tri::No;
+    for part in parts {
+        let [Token::Ident(word)] = part else {
+            return None;
+        };
+        match word.to_ascii_lowercase().as_str() {
+            "size" | "inline-size" => sized = Tri::Yes,
+            "normal" | "scroll-state" | "anchored" | "initial" | "unset" => {}
+            "inherit" | "revert" | "revert-layer" => sized = sized.max(Tri::Maybe),
+            _ => return None,
+        }
+    }
+    Some(sized)
+}
+
+/// Whether a `container` value, names and then `/` and a type, makes a box
+/// a size container.
+fn container_shorthand(parts: &[&[Token]]) -> Option<Tri> {
+    let tokens: Vec<Token> = parts.iter().flat_map(|part| part.iter().cloned()).collect();
+    match tokens.iter().position(|token| *token == Token::Delim('/')) {
+        Some(slash) => {
+            let kind = &tokens[slash + 1..];
+            let parts: Vec<&[Token]> = kind.chunks(1).collect();
+            size_container(&parts)
+        }
+        None => match keyword(parts).as_deref() {
+            Some("inherit" | "revert" | "revert-layer") => Some(Tri::Maybe),
+            _ => Some(Tri::No),
+        },
+    }
 }
 
 /// Whether a `-webkit-box-orient` value stacks the items.
@@ -2001,12 +3023,14 @@ fn add_specificity(total: &mut (u32, u32, u32), other: (u32, u32, u32)) {
 /// What `&` stands for in the selectors of the rules nested in a style
 /// rule: the elements the rule's selectors match, a selector of a
 /// pseudo-element matching none, with the highest specificity among them,
-/// as `:is()` takes them; and how many rules deep the rule is nested.
+/// as `:is()` takes them. In the style rules of an `@scope` rule, `&` and
+/// `:scope` stand for the scope's root, and add no specificity where they
+/// are left implicit (`scope`).
 #[derive(Clone)]
 struct Nest {
     parent: Rc<[ComplexSelector]>,
     specificity: (u32, u32, u32),
-    depth: usize,
+    scope: bool,
 }
 
 /// Parse a selector list; `nest` says what `&` stands for in a nested
@@ -2027,9 +3051,10 @@ fn parse_selector_list(
 }
 
 /// A nested rule's selectors made whole, as a reader reads them: one that
-/// does not name the rule it is nested in (`&`) is one inside it, as
-/// though `& ` came first (`p` reads `& p`, and `> p` reads `& > p`).
-fn nested_selectors(prelude: &[Token]) -> Vec<Token> {
+/// does not name the rule it is nested in (`&`, or in a scope `:scope`) is
+/// one inside it, as though `& ` came first (`p` reads `& p`, and `> p`
+/// reads `& > p`).
+fn nested_selectors(prelude: &[Token], scope: bool) -> Vec<Token> {
     let mut tokens = Vec::with_capacity(prelude.len() + 2);
     for (at, part) in split_top_level(prelude, &Token::Comma)
         .into_iter()
@@ -2039,7 +3064,11 @@ fn nested_selectors(prelude: &[Token]) -> Vec<Token> {
             tokens.push(Token::Comma);
         }
         let part = trim_whitespace(part);
-        if !part.is_empty() && !part.contains(&Token::Delim('&')) {
+        let names_scope = scope
+            && part.windows(2).any(|pair| {
+                matches!(pair, [Token::Colon, Token::Ident(name)] if name.eq_ignore_ascii_case("scope"))
+            });
+        if !part.is_empty() && !part.contains(&Token::Delim('&')) && !names_scope {
             tokens.extend([Token::Delim('&'), Token::Whitespace]);
         }
         tokens.extend_from_slice(part);
@@ -2234,7 +3263,13 @@ fn parse_simple(
                         specificity.2 += 1;
                     } else {
                         specificity.1 += 1;
-                        compound.parts.push(Simple::Pseudo(pseudo_class(&name)));
+                        let pseudo = match nest {
+                            Some(nest) if nest.scope && name == "scope" => {
+                                PseudoClass::Is(nest.parent.clone())
+                            }
+                            _ => pseudo_class(&name),
+                        };
+                        compound.parts.push(Simple::Pseudo(pseudo));
                     }
                     index + 2
                 }
@@ -2251,18 +3286,14 @@ fn parse_simple(
                 }
             }
         }
-        // `&`: in a nested rule, what the rule it is nested in matches
-        // (see [`Nest`]), undecided past the nesting followed; in a rule
-        // of its own, the root.
+        // `&`: in a nested rule, what the rule it is nested in matches (see
+        // [`Nest`]), however deep, as the weight a selector may carry bounds
+        // what it stands for; in a rule of its own, the root.
         Token::Delim('&') => {
             let pseudo = match nest {
                 Some(nest) => {
                     add_specificity(specificity, nest.specificity);
-                    if nest.depth < MAX_SELECTOR_NESTING {
-                        PseudoClass::Is(nest.parent.clone())
-                    } else {
-                        PseudoClass::Undecided
-                    }
+                    PseudoClass::Is(nest.parent.clone())
                 }
                 None => PseudoClass::Root,
             };
@@ -2466,6 +3497,9 @@ pub(super) struct Element {
     /// What the custom properties looked up at it say there, by name (see
     /// [`Cascade::custom_value`]).
     customs: std::cell::RefCell<HashMap<u64, Option<Tri>>>,
+    /// Whether it may be a size container, whose size `@container` rules
+    /// query, as its style says once the walk has read it.
+    container: std::cell::Cell<Tri>,
 }
 
 impl Element {
@@ -2484,6 +3518,7 @@ impl Element {
             other_keys: Box::default(),
             inline: std::cell::OnceCell::new(),
             customs: std::cell::RefCell::default(),
+            container: std::cell::Cell::new(Tri::No),
         };
         let classes = || {
             element
@@ -2827,6 +3862,14 @@ impl<'a> Tree<'a> {
         let earlier = &self.earlier[node.depth];
         earlier.step_before(step, earlier.place(node.sibling))
     }
+
+    /// Whether an element around a node may be a size container, which an
+    /// `@container` rule's query asks of.
+    fn in_container(&self, node: Node) -> bool {
+        self.stack[..node.depth]
+            .iter()
+            .any(|element| element.container.get() != Tri::No)
+    }
 }
 
 fn match_simple(simple: &Simple, tree: &Tree, node: Node, work: &mut u64) -> Tri {
@@ -3143,14 +4186,22 @@ fn match_complex_at(
     match_prefix_at(selector, recorded, last, tree, node, work)
 }
 
-/// How a selector matches the element at the top of the tree.
-fn match_complex(
-    selector: &ComplexSelector,
+/// How surely a rule applies to the element at `node`: as its selector
+/// matches there, capped by the conditions around it (`condition`); a rule
+/// in `@container` only where an element around it may be a size
+/// container.
+fn rule_applies(
+    rule: &StyleRule,
+    condition: Applies,
     recorded: &[Option<u32>],
     tree: &Tree,
+    node: Node,
     work: &mut u64,
-) -> Tri {
-    match_complex_at(selector, recorded, tree, tree.top(), work)
+) -> Applies {
+    if condition == Applies::No || rule.container && !tree.in_container(node) {
+        return Applies::No;
+    }
+    Applies::matched(match_complex_at(&rule.selector, recorded, tree, node, work)).min(condition)
 }
 
 // ---------------------------------------------------------------------------
@@ -3166,9 +4217,15 @@ struct StyleRule {
     /// The classes, ids, and element names its ancestor compounds require
     /// (see [`AncestorKeys`]).
     ancestor_keys: Box<[u64]>,
-    /// Whether the conditions of the at-rules around it hold: `Yes`, or
-    /// `Maybe`, which caps how surely it applies (see [`RuleContext`]).
-    condition: Tri,
+    /// How the conditions of the at-rules around it hold, which caps how
+    /// surely it applies (see [`RuleContext`]).
+    condition: Applies,
+    /// It stands in an `@container` rule, which applies only inside a size
+    /// container.
+    container: bool,
+    /// It stands in an `@scope` rule, which beats an unscoped rule as
+    /// specific as it (scope proximity).
+    scoped: bool,
     /// The cascade layer it belongs to, in its sheet's
     /// [`Stylesheet::layers`].
     layer: Option<u32>,
@@ -3280,10 +4337,10 @@ impl AncestorKeys {
 
 /// A stylesheet reduced to what the check reads: its rules that set
 /// `display`, `visibility`, or `content-visibility` where their conditions
-/// may hold, and the stylesheets it imports for a screen, in order. Rules
-/// that set a margin, padding, width, or flex basis, or that name an SVG
-/// resource to paint, are kept apart as well, and counted where they set
-/// nothing else.
+/// may hold, and the stylesheets it imports where their conditions may
+/// hold, with how they hold, in order. Rules that set a margin, padding,
+/// width, or flex basis, or that name an SVG resource to paint, are kept
+/// apart as well, and counted where they set nothing else.
 #[derive(Debug, Default)]
 pub(super) struct Stylesheet {
     rules: Vec<Rc<StyleRule>>,
@@ -3293,7 +4350,7 @@ pub(super) struct Stylesheet {
     /// The rules kept only for their spacing, painting, or custom
     /// properties.
     others: usize,
-    pub(super) imports: Vec<String>,
+    pub(super) imports: Vec<(String, Applies)>,
     /// The cascade layers it declares, in order, each by its names from the
     /// outermost; an anonymous one by a name no sheet can write.
     layers: Vec<Box<[String]>>,
@@ -3327,13 +4384,16 @@ const MAX_RULE_NESTING: usize = 32;
 /// Cascade layers one stylesheet may declare.
 const MAX_LAYERS_PER_SHEET: usize = 256;
 
-/// What the at-rules around a rule say of it: whether their conditions
-/// hold on a reading system's screen (`@media`, `@supports`, and the size
-/// of a container, not read, which may), and the cascade layer it belongs
-/// to, as an index into [`Stylesheet::layers`].
+/// What the at-rules around a rule say of it: how their conditions hold on
+/// the readers the check follows (`@media`, `@supports`, the size of a
+/// container, which is not read, and a scope's limits); whether it stands
+/// in `@container` or `@scope`; and the cascade layer it belongs to, as an
+/// index into [`Stylesheet::layers`].
 #[derive(Clone, Copy)]
 struct RuleContext {
-    condition: Tri,
+    condition: Applies,
+    container: bool,
+    scoped: bool,
     layer: Option<u32>,
 }
 
@@ -3342,17 +4402,22 @@ pub(super) fn parse_stylesheet(css: &str) -> Result<Stylesheet, DocumentError> {
     let tokens = tokenize(css)?;
     let mut sheet = Stylesheet::default();
     let context = RuleContext {
-        condition: Tri::Yes,
+        condition: Applies::Yes,
+        container: false,
+        scoped: false,
         layer: None,
     };
-    parse_rule_list(&tokens, true, context, &mut sheet, 0)?;
+    parse_rule_list(&tokens, true, context, None, &mut sheet, 0)?;
     Ok(sheet)
 }
 
+/// Parse a list of rules; `scope` says what `:scope` and `&` stand for in
+/// the style rules of an `@scope` rule.
 fn parse_rule_list(
     tokens: &[Token],
     top_level: bool,
     context: RuleContext,
+    scope: Option<&Nest>,
     sheet: &mut Stylesheet,
     nesting: usize,
 ) -> Result<(), DocumentError> {
@@ -3362,7 +4427,7 @@ fn parse_rule_list(
             Token::Whitespace | Token::Cdo | Token::Cdc | Token::Semicolon => index += 1,
             Token::AtKeyword(name) => {
                 index = parse_at_rule(
-                    tokens, index, name, top_level, context, None, sheet, nesting,
+                    tokens, index, name, top_level, context, scope, None, sheet, nesting,
                 )?;
             }
             _ => {
@@ -3374,7 +4439,7 @@ fn parse_rule_list(
                     break;
                 }
                 let (block, end) = block_at(tokens, index);
-                let selectors = RuleSelectors::new(&tokens[start..index], None);
+                let selectors = RuleSelectors::new(&tokens[start..index], scope.cloned());
                 parse_style_block(&selectors, block, context, sheet, nesting)?;
                 index = end;
             }
@@ -3415,6 +4480,7 @@ fn parse_at_rule(
     name: &str,
     top_level: bool,
     context: RuleContext,
+    scope: Option<&Nest>,
     selectors: Option<&RuleSelectors>,
     sheet: &mut Stylesheet,
     nesting: usize,
@@ -3425,18 +4491,39 @@ fn parse_at_rule(
         end = skip_component(tokens, end);
     }
     let prelude = &tokens[index + 1..end];
-    let within = |condition: Tri| RuleContext {
+    let within = |condition: Applies| RuleContext {
         condition: context.condition.min(condition),
         ..context
     };
     if end < tokens.len() && tokens[end] == Token::OpenCurly {
         let (block, after) = block_at(tokens, end);
+        let mut scope = scope.cloned();
         let inner = match name.as_str() {
             "media" => Some(within(media_condition(prelude))),
             "supports" => Some(within(supports_condition(prelude))),
-            // A container's size, and whether an element stands inside a
-            // scope's root and short of its limits, are not read.
-            "container" | "scope" => Some(within(Tri::Maybe)),
+            // A container's size is not read: its rules may apply inside a
+            // size container (see [`Cascade::rule_applies`]).
+            "container" => Some(RuleContext {
+                container: true,
+                ..within(Applies::Doubt)
+            }),
+            "scope" => match (selectors, scope_prelude(prelude)) {
+                (None, Some((root, limited))) => {
+                    scope = Some(root);
+                    let limit = if limited {
+                        Applies::Doubt
+                    } else {
+                        Applies::Yes
+                    };
+                    Some(RuleContext {
+                        scoped: true,
+                        ..within(limit)
+                    })
+                }
+                // A scope whose root is the parent of the sheet's owner, or
+                // nested in a style rule, may apply.
+                (_, _) => Some(within(Applies::Doubt)),
+            },
             "layer" => match layer_names(prelude) {
                 Ok(names) => {
                     if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
@@ -3455,7 +4542,7 @@ fn parse_at_rule(
             // `@keyframes`, and unknown at-rules style no elements.
             _ => None,
         };
-        if let Some(inner) = inner.filter(|inner| inner.condition != Tri::No) {
+        if let Some(inner) = inner.filter(|inner| inner.condition != Applies::No) {
             if nesting >= MAX_RULE_NESTING {
                 return Err(DocumentError::ResourceLimit);
             }
@@ -3463,12 +4550,12 @@ fn parse_at_rule(
                 Some(selectors) => {
                     parse_style_block(selectors, block, inner, sheet, nesting + 1)?;
                 }
-                None => parse_rule_list(block, false, inner, sheet, nesting + 1)?,
+                None => parse_rule_list(block, false, inner, scope.as_ref(), sheet, nesting + 1)?,
             }
         }
         return Ok(after);
     }
-    if name == "layer" && context.condition != Tri::No {
+    if name == "layer" && context.condition != Applies::No {
         // `@layer a, b;` declares the layers, in that order.
         for names in split_top_level(prelude, &Token::Comma) {
             if let Ok(Some(names)) = layer_names(names) {
@@ -3481,20 +4568,46 @@ fn parse_at_rule(
     }
     if name == "import" && top_level && selectors.is_none() {
         if let Some((target, applies)) = import_target(prelude) {
-            if context.condition != Tri::No && applies {
+            let applies = applies.min(context.condition);
+            if applies != Applies::No {
                 if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET {
                     return Err(DocumentError::ResourceLimit);
                 }
-                sheet.imports.push(target);
+                sheet.imports.push((target, applies));
             }
         }
     }
     Ok((end + 1).min(tokens.len()))
 }
 
-/// An `@import`'s target, and whether its media list and `supports()`
-/// condition may apply on a screen.
-fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
+/// The root an `@scope` rule's style rules match inside, as what `&` and
+/// `:scope` stand for in them, and whether limits (`to (...)`) cut the
+/// scope short; `None` for a rule without a root.
+fn scope_prelude(prelude: &[Token]) -> Option<(Nest, bool)> {
+    let parts = components(trim_whitespace(prelude));
+    let parenthesized = |part: &[Token]| part.first() == Some(&Token::OpenParen);
+    let (root, limited) = match parts.as_slice() {
+        [root] if parenthesized(root) => (root, false),
+        [root, to, limit] if parenthesized(root) && is_word(to, "to") && parenthesized(limit) => {
+            (root, true)
+        }
+        _ => return None,
+    };
+    let list = parse_selector_list(trim_whitespace(block_contents(root)), 0, None);
+    let nest = Nest {
+        parent: list
+            .into_iter()
+            .filter(|selector| selector.pseudo_element == PseudoElement::None)
+            .collect(),
+        specificity: (0, 0, 0),
+        scope: true,
+    };
+    Some((nest, limited))
+}
+
+/// An `@import`'s target, and how its `supports()` condition and media list
+/// hold on the readers the check follows.
+fn import_target(prelude: &[Token]) -> Option<(String, Applies)> {
     let tokens = trim_whitespace(prelude);
     let (target, rest) = match tokens {
         [Token::Str(target) | Token::Url(target), rest @ ..] => (target.clone(), rest),
@@ -3508,7 +4621,7 @@ fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
         _ => return None,
     };
     let mut rest = trim_whitespace(rest);
-    let mut supported = Tri::Yes;
+    let mut supported = Applies::Yes;
     loop {
         match rest {
             [Token::Ident(word), tail @ ..] if word.eq_ignore_ascii_case("layer") => {
@@ -3535,7 +4648,7 @@ fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
             _ => break,
         }
     }
-    Some((target, supported.min(media_condition(rest)) != Tri::No))
+    Some((target, supported.min(media_condition(rest))))
 }
 
 /// A style rule's selectors, read once a declaration or a nested rule
@@ -3559,7 +4672,11 @@ impl<'a> RuleSelectors<'a> {
 
     fn list(&self) -> &[ComplexSelector] {
         self.list.get_or_init(|| match &self.parent {
-            Some(parent) => parse_selector_list(&nested_selectors(self.prelude), 0, Some(parent)),
+            Some(parent) => parse_selector_list(
+                &nested_selectors(self.prelude, parent.scope),
+                0,
+                Some(parent),
+            ),
             None => parse_selector_list(self.prelude, 0, None),
         })
     }
@@ -3580,7 +4697,7 @@ impl<'a> RuleSelectors<'a> {
                         .map(|selector| selector.specificity)
                         .max()
                         .unwrap_or((0, 0, 0)),
-                    depth: self.parent.as_ref().map_or(0, |parent| parent.depth + 1),
+                    scope: false,
                 }
             })
             .clone()
@@ -3612,6 +4729,7 @@ fn parse_style_block(
                     name,
                     false,
                     context,
+                    None,
                     Some(selectors),
                     sheet,
                     nesting,
@@ -3659,7 +4777,7 @@ fn push_style_rule(
 ) -> Result<(), DocumentError> {
     let declarations = std::mem::take(declarations);
     let paintings = std::mem::take(paintings);
-    if context.condition != Tri::No && !(declarations.is_empty() && paintings.is_empty()) {
+    if context.condition != Applies::No && !(declarations.is_empty() && paintings.is_empty()) {
         let declarations: Rc<[Declaration]> = declarations.into();
         let paintings: Rc<[Painting]> = paintings.into();
         // A `::before` or `::after` box matters for where a reader breaks
@@ -3714,6 +4832,8 @@ fn push_style_rule(
                     paintings: paintings.clone(),
                     ancestor_keys,
                     condition: context.condition,
+                    container: context.container,
+                    scoped: context.scoped,
                     layer: context.layer,
                 });
                 if painting {
@@ -3813,6 +4933,10 @@ struct Precedence {
     /// styles, and the user agent's rules.
     layer: u32,
     specificity: (u32, u32, u32),
+    /// 1 for a rule in an `@scope` rule, which beats an unscoped one as
+    /// specific as it; how near its scope's root is to the element is not
+    /// read.
+    proximity: u8,
     order: u32,
 }
 
@@ -3832,6 +4956,7 @@ fn inline_precedence(important: bool) -> Precedence {
         },
         layer: 0,
         specificity: (0, 0, 0),
+        proximity: 0,
         order: 0,
     }
 }
@@ -3903,6 +5028,8 @@ pub(super) struct ReaderStyle {
     /// Whether it is transparent (`opacity: 0`), with all it holds, which
     /// is read only for an SVG element that refers to a resource.
     transparent: Tri,
+    /// Whether it is a size container (see [`Element::container`]).
+    container: Tri,
     /// Whether it lays its children out as flex or grid items, and how
     /// they stand.
     items: Tri,
@@ -4121,13 +5248,13 @@ pub(super) struct Cascade {
     /// place among them and its layer, by an id, class, or element name
     /// their rightmost compound requires, and those that require none (see
     /// [`Cascade::item_box`]); and how many of them set nothing else.
-    spacing_rules: Vec<(Rc<StyleRule>, u32, u32)>,
+    spacing_rules: Vec<Ranked>,
     spacing_by_key: HashMap<u64, Vec<usize>>,
     spacing_anywhere: Vec<usize>,
     /// Rules that set a painting property, indexed as those setting a
     /// margin or padding are (see [`Cascade::references`]), and the ids
     /// they name.
-    painting_rules: Vec<(Rc<StyleRule>, u32, u32)>,
+    painting_rules: Vec<Ranked>,
     painting_by_key: HashMap<u64, Vec<usize>>,
     painting_anywhere: Vec<usize>,
     painted_ids: std::collections::HashSet<Rc<str>>,
@@ -4147,21 +5274,33 @@ pub(super) struct Cascade {
 }
 
 /// A rule in a chapter's cascade: its place in the cascade order, its
-/// cascade layer, and the ids of its `~` steps by combinator.
+/// cascade layer, how the conditions around it hold, and the ids of its `~`
+/// steps by combinator.
 struct CascadeRule {
     rule: Rc<StyleRule>,
     order: u32,
     layer: u32,
+    condition: Applies,
     recorded: Box<[Option<u32>]>,
 }
 
-/// The rules that set one custom property, each with its place among the
-/// rules setting custom properties and its layer, indexed by an id, class,
-/// or element name their rightmost compound requires, and those that
-/// require none.
+/// A rule in a chapter's cascade kept for its spacing, painting, or custom
+/// properties: its place among the rules of its kind, its cascade layer,
+/// and how the conditions around it hold, those of the link, `style`
+/// element, or import that applies its sheet among them.
+struct Ranked {
+    rule: Rc<StyleRule>,
+    order: u32,
+    layer: u32,
+    condition: Applies,
+}
+
+/// The rules that set one custom property, indexed by an id, class, or
+/// element name their rightmost compound requires, and those that require
+/// none.
 #[derive(Default)]
 struct CustomRules {
-    rules: Vec<(Rc<StyleRule>, u32, u32)>,
+    rules: Vec<Ranked>,
     by_key: HashMap<u64, Vec<u32>>,
     anywhere: Vec<u32>,
 }
@@ -4176,9 +5315,17 @@ struct SiblingStep {
 }
 
 impl Cascade {
-    pub(super) fn push_sheet(&mut self, sheet: &Stylesheet) {
+    /// Take in a sheet's rules, their conditions capped by `condition`, how
+    /// the link, `style` element, or import applying it holds.
+    pub(super) fn push_sheet(&mut self, sheet: &Stylesheet, condition: Applies) {
         let layers = self.push_layers(sheet);
         let layer = |rule: &StyleRule| rule.layer.map_or(0, |layer| layers[layer as usize]);
+        let ranked = |rule: &Rc<StyleRule>, order: u32| Ranked {
+            rule: rule.clone(),
+            order,
+            layer: layer(rule),
+            condition: rule.condition.min(condition),
+        };
         for rule in &sheet.rules {
             let index = self.rules.len();
             let recorded = rule
@@ -4247,6 +5394,7 @@ impl Cascade {
                 rule: rule.clone(),
                 order: index as u32 + 1,
                 layer: layer(rule),
+                condition: rule.condition.min(condition),
                 recorded,
             });
         }
@@ -4256,8 +5404,7 @@ impl Cascade {
                 Some(key) => self.spacing_by_key.entry(key).or_default().push(index),
                 None => self.spacing_anywhere.push(index),
             }
-            self.spacing_rules
-                .push((rule.clone(), index as u32 + 1, layer(rule)));
+            self.spacing_rules.push(ranked(rule, index as u32 + 1));
         }
         for rule in &sheet.customs {
             self.custom_order += 1;
@@ -4277,9 +5424,7 @@ impl Cascade {
                     Some(key) => rules.by_key.entry(key).or_default().push(index),
                     None => rules.anywhere.push(index),
                 }
-                rules
-                    .rules
-                    .push((rule.clone(), self.custom_order, layer(rule)));
+                rules.rules.push(ranked(rule, self.custom_order));
             }
         }
         for rule in &sheet.painting {
@@ -4293,8 +5438,7 @@ impl Cascade {
                     .iter()
                     .filter_map(|painting| painting.target.clone()),
             );
-            self.painting_rules
-                .push((rule.clone(), index as u32 + 1, layer(rule)));
+            self.painting_rules.push(ranked(rule, index as u32 + 1));
         }
         self.others += sheet.others;
     }
@@ -4405,6 +5549,7 @@ impl Cascade {
             tier,
             layer: self.layer_order(layer, important),
             specificity: rule.selector.specificity,
+            proximity: u8::from(rule.scoped),
             order,
         }
     }
@@ -4496,13 +5641,17 @@ impl Cascade {
             candidates.sort_unstable();
             candidates.dedup();
             for index in candidates {
-                let (rule, order, layer) = &rules.rules[index as usize];
+                let Ranked {
+                    rule,
+                    order,
+                    layer,
+                    condition,
+                } = &rules.rules[index as usize];
                 if !ancestors.hold(&rule.ancestor_keys) {
                     *work += 1;
                     continue;
                 }
-                let certainty =
-                    match_complex_at(&rule.selector, &[], tree, node, work).min(rule.condition);
+                let certainty = rule_applies(rule, *condition, &[], tree, node, work).everywhere();
                 if certainty == Tri::No {
                     continue;
                 }
@@ -4586,6 +5735,7 @@ impl Cascade {
             tier: TIER_AUTHOR,
             layer: 0,
             specificity: (0, 0, 0),
+            proximity: 0,
             order: 0,
         };
         for (property, name) in PAINTING_PROPERTIES.iter().enumerate() {
@@ -4610,12 +5760,18 @@ impl Cascade {
         candidates.sort_unstable();
         candidates.dedup();
         for index in candidates {
-            let (rule, order, layer) = &self.painting_rules[index];
+            let Ranked {
+                rule,
+                order,
+                layer,
+                condition,
+            } = &self.painting_rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, &[], tree, work).min(rule.condition);
+            let certainty =
+                rule_applies(rule, *condition, &[], tree, tree.top(), work).everywhere();
             if certainty == Tri::No {
                 continue;
             }
@@ -4643,6 +5799,7 @@ impl Cascade {
                     tier,
                     layer: 0,
                     specificity: (0, 0, 0),
+                    proximity: 0,
                     order: 0,
                 };
                 add(&painting, precedence, certainty);
@@ -4711,12 +5868,18 @@ impl Cascade {
             }
         };
         for index in candidates {
-            let (rule, order, layer) = &self.spacing_rules[index];
+            let Ranked {
+                rule,
+                order,
+                layer,
+                condition,
+            } = &self.spacing_rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, &[], tree, work).min(rule.condition);
+            let certainty =
+                rule_applies(rule, *condition, &[], tree, tree.top(), work).everywhere();
             if certainty == Tri::No {
                 continue;
             }
@@ -4905,12 +6068,13 @@ impl Cascade {
 
         let mut applied: [Vec<Applied>; 3] = Default::default();
         // Whether the box is inline-level, floats, is positioned out of the
-        // flow, floats to the start of the line, and is transparent; how it
+        // flow, floats to the start of the line, is transparent, and is a
+        // size container; how it
         // lays out its children; and, for flex items, whether they stand in
         // a column or in reverse, may wrap, stand in a column of an old
         // flexible box, are spread along the line, and have a gap between
         // them, and whether an old flexible box clamps its lines.
-        let mut flows: [Vec<(Precedence, Tri, Tri)>; 5] = Default::default();
+        let mut flows: [Vec<(Precedence, Tri, Tri)>; 6] = Default::default();
         let mut layouts: Vec<(Precedence, Tri, Layout)> = Vec::new();
         let mut item_flags: [Vec<(Precedence, Tri, Tri)>; 6] = Default::default();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
@@ -4950,9 +6114,13 @@ impl Cascade {
                     }
                     return;
                 }
-                Property::Opacity => {
-                    if let Some(clear) = declaration.flow {
-                        flows[4].push((precedence, certainty, clear));
+                Property::Opacity | Property::Container => {
+                    let slot = match declaration.property {
+                        Property::Opacity => 4,
+                        _ => 5,
+                    };
+                    if let Some(says) = declaration.flow {
+                        flows[slot].push((precedence, certainty, says));
                     }
                     return;
                 }
@@ -5007,13 +6175,15 @@ impl Cascade {
                 rule,
                 order,
                 layer,
+                condition,
                 recorded,
             } = &self.rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, recorded, tree, work).min(rule.condition);
+            let certainty =
+                rule_applies(rule, *condition, recorded, tree, tree.top(), work).everywhere();
             if certainty == Tri::No {
                 continue;
             }
@@ -5146,6 +6316,7 @@ impl Cascade {
             tier: TIER_AUTHOR,
             layer: 0,
             specificity: (0, 0, 0),
+            proximity: 0,
             order: 0,
         };
         for (prefixed, value) in element.values("display") {
@@ -5220,6 +6391,7 @@ impl Cascade {
             tier: TIER_USER_AGENT,
             layer: 0,
             specificity: (0, 0, 0),
+            proximity: 0,
             order: 0,
         };
         let has = |name: &str| element.values(name).next().is_some();
@@ -5390,6 +6562,7 @@ impl Cascade {
             floats_to_start: resolve_flow(&flows[3], false),
             positioned: resolve_flow(&flows[2], false),
             transparent: resolve_flow(&flows[4], false),
+            container: resolve_flow(&flows[5], false),
             items,
             item_layout,
             contents: layout == Layout::Contents && !contested,
@@ -7646,6 +8819,9 @@ pub(super) fn chapter_text(
         } else {
             None
         };
+        if let Some(style) = &style {
+            element.container.set(style.container);
+        }
         // How the element meets AnyDoc's inline run. Paragraphs, headings,
         // quotes, list items, cells, captions, and the body get runs of
         // their own; lists, tables, `pre`, rules, and containers holding
@@ -7959,7 +9135,7 @@ pub(super) fn cascade_for(css: &[&str]) -> (Cascade, AnyDocCascade) {
     let mut reader = Cascade::default();
     let mut anydoc = AnyDocCascade::default();
     for sheet in css {
-        reader.push_sheet(&parse_stylesheet(sheet).expect("stylesheet"));
+        reader.push_sheet(&parse_stylesheet(sheet).expect("stylesheet"), Applies::Yes);
         anydoc.add(sheet);
     }
     (reader, anydoc)
@@ -9750,34 +10926,79 @@ mod tests {
     fn conditions_hold_as_far_as_the_check_can_tell() {
         let media = |text: &str| media_condition(&tokenize(text).expect("tokens"));
         for (query, holds) in [
-            ("", Tri::Yes),
-            ("screen", Tri::Yes),
-            ("all, print", Tri::Yes),
-            ("not print", Tri::Yes),
-            ("print", Tri::No),
-            ("amzn-kf8", Tri::No),
-            ("not screen", Tri::No),
-            ("print and (color)", Tri::No),
-            ("screen and (min-width: 600px)", Tri::Maybe),
-            ("(min-resolution: 2dppx)", Tri::Maybe),
-            ("not all and (monochrome)", Tri::Maybe),
+            ("", Applies::Yes),
+            ("screen", Applies::Yes),
+            ("only screen", Applies::Yes),
+            ("all, print", Applies::Yes),
+            ("not print", Applies::Yes),
+            ("print", Applies::No),
+            ("amzn-kf8", Applies::No),
+            ("not screen", Applies::No),
+            ("print and (color)", Applies::No),
+            // Features every reader the check follows has, or none has.
+            ("(min-width: 0)", Applies::Yes),
+            ("screen and (min-width: 1px)", Applies::Yes),
+            ("(width >= 0) and (color)", Applies::Yes),
+            ("not all and (monochrome)", Applies::Yes),
+            ("(min-resolution: 1dppx)", Applies::Yes),
+            ("(max-width: 1px)", Applies::No),
+            ("(min-width: 0) and (max-width: 1px)", Applies::No),
+            ("(max-resolution: 0.5dppx)", Applies::No),
+            ("(grid)", Applies::No),
+            // Features that set readers apart.
+            ("screen and (min-width: 600px)", Applies::Varies),
+            ("(max-width: 40em)", Applies::Varies),
+            ("(400px <= width <= 700px)", Applies::Varies),
+            ("(orientation: portrait)", Applies::Varies),
+            ("(min-aspect-ratio: 16/9)", Applies::Varies),
+            ("(min-resolution: 2dppx)", Applies::Varies),
+            ("(hover: hover)", Applies::Varies),
+            ("(prefers-color-scheme: dark)", Applies::Varies),
+            // A query Chromium rejects holds nowhere, and a feature it does
+            // not know fails.
+            ("screen screen", Applies::No),
+            ("not only print", Applies::No),
+            (", print", Applies::No),
+            ("(min-width)", Applies::No),
+            ("(bogus-feature)", Applies::No),
+            ("not (bogus-feature)", Applies::No),
+            ("(-ms-high-contrast: none)", Applies::No),
+            ("(min-width: 0) or (bogus)", Applies::Yes),
+            // Lengths the check cannot size.
+            ("(min-width: calc(100px + 1em))", Applies::Doubt),
+            ("(max-width: 50vw)", Applies::Doubt),
         ] {
             assert_eq!(media(query), holds, "@media {query}");
         }
         let supports = |text: &str| supports_condition(&tokenize(text).expect("tokens"));
         for (condition, holds) in [
-            ("(display: grid)", Tri::Yes),
-            ("((display: flex))", Tri::Yes),
-            ("(display: bogus-value)", Tri::No),
-            ("not (display: bogus-value)", Tri::Yes),
-            ("not (display: grid)", Tri::No),
-            ("(display: grid) and (display: bogus)", Tri::No),
-            ("(display: grid) or (display: bogus)", Tri::Yes),
-            ("(display: flex) and (gap: 1em)", Tri::Maybe),
-            ("(display: run-in)", Tri::Maybe),
-            ("selector(:has(a))", Tri::Maybe),
-            // `not` must stand in parentheses beside `and`.
-            ("(display: grid) and not (display: bogus)", Tri::Maybe),
+            ("(display: grid)", Applies::Yes),
+            ("((display: flex))", Applies::Yes),
+            ("(display: inline flow-root)", Applies::Yes),
+            ("(display: bogus-value)", Applies::No),
+            ("(display: -moz-box)", Applies::No),
+            ("(display: run-in)", Applies::No),
+            ("not (display: bogus-value)", Applies::Yes),
+            ("not (display: grid)", Applies::No),
+            ("(display: grid) and (display: bogus)", Applies::No),
+            ("(display: grid) or (display: bogus)", Applies::Yes),
+            // Properties Chromium knows, whatever their value, and those it
+            // does not.
+            ("(display: flex) and (gap: 1em)", Applies::Yes),
+            ("(position: sticky)", Applies::Yes),
+            ("(--anything: 1)", Applies::Yes),
+            ("(-webkit-hyphens: none)", Applies::No),
+            ("(margin-trim: inline)", Applies::No),
+            ("(-moz-orient: inline)", Applies::No),
+            // Selectors it parses, and those it rejects.
+            ("selector(:has(a))", Applies::Yes),
+            ("selector(p > q::before)", Applies::Yes),
+            ("selector(:-moz-focusring)", Applies::No),
+            ("selector(p, q)", Applies::No),
+            ("font-tech(color-COLRv1)", Applies::Doubt),
+            ("bogus-function(x)", Applies::No),
+            // `not` must stand in parentheses beside `and`: the rule is void.
+            ("(display: grid) and not (display: bogus)", Applies::No),
         ] {
             assert_eq!(supports(condition), holds, "@supports {condition}");
         }
@@ -9787,7 +11008,66 @@ mod tests {
             "(".repeat(100_000),
             ")".repeat(100_000)
         );
-        assert_eq!(supports(&deep), Tri::Maybe);
+        assert_eq!(supports(&deep), Applies::Doubt);
+        let deep = format!("{}(color){}", "(".repeat(100_000), ")".repeat(100_000));
+        assert_eq!(media(&deep), Applies::Doubt);
+    }
+
+    #[test]
+    fn rules_whose_conditions_hold_for_every_reader_apply() {
+        let body = r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#;
+        // A sign every reader the check follows shows.
+        for guarded in [
+            r#"@media (min-width: 0) { .s::before { content: "\2212" } }"#,
+            r#"@media screen and (min-width: 1px) { .s::before { content: "\2212" } }"#,
+            r#"@supports (gap: 1px) { .s::before { content: "\2212" } }"#,
+            r#"@supports selector(:has(p)) { .s::before { content: "\2212" } }"#,
+            r#"@scope (body) { .s::before { content: "\2212" } }"#,
+            r#"@scope (p) { :scope > .s::before { content: "\2212" } }"#,
+        ] {
+            assert!(drops_shown(&[guarded], body), "{guarded}");
+        }
+        // Not at a scope's root itself, nor past its limits; nor in a
+        // container query where no container stands around the element,
+        // nor where Chromium rejects the condition.
+        for guarded in [
+            r#"@scope (.s) { .s::before { content: "\2212" } }"#,
+            r#"@scope (p) to (.s) { .s::before { content: "\2212" } }"#,
+            r#"@container (min-width: 0) { .s::before { content: "\2212" } }"#,
+            r#"@media screen screen { .s::before { content: "\2212" } }"#,
+            r#"@supports (display: -moz-box) { .s::before { content: "\2212" } }"#,
+        ] {
+            assert!(!drops_shown(&[guarded], body), "{guarded}");
+        }
+        // A rule that holds everywhere shows what AnyDoc hides, and keeps
+        // hidden what it converts; one that holds nowhere hides nothing.
+        let refund = r#"<p>Refund due <span class="x">1,250.00</span> by April.</p>"#;
+        for sheet in [
+            ".x { display: none } @media (min-width: 0) { .x { display: inline } }",
+            ".x { display: none } @supports (gap: 1px) { .x { display: inline } }",
+            "@media (max-width: 1px) { .d { color: red } .x { display: none } }",
+            "@media not only print { .d { color: red } .x { display: none } }",
+            "@container (min-width: 0) { .d { color: red } .x { display: none } }",
+            "@supports (display: -moz-box) { .d { color: red } .x { display: none } }",
+        ] {
+            assert!(drops_shown(&[sheet], refund), "{sheet}");
+        }
+        assert!(!converts_hidden(
+            &["p .x { display: none } @media (min-width: 0) { p span.x { display: inline } }"],
+            refund
+        ));
+        // A rule nested nine deep matches as one nested once does.
+        let nested = format!(
+            ".x {{ display: none }} {}.x {{ display: inline }}{}",
+            ".a { ".repeat(9),
+            " }".repeat(9)
+        );
+        let deep = format!(
+            "{}<p>Refund due <span class=\"x\">1,250.00</span> by April.</p>{}",
+            r#"<div class="a">"#.repeat(10),
+            "</div>".repeat(10)
+        );
+        assert!(drops_shown(&[&nested], &deep));
     }
 
     #[test]
