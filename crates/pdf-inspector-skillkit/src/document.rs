@@ -508,8 +508,12 @@ fn map_path_error(error: crate::SkillkitError) -> DocumentError {
         _ => DocumentError::InputUnavailable,
     }
 }
-#[derive(Default)]
-struct PackagePreflight {
+/// What the package preflight found. The worker runs the preflight before it
+/// converts and returns this with the Markdown, for the supervisor to
+/// disclose.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct PackagePreflight {
     external_relationships: bool,
     active_content: bool,
     hidden_content: bool,
@@ -7314,23 +7318,17 @@ pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, Docu
     if !classification.enabled {
         return Err(DocumentError::Unsupported);
     }
-    let (bytes, preflight) = if kind == DocumentKind::Csv {
-        (bytes, PackagePreflight::default())
-    } else {
-        // Decompressing and scanning parts is blocking work; keep it off the
-        // async executor that serves the other tools.
-        let (bytes, preflight) = tokio::task::spawn_blocking(move || {
-            let preflight = preflight_package(&bytes, kind, variant);
-            (bytes, preflight)
-        })
-        .await
-        .map_err(|_| DocumentError::ConversionFailed)?;
-        (bytes, preflight?)
-    };
+    // The worker runs the package preflight before it converts, under the
+    // conversion's deadline, memory ceiling, and in-flight bound, and
+    // returns what the preflight found with the Markdown. Run here, a
+    // crafted package's checks held a thread and memory that no bound
+    // applied to, past the tool's timeout.
+    let (raw_markdown, preflight) = run_worker_process(&bytes, variant).await?;
+    // The worker refuses what the preflight rejects before converting it;
+    // the supervisor applies the same rejection to what it returns.
     if let Some(error) = preflight_rejection(kind, &preflight) {
         return Err(error);
     }
-    let raw_markdown = run_worker_process(&bytes, variant).await?;
     if raw_markdown.len() > MAX_MARKDOWN_SIZE {
         return Err(DocumentError::OutputTooLarge);
     }
@@ -7402,10 +7400,12 @@ pub(crate) struct WorkerJob {
     pub(crate) max_response_bytes: usize,
 }
 
+/// Convert a document in the worker: its Markdown, and what the worker's
+/// package preflight found.
 async fn run_worker_process(
     bytes: &[u8],
     variant: DocumentVariant,
-) -> Result<String, DocumentError> {
+) -> Result<(String, PackagePreflight), DocumentError> {
     if !worker_sandbox_available() {
         return Err(DocumentError::WorkerUnavailable);
     }
@@ -7417,7 +7417,7 @@ async fn run_worker_process_with_executable(
     bytes: &[u8],
     variant: DocumentVariant,
     executable: PathBuf,
-) -> Result<String, DocumentError> {
+) -> Result<(String, PackagePreflight), DocumentError> {
     let permit = worker_semaphore()
         .acquire_owned()
         .await
@@ -7429,9 +7429,9 @@ async fn run_worker_process_with_executable(
         max_response_bytes: MAX_SERIALIZED_WORKER_RESPONSE_BYTES,
     };
     let response = run_worker_job(job, executable, permit).await?;
-    match (response.markdown, response.error) {
-        (Some(markdown), None) => Ok(markdown),
-        (None, Some(error)) => Err(error.into_document_error()),
+    match (response.markdown, response.error, response.preflight) {
+        (Some(markdown), None, Some(preflight)) => Ok((markdown, preflight)),
+        (None, Some(error), _) => Err(error.into_document_error()),
         _ => Err(DocumentError::WorkerProtocol),
     }
 }
@@ -7905,6 +7905,9 @@ pub(crate) struct WorkerResponse {
     pub(crate) json: Option<Box<serde_json::value::RawValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resource: Option<WorkerResourceEvidence>,
+    /// What the package preflight found, beside a document's Markdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preflight: Option<PackagePreflight>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8051,6 +8054,7 @@ pub fn run_worker() -> Result<(), DocumentError> {
             Ok(markdown) if markdown.len() <= MAX_MARKDOWN_SIZE => WorkerResponse {
                 markdown: Some(markdown),
                 error: None,
+                preflight: Some(PackagePreflight::default()),
                 ..Default::default()
             },
             Ok(_) => worker_response_for_error(&DocumentError::OutputTooLarge),
@@ -8060,16 +8064,17 @@ pub fn run_worker() -> Result<(), DocumentError> {
         let kind = kind_for_variant(variant).ok_or(DocumentError::WorkerProtocol)?;
         let format = anydoc_format(variant).ok_or(DocumentError::WorkerProtocol)?;
         match preflight_package(bytes, kind, variant)
-            .and_then(|preflight| preflight_rejection(kind, &preflight).map_or(Ok(()), Err))
+            .and_then(|preflight| preflight_rejection(kind, &preflight).map_or(Ok(preflight), Err))
         {
             Err(error) => worker_response_for_error(&error),
-            Ok(()) => match anydoc::to_markdown_bytes(bytes, Some(format)) {
+            Ok(preflight) => match anydoc::to_markdown_bytes(bytes, Some(format)) {
                 Ok(_) if worker_diagnostics_incomplete() => {
                     worker_response_for_error(&DocumentError::IncompleteConversion)
                 }
                 Ok(markdown) if markdown.len() <= MAX_MARKDOWN_SIZE => WorkerResponse {
                     markdown: Some(markdown),
                     error: None,
+                    preflight: Some(preflight),
                     ..Default::default()
                 },
                 Ok(_) => worker_response_for_error(&DocumentError::OutputTooLarge),
@@ -13201,6 +13206,70 @@ mod tests {
                 "worker process {pid} remained after cancellation reap"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_takes_the_preflight_from_the_worker() {
+        let temporary = tempfile::tempdir().expect("temporary worker directory");
+        // A worker that reads its request and answers with a fixed frame.
+        let answering = |name: &str, response: WorkerResponse| {
+            let frame_path = temporary.path().join(format!("{name}.frame"));
+            let mut frame = Vec::new();
+            write_worker_response(&mut frame, response, MAX_SERIALIZED_WORKER_RESPONSE_BYTES)
+                .expect("worker frame");
+            std::fs::write(&frame_path, frame).expect("write worker frame");
+            let worker = temporary.path().join(format!("{name}.sh"));
+            let frame_path = frame_path.to_string_lossy().replace('\'', "'\\''");
+            std::fs::write(
+                &worker,
+                format!("#!/bin/sh\ncat > /dev/null\ncat '{frame_path}'\n"),
+            )
+            .expect("write answering worker");
+            let mut permissions = std::fs::metadata(&worker)
+                .expect("answering worker metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&worker, permissions).expect("make worker executable");
+            worker
+        };
+        // A package the preflight would refuse reaches the worker, which
+        // runs the preflight: the supervisor reads no package itself.
+        let refused = zip_entries(&[
+            ("[Content_Types].xml", DOCX_TYPES),
+            ("word/document.xml", DOCX_XML),
+            ("word/vbaProject.bin", b"macro"),
+        ]);
+        let found = PackagePreflight {
+            list_numbering_differs: true,
+            ..PackagePreflight::default()
+        };
+        let worker = answering(
+            "converted",
+            WorkerResponse {
+                markdown: Some("Converted".into()),
+                preflight: Some(found),
+                ..Default::default()
+            },
+        );
+        let (markdown, preflight) =
+            run_worker_process_with_executable(&refused, DocumentVariant::Docx, worker)
+                .await
+                .expect("worker Markdown");
+        assert_eq!(markdown, "Converted");
+        assert!(preflight.list_numbering_differs);
+        // Markdown without what the preflight found cannot be disclosed.
+        let worker = answering(
+            "unchecked",
+            WorkerResponse {
+                markdown: Some("Converted".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            run_worker_process_with_executable(&refused, DocumentVariant::Docx, worker).await,
+            Err(DocumentError::WorkerProtocol)
+        ));
     }
 
     #[cfg(unix)]

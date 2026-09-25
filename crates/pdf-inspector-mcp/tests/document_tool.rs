@@ -1524,3 +1524,71 @@ fn docx_external_link_destinations_are_removed() {
     assert!(codes.contains(&"external_relationships_blocked"));
     assert!(codes.contains(&"sanitized_output"));
 }
+
+/// A worker that reads its request and answers with a fixed response frame.
+#[cfg(unix)]
+fn answering_worker(directory: &Path, response: &serde_json::Value) -> std::path::PathBuf {
+    let payload = response.to_string().into_bytes();
+    let mut frame = b"ADW1".to_vec();
+    frame.extend_from_slice(&[2, 0, 0, 0]);
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let frame_path = directory.join("response.frame");
+    std::fs::write(&frame_path, frame).expect("write worker frame");
+    let worker = directory.join("answering-worker.sh");
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\ncat '{}'\n",
+            frame_path.to_string_lossy().replace('\'', "'\\''")
+        ),
+    )
+    .expect("write answering worker");
+    let mut permissions = std::fs::metadata(&worker)
+        .expect("answering worker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&worker, permissions).expect("make answering worker executable");
+    worker
+}
+
+#[cfg(unix)]
+#[test]
+fn document_warnings_come_from_the_workers_preflight() {
+    let fixture = || {
+        format!(
+            "{}/../../test-corpus/docx/public-fixture.docx",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    };
+    let answered = |response: serde_json::Value| {
+        let temporary = tempfile::tempdir().expect("temporary worker directory");
+        let worker = answering_worker(temporary.path(), &response);
+        run_document_tool_with_worker(fixture(), "worker-preflight-test", Some(&worker))
+    };
+    // The package preflight runs in the worker, under its deadline and
+    // memory ceiling; the server discloses what it found.
+    let document = answered(serde_json::json!({
+        "markdown": "PREFLIGHT-MARKER",
+        "preflight": { "list_numbering_differs": true, "hidden_content": true }
+    }));
+    assert_eq!(document["completeness"], "partial", "{document}");
+    assert_eq!(document["markdown"], "PREFLIGHT-MARKER");
+    let codes: Vec<_> = document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap_or_default())
+        .collect();
+    assert!(codes.contains(&"list_numbering_differs"), "{document}");
+    assert!(codes.contains(&"hidden_content_preserved"), "{document}");
+    // What the worker's preflight rejects is refused, and Markdown without
+    // the preflight's findings is not returned.
+    let document = answered(serde_json::json!({
+        "markdown": "PREFLIGHT-MARKER",
+        "preflight": { "unsupported_content": true }
+    }));
+    assert_eq!(document["code"], "incomplete_conversion", "{document}");
+    let document = answered(serde_json::json!({ "markdown": "PREFLIGHT-MARKER" }));
+    assert_eq!(document["code"], "worker_protocol", "{document}");
+}
