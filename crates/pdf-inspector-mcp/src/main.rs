@@ -391,7 +391,7 @@ impl PdfInspectorServer {
 
     /// Convert an enabled DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV package through the supervised document worker.
     #[tool(
-        description = "Convert an enabled local DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV input to sanitized Markdown through a bounded worker",
+        description = "Convert an enabled local DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, exact `.odp`, strict EPUB, or bounded CSV input to sanitized Markdown through a bounded worker. A document whose conversion would lose or misrender what its application shows is refused with a stable code; `completeness: partial` and the warnings name anything the Markdown shows differently",
         annotations(
             title = "Document to Markdown",
             read_only_hint = true,
@@ -430,7 +430,7 @@ impl PdfInspectorServer {
 
     /// Convert a PDF to clean Markdown.
     #[tool(
-        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled",
+        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled. Text on pages listed as needing OCR is missing or unreliable",
         annotations(
             title = "PDF to Markdown",
             read_only_hint = true,
