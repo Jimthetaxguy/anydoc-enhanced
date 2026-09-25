@@ -5694,10 +5694,35 @@ fn sanitize_markdown(markdown: &str) -> (String, bool) {
     // `(` into a new link, while a path is easiest to delimit before the tag
     // next to it disappears. Markers contain nothing either pass rewrites.
     let redacted = redact_destinations_and_paths(markdown);
-    let stripped = html.replace_all(&redacted, "");
+    let stripped = strip_html_tags(&redacted, html);
     let sanitized = redact_destinations_and_paths(&stripped);
     let changed = sanitized != markdown;
     (sanitized, changed)
+}
+
+/// Remove HTML tags, but not text AnyDoc escaped: `\<Client name>` is a
+/// literal `<` and words, as a Markdown renderer reads it. A tag may still
+/// start after the escaped `<`, so the search resumes just past it.
+fn strip_html_tags(text: &str, html: &Regex) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut position = 0;
+    while let Some(tag) = html.find_at(text, position) {
+        let escapes = text[..tag.start()]
+            .bytes()
+            .rev()
+            .take_while(|&byte| byte == b'\\')
+            .count();
+        if escapes % 2 == 1 {
+            position = tag.start() + 1;
+            continue;
+        }
+        output.push_str(&text[copied..tag.start()]);
+        copied = tag.end();
+        position = tag.end();
+    }
+    output.push_str(&text[copied..]);
+    output
 }
 
 fn redact_destinations_and_paths(markdown: &str) -> String {
@@ -6071,6 +6096,31 @@ mod tests {
             assert!(changed, "{input}");
             assert!(!output.contains("attacker"), "{input} -> {output}");
         }
+    }
+
+    #[test]
+    fn sanitizer_keeps_escaped_angle_brackets_as_text() {
+        // AnyDoc escapes a literal `<`, as in a template placeholder.
+        for input in [
+            "Dear \\<Client name>, your \\<Tax year> return",
+            "| \\<Amount> | 100 |",
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (input.to_string(), false),
+                "{input}"
+            );
+        }
+        // An escaped backslash does not escape the tag after it, and a tag
+        // after an escaped `<` is still removed.
+        assert_eq!(
+            sanitize_markdown("a \\\\<b>bold</b>"),
+            ("a \\\\bold".to_string(), true)
+        );
+        assert_eq!(
+            sanitize_markdown("\\<a <script>x</script>"),
+            ("\\<a x".to_string(), true)
+        );
     }
 
     #[test]
