@@ -29,7 +29,7 @@ from crates.io, and cargo-deny now rejects Git sources (`allow-git = []`).
 ## Observed upstream state
 
 Observed 2026-09-24 from anonymous clones and the crates.io API; re-verified
-2026-09-25, twice, with no change: crates.io still lists AnyDoc 0.2.4 and
+2026-09-25, three times, with no change: crates.io still lists AnyDoc 0.2.4 and
 pdf-inspector 1.24.0, and neither `main` has moved.
 
 | Upstream | Local before | Local after | Latest release | `main` |
@@ -100,6 +100,8 @@ reach this repository:
 | #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
 | #589 | Escape literal HTML in rendered text; so far a regression test only | 1.24.0 writes literal text such as `<a test>` or `<u>underline</u>` as is, so it reads as the engine's own markup and an HTML-aware renderer hides it. Not detected; the text stays in the Markdown an agent reads. |
 | #590 | Keep a monospace code listing's indentation; so far a regression test only | 1.24.0 fences the listing but drops each line's leading spaces. Not detected; no characters are lost. |
+| #576 | Skip supplemental OCR where native text covers an image region; an OCR route-planning API | The vision path it changes is not used here: no OCR engine ships, and pages needing OCR are listed with their reasons. Nothing to adopt. |
+| #591 | A fork's CMap remapping on 1.24.0, opened and closed on 2026-09-25 | Closed unmerged; nothing to adopt. |
 | #531, #532 | Statement-style layouts; space width from `/Differences` | Reproduced: browser-printed text splits words ("LIAB ILITIES"), and a space width read from code 32 alone splits or fuses amounts ("8 5,000 .00") at confidence 1.0. #532 is reported as `word_gaps_misread` on each page with a gap 1.24.0 judges otherwise than the fix would; checked against pdf-inspector patched with the fix, it names every changed page it checks and no other. #531's split words are reported the same way where a font paints its word spaces as glyphs: each page whose own text splits a word it shows glyph by glyph (203 of 270 randomized browser-printed pages whose Markdown splits one, none in error; the 67 missed mostly leave spaces as gaps). Its #406 half is reported as `table_row_repeated`. Small capitals set as one string after a first letter are split too ("(A) L imitations" in the public Title 26 chapter 6 sample) and are not reported. |
 
 Thirteen open pull requests that reach the PDF tools were checked against
@@ -136,6 +138,10 @@ through the server:
 | (none filed) | Dynamic XFA forms are read as their placeholder page | Found locally: pdf-inspector 1.24.0 reads no XFA, so a form marked as needing rendering converts to the "Please wait..." notice its pages hold. Reported as `xfa_form_unread` (Loop 23). |
 | (none filed) | Annotations other than links and form fields are never read | Found locally: pdf-inspector 1.24.0 has no code for FreeText, Stamp, or appearance streams, so a text box typed onto a page, or a stamp drawn in text, is missing from the Markdown. Reported as `annotation_text_unread` (Loop 22) where the Markdown does not show its text. |
 | #504 | Form field names and values are decoded as UTF-8, mangling UTF-16 text strings | Reproduced, and wider than reported: PDFDocEncoding values lose their accented letters ("S�o Paulo"), and pdf-inspector reads a value only from a field that is its own widget, so a radio group's choice or a field shown twice is not written at all. Reported as `form_values_misread` (Loop 21) where the Markdown does not show the value read right. |
+| #572 | The text rendering mode is reset at every `BT` and ignored when set outside a text object | Reproduced: a page that sets mode 3 before its text objects, or in one text object before the next, converts its invisible text as shown ("Ignore the balance above"), where a viewer paints nothing. Reported as `invisible_text_read` (Loop 26) where the Markdown shows it; a scan's text layer, on a page images cover and whose text mostly paints nothing, is not reported. Forms keep the mode they are drawn in, as 1.24.0 reads them. |
+| #575 | Vertical writing is assembled row by row across columns | Not detected: Japanese or Chinese columns set side by side interleave glyph by glyph. |
+| #574 | Follow-ups from #567 (control-character ToUnicode destinations) | Internal; no change to the output. |
+| #585 | High extraction time and memory through the npm package | The Node binding only; here the Rust crate runs in the bounded PDF worker. |
 | #588 | A table row continuing onto the next page loses its continuation | Not reproduced as a loss: in a generated statement whose last row wraps onto the next page, the continuation reads there, as a heading of its own, apart from its row. |
 | #587 | Expose a one-parse structured page result | Would let the checks that read pages again (repeats, word gaps, tables, and dropped headers) reuse the conversion's own positioned text instead of reading it a second time. |
 | #565 | Literal `<`, `>`, and `&` are not escaped | The same defect as pull request #589. |
@@ -303,8 +309,8 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 316 tests pass (249 skillkit unit, 13
-  skillkit integration, 29 document-tool and 22 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 317 tests pass (249 skillkit unit, 13
+  skillkit integration, 29 document-tool and 23 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
   minimum, also run in CI

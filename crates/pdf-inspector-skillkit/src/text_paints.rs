@@ -635,6 +635,9 @@ struct PageText {
     /// layers.
     layers: Option<std::rc::Rc<Layers>>,
     hidden_text: Option<Vec<String>>,
+    /// Text a viewer never paints, in render mode 3, that pdf-inspector
+    /// reads as shown, when the page is read for repeats.
+    invisible_text: Option<Vec<String>>,
 }
 
 impl PageText {
@@ -840,12 +843,17 @@ impl PageText {
         }
     }
 
-    /// Note text pdf-inspector reads in a layer a reader hides: a run where
+    /// Note text pdf-inspector reads that a reader does not see, in a layer
+    /// it hides or, when `invisible`, painted in render mode 3: a run where
     /// the text matrix was just set, else more of the run before; its text
     /// where its font can be read, to `MAX_HIDDEN_TEXT` bytes a page.
-    fn note_hidden(&mut self, state: State, bytes: &[u8], placed: bool) {
-        let room = self
-            .hidden_text
+    fn note_unseen(&mut self, state: State, bytes: &[u8], placed: bool, invisible: bool) {
+        let texts = if invisible {
+            &self.invisible_text
+        } else {
+            &self.hidden_text
+        };
+        let room = texts
             .as_ref()
             .is_some_and(|texts| texts.iter().map(String::len).sum::<usize>() < MAX_HIDDEN_TEXT);
         if !(room && state.font && state.reached && state.read_mode != 3) {
@@ -857,7 +865,12 @@ impl PageText {
         else {
             return;
         };
-        let Some(texts) = self.hidden_text.as_mut() else {
+        let texts = if invisible {
+            self.invisible_text.as_mut()
+        } else {
+            self.hidden_text.as_mut()
+        };
+        let Some(texts) = texts else {
             return;
         };
         match texts.last_mut().filter(|_| !placed) {
@@ -983,6 +996,16 @@ impl PageText {
         self.painted();
     }
 
+    /// Whether the page is a scan with a text layer: images cover it, and
+    /// most of its text paints nothing. The layer describes what the scan
+    /// shows; a page drawn over a background image shows its text.
+    fn scanned(&self, page_box: [f64; 4]) -> bool {
+        let page_area = (page_box[2] - page_box[0]) * (page_box[3] - page_box[1]);
+        page_area > 0.0
+            && self.image_area >= COVERED_SHARE * page_area
+            && self.hidden_bytes > self.visible_bytes
+    }
+
     fn is_hidden_layer(&self, page_box: [f64; 4]) -> bool {
         let page_area = (page_box[2] - page_box[0]) * (page_box[3] - page_box[1]);
         page_area > 0.0
@@ -1034,6 +1057,10 @@ pub(crate) struct Findings {
     /// Text pdf-inspector reads in layers a reader hides (see
     /// `optional_content`), by page, on the pages read for repeats.
     pub(crate) hidden_layer_texts: Vec<(u32, Vec<String>)>,
+    /// Text a viewer never paints, in render mode 3, that pdf-inspector
+    /// reads as shown (upstream issue #572), by page, on the pages read for
+    /// repeats but a scan's with its text layer.
+    pub(crate) invisible_texts: Vec<(u32, Vec<String>)>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -1132,6 +1159,9 @@ pub(crate) fn scan_document(
                 if !page.hidden_text.is_empty() {
                     found.hidden_layer_texts.push((number, page.hidden_text));
                 }
+                if !page.invisible_text.is_empty() {
+                    found.invisible_texts.push((number, page.invisible_text));
+                }
                 if let Some(edges) = edges
                     .as_mut()
                     .filter(|edges| edges.len() < crate::repeated_lines::MAX_REPEAT_PAGES)
@@ -1211,6 +1241,9 @@ struct PageFindings {
     edges: Vec<EdgeRun>,
     /// Text pdf-inspector reads in layers a reader hides.
     hidden_text: Vec<String>,
+    /// Text a viewer never paints that pdf-inspector reads, on a page that
+    /// is not a scan with its text layer.
+    invisible_text: Vec<String>,
 }
 
 fn scan_page(
@@ -1266,6 +1299,7 @@ fn scan_page(
         edges: check_twice.then(Vec::new),
         layers: layers.cloned(),
         hidden_text: (check_twice && layers.is_some()).then(Vec::new),
+        invisible_text: check_twice.then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
@@ -1323,6 +1357,11 @@ fn scan_page(
     Ok(PageFindings {
         edges,
         hidden_text: page.hidden_text.take().unwrap_or_default(),
+        invisible_text: page
+            .invisible_text
+            .take()
+            .filter(|_| !page.scanned(page_box))
+            .unwrap_or_default(),
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
@@ -1546,7 +1585,11 @@ fn execute<'a>(
                 placed = true;
                 in_text = true;
                 pending = None;
-                state.read_mode = 0;
+                // pdf-inspector takes each of a page's text objects to start
+                // in mode 0; in a form, the mode goes on as set.
+                if forms.is_empty() {
+                    state.read_mode = 0;
+                }
             }
             "ET" => {
                 page.text_object_ended();
@@ -1599,7 +1642,12 @@ fn execute<'a>(
                 if in_text {
                     page.note_edge(state, text_matrix, &bytes, placed);
                     if state.hidden || layered.contains(&true) {
-                        page.note_hidden(state, &bytes, placed);
+                        page.note_unseen(state, &bytes, placed, false);
+                    }
+                    // Mode 3 paints nothing; pdf-inspector reads it where it
+                    // takes the text object to start in mode 0 (#572).
+                    if state.render_mode == 3 {
+                        page.note_unseen(state, &bytes, placed, true);
                     }
                 }
                 if in_text && !forms.is_empty() {

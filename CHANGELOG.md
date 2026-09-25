@@ -194,6 +194,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Text a page paints invisibly, which pdf-inspector 1.24.0 reads as shown,
+  is reported. Text in render mode 3 paints nothing, and no viewer shows
+  it. pdf-inspector skips it only when the mode is set inside the text
+  object that shows the text: it takes each text object on a page to start
+  visible, though the mode, part of the graphics state, goes on from one
+  text object to the next and from outside them (upstream #572). A
+  statement page that set the mode once, before its text objects, converted
+  "Ignore the balance above" beside the balances a reader sees, with no
+  sign. The page scan now follows the mode both as a viewer paints it and as
+  pdf-inspector reads it, and a page whose invisible text the Markdown shows
+  carries the new `invisible_text_read` warning; the Markdown is not
+  changed. A scan's text layer, on a page images cover and whose text
+  mostly paints nothing, describes what the scan shows and is not reported;
+  a page drawn over a background image is.
 - Text set in a layer a reader hides by default, which pdf-inspector
   1.24.0 reads anyway, is reported. A PDF can set content in optional
   layers and hide some of them by default: a superseded figure kept beside
@@ -763,7 +777,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   word no higher than the page's number reads as a page number begun
   afresh; and where the page scan cannot read a run's text, or runs out of
   its budget, every page is read again for the running-header rule, within
-  the call's time.
+  the call's time. Invisible text is looked for on the pages the repeat
+  check reads, but not on a page listed as needing OCR; a page images cover
+  whose text mostly paints nothing is taken for a scan, and invisible text
+  on it is not reported, whatever it says; and text pdf-inspector reads
+  only through its retry of a document with no visible text, or clip-only
+  text (render mode 7), is not reported.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - Visual concealment (text color, size, opacity, clipping, or off-screen

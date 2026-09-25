@@ -107,6 +107,8 @@ const MAX_NOTICE_WORDS: usize = 150;
 pub const PDF_WARNING_EMBEDDED_FILES_UNREAD: &str = "embedded_files_unread";
 /// The Markdown holds text set in a layer a reader hides by default.
 pub const PDF_WARNING_HIDDEN_LAYER_TEXT_READ: &str = "hidden_layer_text_read";
+/// The Markdown holds text the page paints invisibly (upstream #572).
+pub const PDF_WARNING_INVISIBLE_TEXT_READ: &str = "invisible_text_read";
 /// Characters a text in a hidden layer needs, bare, for the Markdown's
 /// showing it to count.
 const MIN_HIDDEN_CHARS: usize = 6;
@@ -705,9 +707,10 @@ impl PdfInfo {
         pages
     }
 
-    /// Report the pages whose text in layers a reader hides (see
-    /// `optional_content`) the Markdown shows: pdf-inspector read it.
-    fn check_hidden_layers(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
+    /// The pages of `texts`, each a page and texts on it, whose texts of
+    /// `MIN_HIDDEN_CHARS` or more the Markdown shows, among the pages `only`
+    /// names.
+    fn shown_pages(&self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) -> Vec<u32> {
         let pages: Vec<[u32; 1]> = texts.iter().map(|(page, _)| [*page]).collect();
         let texts: Vec<(&[u32], &str)> = pages
             .iter()
@@ -719,7 +722,26 @@ impl PdfInfo {
                     .map(move |text| (page.as_slice(), text.as_str()))
             })
             .collect();
-        let pages = self.showing(&texts, only, true);
+        self.showing(&texts, only, true)
+    }
+
+    /// Report the pages whose text painted invisibly, which pdf-inspector
+    /// reads as shown (upstream #572), the Markdown shows.
+    fn check_invisible_text(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
+        let pages = self.shown_pages(texts, only);
+        if !pages.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_INVISIBLE_TEXT_READ,
+                "On these pages the Markdown holds text the page paints invisibly (text render mode 3), which no viewer shows: pdf-inspector 1.24.0 takes each text object to start visible, though the mode goes on from one to the next and from outside them (upstream #572); such text is not what a reader sees, and may say what the page does not.",
+                pages,
+            ));
+        }
+    }
+
+    /// Report the pages whose text in layers a reader hides (see
+    /// `optional_content`) the Markdown shows: pdf-inspector read it.
+    fn check_hidden_layers(&mut self, texts: &[(u32, Vec<String>)], only: Option<&HashSet<u32>>) {
+        let pages = self.shown_pages(texts, only);
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_HIDDEN_LAYER_TEXT_READ,
@@ -817,6 +839,8 @@ impl PdfInfo {
         self.check_annotation_texts(&annotations);
         let hidden = std::mem::take(&mut found.hidden_layer_texts);
         self.check_hidden_layers(&hidden, only);
+        let invisible = std::mem::take(&mut found.invisible_texts);
+        self.check_invisible_text(&invisible, only);
         if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
