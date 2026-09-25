@@ -56,6 +56,9 @@ const WORKER_PARSER_THREADS: &str = "4";
 pub(crate) const MAX_WORKER_PARAMS_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Entries a package may hold: AnyDoc 0.2.4 refuses a larger archive
+/// (`limits::MAX_ENTRY_COUNT`), and the checks stop there too.
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_PREFLIGHT_PART_BYTES: u64 = 4 * 1024 * 1024;
 /// AnyDoc 0.2.4's own XML bounds (`package::limits`): a part nested deeper,
 /// or holding more nodes, fails its conversion with a resource limit. The
@@ -4777,6 +4780,49 @@ fn docx_numbering_definitions(
     }
 }
 
+/// The paragraph styles' numbering each side of the list replay reads: Word
+/// from the styles part its relationship names, and AnyDoc from its own.
+fn docx_list_styles(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    parts: &DocxListParts,
+) -> Result<DocxStyleNumbering, DocumentError> {
+    let mut read = |part: Option<&str>| -> Result<DocxStyleNumbering, DocumentError> {
+        let mut numbering = DocxStyleNumbering::default();
+        if let Some(entry) = part.and_then(|part| archive.by_name(part).ok()) {
+            docx_style_numbering(
+                open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?,
+                &mut numbering,
+            )?;
+        }
+        Ok(numbering)
+    };
+    let word = read(parts.word_styles.as_deref())?;
+    if parts.word_styles.as_deref() == Some(parts.anydoc_styles.as_str()) {
+        return Ok(word);
+    }
+    let anydoc = read(Some(&parts.anydoc_styles))?;
+    Ok(DocxStyleNumbering {
+        styles: word.styles,
+        default_paragraph: word.default_paragraph,
+        anydoc_styles: anydoc.anydoc_styles,
+    })
+}
+
+/// A numbering part as one side reads it; a side without one, or whose
+/// part is missing, numbers nothing.
+fn docx_list_numbering(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    part: Option<&str>,
+    word: bool,
+) -> Result<DocxNumbering, DocumentError> {
+    match part.and_then(|part| archive.by_name(part).ok()) {
+        Some(entry) => {
+            docx_numbering_definitions(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?, word)
+        }
+        None => Ok(DocxNumbering::default()),
+    }
+}
+
 /// One `w:style` definition as the hidden-text check sees it.
 #[derive(Default)]
 struct DocxStyleDefinition {
@@ -4980,6 +5026,124 @@ fn ooxml_relationships(bytes: &[u8]) -> Result<Vec<OoxmlRelationship>, DocumentE
     }
 }
 
+/// The package relationships namespace.
+const PACKAGE_RELATIONSHIPS_NAMESPACE: &[u8] =
+    b"http://schemas.openxmlformats.org/package/2006/relationships";
+
+/// A relationship type AnyDoc reads, in the Transitional form it maps
+/// Strict types onto.
+const STYLES_RELATIONSHIP: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+const NUMBERING_RELATIONSHIP: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
+
+/// A Strict (ISO/IEC 29500) namespace or relationship type in the
+/// Transitional form AnyDoc 0.2.4 maps it onto (`normalize_ooxml_uri`);
+/// anything else as it stands.
+fn transitional_uri(uri: &str) -> String {
+    uri.strip_prefix("http://purl.oclc.org/ooxml/")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(family, tail)| format!("http://schemas.openxmlformats.org/{family}/2006/{tail}"))
+        .unwrap_or_else(|| uri.to_string())
+}
+
+/// One relationship as Word and AnyDoc read a rels part: a `Relationship`
+/// element in the package relationships namespace, at any depth, its
+/// attributes taken by local name as AnyDoc's `attr_any` takes them, and
+/// its type in the Transitional form.
+struct PackageRelationship {
+    id: String,
+    kind: String,
+    target: String,
+    internal: bool,
+}
+
+/// The relationships of a rels part, in document order, read as AnyDoc
+/// 0.2.4 reads them (`read_rels`): an element without an id or a target is
+/// skipped. A part the reader cannot parse is malformed.
+fn package_relationships(bytes: &[u8]) -> Result<Vec<PackageRelationship>, DocumentError> {
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut relationships = Vec::new();
+    loop {
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        match event {
+            quick_xml::events::Event::Start(event) | quick_xml::events::Event::Empty(event)
+                if xml_local_name(event.name().as_ref()) == b"Relationship"
+                    && matches!(
+                        namespace,
+                        quick_xml::name::ResolveResult::Bound(namespace)
+                            if namespace.as_ref() == PACKAGE_RELATIONSHIPS_NAMESPACE
+                    ) =>
+            {
+                let (Some(id), Some(target)) = (
+                    xml_attribute_value(&event, b"Id"),
+                    xml_attribute_value(&event, b"Target"),
+                ) else {
+                    buffer.clear();
+                    continue;
+                };
+                relationships.push(PackageRelationship {
+                    id,
+                    kind: transitional_uri(
+                        &xml_attribute_value(&event, b"Type").unwrap_or_default(),
+                    ),
+                    target,
+                    internal: !xml_attribute_value(&event, b"TargetMode")
+                        .is_some_and(|mode| mode.eq_ignore_ascii_case("External")),
+                });
+            }
+            quick_xml::events::Event::Eof => return Ok(relationships),
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+/// The part AnyDoc 0.2.4 reads for a typed relationship of a main part
+/// (`typed_part_path`): the target of the internal relationship of that
+/// type with the lowest id, where a later relationship with the same id
+/// replaces an earlier one, else the conventional name beside the main
+/// part.
+fn anydoc_typed_part(
+    relationships: &[PackageRelationship],
+    main: &str,
+    kind: &str,
+    conventional: &str,
+) -> String {
+    let mut by_id: HashMap<&str, &PackageRelationship> = HashMap::new();
+    for relationship in relationships {
+        by_id.insert(&relationship.id, relationship);
+    }
+    let reference = by_id
+        .into_values()
+        .filter(|relationship| relationship.internal && relationship.kind == kind)
+        .min_by(|first, second| first.id.cmp(&second.id))
+        .map_or(conventional, |relationship| relationship.target.as_str());
+    anydoc_resolve(main, reference)
+        .or_else(|| anydoc_resolve(main, conventional))
+        .unwrap_or_else(|| conventional.to_string())
+}
+
+/// The part Word reads for a typed relationship of a main part, as
+/// LibreOffice shows it: the target of the first internal relationship of
+/// that type in the rels part, and none without one. Word has no
+/// conventional name to fall back on.
+fn word_typed_part(
+    relationships: &[PackageRelationship],
+    main: &str,
+    kind: &str,
+) -> Option<String> {
+    relationships
+        .iter()
+        .find(|relationship| relationship.internal && relationship.kind == kind)
+        .and_then(|relationship| anydoc_resolve(main, &relationship.target))
+}
+
 /// Resolve a package reference exactly as AnyDoc 0.2.4 does
 /// (`package::path::resolve`): drop the fragment and query, start from the
 /// base part's directory, clamp `..` at the root, and percent-decode each
@@ -5103,6 +5267,22 @@ struct OoxmlLayout {
     numbering_parts: HashSet<String>,
     /// XLSX worksheets.
     worksheet_parts: HashSet<String>,
+    /// The DOCX styles and numbering parts each side of the list replay
+    /// reads.
+    list_parts: DocxListParts,
+}
+
+/// The styles and numbering parts Word and AnyDoc each read for a Word
+/// document's lists. Where the main part's relationships name one of each,
+/// as ECMA-376 allows, the two sides read the same parts; AnyDoc also reads
+/// a conventional name no relationship gives, and of several relationships
+/// of a type Word takes the first and AnyDoc the lowest id.
+#[derive(Default)]
+struct DocxListParts {
+    word_styles: Option<String>,
+    anydoc_styles: String,
+    word_numbering: Option<String>,
+    anydoc_numbering: String,
 }
 
 fn ooxml_layout(
@@ -5129,7 +5309,11 @@ fn ooxml_layout(
     {
         return Err(DocumentError::Malformed);
     }
-    let relationships = read_relationships(archive, &ooxml_rels_part(main))?;
+    let rels = read_optional_xml_part(archive, &ooxml_rels_part(main))?;
+    let relationships = match &rels {
+        Some(bytes) => ooxml_relationships(bytes)?,
+        None => Vec::new(),
+    };
     let typed = |suffix: &str| -> Vec<String> {
         relationships
             .iter()
@@ -5151,6 +5335,21 @@ fn ooxml_layout(
                 .numbering_parts
                 .insert("word/numbering.xml".to_string());
             layout.numbering_parts.extend(typed("/numbering"));
+            let read = match &rels {
+                Some(bytes) => package_relationships(bytes)?,
+                None => Vec::new(),
+            };
+            layout.list_parts = DocxListParts {
+                word_styles: word_typed_part(&read, main, STYLES_RELATIONSHIP),
+                anydoc_styles: anydoc_typed_part(&read, main, STYLES_RELATIONSHIP, "styles.xml"),
+                word_numbering: word_typed_part(&read, main, NUMBERING_RELATIONSHIP),
+                anydoc_numbering: anydoc_typed_part(
+                    &read,
+                    main,
+                    NUMBERING_RELATIONSHIP,
+                    "numbering.xml",
+                ),
+            };
         }
         DocumentKind::Xlsx => {
             layout.styles_parts.insert("xl/styles.xml".to_string());
@@ -6472,8 +6671,18 @@ fn epub_nav_spine_mismatch(
     }
 }
 
+/// Open a package's archive, refusing one with more entries than AnyDoc
+/// reads.
+fn open_package(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, DocumentError> {
+    let archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| DocumentError::Malformed)?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(DocumentError::ResourceLimit);
+    }
+    Ok(archive)
+}
+
 fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| DocumentError::Malformed)?;
+    let mut archive = open_package(bytes)?;
     if archive.is_empty() {
         return Err(DocumentError::Malformed);
     }
@@ -6722,7 +6931,7 @@ fn preflight_package(
     if matches!(kind, DocumentKind::Epub) {
         return preflight_epub(bytes);
     }
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| DocumentError::Malformed)?;
+    let mut archive = open_package(bytes)?;
     if archive.is_empty() {
         return Err(DocumentError::Malformed);
     }
@@ -7117,9 +7326,10 @@ fn preflight_package(
             xlsx_sheets_have_drawing_text(&mut archive, &layout.worksheet_parts)?;
     }
     if matches!(kind, DocumentKind::Docx) {
+        // Hidden text and labels: every styles and numbering part either
+        // side could read.
         let mut hidden_styles = HashSet::new();
         let mut defaults_hidden = false;
-        let mut style_numbering = DocxStyleNumbering::default();
         for part in &layout.styles_parts {
             let Ok(entry) = archive.by_name(part) else {
                 continue;
@@ -7128,13 +7338,6 @@ fn preflight_package(
                 docx_hidden_styles(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
             hidden_styles.extend(styles);
             defaults_hidden |= defaults;
-            let Ok(entry) = archive.by_name(part) else {
-                continue;
-            };
-            docx_style_numbering(
-                open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?,
-                &mut style_numbering,
-            )?;
         }
         let mut hidden_labels = false;
         let mut label_styles = HashSet::new();
@@ -7146,22 +7349,15 @@ fn preflight_package(
                 docx_numbering_labels(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
             hidden_labels |= hidden;
             label_styles.extend(styles);
-            let mut read = |word: bool| -> Result<Option<DocxNumbering>, DocumentError> {
-                let Ok(entry) = archive.by_name(part) else {
-                    return Ok(None);
-                };
-                docx_numbering_definitions(
-                    open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?,
-                    word,
-                )
-                .map(Some)
-            };
-            let (Some(word), Some(anydoc)) = (read(true)?, read(false)?) else {
-                continue;
-            };
-            result.list_numbering_differs |=
-                DocxNumberings { word, anydoc }.numbers_differ(&docx_scan, &style_numbering);
         }
+        // The lists are replayed once, each side reading the styles and
+        // numbering parts it reads.
+        let parts = &layout.list_parts;
+        let style_numbering = docx_list_styles(&mut archive, parts)?;
+        let word = docx_list_numbering(&mut archive, parts.word_numbering.as_deref(), true)?;
+        let anydoc = docx_list_numbering(&mut archive, Some(&parts.anydoc_numbering), false)?;
+        result.list_numbering_differs |=
+            DocxNumberings { word, anydoc }.numbers_differ(&docx_scan, &style_numbering);
         result.hidden_content |= hidden_labels
             || label_styles
                 .iter()
@@ -9871,11 +10067,27 @@ mod tests {
         format!("<w:{root} {WORD_NS}><w:body>{body}</w:body></w:{root}>").into_bytes()
     }
 
-    fn docx_preflight(entries: &[(&str, &[u8])]) -> PackagePreflight {
+    /// The main part's relationships as Word writes them, naming the
+    /// conventional styles, numbering, and notes parts.
+    const WORD_DOCUMENT_RELS: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/></Relationships>"#;
+
+    /// A Word package of these parts, with Word's relationships for the
+    /// main part unless the parts give their own.
+    fn docx_package(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut all: Vec<(&str, &[u8])> = vec![("[Content_Types].xml", DOCX_TYPES)];
         all.extend_from_slice(entries);
+        if !entries
+            .iter()
+            .any(|(name, _)| *name == "word/_rels/document.xml.rels")
+        {
+            all.push(("word/_rels/document.xml.rels", WORD_DOCUMENT_RELS));
+        }
+        zip_entries(&all)
+    }
+
+    fn docx_preflight(entries: &[(&str, &[u8])]) -> PackagePreflight {
         preflight_package(
-            &zip_entries(&all),
+            &docx_package(entries),
             DocumentKind::Docx,
             DocumentVariant::Docx,
         )
@@ -10203,10 +10415,8 @@ mod tests {
     const PACKAGE_RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
     fn docx_result(entries: &[(&str, &[u8])]) -> Result<PackagePreflight, DocumentError> {
-        let mut all: Vec<(&str, &[u8])> = vec![("[Content_Types].xml", DOCX_TYPES)];
-        all.extend_from_slice(entries);
         preflight_package(
-            &zip_entries(&all),
+            &docx_package(entries),
             DocumentKind::Docx,
             DocumentVariant::Docx,
         )
@@ -11828,6 +12038,249 @@ mod tests {
             ]);
             assert!(preflight.unsupported_content, "{target}");
         }
+    }
+
+    #[test]
+    fn docx_list_parts_are_the_ones_each_side_reads() {
+        let relationship = |id: &str, kind: &str, target: &str, extra: &str| {
+            format!(r#"<Relationship Id="{id}" Type="{kind}" Target="{target}"{extra}/>"#)
+        };
+        let numbering = format!("{REL_NS}/numbering");
+        let parts = |inner: &str| {
+            let rels =
+                format!(r#"<Relationships xmlns="{PACKAGE_RELS_NS}">{inner}</Relationships>"#);
+            let read = package_relationships(rels.as_bytes()).expect("relationships");
+            (
+                word_typed_part(&read, "word/document.xml", NUMBERING_RELATIONSHIP),
+                anydoc_typed_part(
+                    &read,
+                    "word/document.xml",
+                    NUMBERING_RELATIONSHIP,
+                    "numbering.xml",
+                ),
+            )
+        };
+        let named =
+            |word: Option<&str>, anydoc: &str| (word.map(str::to_string), anydoc.to_string());
+        // Word, as LibreOffice shows it, reads the first relationship of the
+        // type, and AnyDoc the lowest id.
+        assert_eq!(
+            parts(
+                &[
+                    relationship("rId5", &numbering, "first.xml", ""),
+                    relationship("rId3", &numbering, "lowest.xml", ""),
+                ]
+                .concat()
+            ),
+            named(Some("word/first.xml"), "word/lowest.xml")
+        );
+        // A later relationship with the same id replaces an earlier one for
+        // AnyDoc; an external one, one in another namespace, and one of
+        // another type are no numbering part; a Strict type is read as the
+        // Transitional one.
+        assert_eq!(
+            parts(
+                &[
+                    relationship("rId1", &numbering, "replaced.xml", ""),
+                    relationship("rId1", &numbering, "kept.xml", ""),
+                    relationship("rId0", &numbering, "far.xml", r#" TargetMode="External""#),
+                    r#"<x:Relationship xmlns:x="urn:x" Id="rId0" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="decoy.xml"/>"#.to_string(),
+                    relationship("rId0", &format!("{REL_NS}/styles"), "styles.xml", ""),
+                ]
+                .concat()
+            ),
+            named(Some("word/replaced.xml"), "word/kept.xml")
+        );
+        assert_eq!(
+            parts(&relationship(
+                "rId1",
+                "http://purl.oclc.org/ooxml/officeDocument/relationships/numbering",
+                "strict.xml",
+                ""
+            )),
+            named(Some("word/strict.xml"), "word/strict.xml")
+        );
+        // Without a relationship Word reads no numbering, and AnyDoc the
+        // conventional part.
+        assert_eq!(parts(""), named(None, "word/numbering.xml"));
+    }
+
+    #[test]
+    fn docx_lists_are_replayed_from_the_parts_each_side_reads() {
+        let item = |text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let styled = |text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="ListItem"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let numbering = |format: &str| {
+            format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="{format}"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            )
+        };
+        let styles = |list: u32| {
+            format!(
+                r#"<w:styles {WORD_NS}><w:style w:type="paragraph" w:styleId="ListItem"><w:pPr><w:numPr><w:numId w:val="{list}"/></w:numPr></w:pPr></w:style></w:styles>"#
+            )
+        };
+        let rels = |inner: &[(&str, &str, &str)]| {
+            let inner: String = inner
+                .iter()
+                .map(|(id, kind, target)| {
+                    format!(r#"<Relationship Id="{id}" Type="{REL_NS}/{kind}" Target="{target}"/>"#)
+                })
+                .collect();
+            format!(r#"<Relationships xmlns="{PACKAGE_RELS_NS}">{inner}</Relationships>"#)
+        };
+        let differs = |body: &str, rels: String, parts: &[(&str, String)]| {
+            let document = word_part("document", body);
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("word/document.xml", &document),
+                ("word/_rels/document.xml.rels", rels.as_bytes()),
+            ];
+            entries.extend(parts.iter().map(|(name, bytes)| (*name, bytes.as_bytes())));
+            docx_preflight(&entries).list_numbering_differs
+        };
+        let items = [item("A"), item("B")].concat();
+        let decimal = numbering("decimal");
+        let roman = numbering("upperRoman");
+        // Two numbering parts: Word reads the first relationship's, AnyDoc
+        // the lowest id's.
+        let two = [
+            ("word/numbering.xml", decimal.clone()),
+            ("word/roman.xml", roman.clone()),
+        ];
+        assert!(differs(
+            &items,
+            rels(&[
+                ("rId1", "numbering", "numbering.xml"),
+                ("rId0", "numbering", "roman.xml")
+            ]),
+            &two
+        ));
+        assert!(!differs(
+            &items,
+            rels(&[
+                ("rId0", "numbering", "roman.xml"),
+                ("rId1", "numbering", "numbering.xml")
+            ]),
+            &two
+        ));
+        // A numbering part no relationship names is AnyDoc's alone.
+        assert!(differs(
+            &items,
+            rels(&[]),
+            &[("word/numbering.xml", decimal.clone())]
+        ));
+        assert!(!differs(
+            &items,
+            rels(&[("rId1", "numbering", "numbering.xml")]),
+            &[("word/numbering.xml", decimal.clone())]
+        ));
+        // So too the styles: a paragraph style numbering its paragraphs in a
+        // part no relationship names, or in the one of two parts only AnyDoc
+        // reads.
+        let body = [styled("A"), styled("B")].concat();
+        assert!(differs(
+            &body,
+            rels(&[("rId1", "numbering", "numbering.xml")]),
+            &[
+                ("word/numbering.xml", decimal.clone()),
+                ("word/styles.xml", styles(1))
+            ]
+        ));
+        let styled_parts = [
+            ("word/numbering.xml", decimal.clone()),
+            ("word/styles.xml", styles(1)),
+            ("word/other.xml", styles(0)),
+        ];
+        assert!(differs(
+            &body,
+            rels(&[
+                ("rId1", "numbering", "numbering.xml"),
+                ("rId5", "styles", "styles.xml"),
+                ("rId2", "styles", "other.xml")
+            ]),
+            &styled_parts
+        ));
+        assert!(!differs(
+            &body,
+            rels(&[
+                ("rId1", "numbering", "numbering.xml"),
+                ("rId2", "styles", "styles.xml"),
+                ("rId5", "styles", "other.xml")
+            ]),
+            &styled_parts
+        ));
+        // However many numbering parts a package names, the lists are
+        // replayed once, against the part each side reads.
+        let mut many: Vec<(String, String)> = (0..300)
+            .map(|index| {
+                (
+                    format!("word/n{index}.xml"),
+                    format!("<w:numbering {WORD_NS}/>"),
+                )
+            })
+            .collect();
+        many.push(("word/numbering.xml".to_string(), decimal.clone()));
+        let named: Vec<(String, &str, String)> = (0..300)
+            .map(|index| {
+                (
+                    format!("rN{index:03}"),
+                    "numbering",
+                    format!("n{index}.xml"),
+                )
+            })
+            .collect();
+        let mut inner: Vec<(&str, &str, &str)> = vec![("rId0", "numbering", "numbering.xml")];
+        inner.extend(
+            named
+                .iter()
+                .map(|(id, kind, target)| (id.as_str(), *kind, target.as_str())),
+        );
+        let parts: Vec<(&str, String)> = many
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+            .collect();
+        let layout = {
+            let document = word_part("document", &items.repeat(100));
+            let rels = rels(&inner);
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("word/document.xml", &document),
+                ("word/_rels/document.xml.rels", rels.as_bytes()),
+            ];
+            entries.extend(parts.iter().map(|(name, bytes)| (*name, bytes.as_bytes())));
+            let package = docx_package(&entries);
+            let mut archive = open_package(&package).expect("package");
+            assert!(
+                !preflight_package(&package, DocumentKind::Docx, DocumentVariant::Docx)
+                    .expect("DOCX preflight")
+                    .list_numbering_differs
+            );
+            ooxml_layout(&mut archive, DocumentKind::Docx).expect("layout")
+        };
+        assert_eq!(layout.numbering_parts.len(), 301);
+        assert_eq!(
+            layout.list_parts.word_numbering.as_deref(),
+            Some("word/numbering.xml")
+        );
+        assert_eq!(layout.list_parts.anydoc_numbering, "word/numbering.xml");
+        // A package with more entries than AnyDoc reads is refused.
+        let entries: Vec<(String, &[u8])> = (0..=MAX_ARCHIVE_ENTRIES)
+            .map(|index| (format!("e{index}"), b"".as_slice()))
+            .collect();
+        let entries: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect();
+        assert!(matches!(
+            open_package(&zip_entries(&entries)),
+            Err(DocumentError::ResourceLimit)
+        ));
     }
 
     #[test]
