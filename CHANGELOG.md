@@ -187,6 +187,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- DOCX list numbers are compared as Word writes its labels, found by
+  checking the review fixtures against LibreOffice. A level without number
+  text (`w:lvlText`) shows no number in Word, while AnyDoc numbers it; a
+  composite label (`%1.%2.`) shows the shallower number as each side counts
+  it, so a second list instance's "2.1." converted as "1.1."; a number the
+  label does not show is no longer compared. Paragraph styles are followed
+  along `w:basedOn` to the end of the chain, as AnyDoc follows them, rather
+  than 32 styles; a numbering number written with white space around it,
+  which Word reads and AnyDoc cannot, is disclosed. Fifteen review fixtures
+  now report `list_numbering_differs`; none of the 320 randomized list
+  documents or the 303 public documents changed.
 - An EPUB whose navigation document sits in the spine, as pandoc places it,
   is no longer refused because the navigation does not list itself. Books
   whose navigation leaves out a chapter are still refused.
@@ -387,14 +398,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AnyDoc converts them.
 - DOCX: a hidden paragraph mark is disclosed for direct numbering (`w:numPr`)
   only, not numbering applied through a paragraph style. List numbers are
-  compared by each level's own number: a composite label (`%1.%2`) whose
-  shallower number differs, and legal numbering (`w:isLgl`), are not; a
-  paragraph style's own `w:ilvl` is ignored, as AnyDoc and ECMA-376 ignore
-  it. Where Word supports
+  compared as the level's number text shows them, in each level's format
+  or, for legal numbering (`w:isLgl`), in decimal; a format other than
+  decimal, roman, or letters counts as differing. A paragraph style's own
+  `w:ilvl` is ignored, as AnyDoc and ECMA-376 ignore it. Where Word supports
   a block-level `mc:Choice` that AnyDoc does not, AnyDoc converts the
   `mc:Fallback`; the check assumes the two branches hold the same text.
-  Word also reads numbering values padded with white space, and style
-  chains deeper than AnyDoc follows, and shows no number for a level
-  without `w:lvlText`; none of these is flagged yet. A level with
-  `w:lvlRestart="0"` is taken never to restart, as Word does, although
-  LibreOffice restarts it.
+  A level with `w:lvlRestart="0"` is taken never to restart, as Word does,
+  although LibreOffice restarts it.

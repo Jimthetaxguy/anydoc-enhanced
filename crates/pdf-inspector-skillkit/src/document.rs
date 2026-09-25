@@ -2413,6 +2413,9 @@ struct DocxStoryScan {
     list_paragraphs: Vec<DocxListParagraph>,
     /// The story part being scanned.
     part: DocxPart,
+    /// A paragraph's list instance or level written with white space
+    /// around it, which Word reads and AnyDoc cannot parse.
+    padded_numbering: bool,
 }
 
 /// A Word story part, in the order AnyDoc converts them.
@@ -2991,6 +2994,7 @@ fn scan_docx_element(
         }
         b"numId" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
             let values = xml_attribute_values(event, b"val");
+            scan.padded_numbering |= values.iter().any(|value| value.trim() != value);
             scan.mark.numbered |= values.iter().any(|value| value.trim() != "0");
             scan.mark.direct_list = true;
             if let Some(list) = values
@@ -3002,7 +3006,9 @@ fn scan_docx_element(
             }
         }
         b"ilvl" if word_path_ends_with(stack, &[b"p", b"pPr", b"numPr"]) => {
-            if let Some(level) = xml_attribute_values(event, b"val")
+            let values = xml_attribute_values(event, b"val");
+            scan.padded_numbering |= values.iter().any(|value| value.trim() != value);
+            if let Some(level) = values
                 .iter()
                 .find_map(|value| value.trim().parse::<usize>().ok())
             {
@@ -3155,6 +3161,9 @@ struct DocxNumbering {
     lists: HashMap<u64, DocxList>,
     /// The first definition declaring each list style (`w:styleLink`).
     style_definitions: HashMap<String, String>,
+    /// A numbering value written with white space around it, which Word
+    /// reads as an XML Schema number and AnyDoc cannot parse.
+    padded: bool,
 }
 
 #[derive(Default)]
@@ -3189,6 +3198,11 @@ struct DocxLevel {
     restart: Option<u32>,
     /// The paragraph style bound to the level (`w:pStyle`).
     style: Option<String>,
+    /// The number text (`w:lvlText`), `%1` to `%9` standing for levels'
+    /// numbers: `None` when absent, and then Word shows no number.
+    text: Option<String>,
+    /// Legal numbering (`w:isLgl`): every level's number shows in decimal.
+    legal: bool,
 }
 
 impl DocxLevel {
@@ -3199,6 +3213,19 @@ impl DocxLevel {
     /// The level's start as Word reads it: 0 when `w:start` is absent.
     fn word_start(&self) -> u64 {
         self.start.unwrap_or(0)
+    }
+
+    /// The levels whose numbers the number text shows.
+    fn shown_levels(&self) -> impl Iterator<Item = usize> + '_ {
+        let text = self.text.as_deref().unwrap_or("");
+        text.split('%').skip(1).filter_map(|after| {
+            after
+                .chars()
+                .next()
+                .and_then(|digit| digit.to_digit(10))
+                .filter(|digit| (1..=9).contains(digit))
+                .map(|digit| digit as usize - 1)
+        })
     }
 }
 
@@ -3242,6 +3269,16 @@ impl DocxCounters {
             }
         }
         self.value[level]
+    }
+
+    /// The number AnyDoc's label shows for a level: its count, or its start
+    /// before it counts and while it waits to restart.
+    fn shown(&self, level: usize, start: u64) -> u64 {
+        if self.started[level] && !self.restart_pending[level] {
+            self.value[level]
+        } else {
+            start
+        }
     }
 
     /// Count each shallower level that has not counted since it last
@@ -3292,12 +3329,43 @@ impl DocxCount {
     }
 }
 
+impl DocxCount {
+    /// How Word shows a level's number in another level's number text: in
+    /// its format, decimal when it names none; `None` for bullets, no
+    /// number, and formats beyond these.
+    fn shown_by_word(level: &DocxLevel) -> Option<Self> {
+        match level.format.as_deref() {
+            None => Some(DocxCount::Decimal),
+            Some(format) => DocxCount::of(format),
+        }
+    }
+
+    /// How AnyDoc shows it: a level without a format is a bullet, and one
+    /// without a number (`none`), or in a format it does not know, shows
+    /// in decimal.
+    fn shown_by_anydoc(level: &DocxLevel) -> Option<Self> {
+        match level.format.as_deref() {
+            None | Some("bullet") => None,
+            Some(format) => Some(DocxCount::of(format).unwrap_or(DocxCount::Decimal)),
+        }
+    }
+}
+
 impl DocxMarker {
-    /// What Word shows: a level defined without a format is numbered.
+    /// What Word shows: a level defined without a format is numbered, and
+    /// one without number text shows no number.
     fn word(level: Option<&DocxLevel>) -> Self {
         let Some(level) = level else {
             return DocxMarker::Nothing;
         };
+        if level
+            .text
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+            && level.format.as_deref() != Some("bullet")
+        {
+            return DocxMarker::Nothing;
+        }
         match level.format.as_deref() {
             None => DocxMarker::Count(DocxCount::Decimal),
             Some("bullet") => DocxMarker::Bullet,
@@ -3456,6 +3524,10 @@ impl DocxNumbering {
     /// show, such as one whose mark is deleted, still takes a number in
     /// AnyDoc.
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
+        // A value only Word can read may number what AnyDoc does not.
+        if scan.padded_numbering || self.padded || styles.padded {
+            return !scan.list_paragraphs.is_empty();
+        }
         let resolved: Vec<Option<(u64, usize)>> = scan
             .list_uses
             .iter()
@@ -3519,24 +3591,63 @@ impl DocxNumbering {
             if !paragraph.anydoc {
                 continue;
             }
+            // The paragraph's own number, where its number text shows it.
+            let text_level = &instance.word_levels[level];
+            let own_shown = text_level.shown_levels().any(|shown| shown == level);
             let differs = match (instance.word_markers[level], anydoc_marker) {
                 (DocxMarker::Other, _) => true,
                 (DocxMarker::Count(shown), DocxMarker::Count(converted)) => {
-                    shown != converted
-                        || anydoc_value != Some(word_value)
-                        // Past `z` Word doubles the letter (`aa`, `bb`),
-                        // and AnyDoc counts on (`aa`, `ab`).
-                        || (matches!(shown, DocxCount::LowerLetter | DocxCount::UpperLetter)
-                            && word_value > 26)
+                    own_shown
+                        && (shown != converted
+                            || anydoc_value != Some(word_value)
+                            // Past `z` Word doubles the letter (`aa`, `bb`),
+                            // and AnyDoc counts on (`aa`, `ab`).
+                            || (matches!(shown, DocxCount::LowerLetter | DocxCount::UpperLetter)
+                                && word_value > 26))
                 }
                 (DocxMarker::Count(_), _) | (_, DocxMarker::Count(_)) => true,
                 _ => false,
             };
-            if differs {
+            // The shallower numbers the text shows (`%1.%2`), as each side
+            // counts them: Word a level a deeper paragraph skipped as used
+            // once, AnyDoc a level's start until it counts and while it
+            // waits to restart. Legal numbering shows each in decimal.
+            let parents_differ = matches!(anydoc_marker, DocxMarker::Count(_))
+                && matches!(instance.word_markers[level], DocxMarker::Count(_))
+                && text_level
+                    .shown_levels()
+                    .filter(|&shown| shown < level)
+                    .any(|shown| {
+                        let legal = |levels: &[DocxLevel; DOCX_LIST_LEVELS], count| {
+                            if levels[level].legal {
+                                DocxCount::Decimal
+                            } else {
+                                count
+                            }
+                        };
+                        let (Some(word_count), Some(anydoc_count)) = (
+                            DocxCount::shown_by_word(&instance.word_levels[shown]),
+                            DocxCount::shown_by_anydoc(&instance.anydoc_levels[shown]),
+                        ) else {
+                            return false;
+                        };
+                        let anydoc_start = self
+                            .lists
+                            .get(&list)
+                            .and_then(|list| list.starts[shown])
+                            .unwrap_or_else(|| instance.anydoc_levels[shown].start());
+                        let anydoc_number = anydoc
+                            .get(&list)
+                            .map_or(anydoc_start, |counters| counters.shown(shown, anydoc_start));
+                        legal(&instance.word_levels, word_count)
+                            != legal(&instance.anydoc_levels, anydoc_count)
+                            || counters.value[shown] != anydoc_number
+                    });
+            if differs || parents_differ {
                 return true;
             }
         }
-        false
+        styles.exhausted()
     }
 }
 
@@ -3547,6 +3658,10 @@ impl DocxNumbering {
 #[derive(Default)]
 struct DocxStyleNumbering {
     styles: HashMap<String, DocxStyleList>,
+    /// A style's list instance written with white space around it.
+    padded: bool,
+    /// Styles stepped through along chains, across the document.
+    steps: std::cell::Cell<usize>,
 }
 
 #[derive(Default)]
@@ -3555,22 +3670,35 @@ struct DocxStyleList {
     list: Option<u64>,
 }
 
-/// Styles followed along a `w:basedOn` chain.
-const MAX_DOCX_STYLE_CHAIN: usize = 32;
+/// Styles stepped through along `w:basedOn` chains in one document. AnyDoc
+/// follows a chain to its end, stopping only at a cycle; past this budget
+/// the numbering is taken to differ.
+const MAX_DOCX_CHAIN_STEPS: usize = 1 << 22;
 
 impl DocxStyleNumbering {
-    /// A style and those it is based on, child first, up to a bounded depth.
+    /// A style and those it is based on, child first, to the chain's end or
+    /// a style it already passed.
     fn chain<'a>(&'a self, style: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         let mut current = Some(style);
+        let mut seen = HashSet::new();
         std::iter::from_fn(move || {
             let style = current?;
+            let steps = self.steps.get() + 1;
+            self.steps.set(steps);
+            if !seen.insert(style) || steps > MAX_DOCX_CHAIN_STEPS {
+                return None;
+            }
             current = self
                 .styles
                 .get(style)
                 .and_then(|definition| definition.based_on.as_deref());
             Some(style)
         })
-        .take(MAX_DOCX_STYLE_CHAIN)
+    }
+
+    /// Whether the chains stepped through ran past their budget.
+    fn exhausted(&self) -> bool {
+        self.steps.get() > MAX_DOCX_CHAIN_STEPS
     }
 
     /// The list instance a paragraph style numbers with: the first along its
@@ -3624,12 +3752,10 @@ fn docx_style_numbering(
             return Err(DocumentError::ResourceLimit);
         }
         let local = xml_local_name(event.name().as_ref()).to_vec();
-        let value = || {
-            xml_attribute_values(&event, b"val")
-                .into_iter()
-                .next()
-                .map(|value| value.trim().to_string())
-        };
+        let raw = xml_attribute_values(&event, b"val").into_iter().next();
+        let value = || raw.as_ref().map(|value| value.trim().to_string());
+        numbering.padded |=
+            local == b"numId" && raw.as_ref().is_some_and(|value| value.trim() != value);
         match local.as_slice() {
             b"style" if start => {
                 open = xml_attribute_values(&event, b"styleId")
@@ -3762,12 +3888,20 @@ fn docx_numbering_definitions(
             return Err(DocumentError::ResourceLimit);
         }
         let local = xml_local_name(event.name().as_ref()).to_vec();
-        let value = |name: &[u8]| {
-            xml_attribute_values(&event, name)
-                .into_iter()
-                .next()
-                .map(|value| value.trim().to_string())
-        };
+        let raw = |name: &[u8]| xml_attribute_values(&event, name).into_iter().next();
+        let value = |name: &[u8]| raw(name).map(|value| value.trim().to_string());
+        // Numbers are XML Schema integers, whose white space Word collapses;
+        // formats and style ids are strings, which keep it, and LibreOffice
+        // reads them as AnyDoc does.
+        let number = matches!(
+            local.as_slice(),
+            b"abstractNumId" | b"start" | b"startOverride" | b"lvlRestart"
+        );
+        numbering.padded |= [b"abstractNumId".as_slice(), b"numId", b"ilvl", b"val"]
+            .iter()
+            .filter(|name| **name != b"val" || number)
+            .filter_map(|name| raw(name))
+            .any(|value| value.trim() != value);
         match local.as_slice() {
             b"abstractNum" if stack.len() == 1 => {
                 definition = value(b"abstractNumId");
@@ -3852,6 +3986,18 @@ fn docx_numbering_definitions(
                     } else {
                         commit(&mut numbering, &definition, list, open);
                     }
+                }
+            }
+            b"lvlText" if xml_path_ends_with(&stack, &[b"lvl"]) => {
+                if let Some(open) = open_level.as_mut() {
+                    if open.level.text.is_none() {
+                        open.level.text = Some(raw(b"val").unwrap_or_default());
+                    }
+                }
+            }
+            b"isLgl" if xml_path_ends_with(&stack, &[b"lvl"]) => {
+                if let Some(open) = open_level.as_mut() {
+                    open.level.legal = !xml_toggle_off(&event);
                 }
             }
             b"numFmt" | b"start" | b"lvlRestart" | b"pStyle"
@@ -9639,6 +9785,103 @@ mod tests {
     }
 
     #[test]
+    fn docx_list_labels_follow_word_number_text() {
+        let paragraph = |list: u32, level: u32, style: &str| {
+            let style = if style.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<w:pStyle w:val="{style}"/>"#)
+            };
+            let numbering = if list == 0 {
+                String::new()
+            } else {
+                format!(r#"<w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{list}"/></w:numPr>"#)
+            };
+            format!(r#"<w:p><w:pPr>{style}{numbering}</w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#)
+        };
+        let differs = |body: String, levels: &str, styles: &str| {
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{levels}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            let document = word_part("document", &body);
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let level = |ilvl: u32, text: Option<&str>| {
+            let text = text.map_or(String::new(), |text| {
+                format!(r#"<w:lvlText w:val="{text}"/>"#)
+            });
+            format!(
+                r#"<w:lvl w:ilvl="{ilvl}"><w:start w:val="1"/><w:numFmt w:val="decimal"/>{text}</w:lvl>"#
+            )
+        };
+        let items = format!("{}{}", paragraph(1, 0, ""), paragraph(1, 0, ""));
+        // A level without number text shows no number in Word; AnyDoc
+        // numbers it.
+        assert!(differs(items.clone(), &level(0, None), ""));
+        assert!(differs(items.clone(), &level(0, Some("")), ""));
+        assert!(!differs(items.clone(), &level(0, Some("%1.")), ""));
+        // A composite label shows the shallower number as each counts it:
+        // Word 2.1 for the second instance's first sub-item, AnyDoc 1.1.
+        let outline = format!("{}{}", level(0, Some("%1.")), level(1, Some("%1.%2.")));
+        assert!(differs(
+            format!(
+                "{}{}{}",
+                paragraph(1, 0, ""),
+                paragraph(1, 0, ""),
+                paragraph(2, 1, "")
+            ),
+            &outline,
+            ""
+        ));
+        assert!(!differs(
+            format!("{}{}", paragraph(1, 0, ""), paragraph(1, 1, "")),
+            &outline,
+            ""
+        ));
+        // A level's own number is compared only where its text shows it.
+        let chapter = format!("{}{}", level(0, Some("%1.")), level(1, Some("Part %1")));
+        assert!(!differs(
+            format!(
+                "{}{}{}",
+                paragraph(1, 0, ""),
+                paragraph(1, 1, ""),
+                paragraph(2, 1, "")
+            ),
+            &chapter,
+            ""
+        ));
+        // A style chain longer than 32 styles is followed, as AnyDoc
+        // follows it.
+        let chain: String = (0..40)
+            .map(|index| {
+                if index == 0 {
+                    r#"<w:style w:type="paragraph" w:styleId="S0"><w:pPr><w:numPr><w:numId w:val="2"/></w:numPr></w:pPr></w:style>"#.to_string()
+                } else {
+                    format!(
+                        r#"<w:style w:type="paragraph" w:styleId="S{index}"><w:basedOn w:val="S{}"/></w:style>"#,
+                        index - 1
+                    )
+                }
+            })
+            .collect();
+        assert!(differs(
+            format!("{}{}", items, paragraph(0, 0, "S39")),
+            &level(0, Some("%1.")),
+            &chain
+        ));
+        // A list instance written with white space around it, which Word
+        // reads and AnyDoc cannot.
+        let padded = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val=" 1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#;
+        assert!(differs(padded.to_string(), &level(0, Some("%1.")), ""));
+    }
+
+    #[test]
     fn docx_list_numbers_word_shows_differently_are_disclosed() {
         let item = |list: u32, level: u32, extra: &str| {
             format!(
@@ -9823,7 +10066,7 @@ mod tests {
         ));
 
         // Headings numbered through levels bound to their styles.
-        let headings = r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading1"/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading2"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
+        let headings = r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading1"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="Heading2"/><w:lvlText w:val="%1.%2."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
         let heading_styles = r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:basedOn w:val="Heading1"/><w:pPr><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr></w:style>"#;
         assert!(!differs(
             [
