@@ -650,43 +650,107 @@ fn ooxml_variant(bytes: &[u8]) -> Option<DocumentVariant> {
     }
 }
 
+/// Whether a SpreadsheetML part hides content: a hidden or very hidden
+/// sheet, which AnyDoc 0.2.4 omits, or a hidden row or column, which it
+/// omits too, or a row or column of zero size, which Excel shows as nothing
+/// and AnyDoc converts. Names match without case and values are decoded and
+/// trimmed, which finds more than AnyDoc's `bool_attr`. A part the reader
+/// cannot parse counts as hiding content.
 fn xml_has_hidden_content(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    [
-        r#"state="hidden""#,
-        r#"state="veryhidden""#,
-        r#"hidden="1""#,
-        r#"hidden="true""#,
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                let element = xml_local_name(event.name().as_ref()).to_ascii_lowercase();
+                let hidden = xml_attributes(&event).into_iter().any(|attribute| {
+                    let name = attribute.local().to_ascii_lowercase();
+                    let value = attribute.value.trim().to_ascii_lowercase();
+                    match (element.as_slice(), name.as_slice()) {
+                        (b"sheet", b"state") => matches!(value.as_str(), "hidden" | "veryhidden"),
+                        (b"row" | b"col", b"hidden") => matches!(value.as_str(), "1" | "true"),
+                        (b"row", b"ht") | (b"col", b"width") => {
+                            value.parse::<f64>().is_ok_and(|size| size <= 0.0)
+                        }
+                        _ => false,
+                    }
+                });
+                if hidden {
+                    return true;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => return false,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+        buffer.clear();
+    }
 }
 
+/// Whether a worksheet holds a formula cell with no cached value (`c` with
+/// an `f` child and no `v` child), which AnyDoc converts as an empty cell.
+/// Elements match by local name in any namespace; a part the reader cannot
+/// parse counts as holding one.
 fn xml_has_uncached_formula(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    let mut remaining = text.as_str();
-    while let Some(offset) = remaining.find("<c") {
-        remaining = &remaining[offset + 2..];
-        let is_cell = remaining.starts_with(char::from(32))
-            || remaining.starts_with(char::from(62))
-            || remaining.starts_with(char::from(47));
-        if !is_cell {
-            if remaining.is_empty() {
-                break;
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut depth = 0usize;
+    // The open cell's depth, and whether it has a formula and a value.
+    let mut cell: Option<(usize, bool, bool)> = None;
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => {
+                let local = xml_local_name(event.name().as_ref()).to_ascii_lowercase();
+                match (local.as_slice(), cell.as_mut()) {
+                    (b"c", None) => cell = Some((depth, false, false)),
+                    (b"f", Some(open)) => open.1 = true,
+                    (b"v", Some(open)) => open.2 = true,
+                    _ => {}
+                }
+                depth += 1;
             }
-            remaining = &remaining[1..];
-            continue;
+            Ok(quick_xml::events::Event::Empty(event)) => {
+                let local = xml_local_name(event.name().as_ref()).to_ascii_lowercase();
+                match (local.as_slice(), cell.as_mut()) {
+                    (b"f", Some(open)) => open.1 = true,
+                    (b"v", Some(open)) => open.2 = true,
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+                if let Some((open, formula, value)) = cell {
+                    if open == depth {
+                        if formula && !value {
+                            return true;
+                        }
+                        cell = None;
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => return cell.is_some_and(|(_, f, v)| f && !v),
+            Ok(_) => {}
+            Err(_) => return true,
         }
-        let Some(end) = remaining.find("</c>") else {
-            break;
-        };
-        let cell = &remaining[..end];
-        if cell.contains("<f") && !cell.contains("<v") {
-            return true;
-        }
-        remaining = &remaining[end + 4..];
+        buffer.clear();
     }
-    false
+}
+
+/// Whether AnyDoc reads a workbook part as XML (`sheet::classify`): after a
+/// UTF-8 byte order mark, the first byte that is not whitespace opens a tag
+/// or a UTF-16 byte order mark. Anything else goes to its binary (XLSB)
+/// reader.
+fn anydoc_workbook_is_xml(bytes: &[u8]) -> bool {
+    let body = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
+    matches!(
+        body.iter().find(|byte| !byte.is_ascii_whitespace()),
+        Some(b'<' | 0xFF | 0xFE)
+    )
 }
 
 fn xml_local_name(name: &[u8]) -> &[u8] {
@@ -704,15 +768,47 @@ fn xml_attribute_value(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8])
 /// Where AnyDoc picks one of several by namespace (`w:val` before `val`),
 /// checking them all covers its pick.
 fn xml_attribute_values(event: &quick_xml::events::BytesStart<'_>, wanted: &[u8]) -> Vec<String> {
+    xml_attributes(event)
+        .into_iter()
+        .filter(|attribute| attribute.local() == wanted)
+        .map(|attribute| attribute.value)
+        .collect()
+}
+
+/// One attribute as AnyDoc's parser sees it.
+struct XmlAttribute {
+    key: Vec<u8>,
+    value: String,
+}
+
+impl XmlAttribute {
+    fn local(&self) -> &[u8] {
+        xml_local_name(&self.key)
+    }
+
+    fn prefixed(&self) -> bool {
+        self.key.contains(&b':')
+    }
+}
+
+/// An element's attributes as AnyDoc reads them: namespace declarations
+/// (`xmlns`, `xmlns:Target`) bind prefixes and are not attributes, so a
+/// declaration cannot shadow the attribute it is named after; values are
+/// decoded (`&#104;idden` is `hidden`), falling back to the raw text.
+fn xml_attributes(event: &quick_xml::events::BytesStart<'_>) -> Vec<XmlAttribute> {
     event
         .attributes()
         .flatten()
-        .filter(|attribute| xml_local_name(attribute.key.as_ref()) == wanted)
-        .map(|attribute| {
-            attribute
+        .filter(|attribute| {
+            let key = attribute.key.as_ref();
+            key != b"xmlns" && !key.starts_with(b"xmlns:")
+        })
+        .map(|attribute| XmlAttribute {
+            key: attribute.key.as_ref().to_vec(),
+            value: attribute
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|value| value.into_owned())
-                .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned()),
         })
         .collect()
 }
@@ -830,19 +926,14 @@ fn xml_has_odf_hidden_content(bytes: &[u8]) -> bool {
                         | b"table-row-properties"
                         | b"table-column-properties"
                 ) {
-                    let visibility = xml_attribute_value(&event, b"visibility");
-                    let display = xml_attribute_value(&event, b"display");
-                    if visibility.as_deref().is_some_and(|value| {
-                        matches!(
-                            value.to_ascii_lowercase().as_str(),
-                            "collapse" | "filter" | "hidden"
-                        )
-                    }) || display.as_deref().is_some_and(|value| {
-                        matches!(
-                            value.to_ascii_lowercase().as_str(),
-                            "false" | "0" | "hidden"
-                        )
-                    }) {
+                    let hidden = xml_attributes(&event).into_iter().any(|attribute| {
+                        let value = attribute.value.trim().to_ascii_lowercase();
+                        (attribute.local() == b"visibility"
+                            && matches!(value.as_str(), "collapse" | "filter" | "hidden"))
+                            || (attribute.local() == b"display"
+                                && matches!(value.as_str(), "none" | "false" | "0" | "hidden"))
+                    });
+                    if hidden {
                         return true;
                     }
                 }
@@ -875,12 +966,11 @@ fn xml_has_odf_external_reference(bytes: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
-                for attribute in event.attributes().flatten() {
-                    if xml_local_name(attribute.key.as_ref()) == b"href"
-                        && is_external_uri(&String::from_utf8_lossy(attribute.value.as_ref()))
-                    {
-                        return true;
-                    }
+                if xml_attribute_values(&event, b"href")
+                    .iter()
+                    .any(|href| is_external_uri(href))
+                {
+                    return true;
                 }
                 buffer.clear();
             }
@@ -1076,13 +1166,12 @@ fn xml_has_odp_hidden_content(bytes: &[u8]) -> bool {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 if xml_local_name(event.name().as_ref()) == b"page"
-                    && event.attributes().flatten().any(|attribute| {
-                        let name = xml_local_name(attribute.key.as_ref());
-                        let value =
-                            String::from_utf8_lossy(attribute.value.as_ref()).to_ascii_lowercase();
-                        (name == b"visibility"
+                    && xml_attributes(&event).into_iter().any(|attribute| {
+                        let value = attribute.value.trim().to_ascii_lowercase();
+                        (attribute.local() == b"visibility"
                             && matches!(value.as_str(), "hidden" | "false" | "0"))
-                            || (name == b"show" && matches!(value.as_str(), "false" | "0"))
+                            || (attribute.local() == b"show"
+                                && matches!(value.as_str(), "false" | "0"))
                     })
                 {
                     return true;
@@ -1094,6 +1183,124 @@ fn xml_has_odp_hidden_content(bytes: &[u8]) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// Drawing-page styles that hide a slide, and the styles slides use, across
+/// an ODP package's content and styles parts. LibreOffice hides a slide with
+/// `presentation:visibility="hidden"` in its drawing-page style.
+#[derive(Default)]
+struct OdpPageStyles {
+    hidden: HashSet<String>,
+    used: HashSet<String>,
+}
+
+impl OdpPageStyles {
+    fn hides_a_page(&self) -> bool {
+        self.used.iter().any(|style| self.hidden.contains(style))
+    }
+}
+
+fn scan_odp_page_styles(bytes: &[u8], styles: &mut OdpPageStyles) {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    // Names of the open `style:style` elements, innermost last.
+    let mut open_styles: Vec<String> = Vec::new();
+    loop {
+        let (event, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => (event, true),
+            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
+            Ok(quick_xml::events::Event::End(_)) => {
+                if stack.pop().as_deref() == Some(b"style".as_slice()) {
+                    open_styles.pop();
+                }
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return,
+            Ok(_) => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let local = xml_local_name(event.name().as_ref()).to_vec();
+        let attributes = xml_attributes(&event);
+        match local.as_slice() {
+            b"style" if start => open_styles.push(
+                attributes
+                    .iter()
+                    .find(|attribute| attribute.local() == b"name")
+                    .map(|attribute| attribute.value.clone())
+                    .unwrap_or_default(),
+            ),
+            b"drawing-page-properties" => {
+                let hidden = attributes.iter().any(|attribute| {
+                    attribute.local() == b"visibility"
+                        && attribute.value.trim().eq_ignore_ascii_case("hidden")
+                });
+                if let Some(style) = open_styles.last().filter(|_| hidden) {
+                    styles.hidden.insert(style.clone());
+                }
+            }
+            b"page" => styles.used.extend(
+                attributes
+                    .into_iter()
+                    .filter(|attribute| attribute.local() == b"style-name")
+                    .map(|attribute| attribute.value),
+            ),
+            _ => {}
+        }
+        if start {
+            stack.push(local);
+        }
+        buffer.clear();
+    }
+}
+
+/// The document kinds an ODF content part's `office:body` holds. AnyDoc
+/// converts the first of text, spreadsheet, and presentation it finds there,
+/// in that order, whatever the package's mimetype says.
+fn odf_body_kind(bytes: &[u8]) -> Option<DocumentKind> {
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut children: HashSet<Vec<u8>> = HashSet::new();
+    loop {
+        let (event, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => (event, true),
+            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
+            Ok(quick_xml::events::Event::End(_)) => {
+                stack.pop();
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let local = xml_local_name(event.name().as_ref()).to_vec();
+        if xml_path_ends_with(&stack, &[b"document-content", b"body"]) && stack.len() == 2 {
+            children.insert(local.clone());
+        }
+        if start {
+            stack.push(local);
+        }
+        buffer.clear();
+    }
+    [
+        (b"text".as_slice(), DocumentKind::Odt),
+        (b"spreadsheet".as_slice(), DocumentKind::Ods),
+        (b"presentation".as_slice(), DocumentKind::Odp),
+    ]
+    .into_iter()
+    .find(|(name, _)| children.contains(*name))
+    .map(|(_, kind)| kind)
 }
 
 fn xml_has_odf_text(bytes: &[u8]) -> bool {
@@ -1145,15 +1352,11 @@ fn xml_has_odt_hidden_or_tracked_content(bytes: &[u8]) -> bool {
                 ) {
                     return true;
                 }
-                for attribute in event.attributes().flatten() {
-                    let name = xml_local_name(attribute.key.as_ref());
-                    let value = String::from_utf8_lossy(attribute.value.as_ref());
-                    if (name == b"condition" && !value.trim().is_empty())
-                        || (name == b"display"
-                            && matches!(
-                                value.to_ascii_lowercase().as_str(),
-                                "none" | "false" | "0" | "hidden"
-                            ))
+                for attribute in xml_attributes(&event) {
+                    let value = attribute.value.trim().to_ascii_lowercase();
+                    if (attribute.local() == b"condition" && !value.is_empty())
+                        || (attribute.local() == b"display"
+                            && matches!(value.as_str(), "none" | "false" | "0" | "hidden"))
                     {
                         return true;
                     }
@@ -1238,35 +1441,140 @@ fn xml_path_ends_with(stack: &[Vec<u8>], suffix: &[&[u8]]) -> bool {
             .all(|(open, wanted)| open.as_slice() == *wanted)
 }
 
+/// WordprocessingML's namespace, Transitional and Strict.
+const WORDPROCESSINGML_NAMESPACES: [&[u8]; 2] = [
+    b"http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    b"http://purl.oclc.org/ooxml/wordprocessingml/main",
+];
+const MARKUP_COMPATIBILITY_NAMESPACE: &[u8] =
+    b"http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+/// The vocabulary of an element in a Word story part, as far as AnyDoc's
+/// walker distinguishes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordVocabulary {
+    Word,
+    MarkupCompatibility,
+    Other,
+}
+
+impl WordVocabulary {
+    fn of(namespace: &quick_xml::name::ResolveResult<'_>) -> Self {
+        match namespace {
+            quick_xml::name::ResolveResult::Bound(namespace)
+                if WORDPROCESSINGML_NAMESPACES.contains(&namespace.as_ref()) =>
+            {
+                Self::Word
+            }
+            quick_xml::name::ResolveResult::Bound(namespace)
+                if namespace.as_ref() == MARKUP_COMPATIBILITY_NAMESPACE =>
+            {
+                Self::MarkupCompatibility
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
+/// An open element of a Word story part.
+struct WordNode {
+    local: Vec<u8>,
+    vocabulary: WordVocabulary,
+}
+
+impl WordNode {
+    fn is(&self, vocabulary: WordVocabulary, local: &[u8]) -> bool {
+        self.vocabulary == vocabulary && self.local == local
+    }
+
+    /// `mc:AlternateContent` and its branches, which wrap content without
+    /// changing what it formats.
+    fn is_compatibility_wrapper(&self) -> bool {
+        self.vocabulary == WordVocabulary::MarkupCompatibility
+            && matches!(
+                self.local.as_slice(),
+                b"AlternateContent" | b"Choice" | b"Fallback"
+            )
+    }
+}
+
+/// Whether the open elements end with `suffix` by local name, looking
+/// through markup-compatibility wrappers: Word applies run properties in an
+/// `mc:Choice` it understands.
+fn word_path_ends_with(stack: &[WordNode], suffix: &[&[u8]]) -> bool {
+    let mut path = stack
+        .iter()
+        .rev()
+        .filter(|node| !node.is_compatibility_wrapper());
+    suffix
+        .iter()
+        .rev()
+        .all(|wanted| path.next().is_some_and(|node| node.local == *wanted))
+}
+
+/// Whether AnyDoc's walker never reaches content under these open elements.
+/// It skips a tracked deletion or move source in WordprocessingML's
+/// namespace. Inside a drawing it instead searches every wrapper for text
+/// boxes, skipping only `mc:Fallback`, until a text box's content returns it
+/// to the walker; a deletion there hides nothing.
+fn word_content_omitted(stack: &[WordNode]) -> bool {
+    let mut searching_drawing = false;
+    for node in stack {
+        if searching_drawing {
+            if node.is(WordVocabulary::Word, b"txbxContent") {
+                searching_drawing = false;
+            } else if node.is(WordVocabulary::MarkupCompatibility, b"Fallback") {
+                return true;
+            }
+        } else if node.vocabulary == WordVocabulary::Word {
+            match node.local.as_slice() {
+                b"del" | b"moveFrom" => return true,
+                b"drawing" | b"pict" | b"object" => searching_drawing = true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Scan one Word story part into `scan`. Parse errors fail closed as
 /// malformed; end tags are not matched against start tags by prefix, as
 /// AnyDoc does not match them either.
 fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), DocumentError> {
-    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut stack: Vec<WordNode> = Vec::new();
     loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(event)) => {
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        let vocabulary = WordVocabulary::of(&namespace);
+        match event {
+            quick_xml::events::Event::Start(event) => {
                 if stack.len() >= MAX_XML_DEPTH {
                     return Err(DocumentError::ResourceLimit);
                 }
-                let local = xml_local_name(event.name().as_ref()).to_vec();
-                scan_docx_element(&event, &local, &stack, scan)?;
-                stack.push(local);
+                let node = WordNode {
+                    local: xml_local_name(event.name().as_ref()).to_vec(),
+                    vocabulary,
+                };
+                scan_docx_element(&event, &node, &stack, scan)?;
+                stack.push(node);
             }
-            Ok(quick_xml::events::Event::Empty(event)) => {
-                let local = xml_local_name(event.name().as_ref()).to_vec();
-                scan_docx_element(&event, &local, &stack, scan)?;
+            quick_xml::events::Event::Empty(event) => {
+                let node = WordNode {
+                    local: xml_local_name(event.name().as_ref()).to_vec(),
+                    vocabulary,
+                };
+                scan_docx_element(&event, &node, &stack, scan)?;
             }
-            Ok(quick_xml::events::Event::End(_)) => {
+            quick_xml::events::Event::End(_) => {
                 stack.pop();
             }
-            Ok(quick_xml::events::Event::Eof) => return Ok(()),
-            Ok(_) => {}
-            Err(_) => return Err(DocumentError::Malformed),
+            quick_xml::events::Event::Eof => return Ok(()),
+            _ => {}
         }
         buffer.clear();
     }
@@ -1274,33 +1582,38 @@ fn scan_docx_story(bytes: &[u8], scan: &mut DocxStoryScan) -> Result<(), Documen
 
 fn scan_docx_element(
     event: &quick_xml::events::BytesStart<'_>,
-    local: &[u8],
-    stack: &[Vec<u8>],
+    node: &WordNode,
+    stack: &[WordNode],
     scan: &mut DocxStoryScan,
 ) -> Result<(), DocumentError> {
     // Properties apply to content only in these positions: the same element
     // under a paragraph mark (`w:pPr/w:rPr`) or in revision history
     // (`w:rPrChange/w:rPr`, `w:pPrChange/w:pPr`) formats nothing visible.
-    let run_property = xml_path_ends_with(stack, &[b"r", b"rPr"]);
-    // Tracked deletions and the source side of tracked moves are omitted from
-    // the output, so nothing inside them is dropped by the parser.
-    let removed = stack
-        .iter()
-        .any(|name| name == b"del" || name == b"moveFrom");
-    match local {
+    let run_property = word_path_ends_with(stack, &[b"r", b"rPr"]);
+    let omitted = word_content_omitted(stack);
+    match node.local.as_slice() {
         // Ruby text loses its base text as well as the annotation, and an
         // imported chunk (`w:altChunk`, HTML or RTF that Word merges on
         // opening) loses all of its content.
-        b"sym" | b"checkBox" | b"ddList" | b"ruby" | b"altChunk" if !removed => {
+        b"sym" | b"checkBox" | b"ddList" | b"ruby" | b"altChunk" if !omitted => {
             scan.dropped = true;
         }
-        b"noBreakHyphen" if !removed && xml_path_ends_with(stack, &[b"r"]) => {
+        // AnyDoc reads a table's rows only as its direct children, so a row
+        // wrapped in a content control or custom XML is dropped.
+        b"tr"
+            if !omitted
+                && node.vocabulary == WordVocabulary::Word
+                && stack.last().is_some_and(|parent| parent.local != b"tbl") =>
+        {
+            scan.dropped = true;
+        }
+        b"noBreakHyphen" if !omitted && word_path_ends_with(stack, &[b"r"]) => {
             scan.omitted_hyphen = true;
         }
         b"vanish" if run_property => scan.hidden_run |= !xml_toggle_off(event),
         b"rStyle" if run_property => record_style(event, scan)?,
-        b"pStyle" if xml_path_ends_with(stack, &[b"p", b"pPr"]) => record_style(event, scan)?,
-        b"tblStyle" if xml_path_ends_with(stack, &[b"tbl", b"tblPr"]) => {
+        b"pStyle" if word_path_ends_with(stack, &[b"p", b"pPr"]) => record_style(event, scan)?,
+        b"tblStyle" if word_path_ends_with(stack, &[b"tbl", b"tblPr"]) => {
             record_style(event, scan)?;
         }
         _ => {}
@@ -1322,6 +1635,68 @@ fn record_style(
         scan.styles_used.insert(style);
     }
     Ok(())
+}
+
+/// Whether a numbering part hides list labels (`w:lvl/w:rPr/w:vanish`),
+/// which AnyDoc 0.2.4 converts, and the character styles its levels apply
+/// to labels. Streamed under the same bounds as the styles part.
+fn docx_numbering_labels(
+    reader: impl std::io::BufRead,
+) -> Result<(bool, HashSet<String>), DocumentError> {
+    let mut reader = quick_xml::Reader::from_reader(reader);
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut nodes = 0usize;
+    let mut hidden = false;
+    let mut styles = HashSet::new();
+    loop {
+        let (event, start) = match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event)) => (event, true),
+            Ok(quick_xml::events::Event::Empty(event)) => (event, false),
+            Ok(quick_xml::events::Event::End(_)) => {
+                stack.pop();
+                buffer.clear();
+                continue;
+            }
+            Ok(quick_xml::events::Event::Eof) => return Ok((hidden, styles)),
+            Ok(_) => {
+                nodes += 1;
+                if nodes > MAX_XML_NODES {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                buffer.clear();
+                continue;
+            }
+            Err(_) => return Err(DocumentError::Malformed),
+        };
+        nodes += 1;
+        if nodes > MAX_XML_NODES || (start && stack.len() >= MAX_XML_DEPTH) {
+            return Err(DocumentError::ResourceLimit);
+        }
+        let local = xml_local_name(event.name().as_ref()).to_vec();
+        if xml_path_ends_with(&stack, &[b"lvl", b"rPr"]) {
+            match local.as_slice() {
+                b"vanish" => hidden |= !xml_toggle_off(&event),
+                b"rStyle" => {
+                    for style in xml_attribute_values(&event, b"val") {
+                        if style.len() > MAX_STYLE_ID_BYTES
+                            || (styles.len() >= MAX_DOCX_STYLES && !styles.contains(&style))
+                        {
+                            return Err(DocumentError::ResourceLimit);
+                        }
+                        styles.insert(style);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if start {
+            stack.push(local);
+        }
+        buffer.clear();
+    }
 }
 
 /// One `w:style` definition as the hidden-text check sees it.
@@ -1642,6 +2017,8 @@ struct OoxmlLayout {
     story_parts: HashSet<String>,
     /// DOCX or XLSX styles.
     styles_parts: HashSet<String>,
+    /// DOCX list numbering, whose level properties format the labels.
+    numbering_parts: HashSet<String>,
     /// XLSX worksheets.
     worksheet_parts: HashSet<String>,
 }
@@ -1688,6 +2065,10 @@ fn ooxml_layout(
             layout.story_parts.extend(typed("/endnotes"));
             layout.styles_parts.insert("word/styles.xml".to_string());
             layout.styles_parts.extend(typed("/styles"));
+            layout
+                .numbering_parts
+                .insert("word/numbering.xml".to_string());
+            layout.numbering_parts.extend(typed("/numbering"));
         }
         DocumentKind::Xlsx => {
             layout.styles_parts.insert("xl/styles.xml".to_string());
@@ -1813,9 +2194,8 @@ fn xml_has_odt_active_content(bytes: &[u8]) -> bool {
                 ) {
                     return true;
                 }
-                for attribute in event.attributes().flatten() {
-                    let value =
-                        String::from_utf8_lossy(attribute.value.as_ref()).to_ascii_lowercase();
+                for attribute in xml_attributes(&event) {
+                    let value = attribute.value.trim().to_ascii_lowercase();
                     if value.starts_with("vnd.sun.star.script:") || value.starts_with("macro:") {
                         return true;
                     }
@@ -1861,16 +2241,36 @@ fn odf_reference_missing(value: &str, archive_names: &HashSet<String>) -> bool {
     anydoc_resolve("content.xml", value).is_none_or(|part| !archive_names.contains(&part))
 }
 
+/// Whether a slide or notes slide hides content AnyDoc 0.2.4 converts: the
+/// slide itself (`show="0"`) or a shape (`p:cNvPr hidden="1"`). Values are
+/// decoded and trimmed; a part the reader cannot parse counts as hidden.
 fn xml_has_hidden_slide(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    [
-        r#"show="0""#,
-        r#"show='0'"#,
-        r#"show="false""#,
-        r#"show='false'"#,
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+    let mut reader = quick_xml::Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(event))
+            | Ok(quick_xml::events::Event::Empty(event)) => {
+                let shape_properties = xml_local_name(event.name().as_ref()) == b"cNvPr";
+                let hidden = xml_attributes(&event).into_iter().any(|attribute| {
+                    let value = attribute.value.trim().to_ascii_lowercase();
+                    (attribute.local() == b"show" && matches!(value.as_str(), "0" | "false"))
+                        || (shape_properties
+                            && attribute.local() == b"hidden"
+                            && matches!(value.as_str(), "1" | "true"))
+                });
+                if hidden {
+                    return true;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => return false,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+        buffer.clear();
+    }
 }
 
 fn xml_has_pptx_shape_tree(bytes: &[u8]) -> bool {
@@ -1936,6 +2336,28 @@ fn xml_is_well_formed(bytes: &[u8]) -> bool {
     }
 }
 
+/// Relationship types that embed or run content: OLE objects, embedded
+/// packages, ActiveX controls, and macro projects. Matched by type, so a
+/// part stored under any name is found.
+fn ooxml_active_relationship(kind: &str) -> bool {
+    const ACTIVE: [&str; 10] = [
+        "/oleObject",
+        "/package",
+        "/control",
+        "/activeXControl",
+        "/activeXControlBinary",
+        "/vbaProject",
+        "/vbaProjectSignature",
+        "/wordVbaData",
+        "/attachedToolbars",
+        "/keyMapCustomizations",
+    ];
+    let kind = kind.trim();
+    ACTIVE.iter().any(|suffix| {
+        kind.len() >= suffix.len() && kind[kind.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    })
+}
+
 fn ooxml_external_target(value: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
     value.starts_with("//")
@@ -1964,15 +2386,12 @@ fn xml_has_ooxml_external_relationship(bytes: &[u8]) -> Result<bool, DocumentErr
             | Ok(quick_xml::events::Event::Empty(event))
                 if xml_local_name(event.name().as_ref()).eq_ignore_ascii_case(b"Relationship") =>
             {
-                let external = event.attributes().flatten().any(|attribute| {
-                    let name = xml_local_name(attribute.key.as_ref());
-                    let value = attribute
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .map(|value| value.into_owned())
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&attribute.value).into_owned());
+                let external = xml_attributes(&event).into_iter().any(|attribute| {
+                    let name = attribute.local();
                     (name.eq_ignore_ascii_case(b"TargetMode")
-                        && value.trim().eq_ignore_ascii_case("External"))
-                        || (name.eq_ignore_ascii_case(b"Target") && ooxml_external_target(&value))
+                        && attribute.value.trim().eq_ignore_ascii_case("External"))
+                        || (name.eq_ignore_ascii_case(b"Target")
+                            && ooxml_external_target(&attribute.value))
                 });
                 if external {
                     return Ok(true);
@@ -2025,19 +2444,27 @@ fn validate_pptx_slide_targets(
         return Err(DocumentError::Malformed);
     }
     let relationships = ooxml_relationships(presentation_rels)?;
-    let slides = pptx_slide_relationship_ids(presentation);
+    let mut targets_by_id: HashMap<&str, Vec<&str>> = HashMap::new();
+    for relationship in &relationships {
+        targets_by_id
+            .entry(relationship.id.as_str())
+            .or_default()
+            .push(relationship.target.as_str());
+    }
+    let slides = pptx_slide_relationship_ids(presentation)?;
     if slides.is_empty() {
         return Err(DocumentError::Malformed);
     }
     let mut incomplete = false;
     for ids in slides {
-        let mut targets = relationships
+        let mut targets = ids
             .iter()
-            .filter(|relationship| ids.contains(&relationship.id))
+            .filter_map(|id| targets_by_id.get(id.as_str()))
+            .flatten()
             .peekable();
         incomplete |= targets.peek().is_none();
-        for relationship in targets {
-            match anydoc_resolve("ppt/presentation.xml", &relationship.target) {
+        for target in targets {
+            match anydoc_resolve("ppt/presentation.xml", target) {
                 Some(part) if slide_parts.contains(&part) => {}
                 _ => incomplete = true,
             }
@@ -2046,40 +2473,71 @@ fn validate_pptx_slide_targets(
     Ok(incomplete)
 }
 
-/// The relationship ids of each listed slide: every prefixed `id` attribute
-/// of a `sldId` (the unprefixed `id` is the slide's number).
-fn pptx_slide_relationship_ids(presentation: &[u8]) -> Vec<HashSet<String>> {
-    let mut reader = quick_xml::Reader::from_reader(Cursor::new(presentation));
+/// PresentationML's namespace, Transitional and Strict.
+const PRESENTATIONML_NAMESPACES: [&[u8]; 2] = [
+    b"http://schemas.openxmlformats.org/presentationml/2006/main",
+    b"http://purl.oclc.org/ooxml/presentationml/main",
+];
+
+/// The relationship ids of each listed slide, read as AnyDoc reads the list:
+/// the `p:sldId` children of the first `p:sldIdLst`, both in PresentationML's
+/// namespace, so a section list (`p14:sldIdLst`) is not a slide list. Every
+/// prefixed `id` a slide carries counts; its unprefixed `id` is the slide's
+/// number, and a namespace declaration is not an attribute.
+fn pptx_slide_relationship_ids(presentation: &[u8]) -> Result<Vec<HashSet<String>>, DocumentError> {
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(presentation));
     reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
+    let mut depth = 0usize;
+    // Depth of the open first slide list, once one has been seen.
+    let mut list: Option<usize> = None;
+    let mut list_seen = false;
     let mut slides = Vec::new();
     loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(quick_xml::events::Event::Start(event))
-            | Ok(quick_xml::events::Event::Empty(event))
-                if xml_local_name(event.name().as_ref()) == b"sldId" =>
-            {
-                slides.push(
-                    event
-                        .attributes()
-                        .flatten()
-                        .filter(|attribute| {
-                            let key = attribute.key.as_ref();
-                            key.contains(&b':') && xml_local_name(key) == b"id"
-                        })
-                        .map(|attribute| {
-                            attribute
-                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                                .map(|value| value.into_owned())
-                                .unwrap_or_else(|_| {
-                                    String::from_utf8_lossy(attribute.value.as_ref()).into_owned()
-                                })
-                        })
-                        .collect(),
-                );
+        let (namespace, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| DocumentError::Malformed)?;
+        let presentationml = matches!(
+            namespace,
+            quick_xml::name::ResolveResult::Bound(namespace)
+                if PRESENTATIONML_NAMESPACES.contains(&namespace.as_ref())
+        );
+        let (element, start) = match event {
+            quick_xml::events::Event::Start(element) => (element, true),
+            quick_xml::events::Event::Empty(element) => (element, false),
+            quick_xml::events::Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if list == Some(depth) {
+                    list = None;
+                }
+                buffer.clear();
+                continue;
             }
-            Ok(quick_xml::events::Event::Eof) | Err(_) => return slides,
-            Ok(_) => {}
+            quick_xml::events::Event::Eof => return Ok(slides),
+            _ => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let local = xml_local_name(element.name().as_ref()).to_vec();
+        if presentationml && local == b"sldIdLst" && !list_seen {
+            list_seen = true;
+            if start {
+                list = Some(depth);
+            }
+        } else if presentationml && local == b"sldId" && list.is_some_and(|open| open + 1 == depth)
+        {
+            slides.push(
+                xml_attributes(&element)
+                    .into_iter()
+                    .filter(|attribute| attribute.prefixed() && attribute.local() == b"id")
+                    .map(|attribute| attribute.value)
+                    .collect(),
+            );
+        }
+        if start {
+            depth += 1;
         }
         buffer.clear();
     }
@@ -2305,11 +2763,22 @@ fn epub_text_has_external(value: &[u8]) -> bool {
         || value.contains("javascript:")
 }
 
+/// What a chapter's markup offers for its stylesheet check: the element
+/// names and classes present, the text of its `<style>` elements, and the
+/// parts its `<link rel="stylesheet">` elements name.
+#[derive(Default)]
+struct EpubChapterStyles {
+    tags: HashSet<String>,
+    classes: HashSet<String>,
+    css: Vec<String>,
+    linked: Vec<String>,
+}
+
 fn epub_inspect_chapter(
     bytes: &[u8],
     chapter_path: &str,
     archive_names: &HashSet<String>,
-) -> Result<PackagePreflight, DocumentError> {
+) -> Result<(PackagePreflight, EpubChapterStyles), DocumentError> {
     if !xml_is_well_formed(bytes) {
         return Err(DocumentError::Malformed);
     }
@@ -2317,15 +2786,20 @@ fn epub_inspect_chapter(
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut result = PackagePreflight::default();
+    let mut styles = EpubChapterStyles::default();
     let mut has_html = false;
     let mut has_body = false;
+    // Text of the `<style>` element being read, if any.
+    let mut style_text: Option<String> = None;
     loop {
-        match reader.read_event_into(&mut buffer) {
+        let event = reader.read_event_into(&mut buffer);
+        let start = matches!(event, Ok(quick_xml::events::Event::Start(_)));
+        match event {
             Ok(quick_xml::events::Event::Start(event))
             | Ok(quick_xml::events::Event::Empty(event)) => {
                 let event_name = event.name();
-                let local = xml_local_name(event_name.as_ref());
-                match local {
+                let local = xml_local_name(event_name.as_ref()).to_ascii_lowercase();
+                match local.as_slice() {
                     b"html" => has_html = true,
                     b"body" => has_body = true,
                     b"script" | b"form" | b"iframe" | b"object" | b"embed" | b"applet" => {
@@ -2333,35 +2807,62 @@ fn epub_inspect_chapter(
                     }
                     _ => {}
                 }
-                for attribute in event.attributes().flatten() {
-                    let name = xml_local_name(attribute.key.as_ref());
-                    let value = String::from_utf8_lossy(attribute.value.as_ref()).into_owned();
-                    let lower = value.to_ascii_lowercase();
+                styles
+                    .tags
+                    .insert(String::from_utf8_lossy(&local).into_owned());
+                let attributes = xml_attributes(&event);
+                let mut rel_stylesheet = false;
+                let mut href = None;
+                for attribute in &attributes {
+                    let name = attribute.local();
+                    let value = attribute.value.as_str();
+                    let lower = value.trim().to_ascii_lowercase();
                     if matches!(name, b"href" | b"src" | b"action" | b"data") {
-                        epub_check_reference(&value, chapter_path, archive_names, &mut result);
+                        epub_check_reference(value, chapter_path, archive_names, &mut result);
                     }
-                    if name.starts_with(b"on")
-                        || name == b"hidden"
+                    if name.starts_with(b"on") {
+                        result.active_content = true;
+                    }
+                    if name == b"hidden"
                         || (name == b"aria-hidden" && lower == "true")
-                        || (name == b"style"
-                            && (lower.contains("display:none")
-                                || lower.contains("visibility:hidden")))
+                        || (name == b"style" && css_declarations_hide(value))
                     {
-                        if name.starts_with(b"on") {
-                            result.active_content = true;
-                        } else {
-                            result.hidden_content = true;
-                        }
+                        result.hidden_content = true;
                     }
-                    if name == b"style"
-                        && (lower.contains("http:")
-                            || lower.contains("https:")
-                            || lower.contains("ftp:")
-                            || lower.contains("file:")
-                            || lower.contains("data:")
-                            || lower.contains("javascript:"))
-                    {
+                    if name == b"style" && epub_text_has_external(value.as_bytes()) {
                         result.external_relationships = true;
+                    }
+                    if name == b"class" {
+                        styles
+                            .classes
+                            .extend(value.split_ascii_whitespace().map(str::to_string));
+                    }
+                    if name == b"rel" {
+                        rel_stylesheet = value
+                            .split_ascii_whitespace()
+                            .any(|rel| rel.eq_ignore_ascii_case("stylesheet"));
+                    }
+                    if name == b"href" {
+                        href = Some(value.to_string());
+                    }
+                }
+                // AnyDoc applies every `<link rel="stylesheet">`, resolved
+                // against the chapter as it resolves other references.
+                if local == b"link" && rel_stylesheet {
+                    if let Some(target) = href.and_then(|href| anydoc_resolve(chapter_path, &href))
+                    {
+                        styles.linked.push(target);
+                    }
+                }
+                if local == b"style" && start {
+                    style_text = Some(String::new());
+                }
+                buffer.clear();
+            }
+            Ok(quick_xml::events::Event::End(event)) => {
+                if xml_local_name(event.name().as_ref()).eq_ignore_ascii_case(b"style") {
+                    if let Some(text) = style_text.take() {
+                        styles.css.push(text);
                     }
                 }
                 buffer.clear();
@@ -2370,11 +2871,17 @@ fn epub_inspect_chapter(
                 if epub_text_has_external(event.as_ref()) {
                     result.external_relationships = true;
                 }
+                if let Some(text) = style_text.as_mut() {
+                    text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::CData(event)) => {
                 if epub_text_has_external(event.as_ref()) {
                     result.external_relationships = true;
+                }
+                if let Some(text) = style_text.as_mut() {
+                    text.push_str(&String::from_utf8_lossy(event.as_ref()));
                 }
                 buffer.clear();
             }
@@ -2382,12 +2889,207 @@ fn epub_inspect_chapter(
                 if !has_html || !has_body {
                     result.missing_required_content = true;
                 }
-                return Ok(result);
+                return Ok((result, styles));
             }
             Ok(_) => buffer.clear(),
             Err(_) => return Err(DocumentError::Malformed),
         }
     }
+}
+
+/// Whether a CSS declaration block hides what it styles, read the way
+/// AnyDoc's `parse_declarations` reads it: `display: none`, which AnyDoc
+/// honors and so omits the content, or `visibility: hidden` or `collapse`,
+/// which it ignores and so converts text a reader never sees.
+fn css_declarations_hide(body: &str) -> bool {
+    body.split(';').any(|declaration| {
+        let Some((name, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let mut value = value.trim().to_ascii_lowercase();
+        if let Some(bang) = value.find('!') {
+            value.truncate(bang);
+        }
+        let value = value.trim();
+        (name == "display" && value == "none")
+            || (name == "visibility" && matches!(value, "hidden" | "collapse"))
+    })
+}
+
+/// The innermost rules of a stylesheet as (selector, declarations), with
+/// comments removed. Rules nested in at-rules such as `@media` are included,
+/// which finds more than AnyDoc, whose parser skips them.
+fn css_rules(css: &str) -> Vec<(String, String)> {
+    let mut text = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        text.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => rest = "",
+        }
+    }
+    text.push_str(rest);
+    let mut rules = Vec::new();
+    // Open blocks: their prelude, and whether they hold nested blocks.
+    let mut open: Vec<(String, bool)> = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        match character {
+            '{' => {
+                if let Some(parent) = open.last_mut() {
+                    parent.1 = true;
+                }
+                open.push((current.trim().to_string(), false));
+                current.clear();
+            }
+            '}' => {
+                if let Some((prelude, nested)) = open.pop() {
+                    if !nested {
+                        rules.push((prelude, current.clone()));
+                    }
+                }
+                current.clear();
+            }
+            ';' if open.is_empty() => current.clear(),
+            _ => current.push(character),
+        }
+    }
+    rules
+}
+
+/// Whether a selector could match an element of the chapter, judged by its
+/// rightmost compound selector's element name and classes. Ids, attribute
+/// conditions, and pseudo-classes are treated as matching; a rule for a
+/// pseudo-element styles generated content and hides nothing.
+fn css_selector_may_match(selector: &str, styles: &EpubChapterStyles) -> bool {
+    let Some(compound) = selector
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '+' | '~'))
+        .rfind(|part| !part.is_empty())
+    else {
+        return false;
+    };
+    let lower = compound.to_ascii_lowercase();
+    if lower.contains("::")
+        || [
+            ":before",
+            ":after",
+            ":first-line",
+            ":first-letter",
+            ":marker",
+        ]
+        .iter()
+        .any(|pseudo| lower.contains(pseudo))
+    {
+        return false;
+    }
+    let mut simple = String::new();
+    let mut depth = 0usize;
+    for character in compound.chars() {
+        match character {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => simple.push(character),
+            _ => {}
+        }
+    }
+    let simple = simple.split(':').next().unwrap_or_default();
+    let mut parts = simple.split('.');
+    let head = parts.next().unwrap_or_default();
+    let tag = head
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let tag_matches = tag.is_empty() || tag == "*" || styles.tags.contains(&tag);
+    tag_matches
+        && parts.all(|class| {
+            let class = class.split('#').next().unwrap_or_default();
+            class.is_empty() || styles.classes.contains(class)
+        })
+}
+
+/// Whether a chapter's stylesheets hide any of its elements.
+fn epub_css_hides_content(styles: &EpubChapterStyles, css: &[String]) -> bool {
+    css.iter()
+        .flat_map(|sheet| css_rules(sheet))
+        .any(|(prelude, body)| {
+            !prelude.starts_with('@')
+                && css_declarations_hide(&body)
+                && prelude
+                    .split(',')
+                    .any(|selector| css_selector_may_match(selector, styles))
+        })
+}
+
+/// Most stylesheets one chapter may pull in through links and imports.
+const MAX_EPUB_STYLESHEETS: usize = 64;
+
+/// The text of every stylesheet a chapter applies: its `<style>` elements,
+/// its linked sheets, and the local sheets those import. AnyDoc applies the
+/// first two; readers also follow imports. A sheet that names an external
+/// resource marks the chapter external.
+fn epub_chapter_stylesheets(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    chapter_path: &str,
+    styles: &EpubChapterStyles,
+    result: &mut PackagePreflight,
+) -> Result<Vec<String>, DocumentError> {
+    let mut sheets = styles.css.clone();
+    // An `@import` in a `<style>` element resolves against the chapter.
+    let mut pending: Vec<String> = styles
+        .css
+        .iter()
+        .flat_map(|sheet| css_imports(sheet, chapter_path))
+        .chain(styles.linked.iter().cloned())
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(path) = pending.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_EPUB_STYLESHEETS {
+            return Err(DocumentError::ResourceLimit);
+        }
+        let Ok(bytes) = epub_read_part(archive, &path) else {
+            // A missing linked sheet is reported by the reference check.
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if epub_text_has_external(text.as_bytes()) {
+            result.external_relationships = true;
+        }
+        pending.extend(css_imports(&text, &path));
+        sheets.push(text);
+    }
+    Ok(sheets)
+}
+
+/// The local stylesheets an `@import` names, resolved against the sheet.
+fn css_imports(css: &str, sheet_path: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    let lower = css.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(offset) = lower[from..].find("@import") {
+        let start = from + offset + "@import".len();
+        let statement = &css[start..css[start..].find(';').map_or(css.len(), |end| start + end)];
+        let target = statement
+            .trim()
+            .trim_start_matches("url(")
+            .trim_start_matches("URL(")
+            .trim_start_matches(['"', '\''])
+            .split(['"', '\'', ')'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !target.is_empty() && !epub_is_external_uri(&target) {
+            imports.extend(anydoc_resolve(sheet_path, &target));
+        }
+        from = start;
+    }
+    imports
 }
 
 fn epub_nav_spine_mismatch(
@@ -2415,11 +3117,11 @@ fn epub_nav_spine_mismatch(
                 let event_name = event.name();
                 let local = xml_local_name(event_name.as_ref());
                 if local == b"nav" {
-                    let is_toc = event.attributes().flatten().any(|attribute| {
-                        let name = xml_local_name(attribute.key.as_ref());
-                        let value = String::from_utf8_lossy(attribute.value.as_ref());
-                        (name == b"type" && value.eq_ignore_ascii_case("toc"))
-                            || (name == b"role" && value.eq_ignore_ascii_case("doc-toc"))
+                    let is_toc = xml_attributes(&event).into_iter().any(|attribute| {
+                        let value = attribute.value.trim();
+                        (attribute.local() == b"type" && value.eq_ignore_ascii_case("toc"))
+                            || (attribute.local() == b"role"
+                                && value.eq_ignore_ascii_case("doc-toc"))
                     });
                     if is_toc {
                         toc_depth = Some(depth);
@@ -2630,11 +3332,13 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
         match epub_read_xml_part(&mut archive, &target)
             .and_then(|chapter| epub_inspect_chapter(&chapter, &target, &archive_names))
         {
-            Ok(chapter_result) => {
+            Ok((chapter_result, styles)) => {
                 result.active_content |= chapter_result.active_content;
                 result.external_relationships |= chapter_result.external_relationships;
                 result.hidden_content |= chapter_result.hidden_content;
                 result.missing_required_content |= chapter_result.missing_required_content;
+                let sheets = epub_chapter_stylesheets(&mut archive, &target, &styles, &mut result)?;
+                result.hidden_content |= epub_css_hides_content(&styles, &sheets);
             }
             Err(DocumentError::Malformed) => result.missing_required_content = true,
             Err(error) => return Err(error),
@@ -2725,6 +3429,7 @@ fn preflight_package(
 
     let layout = ooxml_layout(&mut archive, kind)?;
     let mut docx_scan = DocxStoryScan::default();
+    let mut odp_page_styles = OdpPageStyles::default();
     let mut result = PackagePreflight::default();
     let mut ppt_presentation = None;
     let mut ppt_presentation_rels = None;
@@ -2839,7 +3544,9 @@ fn preflight_package(
             || (matches!(kind, DocumentKind::Pptx)
                 && (lower_name == "ppt/presentation.xml"
                     || lower_name == "ppt/_rels/presentation.xml.rels"
-                    || (lower_name.starts_with("ppt/slides/") && lower_name.ends_with(".xml"))))
+                    || ((lower_name.starts_with("ppt/slides/")
+                        || lower_name.starts_with("ppt/notesslides/"))
+                        && lower_name.ends_with(".xml"))))
             || (matches!(kind, DocumentKind::Docx) && layout.story_parts.contains(&name));
         if inspect_xml {
             if declared > MAX_PREFLIGHT_PART_BYTES {
@@ -2852,6 +3559,14 @@ fn preflight_package(
                 .map_err(|_| DocumentError::Malformed)?;
             if content.len() as u64 > MAX_PREFLIGHT_PART_BYTES {
                 return Err(DocumentError::ResourceLimit);
+            }
+            // A workbook part AnyDoc cannot read as XML goes to its binary
+            // (XLSB) reader, a lane this route does not enable.
+            if matches!(kind, DocumentKind::Xlsx)
+                && name == "xl/workbook.xml"
+                && !anydoc_workbook_is_xml(&content)
+            {
+                return Err(DocumentError::Unsupported);
             }
             let content = anydoc_xml_utf8(content);
             let lower_content = String::from_utf8_lossy(&content).to_ascii_lowercase();
@@ -2873,21 +3588,28 @@ fn preflight_package(
                     if !xml_is_well_formed(&content) {
                         return Err(DocumentError::Malformed);
                     }
+                    // The checks below follow the mimetype's lane; AnyDoc
+                    // follows the body, so a package whose body belongs to
+                    // another lane lacks the content its own lane requires.
+                    result.missing_required_content |= odf_body_kind(&content) != Some(kind);
+                    if matches!(kind, DocumentKind::Odp) {
+                        scan_odp_page_styles(&content, &mut odp_page_styles);
+                    }
                     result.external_relationships |= xml_has_odf_external_reference(&content);
                     result.active_content |= xml_has_odf_active_content(&content);
                     if matches!(kind, DocumentKind::Ods) {
                         result.hidden_content |= xml_has_odf_hidden_content(&content);
                         result.missing_formula_cache |= xml_has_uncached_odf_formula(&content);
-                        result.missing_required_content = !xml_has_odf_spreadsheet(&content);
+                        result.missing_required_content |= !xml_has_odf_spreadsheet(&content);
                     } else if matches!(kind, DocumentKind::Odt) {
                         result.hidden_content |= xml_has_odt_hidden_or_tracked_content(&content);
                         result.active_content |= xml_has_odt_active_content(&content);
                         result.unsupported_content |= xml_has_odt_unsupported_content(&content);
-                        result.missing_required_content = !xml_has_odf_text(&content);
+                        result.missing_required_content |= !xml_has_odf_text(&content);
                         odf_references.extend(xml_odf_internal_references(&content));
                     } else {
                         result.hidden_content |= xml_has_odp_hidden_content(&content);
-                        result.missing_required_content = !xml_has_odf_presentation(&content);
+                        result.missing_required_content |= !xml_has_odf_presentation(&content);
                         odf_references.extend(xml_odf_internal_references(&content));
                     }
                 } else if lower_name == "meta-inf/manifest.xml" {
@@ -2915,22 +3637,25 @@ fn preflight_package(
                         result.hidden_content |= xml_has_odp_hidden_content(&content);
                         result.external_relationships |= xml_has_odf_external_reference(&content);
                         odf_references.extend(xml_odf_internal_references(&content));
+                        scan_odp_page_styles(&content, &mut odp_page_styles);
                     }
                 }
             }
             if lower_name.ends_with(".rels") {
                 result.external_relationships |= xml_has_ooxml_external_relationship(&content)?;
+                result.active_content |= ooxml_relationships(&content)?
+                    .iter()
+                    .any(|relationship| ooxml_active_relationship(&relationship.kind));
             }
             if lower_content.contains("macroenabled") {
                 result.active_content = true;
             }
             if matches!(kind, DocumentKind::Xlsx) {
-                result.hidden_content |= xml_has_hidden_content(lower_content.as_bytes());
+                result.hidden_content |= xml_has_hidden_content(&content);
                 if lower_name.starts_with("xl/worksheets/")
                     || layout.worksheet_parts.contains(&name)
                 {
-                    result.missing_formula_cache |=
-                        xml_has_uncached_formula(lower_content.as_bytes());
+                    result.missing_formula_cache |= xml_has_uncached_formula(&content);
                 }
             }
             if matches!(kind, DocumentKind::Pptx) {
@@ -2946,6 +3671,10 @@ fn preflight_package(
                     }
                     result.hidden_content |= xml_has_hidden_slide(&content);
                     ppt_slide_parts.insert(name);
+                } else if lower_name.starts_with("ppt/notesslides/") && lower_name.ends_with(".xml")
+                {
+                    // AnyDoc converts the text bodies of speaker notes.
+                    result.hidden_content |= xml_has_hidden_slide(&content);
                 }
             }
         }
@@ -2954,6 +3683,7 @@ fn preflight_package(
         kind,
         DocumentKind::Odt | DocumentKind::Ods | DocumentKind::Odp
     ) {
+        result.hidden_content |= odp_page_styles.hides_a_page();
         let mimetype = odf_mimetype.ok_or(DocumentError::Malformed)?;
         let mimetype = std::str::from_utf8(&mimetype)
             .map_err(|_| DocumentError::Malformed)?
@@ -3007,6 +3737,21 @@ fn preflight_package(
             hidden_styles.extend(styles);
             defaults_hidden |= defaults;
         }
+        let mut hidden_labels = false;
+        let mut label_styles = HashSet::new();
+        for part in &layout.numbering_parts {
+            let Ok(entry) = archive.by_name(part) else {
+                continue;
+            };
+            let (hidden, styles) =
+                docx_numbering_labels(open_xml_stream(entry.take(MAX_ARCHIVE_ENTRY_BYTES))?)?;
+            hidden_labels |= hidden;
+            label_styles.extend(styles);
+        }
+        result.hidden_content |= hidden_labels
+            || label_styles
+                .iter()
+                .any(|style| hidden_styles.contains(style));
         result.unsupported_content |= docx_scan.dropped;
         result.omitted_characters |= docx_scan.omitted_hyphen;
         result.hidden_content |= docx_scan.hidden_run
@@ -4423,7 +5168,7 @@ mod tests {
     const XLSX_TYPES: &[u8] = br#"<Types><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
     const PPTX_TYPES: &[u8] = br#"<Types><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>"#;
     const PPSX_TYPES: &[u8] = br#"<Types><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml"/></Types>"#;
-    const PPTX_PRESENTATION: &[u8] = br#"<p:presentation xmlns:p="urn:p" xmlns:r="urn:r"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>"#;
+    const PPTX_PRESENTATION: &[u8] = br#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#;
     const PPTX_RELS: &[u8] = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#;
     const PPTX_SLIDE: &[u8] = br#"<p:sld><p:cSld><p:spTree/></p:cSld></p:sld>"#;
     const DOCX_XML: &[u8] = br#"<document/>"#;
@@ -4579,6 +5324,449 @@ mod tests {
         assert!(matches!(
             external(br#"<Relationships><Relationship Id="rId6" Target="#),
             Err(DocumentError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn namespace_declarations_are_not_attributes() {
+        let event = quick_xml::events::BytesStart::from_content(
+            r#"Relationship xmlns:Target="word/document.xml" Target="word/other.xml" x:Id="r&#49;""#,
+            "Relationship".len(),
+        );
+        assert_eq!(xml_attribute_values(&event, b"Target"), ["word/other.xml"]);
+        assert_eq!(xml_attribute_value(&event, b"Id").as_deref(), Some("r1"));
+
+        // A declaration named after `Type` cannot hide the relationship that
+        // makes another part the main document.
+        let body = word_part("document", "<w:p><w:r><w:t>Decoy</w:t></w:r></w:p>");
+        let rels = format!(
+            r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship xmlns:Type="urn:decoy" Id="rId1" Type="{REL_NS}/officeDocument" Target="word/other.xml"/></Relationships>"#
+        );
+        assert!(matches!(
+            docx_result(&[
+                ("_rels/.rels", rels.as_bytes()),
+                ("word/document.xml", &body),
+                ("word/other.xml", &body),
+            ]),
+            Err(DocumentError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn pptx_checks_read_slides_as_anydoc_reads_them() {
+        let presentation = |extra: &str| {
+            format!(
+                r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="{REL_NS}" xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>{extra}</p:presentation>"#
+            )
+            .into_bytes()
+        };
+        let preflight = |presentation: &[u8], slide: &[u8], extra: &[(&str, &[u8])]| {
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("[Content_Types].xml", PPTX_TYPES),
+                ("ppt/presentation.xml", presentation),
+                ("ppt/_rels/presentation.xml.rels", PPTX_RELS),
+                ("ppt/slides/slide1.xml", slide),
+            ];
+            entries.extend_from_slice(extra);
+            preflight_package(
+                &zip_entries(&entries),
+                DocumentKind::Pptx,
+                DocumentVariant::Pptx,
+            )
+            .unwrap()
+        };
+        // A section list names slides by number, not relationship; AnyDoc
+        // reads only the first PresentationML slide list.
+        let sections = presentation(
+            r#"<p:extLst><p:ext uri="{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"><p14:sectionLst><p14:section name="One"><p14:sldIdLst><p14:sldId id="256"/></p14:sldIdLst></p14:section></p14:sectionLst></p:ext></p:extLst>"#,
+        );
+        assert!(!preflight(&sections, PPTX_SLIDE, &[]).missing_required_content);
+        // Hidden slides and shapes, however the attribute is spelled.
+        for slide in [
+            r#"<p:sld show = "0"><p:cSld><p:spTree/></p:cSld></p:sld>"#,
+            r#"<p:sld show="&#48;"><p:cSld><p:spTree/></p:cSld></p:sld>"#,
+            r#"<p:sld><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="x" hidden=" 1"/></p:nvSpPr></p:sp></p:spTree></p:cSld></p:sld>"#,
+        ] {
+            assert!(
+                preflight(&presentation(""), slide.as_bytes(), &[]).hidden_content,
+                "{slide}"
+            );
+        }
+        // Speaker notes are converted, so their hidden shapes count too.
+        let notes = br#"<p:notes><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="3" name="n" hidden="true"/></p:nvSpPr></p:sp></p:spTree></p:cSld></p:notes>"#;
+        assert!(
+            preflight(
+                &presentation(""),
+                PPTX_SLIDE,
+                &[("ppt/notesSlides/notesSlide1.xml", notes)]
+            )
+            .hidden_content
+        );
+        assert!(!preflight(&presentation(""), PPTX_SLIDE, &[]).hidden_content);
+    }
+
+    #[test]
+    fn slide_lists_are_matched_to_relationships_in_one_pass() {
+        let slides: String = (0..20_000)
+            .map(|index| format!(r#"<p:sldId id="{}" r:id="rId{index}"/>"#, 256 + index))
+            .collect();
+        let presentation = format!(
+            r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="{REL_NS}"><p:sldIdLst>{slides}</p:sldIdLst></p:presentation>"#
+        );
+        let relationships: String = (0..20_000)
+            .map(|index| {
+                format!(
+                    r#"<Relationship Id="rId{index}" Type="{REL_NS}/slide" Target="slides/slide{index}.xml"/>"#
+                )
+            })
+            .collect();
+        let rels = format!("<Relationships>{relationships}</Relationships>");
+        let slide_parts: HashSet<String> = (0..20_000)
+            .map(|index| format!("ppt/slides/slide{index}.xml"))
+            .collect();
+        let started = std::time::Instant::now();
+        let incomplete =
+            validate_pptx_slide_targets(presentation.as_bytes(), rels.as_bytes(), &slide_parts)
+                .unwrap();
+        assert!(!incomplete);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "matching must not scan every relationship for every slide"
+        );
+    }
+
+    #[test]
+    fn xlsx_checks_parse_what_they_look_for() {
+        let with_sheet = |workbook_sheet: &str, worksheet: &str| {
+            let workbook = format!(
+                r#"<workbook xmlns:r="{REL_NS}"><sheets><sheet name="Data" sheetId="1" {workbook_sheet} r:id="rId1"/></sheets></workbook>"#
+            );
+            let rels = format!(
+                r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+            );
+            let sheet = format!("<worksheet><sheetData>{worksheet}</sheetData></worksheet>");
+            preflight_package(
+                &zip_entries(&[
+                    ("[Content_Types].xml", XLSX_TYPES),
+                    ("xl/workbook.xml", workbook.as_bytes()),
+                    ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                    ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+                ]),
+                DocumentKind::Xlsx,
+                DocumentVariant::Xlsx,
+            )
+        };
+        let visible_row = r#"<row r="1"><c r="A1"><v>1</v></c></row>"#;
+        for (sheet, rows) in [
+            (r#"state='hidden'"#, visible_row),
+            (r#"state="&#104;idden""#, visible_row),
+            (r#"state=" veryHidden ""#, visible_row),
+            ("", r#"<row r="1" hidden='1'><c r="A1"><v>1</v></c></row>"#),
+            (
+                "",
+                r#"<row r="1" hidden=" true"><c r="A1"><v>1</v></c></row>"#,
+            ),
+            (
+                "",
+                r#"<row r="1" ht="0" customHeight="1"><c r="A1"><v>1</v></c></row>"#,
+            ),
+        ] {
+            assert!(
+                with_sheet(sheet, rows).unwrap().hidden_content,
+                "{sheet} {rows}"
+            );
+        }
+        for rows in [
+            r#"<row r="1"><c r="A1"><f>1+1</f><!--<v>2</v>--></c></row>"#,
+            r#"<row r="1"><c r="A1"><f>1+1</f></c ></row>"#,
+            r#"<row r="1"><x:c xmlns:x="urn:x" r="A1"><x:f>1+1</x:f></x:c></row>"#,
+        ] {
+            assert!(
+                with_sheet("", rows).unwrap().missing_formula_cache,
+                "{rows}"
+            );
+        }
+        let cached =
+            with_sheet("", r#"<row r="1"><c r="A1"><f>1+1</f><v>2</v></c></row>"#).unwrap();
+        assert!(!cached.missing_formula_cache && !cached.hidden_content);
+        // Hidden defined names, which Excel adds for filters, hide nothing.
+        let workbook = format!(
+            r#"<workbook xmlns:r="{REL_NS}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" hidden="1">Data!$A$1</definedName></definedNames></workbook>"#
+        );
+        let bytes = zip_entries(&[
+            ("[Content_Types].xml", XLSX_TYPES),
+            ("xl/workbook.xml", workbook.as_bytes()),
+        ]);
+        assert!(
+            !preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx)
+                .unwrap()
+                .hidden_content
+        );
+
+        // A workbook part that is not XML goes to AnyDoc's binary reader.
+        let bytes = zip_entries(&[
+            ("[Content_Types].xml", XLSX_TYPES),
+            ("xl/workbook.xml", b"\x81\x01\x00\x83\x01\x00"),
+        ]);
+        assert!(matches!(
+            preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
+            Err(DocumentError::Unsupported)
+        ));
+        assert!(anydoc_workbook_is_xml(b"\xEF\xBB\xBF \n<workbook/>"));
+        assert!(anydoc_workbook_is_xml(&utf16("<workbook/>", true)));
+    }
+
+    #[test]
+    fn odf_checks_follow_the_body_anydoc_converts() {
+        const OFFICE: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0""#;
+        let content = |styles: &str, body: &str| {
+            format!(
+                "<office:document-content {OFFICE}><office:automatic-styles>{styles}</office:automatic-styles><office:body>{body}</office:body></office:document-content>"
+            )
+            .into_bytes()
+        };
+        // AnyDoc converts a text body first, whatever the mimetype says.
+        let text_first = content(
+            "",
+            "<office:text><text:p>Text</text:p></office:text><office:spreadsheet><table:table><table:table-row><table:table-cell/></table:table-row></table:table></office:spreadsheet>",
+        );
+        assert!(
+            preflight_package(
+                &ods_package(&text_first, &[]),
+                DocumentKind::Ods,
+                DocumentVariant::Ods
+            )
+            .unwrap()
+            .missing_required_content
+        );
+        let text_body = content("", "<office:text><text:p>Text</text:p></office:text>");
+        assert!(
+            preflight_package(
+                &odp_package(&text_body, &[]),
+                DocumentKind::Odp,
+                DocumentVariant::Odp
+            )
+            .unwrap()
+            .missing_required_content
+        );
+
+        // LibreOffice hides a slide through its drawing-page style, defined
+        // in either part.
+        let page = r#"<office:presentation><draw:page draw:name="One" draw:style-name="dp9"><draw:frame><draw:text-box><text:p>Hidden</text:p></draw:text-box></draw:frame></draw:page></office:presentation>"#;
+        let hidden_style = r#"<style:style style:name="dp9" style:family="drawing-page"><style:drawing-page-properties presentation:visibility="hidden"/></style:style>"#;
+        let odp = |styles: &str, extra: &[(&str, &[u8])]| {
+            preflight_package(
+                &odp_package(&content(styles, page), extra),
+                DocumentKind::Odp,
+                DocumentVariant::Odp,
+            )
+            .unwrap()
+            .hidden_content
+        };
+        assert!(odp(hidden_style, &[]));
+        let styles_part = format!(
+            "<office:document-styles {OFFICE}><office:styles>{hidden_style}</office:styles></office:document-styles>"
+        );
+        assert!(odp("", &[("styles.xml", styles_part.as_bytes())]));
+        assert!(!odp(
+            r#"<style:style style:name="dp9" style:family="drawing-page"><style:drawing-page-properties presentation:visibility="visible"/></style:style>"#,
+            &[]
+        ));
+
+        // A namespace declaration cannot shadow the attribute that hides a row.
+        let ods = content(
+            "",
+            r#"<office:spreadsheet><table:table><table:table-row xmlns:visibility="urn:decoy" table:visibility="collapse"><table:table-cell office:value-type="string"><text:p>Hidden</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet>"#,
+        );
+        assert!(
+            preflight_package(
+                &ods_package(&ods, &[]),
+                DocumentKind::Ods,
+                DocumentVariant::Ods
+            )
+            .unwrap()
+            .hidden_content
+        );
+        // Values are decoded before they are compared.
+        let odt = content(
+            "",
+            r#"<office:text><text:p text:display="&#110;one">Hidden</text:p></office:text>"#,
+        );
+        assert!(
+            preflight_package(
+                &odt_package(&odt, &[]),
+                DocumentKind::Odt,
+                DocumentVariant::Odt
+            )
+            .unwrap()
+            .hidden_content
+        );
+    }
+
+    #[test]
+    fn docx_checks_follow_anydocs_walker() {
+        const VML: &str = r#"xmlns:v="urn:schemas-microsoft-com:vml""#;
+        const MC: &str =
+            r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+        let dropped = |body: &str| {
+            let document = format!(
+                "<w:document {WORD_NS} {VML} {MC} xmlns:x=\"urn:x\"><w:body>{body}</w:body></w:document>"
+            );
+            docx_preflight(&[("word/document.xml", document.as_bytes())]).unsupported_content
+        };
+        let symbol = r#"<w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p>"#;
+        let text_box = |inner: &str| {
+            format!("<w:p><w:r><w:pict><v:shape>{inner}</v:shape></w:pict></w:r></w:p>")
+        };
+        // Inside a drawing AnyDoc searches every wrapper for text boxes, so a
+        // deletion or foreign element there hides nothing.
+        assert!(dropped(&text_box(&format!(
+            "<x:del><v:textbox><w:txbxContent>{symbol}</w:txbxContent></v:textbox></x:del>"
+        ))));
+        assert!(dropped(&text_box(&format!(
+            "<w:del><v:textbox><w:txbxContent>{symbol}</w:txbxContent></v:textbox></w:del>"
+        ))));
+        // A deletion around the drawing, or the fallback branch AnyDoc skips
+        // while searching, does hide it.
+        assert!(!dropped(&format!(
+            "<w:p><w:del><w:r><w:pict><v:shape><v:textbox><w:txbxContent>{symbol}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:del></w:p>"
+        )));
+        assert!(!dropped(&format!(
+            "<w:p><w:r><w:drawing><mc:AlternateContent><mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent>{symbol}</w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:drawing></w:r></w:p>"
+        )));
+        // A deletion in a foreign namespace is not WordprocessingML's.
+        assert!(dropped(
+            r#"<w:p><x:del><w:r><w:sym w:char="F0FE"/></w:r></x:del></w:p>"#
+        ));
+        // AnyDoc reads only a table's direct rows.
+        let row = "<w:tr><w:tc><w:p><w:r><w:t>Row</w:t></w:r></w:p></w:tc></w:tr>";
+        assert!(dropped(&format!(
+            "<w:tbl>{row}<w:sdt><w:sdtContent>{row}</w:sdtContent></w:sdt></w:tbl>"
+        )));
+        assert!(dropped(&format!(
+            "<w:tbl>{row}<w:customXml>{row}</w:customXml></w:tbl>"
+        )));
+        assert!(!dropped(&format!("<w:tbl>{row}{row}</w:tbl>")));
+
+        // Run properties apply through a markup-compatibility branch.
+        let document = format!(
+            "<w:document {WORD_NS} {MC}><w:body><w:p><w:r><mc:AlternateContent><mc:Choice Requires=\"w14\"><w:rPr><w:vanish/></w:rPr></mc:Choice></mc:AlternateContent><w:t>Hidden</w:t></w:r></w:p></w:body></w:document>"
+        );
+        assert!(docx_preflight(&[("word/document.xml", document.as_bytes())]).hidden_content);
+    }
+
+    #[test]
+    fn docx_numbering_and_embedded_objects_are_checked() {
+        let body = word_part(
+            "document",
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#,
+        );
+        let numbering = |level_properties: &str| {
+            format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:lvlText w:val="%1."/><w:rPr>{level_properties}</w:rPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            )
+        };
+        let with_numbering = |numbering: &str, styles: &str| {
+            let styles = format!("<w:styles {WORD_NS}>{styles}</w:styles>");
+            docx_preflight(&[
+                ("word/document.xml", &body),
+                ("word/numbering.xml", numbering.as_bytes()),
+                ("word/styles.xml", styles.as_bytes()),
+            ])
+            .hidden_content
+        };
+        assert!(with_numbering(&numbering("<w:vanish/>"), ""));
+        assert!(with_numbering(
+            &numbering(r#"<w:rStyle w:val="Quiet"/>"#),
+            r#"<w:style w:type="character" w:styleId="Quiet"><w:rPr><w:vanish/></w:rPr></w:style>"#
+        ));
+        assert!(!with_numbering(&numbering("<w:b/>"), ""));
+
+        // An embedded object is found by its relationship type, whatever
+        // the part is called.
+        let rels = format!(
+            r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rIdOle" Type="{REL_NS}/oleObject" Target="data.bin"/></Relationships>"#
+        );
+        let preflight = docx_preflight(&[
+            ("word/document.xml", &body),
+            ("word/_rels/document.xml.rels", rels.as_bytes()),
+            ("word/data.bin", b"ole"),
+        ]);
+        assert!(preflight.active_content);
+        assert!(ooxml_active_relationship(
+            "http://schemas.microsoft.com/office/2006/relationships/vbaProject"
+        ));
+        assert!(!ooxml_active_relationship(&format!("{REL_NS}/image")));
+    }
+
+    #[test]
+    fn epub_checks_read_every_stylesheet_the_chapter_applies() {
+        let chapter = |head: &str, body: &str| {
+            format!(
+                r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head>{head}</head><body><h1>Chapter One</h1>{body}<img src="../images/logo.png" alt="logo"/></body></html>"#
+            )
+            .into_bytes()
+        };
+        let hidden = |head: &str, body: &str, extra: &[(&str, &[u8])]| {
+            let mut entries: Vec<(&str, &[u8])> = vec![("OPS/images/logo.png", b"png")];
+            entries.extend_from_slice(extra);
+            preflight_package(
+                &epub_package(&chapter(head, body), Some(EPUB_CHAPTER_TWO), &entries),
+                DocumentKind::Epub,
+                DocumentVariant::Epub,
+            )
+            .unwrap()
+            .hidden_content
+        };
+        for body in [
+            r#"<p style="display: none">Hidden</p>"#,
+            r#"<p style="display&#58;none">Hidden</p>"#,
+            r#"<p style="VISIBILITY : Hidden !important">Hidden</p>"#,
+        ] {
+            assert!(hidden("", body, &[]), "{body}");
+        }
+        let marked = r#"<p class="note h">Hidden</p>"#;
+        assert!(hidden(
+            "<style>.h { visibility: hidden }</style>",
+            marked,
+            &[]
+        ));
+        assert!(hidden(
+            "<style>@media screen { p.h { display : none } }</style>",
+            marked,
+            &[]
+        ));
+        // Rules that match no element, or style generated content, hide
+        // nothing in the chapter.
+        assert!(!hidden(
+            "<style>.unused { display: none }</style>",
+            marked,
+            &[]
+        ));
+        assert!(!hidden(
+            "<style>p::before { display: none }</style>",
+            marked,
+            &[]
+        ));
+        // Linked sheets, and the local sheets they import, are read too.
+        let link = r#"<link rel="stylesheet" href="../Styles/main.css"/>"#;
+        assert!(hidden(
+            link,
+            marked,
+            &[("OPS/Styles/main.css", b"/* x */ .h{visibility:collapse}")]
+        ));
+        assert!(hidden(
+            link,
+            marked,
+            &[
+                ("OPS/Styles/main.css", b"@import url(\"more.css\");"),
+                ("OPS/Styles/more.css", b"p.h { display: none; }"),
+            ]
+        ));
+        assert!(!hidden(
+            link,
+            marked,
+            &[("OPS/Styles/main.css", b".h { color: gray }")]
         ));
     }
 

@@ -125,6 +125,9 @@ assert the local result.
 | Imported chunks (`w:altChunk`) that Word merges on opening are dropped | `incomplete_conversion` | `docx/alt-chunk.docx` |
 | A non-breaking hyphen (`w:noBreakHyphen`) is dropped, joining "1040‑SR" into "1040SR" | `completeness: partial` with the `characters_omitted` warning | `docx/non-breaking-hyphen.docx` |
 | One long `formatCode` amplifies into hundreds of MiB | `resource_limit` before conversion | `xlsx/oversized-number-format.xlsx` |
+| Binary workbook records in `xl/workbook.xml` go to the XLSB reader | `unsupported` | `xlsx/binary-workbook.xlsx` |
+| Namespace declarations are bindings, not attributes: `xmlns:Type` shadowed a relationship type for a name-only reader | `malformed` | `docx/namespace-shadowed-main.docx` |
+| `visibility: hidden` from a linked stylesheet is ignored and the text converted | `incomplete_conversion` | `epub/linked-css-hidden.epub` |
 | A UTF-16 part is transcoded before parsing, so a byte-level check misses it | checks read the transcoded text: `incomplete_conversion` | `docx/utf16-footnote-symbol.docx` |
 | Hidden text through a style in a UTF-16 styles part | disclosed with `hidden_content_preserved` | `docx/utf16-hidden-style.docx` |
 | `path::resolve` drops a fragment before applying `..`, so a slide target can leave `ppt/slides/` | `incomplete_conversion` | `pptx/fragment-slide-target.pptx` |
@@ -177,9 +180,14 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 171 tests pass (126 skillkit unit, 12
-  skillkit integration, 25 document-tool and 5 PDF-tool MCP integration, 3
+- `cargo test --workspace --locked`: 182 tests pass (134 skillkit unit, 13
+  skillkit integration, 26 document-tool and 6 PDF-tool MCP integration, 3
   MCP unit)
+- A third review round reproduced 43 packages that passed the checks while
+  AnyDoc converted refused or undisclosed content, and a regression that
+  refused decks using PowerPoint Sections. All 43 now fail closed or are
+  disclosed, and 34 producer-shaped packages (Word, Excel, PowerPoint,
+  LibreOffice, Sigil, and Calibre layouts) convert as before
 - `bash scripts/check-public-hygiene.sh`
 - Golden comparison of every tool over the public corpus against the previous
   review build: 113 calls, no changed output, identical tool list

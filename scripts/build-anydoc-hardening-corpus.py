@@ -38,6 +38,17 @@ must not inherit (see docs/upstream-drift-audit-2026-09-24.md):
 - pptx/case-variant-presentation-rels.pptx: a decoy
   `PPT/_rels/presentation.xml.rels` beside the relationships part AnyDoc reads
   by exact name. Expected `incomplete_conversion`.
+- docx/namespace-shadowed-main.docx: a root relationship whose `xmlns:Type`
+  declaration shadowed its officeDocument type for a name-only reader, so a
+  checked decoy stood in for the main part AnyDoc converts. Expected
+  `malformed`.
+- xlsx/binary-workbook.xlsx: `xl/workbook.xml` holding binary records, which
+  AnyDoc reads with its XLSB reader. Expected `unsupported`.
+- pptx/section-list.pptx: a clean deck with a PowerPoint section list, whose
+  `p14:sldId` entries are not slides. Expected complete conversion.
+- epub/linked-css-hidden.epub: a chapter whose linked stylesheet hides a
+  paragraph with `visibility: hidden`, which AnyDoc converts as visible
+  text. Expected `incomplete_conversion`.
 - epub/encoded-chapter-href.epub: a spine href AnyDoc percent-decodes to a
   chapter with hidden text, beside a clean decoy stored under the encoded
   name. Expected `incomplete_conversion`.
@@ -110,7 +121,7 @@ def presentation_rels(target):
     )
 
 
-def write_pptx(name, entries):
+def write_pptx(name, entries, presentation_extra="", hidden_decoy=True):
     types = (
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
@@ -126,18 +137,51 @@ def write_pptx(name, entries):
     )
     presentation = (
         f"<p:presentation {PRESENTATION_NS}><p:sldIdLst>"
-        '<p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>'
+        '<p:sldId id="256" r:id="rId2"/></p:sldIdLst>'
+        f"{presentation_extra}</p:presentation>"
+    )
+    base = [
+        ("[Content_Types].xml", types),
+        ("_rels/.rels", root),
+        ("ppt/presentation.xml", presentation),
+        ("ppt/slides/slide1.xml", slide("DECOY-SLIDE" if hidden_decoy else "SECTION-SLIDE")),
+    ]
+    if hidden_decoy:
+        base.append(("other/slide.xml", slide("HIDDEN-SLIDE-TEXT", hidden=True)))
+    write_package(CORPUS / "pptx" / name, base + entries)
+
+
+def write_epub(name, opf_manifest, spine, nav_href, parts):
+    xhtml = 'xmlns="http://www.w3.org/1999/xhtml"'
+    container = (
+        '<?xml version="1.0"?><container version="1.0" '
+        'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+        '<rootfile full-path="OPS/package.opf" media-type="application/oebps-package+xml"/>'
+        "</rootfiles></container>"
+    )
+    opf = (
+        '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
+        'unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<dc:identifier id="id">urn:uuid:00000000-0000-4000-8000-000000000000</dc:identifier>'
+        f"<dc:title>Hardening</dc:title><dc:language>en</dc:language></metadata><manifest>"
+        f'{opf_manifest}<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
+        f"</manifest><spine>{spine}</spine></package>"
+    )
+    nav = (
+        f'<?xml version="1.0"?><html {xhtml}><head><title>Contents</title></head><body>'
+        '<nav xmlns:epub="http://www.idpf.org/2007/ops" epub:type="toc"><ol>'
+        f'<li><a href="{nav_href}">One</a></li></ol></nav></body></html>'
     )
     write_package(
-        CORPUS / "pptx" / name,
+        CORPUS / "epub" / name,
         [
-            ("[Content_Types].xml", types),
-            ("_rels/.rels", root),
-            ("ppt/presentation.xml", presentation),
-            ("ppt/slides/slide1.xml", slide("DECOY-SLIDE")),
-            ("other/slide.xml", slide("HIDDEN-SLIDE-TEXT", hidden=True)),
+            ("mimetype", "application/epub+zip"),
+            ("META-INF/container.xml", container),
+            ("OPS/package.opf", opf),
+            ("OPS/nav.xhtml", nav),
         ]
-        + entries,
+        + parts,
+        stored={"mimetype"},
     )
 
 
@@ -189,7 +233,7 @@ def paragraph(text):
     return f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
 
 
-def write_docx(name, body, document_rels=None, parts=()):
+def write_docx(name, body, document_rels=None, parts=(), root_rels=DOCX_ROOT_RELS):
     document = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f"<w:document {WORD_NS}><w:body>"
@@ -200,7 +244,7 @@ def write_docx(name, body, document_rels=None, parts=()):
     )
     entries = [
         ("[Content_Types].xml", DOCX_TYPES),
-        ("_rels/.rels", DOCX_ROOT_RELS),
+        ("_rels/.rels", root_rels),
         ("word/document.xml", document),
     ]
     if document_rels is not None:
@@ -285,6 +329,25 @@ def write_oversized_number_format():
     write_package(CORPUS / "xlsx" / "oversized-number-format.xlsx", patched)
 
 
+def write_binary_workbook():
+    source = CORPUS / "xlsx" / "public-workpaper.xlsx"
+    with ZipFile(source) as archive:
+        entries = [
+            (info.filename, archive.read(info))
+            for info in archive.infolist()
+            if not info.filename.endswith("/")
+        ]
+    # BrtBeginBook and BrtEndBook records: a binary workbook stream.
+    binary = bytes([0x83, 0x01, 0x00, 0x84, 0x01, 0x00])
+    write_package(
+        CORPUS / "xlsx" / "binary-workbook.xlsx",
+        [
+            (filename, binary if filename == "xl/workbook.xml" else data)
+            for filename, data in entries
+        ],
+    )
+
+
 def main():
     write_docx(
         "symbol-checkbox.docx",
@@ -342,6 +405,57 @@ def main():
         ],
     )
     write_encoded_chapter_epub()
+    xhtml = 'xmlns="http://www.w3.org/1999/xhtml"'
+    write_epub(
+        "linked-css-hidden.epub",
+        '<item id="ch1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/>'
+        '<item id="css" href="Styles/main.css" media-type="text/css"/>',
+        '<itemref idref="ch1"/>',
+        "Text/ch1.xhtml",
+        [
+            (
+                "OPS/Text/ch1.xhtml",
+                f'<?xml version="1.0"?><html {xhtml}><head><title>Chapter</title>'
+                '<link rel="stylesheet" type="text/css" href="../Styles/main.css"/></head>'
+                '<body><p>VISIBLE-CHAPTER</p><p class="note">HIDDEN-CSS-TEXT</p></body></html>',
+            ),
+            ("OPS/Styles/main.css", "p { margin: 0 }\n.note { visibility: hidden; }\n"),
+        ],
+    )
+    write_pptx(
+        "section-list.pptx",
+        [("ppt/_rels/presentation.xml.rels", presentation_rels("slides/slide1.xml"))],
+        presentation_extra=(
+            '<p:extLst><p:ext uri="{521415D9-36F7-43E2-AB2F-B90AF26B5E84}">'
+            '<p14:sectionLst xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main">'
+            '<p14:section name="Opening" id="{00000000-0000-4000-8000-000000000001}">'
+            '<p14:sldIdLst><p14:sldId id="256"/></p14:sldIdLst></p14:section>'
+            "</p14:sectionLst></p:ext></p:extLst>"
+        ),
+        hidden_decoy=False,
+    )
+    write_docx(
+        "namespace-shadowed-main.docx",
+        paragraph("DECOY-MAIN"),
+        parts=[
+            (
+                "word/other.xml",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f"<w:document {WORD_NS}><w:body>"
+                '<w:p><w:r><w:sym w:font="Wingdings" w:char="F0FE"/></w:r>'
+                "<w:r><w:t xml:space=\"preserve\"> OTHER-MAIN-ANSWER</w:t></w:r></w:p>"
+                "<w:sectPr/></w:body></w:document>",
+            )
+        ],
+        root_rels=(
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{RELS_NS}">'
+            '<Relationship xmlns:Type="urn:example:decoy" Id="rId1" '
+            f'Type="{REL_TYPE}/officeDocument" Target="word/other.xml"/>'
+            "</Relationships>"
+        ),
+    )
+    write_binary_workbook()
     write_docx(
         "non-breaking-hyphen.docx",
         '<w:p><w:r><w:t xml:space="preserve">FORM 1040</w:t><w:noBreakHyphen/>'

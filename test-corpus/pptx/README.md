@@ -21,3 +21,6 @@ the slide AnyDoc converts is the slide the boundary checked, and must return
   hides a `..` from AnyDoc's resolver.
 - `case-variant-presentation-rels.pptx` adds a decoy
   `PPT/_rels/presentation.xml.rels` beside the part AnyDoc reads.
+
+`section-list.pptx`, from the same generator, is a clean deck with a PowerPoint
+section list and must convert: section entries (`p14:sldId`) are not slides.

@@ -266,6 +266,7 @@ came back clean. The evidence and dispositions are in
 | Review 1–2 | Make every preflight check read what AnyDoc reads: its transcoding, its reference resolution, its exact part names | Five decoy fixtures that converted as complete with no warning now fail closed or disclose |
 | 6 | DOCX inline content: refuse ruby text and imported chunks; report dropped non-breaking hyphens as `partial` with a warning | Three fixtures; the DOCX lane emits `partial` for the first time |
 | 7 | Optional region `frame` (`sheet` default, `display` for rendered-page boxes) from pdf-inspector 1.24 | A generated `/Rotate 90` page: each frame's rectangle finds the text only in that frame |
+| Review 3 | Parse what the checks look for, in every lane, as AnyDoc reads it: namespace declarations, decoded values, CSS, drawing-page styles, walker positions, binary workbooks | 43 reproduced bypasses now fail closed or are disclosed; the Sections regression is fixed; a quadratic slide match is linear |
 
 ## Next slices
 
@@ -279,7 +280,12 @@ came back clean. The evidence and dispositions are in
 2. **Next AnyDoc release.** Follow the adoption checklist in the drift audit:
    non-exhaustive `Format` arms, the four Wingdings codes from #177, and a
    re-check of the ported `to_utf8` and `path::resolve`.
-3. **Non-Linux containment.** PDF and document parsing still lack a memory
+3. **External hyperlinks outside DOCX.** PPTX, XLSX, and EPUB refuse any
+   external relationship, including an ordinary hyperlink, while DOCX converts
+   and removes the destination with a warning. Hyperlink relationships could
+   follow the DOCX policy, since the sanitizer already removes their
+   destinations. This is a policy change for the owners to decide.
+4. **Non-Linux containment.** PDF and document parsing still lack a memory
    ceiling on macOS and fall back to in-process parsing where no sandbox
    exists; filesystem isolation remains open on every platform.
 

@@ -50,6 +50,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   officeDocument relationship must name the checked part. Each hidden-content
   or dropped-content decoy found in review converted as complete before this
   change and now fails closed or is disclosed.
+- Package checks read markup as AnyDoc does. Namespace declarations are not
+  attributes: `xmlns:Target` can no longer shadow `Target`. Every attribute is
+  decoded before comparison.
+- XLSX hidden-sheet, hidden-row, and cached-formula checks parse the XML and
+  also treat zero-size rows and columns as hidden. Binary workbook records in
+  `xl/workbook.xml` are refused as `unsupported`. Hidden defined names, which
+  Excel adds for filters, no longer refuse a workbook.
+- PPTX hidden slides and hidden shapes (`cNvPr hidden`) are parsed rather than
+  matched as text, and speaker notes are checked. ODP slides hidden through a
+  drawing-page style are refused. An ODF package whose body belongs to another
+  lane than its mimetype reports missing content.
+- DOCX: only WordprocessingML deletions exempt content, and only where
+  AnyDoc's walker skips them; a deletion inside a drawing does not hide a text
+  box. Table rows wrapped in content controls or custom XML are refused.
+  Hidden list labels in the numbering part are disclosed. Run properties inside
+  `mc:AlternateContent` are read. Embedded objects are found by relationship
+  type, whatever their part name.
+- EPUB hiding is evaluated in inline styles, `<style>` elements, linked
+  stylesheets, and their local imports. Both `display: none` and
+  `visibility: hidden`/`collapse` count, as AnyDoc's declaration parser reads
+  them.
 - A PDF page-content bomb that still peaks at 2.1 GiB in-process under
   `pdf-inspector` 1.24.0 now returns `resource_limit` from the worker.
 - Replaced the yanked `chacha20` 0.10.0 with 0.10.2.
@@ -78,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `parse_irc_sections` reads the Markdown pdf-inspector renders. It returns
   full provision labels such as `(d)(2)(A)(i)`, flags repealed sections, and
   keeps editorial and statutory notes apart from the operative text.
-- `scripts/build-anydoc-hardening-corpus.py` and thirteen synthetic fixtures that
+- `scripts/build-anydoc-hardening-corpus.py` and seventeen synthetic fixtures that
   reproduce pinned-AnyDoc behaviors the local contract does not inherit.
 - `docs/upstream-drift-audit-2026-09-24.md`: the upstream refresh audit and the
   disposition of each open AnyDoc pull request.
@@ -97,7 +118,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependabot weekly cargo + actions updates
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
+### Fixed
+- Decks using PowerPoint Sections convert again. Section entries
+  (`p14:sldId`) were read as slides without relationships, which refused the
+  deck as incomplete.
+- Matching slides to relationships is a single pass; a crafted deck had made
+  it quadratic.
+
 ### Known limitations
+- The DOCX checks keep at most 16,384 styles and 1,024-byte style ids per
+  document and return `resource_limit` beyond them; a styles part that must be
+  transcoded is checked in memory up to 4 MiB.
+- PPTX, XLSX, and EPUB refuse external hyperlinks as incomplete, where DOCX
+  converts them with a warning and removes the destination.
 - `parse_irc_sections` reads U.S. Code Title 26 structure; Treasury Regulation
   numbering (`§ 1.401(k)-1`) is not parsed.
 - `identify_tax_form`: bank-direct 1099-INTs that render as numeric tables only return `Unknown` (no header text in markdown)

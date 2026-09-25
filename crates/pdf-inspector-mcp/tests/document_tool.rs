@@ -569,6 +569,10 @@ fn strict_epub_negative_fixtures_fail_closed() {
     for (name, expected_code) in [
         ("missing-spine-chapter.epub", "incomplete_conversion"),
         ("malformed-spine-chapter.epub", "incomplete_conversion"),
+        // From scripts/build-anydoc-hardening-corpus.py: content only
+        // AnyDoc's own reading finds.
+        ("encoded-chapter-href.epub", "incomplete_conversion"),
+        ("linked-css-hidden.epub", "incomplete_conversion"),
         ("nav-spine-mismatch.epub", "incomplete_conversion"),
         ("missing-local-resource.epub", "incomplete_conversion"),
         ("external-reference.epub", "incomplete_conversion"),
@@ -1277,7 +1281,8 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
             "pptx/case-variant-presentation-rels.pptx",
             "incomplete_conversion",
         ),
-        ("epub/encoded-chapter-href.epub", "incomplete_conversion"),
+        ("docx/namespace-shadowed-main.docx", "malformed"),
+        ("xlsx/binary-workbook.xlsx", "unsupported"),
         ("xlsx/oversized-number-format.xlsx", "resource_limit"),
     ] {
         let fixture = format!(
@@ -1336,6 +1341,19 @@ fn docx_hidden_text_is_converted_and_disclosed() {
             "{fixture}"
         );
     }
+}
+
+#[test]
+fn pptx_section_lists_are_not_slides() {
+    let fixture = format!(
+        "{}/../../test-corpus/pptx/section-list.pptx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "pptx-sections-integration-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    assert!(document["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("SECTION-SLIDE")));
 }
 
 #[test]

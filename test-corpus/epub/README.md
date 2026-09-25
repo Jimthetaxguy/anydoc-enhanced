@@ -42,9 +42,11 @@ content. The overlapping `active-content.epub`, `hidden-content.epub`, and
 `encrypted.epub` names now refer to the generator-backed qualification
 fixtures, so their earlier hashes are not listed as separate artifacts.
 
-The directory therefore contains fifteen packages: ten generated
+The directory therefore contains sixteen packages: ten generated
 qualification fixtures, four retained low-level fixtures, and
-`encoded-chapter-href.epub` from `scripts/build-anydoc-hardening-corpus.py`.
+`encoded-chapter-href.epub` and `linked-css-hidden.epub` from
+`scripts/build-anydoc-hardening-corpus.py`. The second hides a paragraph
+through a linked stylesheet and must return `incomplete_conversion`.
 That package's spine href percent-decodes, as AnyDoc resolves it, to a chapter
 with hidden text beside a clean decoy stored under the encoded name; it must
 return `incomplete_conversion`. Its hash is recorded in the corpus index.
