@@ -7146,6 +7146,21 @@ impl Cascade {
                 }
             }
         }
+        // The quote marks a reader's own rules put around a `q` (HTML's
+        // rendering section), which author rules may replace.
+        if element.lower == "q" {
+            let user_agent = Precedence {
+                tier: TIER_USER_AGENT,
+                layer: 0,
+                specificity: (0, 0, 0),
+                proximity: 0,
+                order: 0,
+            };
+            for (styled, content) in pseudo_styled.iter_mut().zip(&mut pseudo_content) {
+                *styled = true;
+                content.push((user_agent, Applies::Yes, Some(Generated::Ornament)));
+            }
+        }
         for (prefixed, declaration) in element.inline_style(work)? {
             if declaration.property.spaces() {
                 continue;
@@ -9818,7 +9833,7 @@ pub(super) fn chapter_text(
             || (anydoc_hidden && (reach == Reach::Omitted || matches!(local.as_str(), "br" | "hr")))
             || (parent_reach == Some(Reach::Walk)
                 && matches!(local.as_str(), "br" | "img" | "image"))
-            || (reach != Reach::Dropped && reader.styles_pseudo_boxes())
+            || (reach != Reach::Dropped && (reader.styles_pseudo_boxes() || local == "q"))
             || !references.is_empty()
         {
             let tree = Tree {
@@ -12031,6 +12046,18 @@ mod tests {
         ] {
             assert!(!drops_shown(&[sheets], body), "{sheets} {body}");
         }
+    }
+
+    #[test]
+    fn a_readers_own_quote_marks_keep_digits_apart() {
+        // A reader sets quote marks around a `q`, between the digits before
+        // it and those in it, where AnyDoc sets none, unless a rule takes
+        // them away.
+        let quoted = "<p>In 2023<q>15 cases</q> closed.</p>";
+        assert!(drops_shown(&[], quoted));
+        assert!(drops_shown(&[], "<p>Filed 12<q/>50 times.</p>"));
+        assert!(!drops_shown(&["q::before { content: none }"], quoted));
+        assert!(!drops_shown(&[], "<p>In 2023 <q>15 cases</q> closed.</p>"));
     }
 
     #[test]
