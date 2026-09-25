@@ -988,6 +988,9 @@ struct WorksheetScan {
     /// The style index and value class of each cell AnyDoc renders, to be
     /// checked against the workbook's number formats.
     format_uses: HashSet<(u32, xlsx_numfmt::CellClass)>,
+    /// The largest negative value each style meets, the only negative of the
+    /// style kept in `format_uses`.
+    largest_negative: HashMap<u32, f64>,
     /// More distinct uses than a workbook can hold.
     too_many_formats: bool,
 }
@@ -1057,12 +1060,28 @@ impl FormulaCandidate {
 impl WorksheetScan {
     fn close_cell(&mut self, cell: &FormulaCandidate) {
         self.uncached_formula |= cell.formula && !cell.renders();
-        if let Some(format_use) = cell.format_use() {
-            if self.format_uses.len() < MAX_FORMAT_USES {
-                self.format_uses.insert(format_use);
-            } else if !self.format_uses.contains(&format_use) {
-                self.too_many_formats = true;
+        let Some(format_use) = cell.format_use() else {
+            return;
+        };
+        // A larger negative value shows at least as much of its format as a
+        // smaller one, so each style's largest is checked for them all.
+        if let (style, xlsx_numfmt::CellClass::Negative { magnitude }) = format_use {
+            match self.largest_negative.get(&style) {
+                Some(&largest) if largest >= magnitude => return,
+                Some(&largest) => {
+                    self.format_uses.remove(&(
+                        style,
+                        xlsx_numfmt::CellClass::Negative { magnitude: largest },
+                    ));
+                }
+                None => {}
             }
+            self.largest_negative.insert(style, magnitude);
+        }
+        if self.format_uses.len() < MAX_FORMAT_USES {
+            self.format_uses.insert(format_use);
+        } else if !self.format_uses.contains(&format_use) {
+            self.too_many_formats = true;
         }
     }
 }
@@ -11644,6 +11663,17 @@ mod tests {
         assert!(!workbook(r#"<c r="A1" s="0"><v>-1234</v></c>"#, red).unsupported_content);
         let parens = r#"#,##0;[Red]\(#,##0\)"#;
         assert!(!workbook(r#"<c r="A1" s="1"><v>-1234</v></c>"#, parens).unsupported_content);
+        // A style's largest negative value decides for all of them: a
+        // residue showing as zero halves passes alone, not beside a value
+        // that shows without its sign.
+        let halves = "# ?/2;[Red]# ?/2";
+        assert!(!workbook(r#"<c r="A1" s="1"><v>-0.2</v></c>"#, halves).unsupported_content);
+        for cells in [
+            r#"<c r="A1" s="1"><v>-0.2</v></c><c r="B1" s="1"><v>-0.7</v></c>"#,
+            r#"<c r="A1" s="1"><v>-0.7</v></c><c r="B1" s="1"><v>-0.2</v></c>"#,
+        ] {
+            assert!(workbook(cells, halves).unsupported_content, "{cells}");
+        }
         // A value a format hides is hidden content; a hidden zero is not.
         let hide = ";;;";
         assert!(workbook(r#"<c r="A1" s="1"><v>98765</v></c>"#, hide).hidden_content);

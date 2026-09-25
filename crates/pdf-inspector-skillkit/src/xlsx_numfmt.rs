@@ -24,32 +24,58 @@
 //! is not needed and is not checked.
 
 /// How a cell's value meets its format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum CellClass {
-    /// A negative value, with the fewest decimals at which it shows a digit
-    /// other than zero: negative for a value of tens or more.
+    /// A negative value, by its magnitude. A larger one shows at least as
+    /// much of a format as a smaller one, so a style's largest stands for
+    /// them all.
     Negative {
-        shown_from: i8,
+        magnitude: f64,
     },
     Zero,
     Positive,
     Text,
 }
 
+impl PartialEq for CellClass {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CellClass::Negative { magnitude }, CellClass::Negative { magnitude: other }) => {
+                magnitude.to_bits() == other.to_bits()
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+impl Eq for CellClass {}
+
+impl std::hash::Hash for CellClass {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        if let CellClass::Negative { magnitude } = self {
+            magnitude.to_bits().hash(state);
+        }
+    }
+}
+
 impl CellClass {
     /// The class of a finite number.
     pub(super) fn of(number: f64) -> Self {
         if number < 0.0 {
-            // The fewest decimals `d` at which `|number| × 10^d` rounds away
-            // from zero.
-            let shown_from = (0.5 / number.abs()).log10().ceil().clamp(-99.0, 99.0) as i8;
-            CellClass::Negative { shown_from }
+            CellClass::Negative { magnitude: -number }
         } else if number > 0.0 {
             CellClass::Positive
         } else {
             CellClass::Zero
         }
     }
+}
+
+/// The fewest decimals `d` at which `magnitude × 10^d` rounds away from
+/// zero: negative for a value of tens or more.
+fn shown_from(magnitude: f64) -> i32 {
+    (0.5 / magnitude).log10().ceil().clamp(-99.0, 99.0) as i32
 }
 
 /// What converting a cell of some class through a format loses.
@@ -129,9 +155,11 @@ struct Section {
     /// A fraction (`# ?/?`), which shows a value too small for a digit
     /// before its point as a fraction ("1/4").
     fraction: bool,
-    /// The digits of its denominator: placeholders (`?/??` shows up to 99)
-    /// or a fixed number (`?/16`).
-    denominator_digits: i32,
+    /// The largest denominator a fraction shows: a fixed number (`?/16`),
+    /// or the largest its placeholders hold (99 for `?/??`).
+    denominator: f64,
+    /// Percent signs, each of which scales the value by a hundred.
+    percents: i32,
 }
 
 /// A format code as AnyDoc reads it.
@@ -210,8 +238,13 @@ fn parse_section(section: &str) -> Option<Section> {
     // The number's decimals, its trailing (scaling) commas, and percents.
     let (mut after_point, mut placeholders_after_point) = (false, 0i32);
     let (mut commas_after_digit, mut percents) = (0i32, 0i32);
-    // Whether the denominator of a fraction is being read.
-    let mut denominator = false;
+    // A fraction as AnyDoc reads one: a bar directly after an integer
+    // placeholder, then the denominator's placeholders, or a fixed number
+    // directly after the bar. The count of tokens read just after the last
+    // integer placeholder and after the bar: the same count later means
+    // nothing came between.
+    let (mut placeholder_end, mut bar_end) = (None, None);
+    let (mut denominator_places, mut fixed_denominator) = (0i32, None);
     let mut index = 0;
     while index < characters.len() {
         let character = characters[index];
@@ -288,10 +321,15 @@ fn parse_section(section: &str) -> Option<Section> {
             }
             '0' | '#' | '?' | '.' | ',' | '%' => {
                 digits |= matches!(character, '0' | '#' | '?' | '.');
-                if denominator && matches!(character, '0' | '#' | '?') {
-                    parsed.denominator_digits += 1;
-                } else {
-                    denominator = false;
+                let placeholder = matches!(character, '0' | '#' | '?');
+                if parsed.fraction {
+                    // Past the bar every placeholder is the denominator's;
+                    // a point, or a placeholder after a fixed denominator,
+                    // is rejected.
+                    if character == '.' || (placeholder && fixed_denominator.is_some()) {
+                        return None;
+                    }
+                    denominator_places += i32::from(placeholder);
                 }
                 match character {
                     '.' => after_point = true,
@@ -303,12 +341,18 @@ fn parse_section(section: &str) -> Option<Section> {
                     }
                 }
                 tokens += 1;
+                if placeholder && !after_point && !exponent && !parsed.fraction {
+                    placeholder_end = Some(tokens);
+                }
             }
             '@' => {
                 parsed.text = true;
                 tokens += 1;
             }
             'E' | 'e' if matches!(characters.get(index + 1), Some('+' | '-')) => {
+                if parsed.fraction {
+                    return None;
+                }
                 exponent = true;
                 parsed.exponent = true;
                 tokens += 1;
@@ -353,20 +397,32 @@ fn parse_section(section: &str) -> Option<Section> {
                 continue;
             }
             '1'..='9' => {
+                // Digits directly after the bar are a fixed denominator.
+                let fixed = bar_end == Some(tokens);
                 bare_digits = true;
                 tokens += 1;
-                while index < characters.len() && characters[index].is_ascii_digit() {
-                    parsed.denominator_digits += i32::from(denominator);
+                let start = index;
+                while characters.get(index).is_some_and(char::is_ascii_digit) {
                     index += 1;
+                }
+                if fixed {
+                    let number: String = characters[start..index].iter().collect();
+                    fixed_denominator = Some(number.parse::<u64>().ok()? as f64);
                 }
                 continue;
             }
             '$' | '-' | '+' | '(' | ')' | ':' | ' ' | '/' => {
-                tokens += 1;
                 parsed.sign |= matches!(character, '-' | '(' | ')');
-                denominator = character == '/' && (digits || bare_digits);
-                parsed.fraction |= denominator;
-                push_literal(&mut parsed.literal, &character.to_string());
+                // A slash directly after an integer placeholder is a
+                // fraction's bar, part of the number; any other is text the
+                // section shows.
+                if character == '/' && !parsed.fraction && placeholder_end == Some(tokens) {
+                    parsed.fraction = true;
+                    bar_end = Some(tokens + 1);
+                } else {
+                    push_literal(&mut parsed.literal, &character.to_string());
+                }
+                tokens += 1;
             }
             _ => return None,
         }
@@ -381,8 +437,14 @@ fn parse_section(section: &str) -> Option<Section> {
     if !general && !parsed.date && parsed.text && (digits || exponent || bare_digits) {
         return None;
     }
+    // A bar with no denominator after it is rejected.
+    if parsed.fraction && denominator_places == 0 && fixed_denominator.is_none() {
+        return None;
+    }
     parsed.empty = tokens == 0;
     parsed.decimals = placeholders_after_point + 2 * percents - 3 * commas_after_digit;
+    parsed.denominator = fixed_denominator.unwrap_or_else(|| 10f64.powi(denominator_places) - 1.0);
+    parsed.percents = percents;
     Some(parsed)
 }
 
@@ -521,15 +583,17 @@ pub(super) fn loss(id: u32, code: Option<&str>, class: CellClass) -> FormatLoss 
         _ => 2,
     };
     let section = &numeric_sections[index];
-    if let CellClass::Negative { shown_from } = class {
+    if let CellClass::Negative { magnitude } = class {
         // Too small to show a digit: a zero, however it is marked. A
         // fraction shows zero below half its smallest step, one over its
-        // largest denominator: a value too small for as many decimals as
-        // the denominator has digits.
+        // largest denominator, as AnyDoc rounds the numerator of the value
+        // its percent signs scale. AnyDoc also divides it by a thousand for
+        // each scaling comma, where LibreOffice shows the fraction unscaled
+        // (-0.2 in `# ?/?,` as 1/5), so the commas are left out.
         let zero = if section.fraction {
-            i32::from(shown_from) > section.denominator_digits
+            magnitude * 100f64.powi(section.percents) * section.denominator < 0.5
         } else {
-            !section.exponent && i32::from(shown_from) > section.decimals
+            !section.exponent && shown_from(magnitude) > section.decimals
         };
         if zero {
             return FormatLoss::default();
@@ -554,7 +618,7 @@ mod tests {
     use CellClass::{Positive, Text, Zero};
 
     /// A negative value that shows at any decimals.
-    const NEGATIVE: CellClass = CellClass::Negative { shown_from: 0 };
+    const NEGATIVE: CellClass = CellClass::Negative { magnitude: 2.0 };
 
     fn misrendered(code: &str, class: CellClass) -> bool {
         loss(164, Some(code), class).misrendered
@@ -620,18 +684,40 @@ mod tests {
             ("#,##0,;[Red]#,##0,", -600.0, true),
             ("0.00E+00;[Red]0.00E+00", -2.91e-11, true),
             // A fraction shows a quarter as "1/4", and zero below half its
-            // smallest step: 1/18 for one digit, 1/198 for two, 1/32 for
-            // sixteenths (where a value between a thousandth and that step
-            // is still taken as shown).
+            // smallest step: 1/18 for one digit, 1/198 for two, and for a
+            // fixed denominator, 1/4 for halves, 1/20 for tenths, 1/32 for
+            // sixteenths.
             ("# ?/?;[Red]# ?/?", -0.25, true),
             ("# ??/??;[Red]# ??/??", -0.25, true),
             ("# ?/?;[Red]# ?/?", -5.55e-17, false),
+            ("# ?/?;[Red]# ?/?", -0.052, false),
+            ("# ?/?;[Red]# ?/?", -0.06, true),
             ("?/?;[Red]?/?", -0.03, false),
             ("# ??/??;[Red]# ??/??", -0.004, false),
             ("# ??/??;[Red]# ??/??", -0.006, true),
             ("# ?/16;[Red]# ?/16", -0.001, false),
+            ("# ??/16;[Red]# ??/16", -0.03, false),
             ("# ?/16;[Red]# ?/16", -0.1, true),
+            ("# ?/2;[Red]# ?/2", -0.2, false),
+            ("# ?/2;[Red]# ?/2", -0.3, true),
+            ("# ?/10;[Red]# ?/10", -0.049, false),
+            ("# ?/10;[Red]# ?/10", -0.06, true),
             ("# ?/?;[Red]# ?/?", -1.5, true),
+            // Every placeholder past the bar is the denominator's: 2/67
+            // shows as "2/6 7".
+            ("# ?/? ?;[Red]# ?/? ?", -0.03, true),
+            // Percent signs scale the value; scaling commas are left out.
+            ("# ?/?%;[Red]# ?/?%", -0.004, true),
+            ("# ?/?%;[Red]# ?/?%", -0.0004, false),
+            ("# ?/?,;[Red]# ?/?,", -0.2, true),
+            // A fraction's bar is not text marking the section; a slash
+            // anywhere else is.
+            ("0.00;[Red]# ?/?", -0.2, true),
+            ("0.00;[Red]0/?", -0.25, true),
+            ("?*x/?;[Red]?*x/?", -0.25, true),
+            ("0.00;[Red]-# ?/?", -0.2, false),
+            ("0.00;[Red]0.0/0", -0.25, false),
+            ("?/?;[Red]?/?/", -0.25, false),
         ] {
             assert_eq!(
                 loss(164, Some(code), class(value)).misrendered,
@@ -725,6 +811,8 @@ mod tests {
             "\"Total: \"General",
             "0.00E+00",
             "# ?/?",
+            "# ??/16",
+            "0.00/",
             "[>=1000]#,##0;0",
         ] {
             assert!(parse(code).parses, "{code}");
@@ -740,6 +828,13 @@ mod tests {
             "[Purple]0",
             "[<0]0;[>0]0;[=0]0",
             "0;0;0;0",
+            // A fraction without a denominator directly after its bar, or
+            // with more after a fixed one.
+            "# ?/",
+            "# ?/ 16",
+            "# ?/16 ?",
+            "?/?.0",
+            "?/?E+0",
         ] {
             assert!(!parse(code).parses, "{code}");
         }
