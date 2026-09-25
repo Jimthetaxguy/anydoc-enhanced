@@ -1930,6 +1930,64 @@ fn text_in_layers_a_reader_hides_is_reported() {
     );
 }
 
+/// A statement page naming a membership dictionary of `layers` layers, all
+/// on but the last, in `spans` empty marked-content spans before its
+/// superseded balance, set in a span naming it too.
+fn many_spans_pdf(spans: usize, layers: usize) -> Vec<u8> {
+    let first_layer = 7;
+    let references: Vec<String> = (0..layers)
+        .map(|layer| format!("{} 0 R", first_layer + layer))
+        .collect();
+    let mut content = String::from("BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET\n");
+    content.push_str(&"/OC /MC0 BDC EMC\n".repeat(spans));
+    content.push_str(
+        "/OC /MC0 BDC BT /F1 10 Tf 72 680 Td (Ending balance 1,000.00 superseded) Tj ET EMC",
+    );
+    let mut objects = vec![
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [{}] /D << /OFF [{}] >> >> >>",
+            references.join(" "),
+            references[layers - 1]
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", content.as_bytes()),
+        format!(
+            "<< /Type /OCMD /OCGs [{}] /P /AllOn >>",
+            references.join(" ")
+        )
+        .into_bytes(),
+    ];
+    objects
+        .extend((0..layers).map(|layer| format!("<< /Type /OCG /Name (L{layer}) >>").into_bytes()));
+    pdf_file(&objects)
+}
+
+#[test]
+fn layers_named_in_many_spans_are_judged_once() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let path = temporary.path().join("many-spans.pdf");
+    std::fs::write(&path, many_spans_pdf(100_000, 1_000)).expect("write PDF");
+    let path = path.to_str().expect("UTF-8 path").to_string();
+    let started = Instant::now();
+    let results = call_tools(
+        &[("pdf_to_markdown", serde_json::json!({ "path": path }))],
+        None,
+    );
+    // Judged span by span, the thousand layers were read a hundred million
+    // times, which ran past the worker's deadline.
+    let warning = results[0]["warnings"].as_array().and_then(|warnings| {
+        warnings
+            .iter()
+            .find(|warning| warning["code"] == "hidden_layer_text_read")
+            .map(|warning| warning["pages"].clone())
+    });
+    assert_eq!(warning, Some(serde_json::json!([1])), "{}", results[0]);
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
 /// A filled one-page form whose fields are `fields`, objects 6 on, each
 /// given its number; `annotations` lists the page's widgets (pdf-inspector
 /// issue #504).

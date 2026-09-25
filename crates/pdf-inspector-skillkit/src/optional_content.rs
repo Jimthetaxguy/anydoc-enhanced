@@ -12,21 +12,49 @@
 //! visibility expression says, and a layer meant for design only has no
 //! effect on viewing. Content is hidden where a marked-content span, a
 //! form, or an annotation names a layer so hidden.
+//!
+//! Each verdict is reached once: a layer's, and that of a membership
+//! dictionary or an expression the document holds, are kept, so a page
+//! naming one dictionary of a thousand layers in each of a hundred thousand
+//! spans reads the thousand layers once. The layers and terms read to reach
+//! verdicts not yet kept are bounded per document; past the bound, content
+//! whose verdict is not kept shows, so the check reports less, never text a
+//! reader sees.
 
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 /// How deep a visibility expression is read; deeper, its content shows.
 const MAX_EXPRESSION_DEPTH: usize = 32;
+/// Layers and expression terms read per document to reach verdicts not yet
+/// kept (see the module's documentation).
+const MAX_TERMS: usize = 1_000_000;
+
+/// What a verdict is kept by: a layer, by its object id; a membership
+/// dictionary or an expression the document refers to, by its object id;
+/// or a dictionary the document holds in place, by its address, which
+/// stays put while the document is read, as `GlyphFonts` keeps fonts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Key {
+    Layer(ObjectId),
+    Object(ObjectId),
+    Address(usize),
+}
 
 /// The document's layers, as its default configuration sets them.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Layers {
     /// Whether layers are off unless turned on.
     base_off: bool,
     on: HashSet<ObjectId>,
     off: HashSet<ObjectId>,
+    /// Whether the content each layer, membership dictionary, and
+    /// expression judged so far marks shows.
+    shows: RefCell<HashMap<Key, bool>>,
+    /// Layers and terms left to read (see `MAX_TERMS`).
+    terms: Cell<usize>,
 }
 
 fn resolve<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
@@ -69,21 +97,51 @@ impl Layers {
             .and_then(|default| resolve(document, default))
             .and_then(|default| default.as_dict().ok());
         let Some(default) = default else {
-            return Some(Layers::default());
+            return Some(Layers::set(false, HashSet::new(), HashSet::new()));
         };
-        Some(Layers {
-            base_off: default
+        Some(Layers::set(
+            default
                 .get(b"BaseState")
                 .ok()
                 .and_then(|state| state.as_name().ok())
                 .is_some_and(|state| state == b"OFF"),
-            on: references(document, default.get(b"ON").ok()),
-            off: references(document, default.get(b"OFF").ok()),
-        })
+            references(document, default.get(b"ON").ok()),
+            references(document, default.get(b"OFF").ok()),
+        ))
     }
 
-    /// Whether the layer `id` shows: a layer for design only always does.
-    fn layer_shows(&self, document: &Document, id: ObjectId) -> bool {
+    /// Layers set as `base_off` says, with those `on` turned on and those
+    /// `off` turned off, no verdict reached yet.
+    fn set(base_off: bool, on: HashSet<ObjectId>, off: HashSet<ObjectId>) -> Self {
+        Layers {
+            base_off,
+            on,
+            off,
+            shows: RefCell::new(HashMap::new()),
+            terms: Cell::new(MAX_TERMS),
+        }
+    }
+
+    /// Take a layer or a term to read from the document's bound; `None`
+    /// once it is spent.
+    fn term(&self) -> Option<()> {
+        let left = self.terms.get().checked_sub(1)?;
+        self.terms.set(left);
+        Some(())
+    }
+
+    /// The verdict kept for `key`, if any.
+    fn kept(&self, key: Key) -> Option<bool> {
+        self.shows.borrow().get(&key).copied()
+    }
+
+    /// Whether the layer `id` shows, judged once: a layer for design only
+    /// always does. `None` once the bound is spent.
+    fn layer_shows(&self, document: &Document, id: ObjectId) -> Option<bool> {
+        self.term()?;
+        if let Some(shows) = self.kept(Key::Layer(id)) {
+            return Some(shows);
+        }
         let design_only = document
             .get_dictionary(id)
             .ok()
@@ -96,50 +154,108 @@ impl Layers {
                 }),
                 _ => false,
             });
-        if design_only {
-            return true;
-        }
-        if self.base_off {
-            self.on.contains(&id)
-        } else {
-            !self.off.contains(&id)
-        }
+        let shows = design_only
+            || if self.base_off {
+                self.on.contains(&id)
+            } else {
+                !self.off.contains(&id)
+            };
+        self.shows.borrow_mut().insert(Key::Layer(id), shows);
+        Some(shows)
     }
 
-    /// Whether a visibility expression shows its content.
-    fn expression_shows(&self, document: &Document, expression: &Object, depth: usize) -> bool {
+    /// Whether a visibility expression shows its content, read `depth`
+    /// deep. A term past `MAX_EXPRESSION_DEPTH` is taken to show, and
+    /// clears `whole`: the verdict then depends on where the expression was
+    /// reached from, and is not kept. `None` once the bound is spent.
+    fn expression_shows(
+        &self,
+        document: &Document,
+        expression: &Object,
+        depth: usize,
+        whole: &mut bool,
+    ) -> Option<bool> {
         if depth > MAX_EXPRESSION_DEPTH {
-            return true;
+            *whole = false;
+            return Some(true);
         }
+        self.term()?;
         match expression {
             Object::Reference(id) => match document.get_object(*id) {
-                Ok(Object::Array(array)) => {
-                    self.expression_shows(document, &Object::Array(array.clone()), depth + 1)
+                Ok(Object::Array(terms)) => {
+                    let key = Key::Object(*id);
+                    if let Some(shows) = self.kept(key) {
+                        return Some(shows);
+                    }
+                    let mut own = true;
+                    let shows = self.terms_show(document, terms, depth + 1, &mut own)?;
+                    if own {
+                        self.shows.borrow_mut().insert(key, shows);
+                    } else {
+                        *whole = false;
+                    }
+                    Some(shows)
                 }
                 Ok(_) => self.layer_shows(document, *id),
-                Err(_) => true,
+                Err(_) => Some(true),
             },
-            Object::Array(terms) => {
-                let Some(operator) = terms.first().and_then(|operator| operator.as_name().ok())
-                else {
-                    return true;
-                };
-                let mut operands = terms[1..]
-                    .iter()
-                    .map(|term| self.expression_shows(document, term, depth + 1));
-                match operator {
-                    b"And" => operands.all(|shows| shows),
-                    b"Or" => operands.any(|shows| shows),
-                    b"Not" => !operands.next().unwrap_or(false),
-                    _ => true,
-                }
-            }
-            _ => true,
+            Object::Array(terms) => self.terms_show(document, terms, depth, whole),
+            _ => Some(true),
         }
     }
 
-    /// Whether a form or an annotation whose dictionary is `dictionary` is
-    /// hidden by the layer its `/OC` names.
+    /// Whether an expression given as its terms, an operator and then its
+    /// operands, shows its content (see `expression_shows`).
+    fn terms_show(
+        &self,
+        document: &Document,
+        terms: &[Object],
+        depth: usize,
+        whole: &mut bool,
+    ) -> Option<bool> {
+        if depth > MAX_EXPRESSION_DEPTH {
+            *whole = false;
+            return Some(true);
+        }
+        let Some((operator, operands)) = terms.split_first() else {
+            return Some(true);
+        };
+        let Ok(operator) = operator.as_name() else {
+            return Some(true);
+        };
+        let mut operands = operands.iter();
+        // The next operand's verdict, if there is one; `None` once the bound
+        // is spent.
+        let mut next = |operands: &mut std::slice::Iter<'_, Object>| match operands.next() {
+            Some(term) => self
+                .expression_shows(document, term, depth + 1, whole)
+                .map(Some),
+            None => Some(None),
+        };
+        match operator {
+            b"And" => {
+                while let Some(shows) = next(&mut operands)? {
+                    if !shows {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            b"Or" => {
+                while let Some(shows) = next(&mut operands)? {
+                    if shows {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            b"Not" => Some(!next(&mut operands)?.unwrap_or(false)),
+            _ => Some(true),
+        }
+    }
+
+    /// Whether a form or an annotation whose dictionary is `dictionary`, one
+    /// the document holds, is hidden by the layer its `/OC` names.
     pub(crate) fn hide(&self, document: &Document, dictionary: &Dictionary) -> bool {
         dictionary
             .get(b"OC")
@@ -147,58 +263,110 @@ impl Layers {
     }
 
     /// Whether optional content marked with `properties`, a layer or a
-    /// membership dictionary, is hidden.
+    /// membership dictionary the document holds, is hidden; the verdict is
+    /// kept for the next span naming it. Past the bound, content shows.
     pub(crate) fn hides(&self, document: &Document, properties: &Object) -> bool {
-        let (id, dictionary): (Option<ObjectId>, Option<&Dictionary>) = match properties {
-            Object::Reference(id) => (Some(*id), document.get_dictionary(*id).ok()),
-            Object::Dictionary(dictionary) => (None, Some(dictionary)),
-            _ => (None, None),
+        let key = match properties {
+            Object::Reference(id) => Key::Object(*id),
+            Object::Dictionary(dictionary) => Key::Address(std::ptr::from_ref(dictionary) as usize),
+            _ => return false,
         };
-        let Some(dictionary) = dictionary else {
-            return false;
+        if let Some(shows) = self.kept(key) {
+            return !shows;
+        }
+        let (id, dictionary) = match properties {
+            Object::Reference(id) => match document.get_dictionary(*id) {
+                Ok(dictionary) => (Some(*id), dictionary),
+                Err(_) => return false,
+            },
+            Object::Dictionary(dictionary) => (None, dictionary),
+            _ => return false,
         };
+        let mut whole = true;
+        match self.membership_shows(document, id, dictionary, &mut whole) {
+            Some(shows) => {
+                if whole {
+                    self.shows.borrow_mut().insert(key, shows);
+                }
+                !shows
+            }
+            None => false,
+        }
+    }
+
+    /// Whether optional content marked with a membership dictionary written
+    /// in the content itself is hidden. Its verdict is not kept: the content
+    /// is let go once read, and another dictionary may take its address.
+    /// Past the bound, content shows.
+    pub(crate) fn hides_written(&self, document: &Document, dictionary: &Dictionary) -> bool {
+        self.membership_shows(document, None, dictionary, &mut true)
+            .is_some_and(|shows| !shows)
+    }
+
+    /// Whether the content a layer or a membership dictionary marks shows:
+    /// a layer, where the document refers to it as `id`, as it is set; a
+    /// membership dictionary as its expression, or else its policy over its
+    /// layers, says. `None` once the bound is spent.
+    fn membership_shows(
+        &self,
+        document: &Document,
+        id: Option<ObjectId>,
+        dictionary: &Dictionary,
+        whole: &mut bool,
+    ) -> Option<bool> {
         let membership = dictionary
             .get(b"Type")
             .ok()
             .and_then(|kind| kind.as_name().ok())
             .is_some_and(|kind| kind == b"OCMD");
         if !membership {
-            return id.is_some_and(|id| !self.layer_shows(document, id));
+            return match id {
+                Some(id) => self.layer_shows(document, id),
+                None => Some(true),
+            };
         }
         if let Ok(expression) = dictionary.get(b"VE") {
-            return !self.expression_shows(document, expression, 0);
+            return self.expression_shows(document, expression, 0, whole);
         }
-        let layers: Vec<bool> = match dictionary.get(b"OCGs") {
+        let single;
+        let entries: &[Object] = match dictionary.get(b"OCGs") {
             Ok(Object::Reference(id)) => match document.get_object(*id) {
-                Ok(Object::Array(array)) => array
-                    .iter()
-                    .filter_map(|entry| entry.as_reference().ok())
-                    .map(|id| self.layer_shows(document, id))
-                    .collect(),
-                _ => vec![self.layer_shows(document, *id)],
+                Ok(Object::Array(array)) => array,
+                _ => {
+                    single = [Object::Reference(*id)];
+                    &single
+                }
             },
-            Ok(Object::Array(array)) => array
-                .iter()
-                .filter_map(|entry| entry.as_reference().ok())
-                .map(|id| self.layer_shows(document, id))
-                .collect(),
-            _ => Vec::new(),
+            Ok(Object::Array(array)) => array,
+            _ => &[],
         };
-        if layers.is_empty() {
-            return false;
+        let mut layers = entries
+            .iter()
+            .filter_map(|entry| entry.as_reference().ok())
+            .peekable();
+        if layers.peek().is_none() {
+            return Some(true);
         }
         let policy = dictionary
             .get(b"P")
             .ok()
             .and_then(|policy| policy.as_name().ok())
             .unwrap_or(b"AnyOn");
-        let shows = match policy {
-            b"AllOn" => layers.iter().all(|shows| *shows),
-            b"AnyOff" => layers.iter().any(|shows| !shows),
-            b"AllOff" => layers.iter().all(|shows| !shows),
-            _ => layers.iter().any(|shows| *shows),
+        // A policy asks whether all of the layers, or any, are on, or off;
+        // the layers are read until one decides it.
+        let (all, on) = match policy {
+            b"AllOn" => (true, true),
+            b"AnyOff" => (false, false),
+            b"AllOff" => (true, false),
+            _ => (false, true),
         };
-        !shows
+        for layer in layers {
+            let asked = self.layer_shows(document, layer)? == on;
+            if asked != all {
+                return Some(asked);
+            }
+        }
+        Some(all)
     }
 }
 
@@ -259,5 +427,106 @@ mod tests {
         let catalog = plain.add_object(dictionary! { "Type" => "Catalog" });
         plain.trailer.set("Root", catalog);
         assert!(Layers::new(&plain).is_none());
+    }
+
+    /// A document whose default configuration turns `off` off, among
+    /// `layers` layers, and the layers.
+    fn with_layers(layers: usize, off: &[usize]) -> (Document, Vec<ObjectId>) {
+        let mut document = Document::with_version("1.7");
+        let ids: Vec<ObjectId> = (0..layers)
+            .map(|_| document.add_object(dictionary! { "Type" => "OCG" }))
+            .collect();
+        let off: Vec<Object> = off.iter().map(|&index| ids[index].into()).collect();
+        let catalog = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "OCProperties" => dictionary! {
+                "OCGs" => ids.iter().map(|&id| id.into()).collect::<Vec<Object>>(),
+                "D" => dictionary! { "OFF" => off },
+            },
+        });
+        document.trailer.set("Root", catalog);
+        (document, ids)
+    }
+
+    #[test]
+    fn verdicts_are_kept_and_reading_them_is_bounded() {
+        let (mut document, ids) = with_layers(1000, &[999]);
+        let all: Vec<Object> = ids.iter().map(|&id| id.into()).collect();
+        let all_on = document.add_object(dictionary! {
+            "Type" => "OCMD", "OCGs" => all.clone(), "P" => "AllOn",
+        });
+        let any_off = document.add_object(dictionary! {
+            "Type" => "OCMD", "OCGs" => all, "P" => "AnyOff",
+        });
+        // A membership dictionary held in place, as resources hold it.
+        let held = Object::Dictionary(dictionary! {
+            "Type" => "OCMD", "OCGs" => vec![ids[999].into()],
+        });
+        let layers = Layers::new(&document).expect("layers");
+        assert!(layers.hides(&document, &all_on.into()));
+        assert!(layers.hides(&document, &held));
+        let spent = MAX_TERMS - layers.terms.get();
+        assert!(spent > 1000);
+        // Named again, a dictionary's verdict costs nothing to read.
+        for _ in 0..100_000 {
+            assert!(layers.hides(&document, &all_on.into()));
+            assert!(layers.hides(&document, &held));
+        }
+        assert_eq!(MAX_TERMS - layers.terms.get(), spent);
+        // Past the bound, content whose verdict is not kept shows; a kept
+        // verdict stands.
+        layers.terms.set(0);
+        assert!(!layers.hides(&document, &any_off.into()));
+        assert!(layers.hides(&document, &all_on.into()));
+    }
+
+    /// `levels` expressions over `inner`, each an `operator` naming the
+    /// one below `times` times, the outermost last.
+    fn wrapped(
+        document: &mut Document,
+        inner: ObjectId,
+        levels: usize,
+        operator: &str,
+        times: usize,
+    ) -> Vec<ObjectId> {
+        let mut wrappers = vec![inner];
+        for _ in 0..levels {
+            let below = *wrappers.last().expect("an expression");
+            let mut terms: Vec<Object> = vec![operator.into()];
+            terms.extend(std::iter::repeat_n(Object::from(below), times));
+            wrappers.push(document.add_object(terms));
+        }
+        wrappers
+    }
+
+    #[test]
+    fn expressions_are_read_once_each_and_whole() {
+        let (mut document, ids) = with_layers(2, &[1]);
+        // Fifteen expressions, each naming the one below twice, as deep as
+        // an expression is read: term by term, the innermost would be read
+        // 32,768 times.
+        let inner = document.add_object(vec!["Or".into(), ids[0].into(), ids[1].into()]);
+        let shared = wrapped(&mut document, inner, 15, "And", 2);
+        let shared = document.add_object(dictionary! {
+            "Type" => "OCMD", "VE" => *shared.last().expect("an expression"),
+        });
+        let layers = Layers::new(&document).expect("layers");
+        assert!(!layers.hides(&document, &shared.into()));
+        assert!(MAX_TERMS - layers.terms.get() < 1_000);
+        // An expression reached past the depth read is taken to show, and a
+        // verdict reached so, which depends on the way there, is not kept:
+        // the expression eight levels up reads its layer from near.
+        let (mut document, ids) = with_layers(1, &[0]);
+        let hidden = document.add_object(vec!["And".into(), ids[0].into()]);
+        let levels = wrapped(&mut document, hidden, 16, "And", 1);
+        let far = document.add_object(dictionary! { "Type" => "OCMD", "VE" => levels[16] });
+        let near = document.add_object(dictionary! { "Type" => "OCMD", "VE" => levels[8] });
+        let layers = Layers::new(&document).expect("layers");
+        assert!(!layers.hides(&document, &far.into()));
+        assert!(layers.hides(&document, &near.into()));
+        // Written in the content, a dictionary is read each time.
+        let written = dictionary! { "Type" => "OCMD", "VE" => hidden };
+        assert!(layers.hides_written(&document, &written));
+        assert!(layers.hides_written(&document, &written));
     }
 }

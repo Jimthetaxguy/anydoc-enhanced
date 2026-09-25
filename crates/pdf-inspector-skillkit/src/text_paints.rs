@@ -1942,12 +1942,8 @@ fn execute<'a>(
     // unscaled text space units, while every run shown since is in a font
     // whose widths the scan reads.
     let mut travelled: Option<f64> = Some(0.0);
-    // The marked-content spans open, and whether each gives the text its
-    // glyphs stand for, which pdf-inspector reads in place of the glyphs.
-    let mut spans: Vec<bool> = Vec::new();
-    // The marked-content spans open, and whether each is in a layer a
-    // reader hides.
-    let mut layered: Vec<bool> = Vec::new();
+    // The marked-content spans open.
+    let mut marked = Marked::default();
     for operation in &content.operations {
         let operands = &operation.operands;
         let operator = operation.operator.as_str();
@@ -2037,46 +2033,40 @@ fn execute<'a>(
                     state.render_mode = mode;
                 }
             }
-            "BMC" => {
-                spans.push(false);
-                layered.push(false);
-            }
+            "BMC" => marked.open(false, false),
             "BDC" => {
-                spans.push(
-                    operands
-                        .get(1)
-                        .and_then(|properties| match properties {
-                            Object::Dictionary(properties) => Some(properties),
-                            Object::Reference(id) => document.get_dictionary(*id).ok(),
-                            _ => None,
-                        })
-                        .is_some_and(gives_actual_text),
-                );
+                let actual_text = operands
+                    .get(1)
+                    .and_then(|properties| match properties {
+                        Object::Dictionary(properties) => Some(properties),
+                        Object::Reference(id) => document.get_dictionary(*id).ok(),
+                        _ => None,
+                    })
+                    .is_some_and(gives_actual_text);
                 // A span marked /OC names its layer, or a membership
-                // dictionary, among the resources' properties.
+                // dictionary, among the resources' properties, or writes
+                // the dictionary in place.
                 let optional = operands
                     .first()
                     .and_then(|tag| tag.as_name().ok())
                     .is_some_and(|tag| tag == b"OC");
-                let properties = match operands.get(1) {
-                    Some(Object::Name(name)) => resources
-                        .find(document, b"Properties", name)
-                        .map(|(properties, _)| properties),
-                    other => other,
-                };
-                layered.push(
-                    optional
-                        && page
-                            .layers
-                            .as_ref()
-                            .zip(properties)
-                            .is_some_and(|(layers, properties)| layers.hides(document, properties)),
-                );
+                let hidden = optional
+                    && page
+                        .layers
+                        .as_ref()
+                        .is_some_and(|layers| match operands.get(1) {
+                            Some(Object::Name(name)) => resources
+                                .find(document, b"Properties", name)
+                                .is_some_and(|(properties, _)| layers.hides(document, properties)),
+                            Some(Object::Dictionary(properties)) => {
+                                layers.hides_written(document, properties)
+                            }
+                            Some(properties) => layers.hides(document, properties),
+                            None => false,
+                        });
+                marked.open(actual_text, hidden);
             }
-            "EMC" => {
-                spans.pop();
-                layered.pop();
-            }
+            "EMC" => marked.close(),
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
                     state.font = name.as_name().is_ok();
@@ -2217,7 +2207,7 @@ fn execute<'a>(
                     !forms.is_empty() && state.white && matches!(state.read_mode, 0 | 4 | 7);
                 if in_text && state.font && state.reached && state.read_mode != 3 && !white {
                     let edge = page.note_edge(state, text_matrix, &bytes, placed);
-                    let hidden = state.hidden || layered.contains(&true);
+                    let hidden = state.hidden || marked.hidden > 0;
                     page.note_unseen(
                         state,
                         text_matrix,
@@ -2251,7 +2241,7 @@ fn execute<'a>(
                 }
                 // Inside a span giving the text its glyphs stand for,
                 // pdf-inspector reads that text and not the glyphs.
-                let glyphs_read = !spans.contains(&true);
+                let glyphs_read = marked.actual_text == 0;
                 page.note_glyphs(state, text_matrix, text, placed && in_text && glyphs_read);
                 let before = travelled;
                 travelled = None;
@@ -2359,7 +2349,7 @@ fn execute<'a>(
                         // no spacing, with the fonts of its own resources,
                         // and reads it at all only where it finds the form.
                         let hidden = state.hidden
-                            || layered.contains(&true)
+                            || marked.hidden > 0
                             || page
                                 .layers
                                 .as_ref()
@@ -2454,6 +2444,33 @@ fn without_comments(content: &[u8]) -> Vec<u8> {
         index += 1;
     }
     kept
+}
+
+/// The marked-content spans open in a content stream: whether each gives
+/// the text its glyphs stand for (see `gives_actual_text`), which
+/// pdf-inspector reads in place of the glyphs, and whether each is in a
+/// layer a reader hides; with how many of each are open, so a string asks
+/// whether it is in one at once however many spans a stream leaves open.
+#[derive(Default)]
+struct Marked {
+    open: Vec<(bool, bool)>,
+    actual_text: usize,
+    hidden: usize,
+}
+
+impl Marked {
+    fn open(&mut self, actual_text: bool, hidden: bool) {
+        self.open.push((actual_text, hidden));
+        self.actual_text += usize::from(actual_text);
+        self.hidden += usize::from(hidden);
+    }
+
+    fn close(&mut self) {
+        if let Some((actual_text, hidden)) = self.open.pop() {
+            self.actual_text -= usize::from(actual_text);
+            self.hidden -= usize::from(hidden);
+        }
+    }
 }
 
 /// Whether a marked-content span's properties give the text its glyphs
@@ -3028,6 +3045,57 @@ pub(crate) mod tests {
         ] {
             assert!(texts.iter().any(|looked| looked == text), "{text}");
         }
+    }
+
+    /// A one-page document whose default configuration hides the layer
+    /// its resources name `/MC0`, drawing `content` in Helvetica as `/F1`.
+    fn layered_pdf(content: &str) -> Vec<u8> {
+        pdf_of(&[
+            b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] >> >> >>"
+                .to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> >> \
+              /Contents 5 0 R >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_vec(),
+            stream("", content.as_bytes()),
+            b"<< /Type /OCG /Name (Superseded) >>".to_vec(),
+        ])
+    }
+
+    /// The text the scan notes in hidden layers, by page.
+    fn hidden_texts(pdf: &[u8]) -> Vec<(u32, Vec<String>)> {
+        scan(pdf, &HashSet::new(), Some(&HashSet::new()), None)
+            .hidden_layer_texts
+            .into_iter()
+            .map(|(page, texts)| (page, texts.texts))
+            .collect()
+    }
+
+    #[test]
+    fn text_in_spans_of_a_hidden_layer_is_noted_however_deep() {
+        // A hidden span open around many spans of other kinds, and a
+        // stream leaving spans open: the text in it is hidden, and the text
+        // after the spans close shows.
+        let inner = "/Span BMC ".repeat(50_000);
+        let closes = "EMC ".repeat(50_001);
+        let content = format!(
+            "/OC /MC0 BDC {inner} BT /F1 10 Tf 72 680 Td (Ending balance 1,000.00 superseded) Tj ET \
+             {closes} BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET {inner}"
+        );
+        assert_eq!(
+            hidden_texts(&layered_pdf(&content)),
+            [(1, vec!["Ending balance 1,000.00 superseded".to_string()])]
+        );
+        // A membership dictionary written in the span itself.
+        let written = "/OC << /Type /OCMD /OCGs [6 0 R] >> BDC \
+                       BT /F1 10 Tf 72 680 Td (Draft figures) Tj ET EMC";
+        assert_eq!(
+            hidden_texts(&layered_pdf(written)),
+            [(1, vec!["Draft figures".to_string()])]
+        );
     }
 
     #[test]
