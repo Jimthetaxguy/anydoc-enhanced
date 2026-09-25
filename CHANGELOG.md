@@ -519,7 +519,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     columns set off the page no longer are, and labels under a UCS-2
     vertical CMap with a ToUnicode map are read to confirm them, where
     they had been reported unconfirmed.
-  Over 4,963 corpus, fixture, and review PDFs no warning changed and none
+  Over 4,412 corpus, fixture, and review PDFs no warning changed and none
   timed out; the review's own files change as above, and its stress files
   convert as fast as before, the longest vertical one in 186 MB from 486.
 - Review round eleven checked the round-ten fixes and loops 22 to 25:
