@@ -1783,6 +1783,24 @@ enum Property {
     /// Whether a box is a size container, whose size `@container` rules
     /// query (`container-type`, `container`).
     Container,
+    /// For a `::before` or `::after` box, read from `display`: whether it
+    /// is an inline box that is a block inside (`inline-block`), which a
+    /// width sizes.
+    InlineBlock,
+    /// For a `::before` or `::after` box, read from `position`: whether
+    /// offsets move it from where it stands (`relative`).
+    Relative,
+    /// For a `::before` box: whether its width or minimum width is wider
+    /// than none (`width`, `min-width`).
+    BoxWidth,
+    /// For a `::before` or `::after` box: whether offsets move it toward
+    /// the start of the line (`left` below zero, `right` above zero), or
+    /// toward its end.
+    ShiftStart,
+    ShiftEnd,
+    /// For a `::before` box: whether it sets what it shows at the end of
+    /// its line (`text-align: right`).
+    AlignEnd,
 }
 
 impl Property {
@@ -1799,6 +1817,22 @@ impl Property {
                 | Property::Width
                 | Property::FlexBasis
                 | Property::FlexBasisAuto
+        )
+    }
+
+    /// What only a `::before` or `::after` box is read for: what it shows,
+    /// whether it keeps line feeds, and where its box sets it.
+    fn of_pseudo_box(self) -> bool {
+        matches!(
+            self,
+            Property::Content
+                | Property::WhiteSpace
+                | Property::InlineBlock
+                | Property::Relative
+                | Property::BoxWidth
+                | Property::ShiftStart
+                | Property::ShiftEnd
+                | Property::AlignEnd
         )
     }
 }
@@ -2459,19 +2493,25 @@ fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
 }
 
 /// What a declaration of flex items' layout, or a margin or padding, says
-/// (see [`parse_declarations`]): one property; the left and the right of a
+/// (see [`parse_declarations`]): one property; one [`parse_declaration`]
+/// reads, and one more read from its value; the left and the right of a
 /// margin or padding, from one to four lengths from the top clockwise, or
 /// one or two from the start; a flex box's direction and wrapping; the
-/// gap between columns, after that between rows; or a flex item's basis,
-/// alone or after its growth and shrinking (`flex`).
+/// gap between columns, after that between rows; a flex item's basis,
+/// alone or after its growth and shrinking (`flex`); a width, for a flex
+/// item and for a `::before` box; or an offset, from the left where
+/// `Shift` holds `true`, from the right otherwise.
 #[derive(Clone, Copy)]
 enum Reads {
     One(Property, fn(&[&[Token]]) -> Option<Tri>),
+    Also(Property, fn(&[&[Token]]) -> Option<Tri>),
     Sides(Property, Property, bool),
     FlexFlow,
     Gap,
     Basis,
     Flex,
+    Width,
+    Shift(bool),
 }
 
 /// The declarations a token run holds that the check reads. Most set one
@@ -2514,7 +2554,13 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
         "padding-right" | "padding-inline-end" | "-webkit-padding-end" => {
             Reads::One(Property::PaddingRight, one_positive_length)
         }
-        "width" => Reads::One(Property::Width, one_full_line),
+        "width" => Reads::Width,
+        "min-width" => Reads::One(Property::BoxWidth, box_width),
+        "display" => Reads::Also(Property::InlineBlock, inline_block),
+        "position" => Reads::Also(Property::Relative, moves_box),
+        "left" | "inset-inline-start" => Reads::Shift(true),
+        "right" | "inset-inline-end" => Reads::Shift(false),
+        "text-align" => Reads::One(Property::AlignEnd, aligns_end),
         "container-type" => Reads::One(Property::Container, size_container),
         "container" => Reads::One(Property::Container, container_shorthand),
         "flex-basis" | "-webkit-flex-basis" => Reads::Basis,
@@ -2591,6 +2637,20 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             _ => [None, None],
         },
         Reads::One(property, says) => [declare(property, says(&parts)), None],
+        Reads::Also(property, says) => [
+            parse_declaration(&name, rest),
+            declare(property, says(&parts)),
+        ],
+        Reads::Width => [
+            declare(Property::Width, one_full_line(&parts)),
+            declare(Property::BoxWidth, box_width(&parts)),
+        ],
+        // A positive `left` moves a box toward the line's end, a positive
+        // `right` toward its start.
+        Reads::Shift(left) => [
+            declare(Property::ShiftStart, shifts(&parts, !left)),
+            declare(Property::ShiftEnd, shifts(&parts, left)),
+        ],
         Reads::Sides(left, right, clockwise) => {
             let (start, end) = match (clockwise, parts.as_slice()) {
                 (true, [all]) | (false, [all]) => (all, all),
@@ -2718,6 +2778,111 @@ fn flex_wrap(parts: &[&[Token]]) -> Option<Tri> {
         }
     }
     Some(wraps)
+}
+
+/// `display` keywords that make an inline-level box a block inside, which
+/// a width sizes.
+const INLINE_BLOCK_KEYWORDS: [&str; 9] = [
+    "inline-block",
+    "inline-table",
+    "inline-flex",
+    "inline-grid",
+    "-webkit-inline-box",
+    "-webkit-inline-flex",
+    "-moz-inline-box",
+    "-ms-inline-flexbox",
+    "-ms-inline-grid",
+];
+
+/// Whether a `display` value makes an inline-level box a block inside
+/// (`inline-block`, `inline flow-root`), which a width sizes; `Maybe`
+/// where it takes the parent's.
+fn inline_block(parts: &[&[Token]]) -> Option<Tri> {
+    let words = parts
+        .iter()
+        .map(|part| match part {
+            [Token::Ident(word)] => Some(word.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Option<Vec<String>>>()?;
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let inline_block = match words.as_slice() {
+        ["inherit" | "revert" | "revert-layer"] => return Some(Tri::Maybe),
+        [one] => INLINE_BLOCK_KEYWORDS.contains(one),
+        ["inline", inner] | [inner, "inline"] => {
+            matches!(*inner, "flow-root" | "flex" | "grid" | "table")
+        }
+        _ => false,
+    };
+    Some(if inline_block { Tri::Yes } else { Tri::No })
+}
+
+/// Whether a `position` value lets offsets move a box from where it
+/// stands: `relative`. A static box ignores them, `sticky` keeps them for
+/// scrolling, and `absolute` and `fixed` take it out of the line.
+fn moves_box(parts: &[&[Token]]) -> Option<Tri> {
+    match keyword(parts)?.as_str() {
+        "relative" => Some(Tri::Yes),
+        "static" | "sticky" | "-webkit-sticky" | "absolute" | "fixed" | "initial" | "unset" => {
+            Some(Tri::No)
+        }
+        "inherit" | "revert" | "revert-layer" => Some(Tri::Maybe),
+        _ => None,
+    }
+}
+
+/// Whether a `::before` box's width or minimum width is wider than none: a
+/// length or percentage above zero. `auto` and the widths the box's content
+/// sizes are not; one computed from others may be.
+fn box_width(parts: &[&[Token]]) -> Option<Tri> {
+    match parts {
+        [[Token::Ident(word)]] => match word.to_ascii_lowercase().as_str() {
+            "auto" | "none" | "initial" | "unset" | "min-content" | "max-content"
+            | "fit-content" => Some(Tri::No),
+            "inherit" | "revert" | "revert-layer" | "stretch" | "-webkit-fill-available" => {
+                Some(Tri::Maybe)
+            }
+            _ => None,
+        },
+        [part] => positive_length(part),
+        _ => None,
+    }
+}
+
+/// Whether an offset moves a box the way lengths above zero do, where
+/// `positive` holds, or below zero otherwise; `Maybe` for a value
+/// computed from others or taken from the parent.
+fn shifts(parts: &[&[Token]], positive: bool) -> Option<Tri> {
+    match parts {
+        [[Token::Numeric(number)]] => {
+            let split = number
+                .find(|character: char| character.is_ascii_alphabetic() || character == '%')
+                .unwrap_or(number.len());
+            let length: f64 = number[..split].parse().ok()?;
+            let moves = if positive { length > 0.0 } else { length < 0.0 };
+            Some(if moves { Tri::Yes } else { Tri::No })
+        }
+        [[Token::Ident(word)]] => match word.to_ascii_lowercase().as_str() {
+            "auto" | "initial" | "unset" => Some(Tri::No),
+            "inherit" | "revert" | "revert-layer" => Some(Tri::Maybe),
+            _ => None,
+        },
+        [[Token::Function(_), ..]] => Some(Tri::Maybe),
+        _ => None,
+    }
+}
+
+/// Whether a `text-align` value sets a box's content at the end of a
+/// left-to-right line (`right`, `end`); `Maybe` where it takes the
+/// parent's.
+fn aligns_end(parts: &[&[Token]]) -> Option<Tri> {
+    match keyword(parts)?.as_str() {
+        "right" | "end" | "-webkit-right" => Some(Tri::Yes),
+        "left" | "start" | "center" | "justify" | "justify-all" | "-webkit-left"
+        | "-webkit-center" | "initial" => Some(Tri::No),
+        "inherit" | "unset" | "match-parent" | "revert" | "revert-layer" => Some(Tri::Maybe),
+        _ => None,
+    }
 }
 
 /// Whether a `container-type` value makes a box a size container.
@@ -4938,30 +5103,28 @@ fn push_style_rule(
         // lines, which its `display`, `content`, `float`, `position`, and
         // `white-space` decide, for the text it shows, which its
         // `visibility` and `opacity` may keep unseen, and for whether its
-        // margins and padding set a dash apart from the element's content.
-        // An element's own `content` and `white-space` are not read, its
-        // `opacity` only where it refers to an SVG resource, and its
-        // margins, padding, width, and flex basis only for flex and grid
-        // items (see [`Cascade::item_box`]). Painting properties that name
-        // an SVG resource are kept apart (see [`Cascade::references`]).
+        // margins, padding, width, offsets, and alignment set a dash apart
+        // from the element's content. An element's own `content`,
+        // `white-space`, offsets, and alignment are not read, its `opacity`
+        // only where it refers to an SVG resource, and its margins,
+        // padding, width, and flex basis only for flex and grid items (see
+        // [`Cascade::item_box`]). Painting properties that name an SVG
+        // resource are kept apart (see [`Cascade::references`]).
         let lays_out = declarations.iter().any(|declaration| {
-            matches!(
-                declaration.property,
-                Property::Display
-                    | Property::Content
-                    | Property::Float
-                    | Property::Position
-                    | Property::WhiteSpace
-                    | Property::Visibility
-                    | Property::Opacity
-            )
+            declaration.property.of_pseudo_box()
+                || matches!(
+                    declaration.property,
+                    Property::Display
+                        | Property::Float
+                        | Property::Position
+                        | Property::Visibility
+                        | Property::Opacity
+                )
         });
         let styles_element = declarations.iter().any(|declaration| {
             !declaration.property.spaces()
-                && !matches!(
-                    declaration.property,
-                    Property::Content | Property::WhiteSpace | Property::Custom
-                )
+                && !declaration.property.of_pseudo_box()
+                && declaration.property != Property::Custom
         });
         let customizes = declarations
             .iter()
@@ -6443,6 +6606,12 @@ impl Cascade {
                 // grid items (see [`Cascade::item_box`]).
                 Property::Content
                 | Property::WhiteSpace
+                | Property::InlineBlock
+                | Property::Relative
+                | Property::BoxWidth
+                | Property::ShiftStart
+                | Property::ShiftEnd
+                | Property::AlignEnd
                 | Property::Custom
                 | Property::Width
                 | Property::FlexBasis
@@ -6498,6 +6667,11 @@ impl Cascade {
         let mut pseudo_clear: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
         let mut pseudo_margin: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
         let mut pseudo_padding: [Vec<(Precedence, Applies, Tri)>; 2] = Default::default();
+        // And where its box sets what it shows: whether it is an inline
+        // block, whether offsets move it, whether a width makes it wider
+        // than none, whether it sets what it shows at the end of its line,
+        // and whether offsets move it away from the element's content.
+        let mut pseudo_geometry: [[Vec<(Precedence, Applies, Tri)>; 5]; 2] = Default::default();
         // Whether a rule for each box may apply at all.
         let mut pseudo_styled = [false; 2];
         for index in candidates {
@@ -6538,6 +6712,22 @@ impl Cascade {
                     }
                     let precedence = self.precedence(declaration, rule, *order, *layer);
                     let declaration = &self.resolved(declaration, tree, ancestors, work)?;
+                    let geometry = match declaration.property {
+                        Property::InlineBlock => Some(0),
+                        Property::Relative => Some(1),
+                        Property::BoxWidth => Some(2),
+                        Property::AlignEnd => Some(3),
+                        Property::ShiftStart if slot == 0 => Some(4),
+                        Property::ShiftEnd if slot == 1 => Some(4),
+                        Property::ShiftStart | Property::ShiftEnd => continue,
+                        _ => None,
+                    };
+                    if let Some(kind) = geometry {
+                        if let Some(says) = declaration.flow {
+                            pseudo_geometry[slot][kind].push((precedence, certainty, says));
+                        }
+                        continue;
+                    }
                     match (declaration.property, declaration.flow) {
                         (Property::Content, _) => {
                             pseudo_content[slot].push((
@@ -6790,6 +6980,43 @@ impl Cascade {
         if has("hidden") {
             add(&hide, presentation, Applies::Yes);
         }
+        // How the box lays out its children. Flex items stand apart in a
+        // column or in reverse, and with a gap or spread along a block's
+        // line; in an inline box, which is as wide as they are, nothing
+        // spreads them. An old flexible box in a column keeps its inline
+        // children in lines as a block does, as Blink and WebKit lay it out,
+        // and one that clamps its lines is a block. A grid's tracks stretch
+        // across a block, and stack in an inline box without columns: its
+        // items stand apart.
+        let inline = resolve_flow(&flows[0], !block_by_default);
+        let flag = |slot: usize| resolve_flow(&item_flags[slot], false);
+        let (layout, contested) = resolve_value(&layouts, Layout::Flow);
+        let (items, item_layout) = match layout {
+            _ if contested => (Tri::Maybe, ItemLayout::default()),
+            Layout::Flow | Layout::Contents => (Tri::No, ItemLayout::default()),
+            Layout::Unknown => (Tri::Maybe, ItemLayout::default()),
+            Layout::Flex => {
+                let spread = if inline == Tri::Yes { Tri::No } else { flag(3) };
+                let item_layout = ItemLayout {
+                    turned: flag(0),
+                    spaced: flag(4).max(spread),
+                    wraps: flag(1),
+                };
+                (Tri::Yes, item_layout)
+            }
+            Layout::Box => (
+                all_three(flag(2).not(), flag(5).not(), Tri::Yes),
+                ItemLayout::default(),
+            ),
+            Layout::Grid => {
+                let item_layout = ItemLayout {
+                    turned: Tri::Yes,
+                    spaced: Tri::Yes,
+                    wraps: Tri::No,
+                };
+                (Tri::Yes, item_layout)
+            }
+        };
         // A box exists where `content` gives one and `display` does not take
         // it away: what it shows, and whether it breaks the line, as a block
         // in the flow or with a line feed it keeps. Without a `white-space`
@@ -6841,15 +7068,41 @@ impl Cascade {
             };
             let out_of_flow = resolve_flow(&pseudo_out[slot], false)
                 .max(resolve_flow(&pseudo_floats[slot], false));
+            let breaks = all_three(
+                exists,
+                resolve_flow(&pseudo_blocks[slot], false).max(line_feed),
+                out_of_flow.not(),
+            );
             // Hyphens or dashes set apart from the element's content, by
-            // white space, a margin or padding, or out of the flow: before
-            // it, a bullet; after it, a separator from what follows.
-            // Touching the content, a minus.
+            // white space, a margin or padding, out of the flow, or on a
+            // line of their own; before it, by an inline block, or a flex or
+            // grid item, a width makes wider than none, which keeps them at
+            // its start; by offsets moving the box away from the content;
+            // or as a flex or grid item a gap, a spread, or the grid's cells
+            // set apart from the element's text. Before it, a bullet; after
+            // it, a separator from what follows. Touching the content, a
+            // minus.
+            let geometry = |kind: usize| resolve_flow(&pseudo_geometry[slot][kind], false);
+            let widened = if slot == 0 {
+                all_three(geometry(0).max(items), geometry(2), geometry(3).not())
+            } else {
+                Tri::No
+            };
+            let shifted = all_three(geometry(1), geometry(4), Tri::Yes);
+            let laid_apart = if items == Tri::Yes {
+                item_layout.spaced
+            } else {
+                Tri::No
+            };
             let apart = |spaced: bool| {
                 spaced
                     || resolve_flow(&pseudo_margin[slot], false)
                         .max(resolve_flow(&pseudo_padding[slot], false))
                         .max(out_of_flow)
+                        .max(breaks)
+                        .max(widened)
+                        .max(shifted)
+                        .max(laid_apart)
                         == Tri::Yes
             };
             let (sign, bullet) = match surely {
@@ -6864,11 +7117,6 @@ impl Cascade {
                 Some(Generated::Ornament | Generated::LineFeed) => (Some(Sign::Between), false),
                 _ => (None, false),
             };
-            let breaks = all_three(
-                exists,
-                resolve_flow(&pseudo_blocks[slot], false).max(line_feed),
-                out_of_flow.not(),
-            );
             let unseen = if resolve_flow(&pseudo_clear[slot], false) == Tri::Yes {
                 Some(true)
             } else {
@@ -6887,43 +7135,6 @@ impl Cascade {
             }
         };
         let (before, after) = (pseudo(0), pseudo(1));
-        // How the box lays out its children. Flex items stand apart in a
-        // column or in reverse, and with a gap or spread along a block's
-        // line; in an inline box, which is as wide as they are, nothing
-        // spreads them. An old flexible box in a column keeps its inline
-        // children in lines as a block does, as Blink and WebKit lay it out,
-        // and one that clamps its lines is a block. A grid's tracks stretch
-        // across a block, and stack in an inline box without columns: its
-        // items stand apart.
-        let inline = resolve_flow(&flows[0], !block_by_default);
-        let flag = |slot: usize| resolve_flow(&item_flags[slot], false);
-        let (layout, contested) = resolve_value(&layouts, Layout::Flow);
-        let (items, item_layout) = match layout {
-            _ if contested => (Tri::Maybe, ItemLayout::default()),
-            Layout::Flow | Layout::Contents => (Tri::No, ItemLayout::default()),
-            Layout::Unknown => (Tri::Maybe, ItemLayout::default()),
-            Layout::Flex => {
-                let spread = if inline == Tri::Yes { Tri::No } else { flag(3) };
-                let item_layout = ItemLayout {
-                    turned: flag(0),
-                    spaced: flag(4).max(spread),
-                    wraps: flag(1),
-                };
-                (Tri::Yes, item_layout)
-            }
-            Layout::Box => (
-                all_three(flag(2).not(), flag(5).not(), Tri::Yes),
-                ItemLayout::default(),
-            ),
-            Layout::Grid => {
-                let item_layout = ItemLayout {
-                    turned: Tri::Yes,
-                    spaced: Tri::Yes,
-                    wraps: Tri::No,
-                };
-                (Tri::Yes, item_layout)
-            }
-        };
         Ok(ReaderStyle {
             display: hidden(&applied[0], Tri::No),
             visibility: hidden(&applied[1], inherited_invisible),
@@ -11903,6 +12114,57 @@ mod tests {
             r#"li { display: inline } li + li::before { content: " \B7 " }"#,
         ] {
             assert!(!drops_shown(&[sheet], items), "{sheet}");
+        }
+    }
+
+    #[test]
+    fn a_dash_its_box_sets_apart_is_a_bullet() {
+        let items =
+            r#"<ul class="ledger"><li>Opening balance</li><li>1,250.00</li><li>12</li></ul>"#;
+        let unmarked = "ul.ledger { list-style: none }";
+        // A dash set apart from the item's text by an inline block's width,
+        // which keeps it at the block's start, by offsets moving it away,
+        // or by the gap or the grid cells of an item laying out flex or
+        // grid items, is its bullet; after the digits, a separator.
+        for dash in [
+            r#"li::before { content: "\2013"; display: inline-block; width: 1.5em; margin-left: -1.5em }"#,
+            r#"li::before { content: "\2013"; display: inline-block; min-width: 1em }"#,
+            r#"li::before { content: "\2013"; display: inline flow-root; width: 1.5em }"#,
+            r#"li::before { content: "\2013"; position: relative; left: -0.6em }"#,
+            r#"li::before { content: "\2013"; position: relative; inset-inline-end: 0.6em }"#,
+            r#"li::before { content: "\2013"; display: block }"#,
+            r#"li { display: flex; gap: .5em } li::before { content: "\2013" }"#,
+            r#"li { display: flex } li::before { content: "\2013"; width: 1.5em }"#,
+            r#"li { display: grid; grid-template-columns: 1.5em 1fr } li::before { content: "\2013" }"#,
+            r#"li { display: flex; gap: .5em } li::after { content: "\2013" }"#,
+            r#"li { display: grid } li::after { content: "\2013" }"#,
+            r#"li::after { content: "\2013"; position: relative; left: 0.6em }"#,
+        ] {
+            assert!(
+                !drops_shown(&[&format!("{unmarked} {dash}")], items),
+                "{dash}"
+            );
+        }
+        // Touching the text, it is a minus: in an inline box, which a width
+        // does not size; at the end of an inline block; with offsets a
+        // static box ignores, or moving it toward the text; as a flex item
+        // without a gap; and after the digits, at the start of a wide box.
+        for dash in [
+            r#"li::before { content: "\2013"; display: inline-block }"#,
+            r#"li::before { content: "\2013"; width: 1.5em }"#,
+            r#"li::before { content: "\2013"; display: inline-block; width: 0 }"#,
+            r#"li::before { content: "\2013"; display: inline-block; width: 1.5em; text-align: right }"#,
+            r#"li::before { content: "\2013"; left: -0.6em }"#,
+            r#"li::before { content: "\2013"; position: relative; left: 0.6em }"#,
+            r#"li { display: flex } li::before { content: "\2013" }"#,
+            r#"li::after { content: "\2013"; display: inline-block; width: 1.5em }"#,
+            r#"li { display: flex } li::after { content: "\2013"; width: 1.5em }"#,
+            r#"li::after { content: "\2013"; position: relative; left: -0.1em }"#,
+        ] {
+            assert!(
+                drops_shown(&[&format!("{unmarked} {dash}")], items),
+                "{dash}"
+            );
         }
     }
 
