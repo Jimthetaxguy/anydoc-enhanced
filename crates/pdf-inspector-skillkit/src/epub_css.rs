@@ -7,11 +7,13 @@
 //!   Syntax 3 tokenizer (comments, escapes, strings), media queries, the
 //!   selector grammar, the cascade, and the user-agent rules that hide
 //!   content. Sibling combinators and positions among siblings are matched
-//!   exactly, from a pass over the chapter before the walk and the earlier
-//!   siblings it keeps. Where it cannot decide (`:has()`, an unknown
-//!   pseudo-class, a value set through `var()`), it lets a hiding rule apply
-//!   and keeps a showing rule from overriding one, so it errs toward finding
-//!   hidden text.
+//!   exactly: positions from a pass over the chapter before the walk, `+`
+//!   from the earlier siblings the walk keeps, and a rule's `~` step from
+//!   the first sibling that fits it, noted as each sibling ends, which
+//!   costs a lookup however far back that sibling is. Where it cannot
+//!   decide (`:has()`, an unknown pseudo-class, a value set through
+//!   `var()`), it lets a hiding rule apply and keeps a showing rule from
+//!   overriding one, so it errs toward finding hidden text.
 //! - The AnyDoc model ports AnyDoc 0.2.4's own subset (`shared::html`):
 //!   `display` from bare `tag`, `.class`, and `tag.class` rules and from
 //!   inline styles, applied only to the elements its walker styles.
@@ -1495,6 +1497,9 @@ pub(super) struct Element {
     /// decoded values, in document order.
     attributes: Vec<(String, bool, String)>,
     position: Position,
+    /// Its element name, ids, and classes as the keys rules are filtered by
+    /// (see [`selector_key`]).
+    keys: Box<[u64]>,
 }
 
 impl Element {
@@ -1503,12 +1508,22 @@ impl Element {
         attributes: Vec<(String, bool, String)>,
         position: Position,
     ) -> Self {
-        Element {
+        let mut element = Element {
             local: local.to_string(),
             lower: local.to_ascii_lowercase(),
             attributes,
             position,
-        }
+            keys: Box::default(),
+        };
+        element.keys = std::iter::once(selector_key(KEY_TYPE, &element.lower))
+            .chain(element.values("id").map(|(_, id)| selector_key(KEY_ID, id)))
+            .chain(element.values("class").flat_map(|(_, classes)| {
+                classes
+                    .split_ascii_whitespace()
+                    .map(|class| selector_key(KEY_CLASS, class))
+            }))
+            .collect();
+        element
     }
 
     fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (bool, &'a str)> + 'a {
@@ -1583,7 +1598,11 @@ fn nth_matches(step: i64, offset: i64, index: u32) -> bool {
 /// The earlier element siblings of the open element at one depth, as far
 /// as selectors test them: the first and the most recent, the names, ids,
 /// and classes of any let go between them to bound memory, and those of
-/// all, so that a `~` step for a sibling not there costs a lookup.
+/// all, so that a `~` step for a sibling not there costs a lookup. For the
+/// `~` steps of the rules, where the first sibling that may fit one came,
+/// and the first that certainly does, found as each sibling ends (see
+/// [`Cascade::note_sibling`]): that settles the step for every later
+/// sibling, however many were let go.
 #[derive(Default)]
 pub(super) struct Earlier {
     first: Vec<Element>,
@@ -1591,6 +1610,11 @@ pub(super) struct Earlier {
     dropped: bool,
     dropped_keys: std::collections::HashSet<u64>,
     seen_keys: std::collections::HashSet<u64>,
+    /// The siblings taken in so far, kept or let go.
+    count: u32,
+    /// By step: the places, counted from 0, of the first sibling that may
+    /// fit it and of the first that certainly does (`u32::MAX` for none).
+    steps: HashMap<u32, (u32, u32)>,
 }
 
 /// Earlier siblings kept at each depth: the first, which rules such as
@@ -1600,6 +1624,7 @@ const RECENT_SIBLINGS_KEPT: usize = 96;
 
 impl Earlier {
     fn push(&mut self, element: Element) {
+        self.count += 1;
         self.seen_keys.extend(AncestorKeys::keys(&element));
         if self.first.len() < FIRST_SIBLINGS_KEPT {
             self.first.push(element);
@@ -1628,6 +1653,44 @@ impl Earlier {
     /// Whether siblings were let go before the kept one at `at`.
     fn gap_before(&self, at: usize) -> bool {
         self.dropped && at >= self.first.len()
+    }
+
+    /// Where a kept sibling sits among all taken in, counted from 0; an
+    /// open element (`None`) comes after them all.
+    fn place(&self, sibling: Option<usize>) -> u32 {
+        match sibling {
+            None => self.count,
+            Some(at) if at < self.first.len() => at as u32,
+            Some(at) => self.count - self.recent.len() as u32 + (at - self.first.len()) as u32,
+        }
+    }
+
+    /// Whether a sibling before `place` fits a `~` step.
+    fn step_before(&self, step: u32, place: u32) -> Tri {
+        match self.steps.get(&step) {
+            Some(&(_, certain)) if certain < place => Tri::Yes,
+            Some(&(possible, _)) if possible < place => Tri::Maybe,
+            _ => Tri::No,
+        }
+    }
+
+    /// Whether a sibling taken in certainly fits a `~` step, which settles
+    /// it for all the siblings after.
+    fn step_settled(&self, step: u32) -> bool {
+        self.steps
+            .get(&step)
+            .is_some_and(|&(_, certain)| certain != u32::MAX)
+    }
+
+    /// Note how the sibling at `place` fits a `~` step.
+    fn note_step(&mut self, step: u32, fits: Tri, place: u32) {
+        let (possible, certain) = self.steps.entry(step).or_insert((u32::MAX, u32::MAX));
+        if fits != Tri::No {
+            *possible = (*possible).min(place);
+        }
+        if fits == Tri::Yes {
+            *certain = (*certain).min(place);
+        }
     }
 }
 
@@ -1715,6 +1778,13 @@ impl<'a> Tree<'a> {
         let earlier = &self.earlier[node.depth];
         earlier.gap_before(node.sibling.unwrap_or_else(|| earlier.len()))
             && compound_keys(compound).all(|key| earlier.dropped_keys.contains(&key))
+    }
+
+    /// Whether an earlier sibling of a node fits a `~` step the walk
+    /// records, with the part of the selector before it.
+    fn step_before(&self, node: Node, step: u32) -> Tri {
+        let earlier = &self.earlier[node.depth];
+        earlier.step_before(step, earlier.place(node.sibling))
     }
 }
 
@@ -1847,13 +1917,13 @@ fn match_simple(simple: &Simple, tree: &Tree, node: Node, work: &mut u64) -> Tri
             }
             PseudoClass::Not(list) => list
                 .iter()
-                .map(|selector| match_complex_at(selector, tree, node, work))
+                .map(|selector| match_complex_at(selector, &[], tree, node, work))
                 .max()
                 .unwrap_or(Tri::No)
                 .not(),
             PseudoClass::Is(list) => list
                 .iter()
-                .map(|selector| match_complex_at(selector, tree, node, work))
+                .map(|selector| match_complex_at(selector, &[], tree, node, work))
                 .max()
                 .unwrap_or(Tri::No),
             PseudoClass::Undecided => Tri::Maybe,
@@ -1882,17 +1952,21 @@ enum MatchMode {
     Certain,
 }
 
-/// Whether a selector matches at `node`, walking it right to left.
+/// Whether a selector's compounds up to `last` match at `node`, walking
+/// them right to left. `recorded` holds, by combinator, the ids of the
+/// rule's `~` steps the walk records (see [`Earlier`]); a selector inside
+/// a pseudo-class has none.
 fn match_chain(
     selector: &ComplexSelector,
+    recorded: &[Option<u32>],
+    last: usize,
     tree: &Tree,
     node: Node,
     mode: MatchMode,
     work: &mut u64,
 ) -> bool {
-    let last = selector.compounds.len() - 1;
     mode.accepts(match_compound(&selector.compounds[last], tree, node, work))
-        && match_before(selector, tree, node, last, mode, work)
+        && match_before(selector, recorded, tree, node, last, mode, work)
 }
 
 impl MatchMode {
@@ -1906,10 +1980,12 @@ impl MatchMode {
 
 /// Match the compounds before `step`, compound `step` having matched at
 /// `node`, trying each element a descendant or `~` step may take until one
-/// leads to a match. Where a step reaches siblings let go to bound memory,
-/// or the work runs out, the match is possible but not certain.
+/// leads to a match. A `~` step the walk records is settled by the first
+/// sibling that fits it. Where another reaches siblings let go to bound
+/// memory, or the work runs out, the match is possible but not certain.
 fn match_before(
     selector: &ComplexSelector,
+    recorded: &[Option<u32>],
     tree: &Tree,
     node: Node,
     step: usize,
@@ -1926,7 +2002,7 @@ fn match_before(
     let compound = &selector.compounds[previous];
     let fits = |candidate: Node, work: &mut u64| {
         mode.accepts(match_compound(compound, tree, candidate, work))
-            && match_before(selector, tree, candidate, previous, mode, work)
+            && match_before(selector, recorded, tree, candidate, previous, mode, work)
     };
     match selector.combinators[previous] {
         Combinator::Child => tree.parent(node).is_some_and(|parent| fits(parent, work)),
@@ -1939,7 +2015,7 @@ fn match_before(
             let mut candidate = tree.parent(node);
             while let Some(ancestor) = candidate {
                 if mode.accepts(match_compound(compound, tree, ancestor, work)) {
-                    if match_before(selector, tree, ancestor, previous, mode, work) {
+                    if match_before(selector, recorded, tree, ancestor, previous, mode, work) {
                         return true;
                     }
                     if nearest_settles {
@@ -1959,6 +2035,9 @@ fn match_before(
             Before::Unknown => undecided,
         },
         Combinator::General => {
+            if let Some(&Some(id)) = recorded.get(previous) {
+                return mode.accepts(tree.step_before(node, id));
+            }
             if !tree.siblings_may_fit(node, compound) {
                 return false;
             }
@@ -1975,19 +2054,60 @@ fn match_before(
     }
 }
 
-fn match_complex_at(selector: &ComplexSelector, tree: &Tree, node: Node, work: &mut u64) -> Tri {
-    if !match_chain(selector, tree, node, MatchMode::Possible, work) {
+/// How a selector's compounds up to `last` match at `node`: certainly,
+/// possibly, or not. The certain match, which settles most, comes first.
+fn match_prefix_at(
+    selector: &ComplexSelector,
+    recorded: &[Option<u32>],
+    last: usize,
+    tree: &Tree,
+    node: Node,
+    work: &mut u64,
+) -> Tri {
+    if !match_chain(
+        selector,
+        recorded,
+        last,
+        tree,
+        node,
+        MatchMode::Possible,
+        work,
+    ) {
         Tri::No
-    } else if match_chain(selector, tree, node, MatchMode::Certain, work) {
+    } else if match_chain(
+        selector,
+        recorded,
+        last,
+        tree,
+        node,
+        MatchMode::Certain,
+        work,
+    ) {
         Tri::Yes
     } else {
         Tri::Maybe
     }
 }
 
+fn match_complex_at(
+    selector: &ComplexSelector,
+    recorded: &[Option<u32>],
+    tree: &Tree,
+    node: Node,
+    work: &mut u64,
+) -> Tri {
+    let last = selector.compounds.len() - 1;
+    match_prefix_at(selector, recorded, last, tree, node, work)
+}
+
 /// How a selector matches the element at the top of the tree.
-fn match_complex(selector: &ComplexSelector, tree: &Tree, work: &mut u64) -> Tri {
-    match_complex_at(selector, tree, tree.top(), work)
+fn match_complex(
+    selector: &ComplexSelector,
+    recorded: &[Option<u32>],
+    tree: &Tree,
+    work: &mut u64,
+) -> Tri {
+    match_complex_at(selector, recorded, tree, tree.top(), work)
 }
 
 // ---------------------------------------------------------------------------
@@ -2019,14 +2139,14 @@ const KEY_TYPE: u8 = 0;
 const KEY_ID: u8 = 1;
 const KEY_CLASS: u8 = 2;
 
-/// The keys a selector's ancestor compounds require: those joined to the
-/// compound on their right by a descendant or child combinator, whose
-/// element names, ids, and classes some ancestor must carry. A compound
-/// before a sibling combinator matches a sibling, and requires nothing of
-/// the ancestors.
-fn ancestor_keys(selector: &ComplexSelector) -> Box<[u64]> {
+/// The keys the ancestor compounds of a selector's compounds up to `last`
+/// require: those joined to the compound on their right by a descendant or
+/// child combinator, whose element names, ids, and classes some ancestor
+/// must carry. A compound before a sibling combinator matches a sibling,
+/// and requires nothing of the ancestors.
+fn ancestor_keys(selector: &ComplexSelector, last: usize) -> Box<[u64]> {
     let mut keys: Vec<u64> = Vec::new();
-    for (compound, combinator) in selector.compounds.iter().zip(&selector.combinators) {
+    for (compound, combinator) in selector.compounds[..last].iter().zip(&selector.combinators) {
         if matches!(combinator, Combinator::Adjacent | Combinator::General) {
             continue;
         }
@@ -2062,13 +2182,7 @@ pub(super) struct AncestorKeys {
 
 impl AncestorKeys {
     fn keys(element: &Element) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(selector_key(KEY_TYPE, &element.lower))
-            .chain(element.values("id").map(|(_, id)| selector_key(KEY_ID, id)))
-            .chain(element.values("class").flat_map(|(_, classes)| {
-                classes
-                    .split_ascii_whitespace()
-                    .map(|class| selector_key(KEY_CLASS, class))
-            }))
+        element.keys.iter().copied()
     }
 
     fn push(&mut self, element: &Element) {
@@ -2314,7 +2428,7 @@ fn parse_style_block(
                 PseudoElement::Other => false,
             };
             if kept {
-                let ancestor_keys = ancestor_keys(&selector);
+                let ancestor_keys = ancestor_keys(&selector, selector.compounds.len() - 1);
                 sheet.rules.push(Rc::new(StyleRule {
                     selector,
                     declarations: declarations.clone(),
@@ -2527,23 +2641,88 @@ enum RuleKey {
     Tag(String),
 }
 
+/// The id, class, or element name a compound requires, the rarest kind
+/// first, by which an element that cannot fit it is set aside.
+fn rarest_key(compound: &Compound) -> Option<u64> {
+    let key = |kind: u8| {
+        compound.parts.iter().find_map(|part| match (part, kind) {
+            (Simple::Id(id), KEY_ID) => Some(selector_key(KEY_ID, id)),
+            (Simple::Class(class), KEY_CLASS) => Some(selector_key(KEY_CLASS, class)),
+            (
+                Simple::Type {
+                    name: Some(name), ..
+                },
+                KEY_TYPE,
+            ) => Some(selector_key(KEY_TYPE, name)),
+            _ => None,
+        })
+    };
+    key(KEY_ID)
+        .or_else(|| key(KEY_CLASS))
+        .or_else(|| key(KEY_TYPE))
+}
+
 /// The rules a chapter applies in cascade order, indexed by the id, class,
 /// or element name their rightmost compound requires.
 #[derive(Default)]
 pub(super) struct Cascade {
-    rules: Vec<(Rc<StyleRule>, u32)>,
+    rules: Vec<CascadeRule>,
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
     by_tag: HashMap<String, Vec<usize>>,
     universal: Vec<usize>,
     /// Rules for `::before` and `::after` boxes.
     pseudo_rules: usize,
+    /// The `~` steps of the rules, which the walk records as siblings end.
+    sibling_steps: Vec<SiblingStep>,
+    /// Those steps by an id, class, or element name their compound
+    /// requires, and those that require none.
+    steps_by_key: HashMap<u64, Vec<u32>>,
+    steps_anywhere: Vec<u32>,
+}
+
+/// A rule in a chapter's cascade: its place in the cascade order, and the
+/// ids of its `~` steps by combinator.
+struct CascadeRule {
+    rule: Rc<StyleRule>,
+    order: u32,
+    recorded: Box<[Option<u32>]>,
+}
+
+/// A `~` step of a rule: the rule, the compound before the combinator, and
+/// the keys the part of the selector up to it requires of the ancestors,
+/// which a sibling that fits it shares.
+struct SiblingStep {
+    rule: u32,
+    compound: u32,
+    ancestor_keys: Box<[u64]>,
 }
 
 impl Cascade {
     pub(super) fn push_sheet(&mut self, sheet: &Stylesheet) {
         for rule in &sheet.rules {
             let index = self.rules.len();
+            let recorded = rule
+                .selector
+                .combinators
+                .iter()
+                .enumerate()
+                .map(|(at, combinator)| {
+                    (*combinator == Combinator::General).then(|| {
+                        let step = self.sibling_steps.len() as u32;
+                        self.sibling_steps.push(SiblingStep {
+                            rule: index as u32,
+                            compound: at as u32,
+                            ancestor_keys: ancestor_keys(&rule.selector, at),
+                        });
+                        match rarest_key(&rule.selector.compounds[at]) {
+                            Some(key) => self.steps_by_key.entry(key).or_default().push(step),
+                            None => self.steps_anywhere.push(step),
+                        }
+                        step
+                    })
+                })
+                .collect();
             let key = rule
                 .selector
                 .compounds
@@ -2581,12 +2760,82 @@ impl Cascade {
                 Some(RuleKey::Tag(tag)) => self.by_tag.entry(tag).or_default().push(index),
                 None => self.universal.push(index),
             }
-            self.rules.push((rule.clone(), index as u32 + 1));
+            self.rules.push(CascadeRule {
+                rule: rule.clone(),
+                order: index as u32 + 1,
+                recorded,
+            });
         }
     }
 
     pub(super) fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Record how the element that has just ended among the siblings at
+    /// the top of `earlier` fits each `~` step of the rules, with the part
+    /// of the selector before it: its siblings before it, and its
+    /// ancestors, are those a later sibling's match would reach through
+    /// it. A step one sibling certainly fits is settled for all after it,
+    /// and not tried again; one whose ancestors the open elements lack is
+    /// set aside with a lookup per key.
+    fn note_sibling(
+        &self,
+        stack: &[Element],
+        earlier: &mut [Earlier],
+        ancestors: &AncestorKeys,
+        work: &mut u64,
+    ) {
+        if self.sibling_steps.is_empty() || *work > MAX_MATCH_WORK {
+            return;
+        }
+        let depth = stack.len();
+        let fits: Vec<(u32, Tri)> = {
+            let tree = Tree {
+                stack,
+                earlier: &*earlier,
+            };
+            let siblings = &tree.earlier[depth];
+            let node = Node {
+                depth,
+                sibling: Some(siblings.len() - 1),
+            };
+            let keyed = AncestorKeys::keys(tree.element(node))
+                .filter_map(|key| self.steps_by_key.get(&key))
+                .flatten();
+            let mut fits = Vec::new();
+            for &step in self.steps_anywhere.iter().chain(keyed) {
+                if siblings.step_settled(step) {
+                    continue;
+                }
+                if *work > MAX_MATCH_WORK {
+                    break;
+                }
+                let sibling_step = &self.sibling_steps[step as usize];
+                if !ancestors.hold(&sibling_step.ancestor_keys) {
+                    *work += 1;
+                    continue;
+                }
+                let CascadeRule { rule, recorded, .. } = &self.rules[sibling_step.rule as usize];
+                let fit = match_prefix_at(
+                    &rule.selector,
+                    recorded,
+                    sibling_step.compound as usize,
+                    &tree,
+                    node,
+                    work,
+                );
+                if fit != Tri::No {
+                    fits.push((step, fit));
+                }
+            }
+            fits
+        };
+        let siblings = &mut earlier[depth];
+        let place = siblings.count - 1;
+        for (step, fit) in fits {
+            siblings.note_step(step, fit, place);
+        }
     }
 
     /// Whether any rule styles a `::before` or `::after` box, which may
@@ -2667,12 +2916,16 @@ impl Cascade {
         let mut pseudo_out: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_line_feeds: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         for index in candidates {
-            let (rule, order) = &self.rules[index];
+            let CascadeRule {
+                rule,
+                order,
+                recorded,
+            } = &self.rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, tree, work);
+            let certainty = match_complex(&rule.selector, recorded, tree, work);
             if certainty == Tri::No {
                 continue;
             }
@@ -4140,6 +4393,7 @@ pub(super) fn chapter_text(
                     earlier.pop();
                     if let Some(siblings) = earlier.last_mut() {
                         siblings.push(closed);
+                        reader.note_sibling(&elements, &mut earlier, &ancestors, work);
                     }
                 }
                 if let Some(closed) = open.pop() {
@@ -4487,6 +4741,7 @@ pub(super) fn chapter_text(
                 earlier.pop();
                 if let Some(siblings) = earlier.last_mut() {
                     siblings.push(closed);
+                    reader.note_sibling(&elements, &mut earlier, &ancestors, work);
                 }
             }
             effects.opens_run = false;
@@ -4789,6 +5044,22 @@ mod tests {
         assert!(hidden("h2 ~ p.s { visibility: hidden }", &middle));
         assert!(hidden("p + p.s { visibility: hidden }", &middle));
         assert!(!hidden("h2 + p.s { visibility: hidden }", &middle));
+        // A sibling let go settles a `~` step, with the part of the
+        // selector before it, as surely as one kept: a reader starts a new
+        // line for the box, and words run together.
+        let filler = |count: usize| "<i>x</i>".repeat(count);
+        let gone = format!(
+            r#"<div>{}<i class="key">k</i>{}<span>Balance due</span><span class="amt">Grand total</span></div>"#,
+            filler(33),
+            filler(110)
+        );
+        let breaks = |rule: &str| walk(&[rule], &gone).fuses_blocks;
+        assert!(breaks(".key ~ .amt { display: block }"));
+        assert!(breaks("i + .key ~ .amt { display: block }"));
+        assert!(breaks("div > .key ~ .amt { display: block }"));
+        assert!(breaks(".key ~ span + .amt { display: block }"));
+        assert!(!breaks("b + .key ~ .amt { display: block }"));
+        assert!(!breaks(".other ~ .amt { display: block }"));
         // A drop cap set by a sibling rule is settled.
         let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
         let dropcap = r#"<h1>One</h1><p><span class="dc">W</span>hen the office opened</p>"#;
@@ -4810,6 +5081,20 @@ mod tests {
         let mut work = 0;
         chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
         assert!(work <= 2 * 2000 * 200 + 10_000, "{work}");
+    }
+
+    #[test]
+    fn sibling_rules_reaching_the_first_sibling_cost_a_lookup() {
+        // A chapter heading's rules reaching every later paragraph, the
+        // heading the first sibling, as a chapter opening might set them.
+        let sheet = "h1.ct ~ p { display: block } h1.ct ~ p.t1::after { content: ''; display: block } h1 ~ p { float: none } h1 ~ p.t3 { position: static }";
+        let (reader, anydoc) = cascade_for(&[sheet]);
+        let body: String = std::iter::once(r#"<h1 class="ct">Chapter</h1>"#.to_string())
+            .chain((0..3000).map(|line| format!(r#"<p class="t{}">Line {line}</p>"#, line % 4)))
+            .collect();
+        let mut work = 0;
+        chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
+        assert!(work <= 3000 * 4 * 2 + 10_000, "{work}");
     }
 
     #[test]
