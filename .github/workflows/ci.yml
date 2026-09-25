@@ -50,6 +50,17 @@ jobs:
       - name: cargo build (release)
         run: cargo build --workspace --release --locked
 
+  msrv:
+    name: msrv (1.88 / ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the declared rust-version
+        uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+
   containment:
     name: worker containment (${{ matrix.os }})
     strategy:
