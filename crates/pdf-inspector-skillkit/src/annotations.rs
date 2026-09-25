@@ -18,7 +18,9 @@
 //! annotations share it, to `MAX_APPEARANCE_BYTES` decoded, and a
 //! document's streams to `MAX_APPEARANCE_TOTAL` in all, looking through the
 //! forms it draws to `MAX_FORM_DEPTH` deep, for an operator that shows a
-//! string. Past the bounds, a stamp is taken to draw no text.
+//! string. Past the bounds, a stamp is taken to draw no text; a stream
+//! whose verdict the bounds cut short is read again where it is reached
+//! another way, as a form nearer a stamp than it was to the first.
 
 use std::collections::{HashMap, HashSet};
 
@@ -266,13 +268,37 @@ fn shows_text(content: &[u8], drawn: &mut Vec<Vec<u8>>) -> bool {
 }
 
 /// The appearance streams of a document, each read at most once, within a
-/// budget for the whole document.
+/// budget for the whole document, but where its verdict was cut short.
 struct Appearances<'a> {
     document: &'a Document,
-    /// Whether each stream read draws text.
-    drawn: HashMap<ObjectId, bool>,
+    /// Whether each stream read draws text, and `None` for one being read.
+    drawn: HashMap<ObjectId, Option<bool>>,
     /// Decoded bytes left to read.
     budget: usize,
+}
+
+/// Whether a stream draws text, and whether that was read whole: not cut
+/// short by the depth read, the document's budget, or a form met again
+/// while it is read.
+#[derive(Clone, Copy)]
+struct Verdict {
+    drawn: bool,
+    whole: bool,
+}
+
+impl Verdict {
+    const DRAWN: Verdict = Verdict {
+        drawn: true,
+        whole: true,
+    };
+    const NONE: Verdict = Verdict {
+        drawn: false,
+        whole: true,
+    };
+    const CUT_SHORT: Verdict = Verdict {
+        drawn: false,
+        whole: false,
+    };
 }
 
 impl<'a> Appearances<'a> {
@@ -304,59 +330,81 @@ impl<'a> Appearances<'a> {
                 .and_then(|state| states.get(state).ok()),
             _ => Some(normal),
         };
-        stream.is_some_and(|stream| self.object(stream, 0))
+        stream.is_some_and(|stream| self.object(stream, 0).drawn)
     }
 
-    /// Whether a stream, given as it is referred to, draws text.
-    fn object(&mut self, object: &Object, depth: usize) -> bool {
+    /// Whether a stream, given as it is referred to, draws text. A verdict
+    /// read whole, or that it draws text, is kept; any other depends on the
+    /// way the stream was reached, and is not.
+    fn object(&mut self, object: &Object, depth: usize) -> Verdict {
         match object {
             Object::Reference(id) => {
-                if let Some(&drawn) = self.drawn.get(id) {
-                    return drawn;
+                match self.drawn.get(id) {
+                    Some(Some(drawn)) => {
+                        return Verdict {
+                            drawn: *drawn,
+                            whole: true,
+                        }
+                    }
+                    // A form drawing itself, which ends the read; what the
+                    // forms it passes through draw depends on it.
+                    Some(None) => return Verdict::CUT_SHORT,
+                    None => {}
                 }
-                // Taken to draw nothing while it is read, so that a form
-                // drawing itself ends.
-                self.drawn.insert(*id, false);
+                self.drawn.insert(*id, None);
                 let document = self.document;
-                let drawn = match document.get_object(*id) {
+                let verdict = match document.get_object(*id) {
                     Ok(Object::Stream(stream)) => self.read(stream, depth),
-                    _ => false,
+                    _ => Verdict::NONE,
                 };
-                self.drawn.insert(*id, drawn);
-                drawn
+                if verdict.drawn || verdict.whole {
+                    self.drawn.insert(*id, Some(verdict.drawn));
+                } else {
+                    self.drawn.remove(id);
+                }
+                verdict
             }
             Object::Stream(stream) => self.read(stream, depth),
-            _ => false,
+            _ => Verdict::NONE,
         }
     }
 
     /// Whether a stream draws text, itself or through the forms it draws.
-    fn read(&mut self, stream: &Stream, depth: usize) -> bool {
+    fn read(&mut self, stream: &Stream, depth: usize) -> Verdict {
         let limit = self.budget.min(MAX_APPEARANCE_BYTES);
         if limit == 0 {
-            return false;
+            return Verdict::CUT_SHORT;
         }
         let content = match stream.get_plain_content_with_limit(limit) {
             Ok(content) => content,
             Err(error) => {
                 // A stream that would decode past the limit spends it; one
-                // that does not decode, its own bytes.
-                self.budget -= match error {
+                // that does not decode, its own bytes. One past its own
+                // bound draws nothing however it is reached; past what is
+                // left of the document's, it may yet.
+                let (spent, whole) = match error {
                     lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
                         ..
-                    }) => limit,
-                    _ => stream.content.len().min(limit),
+                    }) => (limit, limit == MAX_APPEARANCE_BYTES),
+                    _ => (stream.content.len().min(limit), true),
                 };
-                return false;
+                self.budget -= spent;
+                return Verdict {
+                    drawn: false,
+                    whole,
+                };
             }
         };
         self.budget -= content.len().min(limit);
         let mut drawn = Vec::new();
         if shows_text(&content, &mut drawn) {
-            return true;
+            return Verdict::DRAWN;
         }
-        if depth >= MAX_FORM_DEPTH || drawn.is_empty() {
-            return false;
+        if drawn.is_empty() {
+            return Verdict::NONE;
+        }
+        if depth >= MAX_FORM_DEPTH {
+            return Verdict::CUT_SHORT;
         }
         let document = self.document;
         let Some(xobjects) = stream
@@ -367,10 +415,11 @@ impl<'a> Appearances<'a> {
             .and_then(|resources| resources.get(b"XObject").ok())
             .and_then(|xobjects| dictionary(document, xobjects))
         else {
-            return false;
+            return Verdict::NONE;
         };
         let mut looked: HashSet<Vec<u8>> = HashSet::new();
-        drawn.into_iter().any(|name| {
+        let mut whole = true;
+        for name in drawn {
             let form = xobjects.get(&name).ok().filter(|form| {
                 resolve(document, form)
                     .and_then(|form| form.as_stream().ok())
@@ -378,8 +427,19 @@ impl<'a> Appearances<'a> {
                     .and_then(|subtype| subtype.as_name().ok())
                     == Some(b"Form")
             });
-            looked.insert(name) && form.is_some_and(|form| self.object(form, depth + 1))
-        })
+            let Some(form) = form.filter(|_| looked.insert(name)) else {
+                continue;
+            };
+            let verdict = self.object(form, depth + 1);
+            if verdict.drawn {
+                return Verdict::DRAWN;
+            }
+            whole &= verdict.whole;
+        }
+        Verdict {
+            drawn: false,
+            whole,
+        }
     }
 }
 
@@ -697,6 +757,45 @@ mod tests {
                 "Over the edge"
             ]
         );
+    }
+
+    #[test]
+    fn verdicts_cut_short_by_the_depth_read_are_not_kept() {
+        let found = document(|document| {
+            let text = document.add_object(Stream::new(
+                dictionary! { "Subtype" => "Form" },
+                b"BT /F1 12 Tf (VOID) Tj ET".to_vec(),
+            ));
+            // Forms each drawing the one below, one more than are read.
+            let mut chain = vec![text];
+            for _ in 0..=MAX_FORM_DEPTH {
+                let below = *chain.last().expect("a form");
+                chain.push(document.add_object(Stream::new(
+                    dictionary! {
+                        "Subtype" => "Form",
+                        "Resources" => dictionary! { "XObject" => dictionary! { "Fx" => below } },
+                    },
+                    b"/Fx Do".to_vec(),
+                )));
+            }
+            let stamp = |contents: &str, appearance: ObjectId| {
+                dictionary! {
+                    "Subtype" => "Stamp", "Contents" => Object::string_literal(contents),
+                    "AP" => dictionary! { "N" => appearance },
+                }
+            };
+            // A stamp drawing its text past the depth read, taken to draw
+            // none, and then one drawing it through one form, which does.
+            vec![
+                stamp("Void stamp deep", *chain.last().expect("a form")),
+                stamp("Void stamp near", chain[1]),
+            ]
+        });
+        let texts: Vec<String> = unread(&found, None, None)
+            .into_iter()
+            .map(|annotation| annotation.text)
+            .collect();
+        assert_eq!(texts, ["Void stamp near"]);
     }
 
     #[test]
