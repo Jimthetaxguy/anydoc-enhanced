@@ -187,6 +187,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- EPUB selectors that rely on siblings are matched as a reader matches
+  them. Round seven counted a rule with `h2 + p`, `h1 ~ p`,
+  `:first-of-type`, or `:last-child` only where digits met, because one
+  pass through a chapter could not settle it; words it ran together
+  converted. A pass before the walk now counts each element's siblings, and
+  the walk keeps the earlier siblings rules test (the first 32 and the
+  latest 96, with the names, ids, and classes of any let go between).
+  Against Chromium's layout of 800 randomized chapters, the check now
+  refuses all 417 in which AnyDoc runs words together and none of the 383
+  others; round seven missed 13 and refused 1 in error. Selector matching
+  backtracks where a nearer ancestor or sibling fails, within the match
+  budget, and a `~` step for a sibling a chapter lacks costs one lookup.
+  Text that opens with closing punctuation, such as a period a clearfix
+  box sets on a line of its own, no longer counts as run together, except
+  digits meeting across a decimal point ("12." and "5"). A link holding an
+  inline box with a heading inside no longer counts as broken where the
+  reader keeps one line.
 - Words and amounts that pdf-inspector 1.24.0 runs together or splits because
   it measures word gaps against the wrong space width (open upstream #532)
   are reported. For a subset font whose differences name the space at a code
@@ -467,13 +484,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `content`, `position`, and `white-space` of `::before` and `::after`
   boxes. A floated or positioned box keeps the line before it and ends the
   line after it, unless it holds a drop cap: one or two characters, or
-  three going on in lower case, and no digits. The walk reads a chapter
-  once, so a rule it cannot settle, with a sibling selector (`h2 + p`),
-  `:has()`, `:last-child`, or `:lang()`, counts only where digits meet:
-  "Balance due" and "1,250.00" run together under such a rule are not
-  refused. Alt text meeting other text counts the same way. Generated
-  counters refuse a book even where they match AnyDoc's own list
-  numbers.
+  three going on in lower case, and no digits. A rule the walk cannot
+  settle, with `:has()` or `:lang()`, or reaching a sibling let go past
+  the first 32 and the latest 96, counts only where digits meet: "Balance
+  due" and "1,250.00" run together under such a rule are not refused. Alt
+  text meeting other text counts the same way. Generated counters refuse a
+  book even where they match AnyDoc's own list numbers.
 - ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
   converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
 - EPUB `noscript` content is treated as shown, as readers without scripting

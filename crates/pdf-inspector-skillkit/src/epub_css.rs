@@ -6,7 +6,9 @@
 //! - The reader model follows CSS as reading systems apply it: the CSS
 //!   Syntax 3 tokenizer (comments, escapes, strings), media queries, the
 //!   selector grammar, the cascade, and the user-agent rules that hide
-//!   content. Where it cannot decide (a sibling combinator, an unknown
+//!   content. Sibling combinators and positions among siblings are matched
+//!   exactly, from a pass over the chapter before the walk and the earlier
+//!   siblings it keeps. Where it cannot decide (`:has()`, an unknown
 //!   pseudo-class, a value set through `var()`), it lets a hiding rule apply
 //!   and keeps a showing rule from overriding one, so it errs toward finding
 //!   hidden text.
@@ -23,7 +25,9 @@
 //! grid items), `float` and `position`, and `::before` and `::after` boxes
 //! that are blocks or keep a line feed. The chapter walk mirrors AnyDoc's
 //! inline runs, including the way it flattens a link's blocks into the text
-//! around it. A break only a rule the walk cannot settle gives counts where
+//! around it. Text runs together where a word, or a number, meets another
+//! with nothing between; closing punctuation joins the word before it as
+//! written. A break only a rule the walk cannot settle gives counts where
 //! digits meet, which the Markdown reads as one number.
 //!
 //! Text a `::before` or `::after` box shows is text AnyDoc drops: flagged
@@ -976,8 +980,10 @@ impl Tri {
 enum Combinator {
     Descendant,
     Child,
-    /// `+` or `~`: siblings are not tracked, so the step is undecided.
-    Sibling,
+    /// `+`: the element just before.
+    Adjacent,
+    /// `~`: any element before.
+    General,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1020,10 +1026,17 @@ enum PseudoClass {
     Always,
     Link,
     Root,
-    FirstChild,
-    NthChild {
+    /// Where the element sits among its siblings, counted from the first
+    /// or the last, among all of them or those of its name.
+    Nth {
         step: i64,
         offset: i64,
+        from_last: bool,
+        of_type: bool,
+    },
+    /// The only one, among all or those of its name.
+    Only {
+        of_type: bool,
     },
     Not(Vec<ComplexSelector>),
     Is(Vec<ComplexSelector>),
@@ -1109,7 +1122,8 @@ fn parse_complex(tokens: &[Token], nesting: usize) -> ComplexSelector {
         let combinator = match &tokens[index] {
             Token::Whitespace => Some(Combinator::Descendant),
             Token::Delim('>') => Some(Combinator::Child),
-            Token::Delim('+' | '~') => Some(Combinator::Sibling),
+            Token::Delim('+') => Some(Combinator::Adjacent),
+            Token::Delim('~') => Some(Combinator::General),
             Token::Delim('|') if tokens.get(index + 1) == Some(&Token::Delim('|')) => {
                 index += 1;
                 Some(Combinator::Descendant)
@@ -1288,7 +1302,14 @@ fn pseudo_class(name: &str) -> PseudoClass {
         | "-webkit-autofill" | "modal" | "popover-open" | "host" => PseudoClass::Never,
         "link" | "any-link" | "-webkit-any-link" => PseudoClass::Link,
         "root" | "scope" => PseudoClass::Root,
-        "first-child" => PseudoClass::FirstChild,
+        "first-child" | "last-child" | "first-of-type" | "last-of-type" => PseudoClass::Nth {
+            step: 0,
+            offset: 1,
+            from_last: name.starts_with("last"),
+            of_type: name.ends_with("of-type"),
+        },
+        "only-child" => PseudoClass::Only { of_type: false },
+        "only-of-type" => PseudoClass::Only { of_type: true },
         "defined" => PseudoClass::Always,
         _ => PseudoClass::Undecided,
     }
@@ -1326,10 +1347,13 @@ fn functional_pseudo_class(
             PseudoClass::Undecided
         }
         "host" | "host-context" => PseudoClass::Never,
-        "nth-child" => {
+        "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
             specificity.1 += 1;
-            parse_nth(arguments).map_or(PseudoClass::Undecided, |(step, offset)| {
-                PseudoClass::NthChild { step, offset }
+            parse_nth(arguments).map_or(PseudoClass::Undecided, |(step, offset)| PseudoClass::Nth {
+                step,
+                offset,
+                from_last: name.starts_with("nth-last"),
+                of_type: name.ends_with("of-type"),
             })
         }
         _ => {
@@ -1424,6 +1448,18 @@ fn parse_attribute(tokens: &[Token]) -> Simple {
 // ---------------------------------------------------------------------------
 // Matching
 
+/// Where an element sits among its parent's element children, counted in
+/// a pass over the chapter before the walk.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Position {
+    /// From 1, among all of them and among those of its name.
+    index: u32,
+    index_of_type: u32,
+    /// How many there are, and how many of its name; 0 where not counted.
+    count: u32,
+    count_of_type: u32,
+}
+
 /// An element as the selector engine sees it.
 pub(super) struct Element {
     /// The local name as written.
@@ -1432,17 +1468,20 @@ pub(super) struct Element {
     /// Attribute local names (lowercased), whether each is prefixed, and
     /// decoded values, in document order.
     attributes: Vec<(String, bool, String)>,
-    /// Position among the parent's element children, from 1.
-    index: usize,
+    position: Position,
 }
 
 impl Element {
-    pub(super) fn new(local: &str, attributes: Vec<(String, bool, String)>, index: usize) -> Self {
+    pub(super) fn new(
+        local: &str,
+        attributes: Vec<(String, bool, String)>,
+        position: Position,
+    ) -> Self {
         Element {
             local: local.to_string(),
             lower: local.to_ascii_lowercase(),
             attributes,
-            index,
+            position,
         }
     }
 
@@ -1506,8 +1545,8 @@ fn attribute_certainty(
     result
 }
 
-fn nth_matches(step: i64, offset: i64, index: usize) -> bool {
-    let index = index as i64;
+fn nth_matches(step: i64, offset: i64, index: u32) -> bool {
+    let index = i64::from(index);
     if step == 0 {
         return index == offset;
     }
@@ -1515,8 +1554,146 @@ fn nth_matches(step: i64, offset: i64, index: usize) -> bool {
     distance % step == 0 && distance / step >= 0
 }
 
-fn match_simple(simple: &Simple, stack: &[Element], position: usize, work: &mut u64) -> Tri {
-    let element = &stack[position];
+/// The earlier element siblings of the open element at one depth, as far
+/// as selectors test them: the first and the most recent, the names, ids,
+/// and classes of any let go between them to bound memory, and those of
+/// all, so that a `~` step for a sibling not there costs a lookup.
+#[derive(Default)]
+pub(super) struct Earlier {
+    first: Vec<Element>,
+    recent: std::collections::VecDeque<Element>,
+    dropped: bool,
+    dropped_keys: std::collections::HashSet<u64>,
+    seen_keys: std::collections::HashSet<u64>,
+}
+
+/// Earlier siblings kept at each depth: the first, which rules such as
+/// `h1 ~ p` test, and the most recent, which `h2 + p` tests.
+const FIRST_SIBLINGS_KEPT: usize = 32;
+const RECENT_SIBLINGS_KEPT: usize = 96;
+
+impl Earlier {
+    fn push(&mut self, element: Element) {
+        self.seen_keys.extend(AncestorKeys::keys(&element));
+        if self.first.len() < FIRST_SIBLINGS_KEPT {
+            self.first.push(element);
+            return;
+        }
+        if self.recent.len() == RECENT_SIBLINGS_KEPT {
+            if let Some(gone) = self.recent.pop_front() {
+                self.dropped_keys.extend(AncestorKeys::keys(&gone));
+            }
+            self.dropped = true;
+        }
+        self.recent.push_back(element);
+    }
+
+    fn len(&self) -> usize {
+        self.first.len() + self.recent.len()
+    }
+
+    fn get(&self, at: usize) -> &Element {
+        match at.checked_sub(self.first.len()) {
+            None => &self.first[at],
+            Some(recent) => &self.recent[recent],
+        }
+    }
+
+    /// Whether siblings were let go before the kept one at `at`.
+    fn gap_before(&self, at: usize) -> bool {
+        self.dropped && at >= self.first.len()
+    }
+}
+
+/// The elements selectors test: the open elements, root first, and the
+/// earlier siblings of each.
+pub(super) struct Tree<'a> {
+    stack: &'a [Element],
+    earlier: &'a [Earlier],
+}
+
+/// An open element, or one of its earlier siblings (`sibling`, counted
+/// among those kept).
+#[derive(Clone, Copy)]
+struct Node {
+    depth: usize,
+    sibling: Option<usize>,
+}
+
+/// The element just before another among its siblings.
+enum Before {
+    Element(Node),
+    Nothing,
+    /// It was let go to bound memory.
+    Unknown,
+}
+
+impl<'a> Tree<'a> {
+    fn element(&self, node: Node) -> &'a Element {
+        match node.sibling {
+            None => &self.stack[node.depth],
+            Some(at) => self.earlier[node.depth].get(at),
+        }
+    }
+
+    fn top(&self) -> Node {
+        Node {
+            depth: self.stack.len() - 1,
+            sibling: None,
+        }
+    }
+
+    fn parent(&self, node: Node) -> Option<Node> {
+        node.depth.checked_sub(1).map(|depth| Node {
+            depth,
+            sibling: None,
+        })
+    }
+
+    /// The kept earlier siblings of a node, nearest first.
+    fn earlier(&self, node: Node) -> impl Iterator<Item = Node> {
+        let at = node
+            .sibling
+            .unwrap_or_else(|| self.earlier[node.depth].len());
+        (0..at).rev().map(move |sibling| Node {
+            depth: node.depth,
+            sibling: Some(sibling),
+        })
+    }
+
+    fn before(&self, node: Node) -> Before {
+        let earlier = &self.earlier[node.depth];
+        let at = node.sibling.unwrap_or_else(|| earlier.len());
+        if at == 0 {
+            Before::Nothing
+        } else if earlier.gap_before(at) && at == earlier.first.len() {
+            Before::Unknown
+        } else {
+            Before::Element(Node {
+                depth: node.depth,
+                sibling: Some(at - 1),
+            })
+        }
+    }
+
+    /// Whether some earlier sibling carries each element name, id, and
+    /// class a compound requires.
+    fn siblings_may_fit(&self, node: Node, compound: &Compound) -> bool {
+        let seen = &self.earlier[node.depth].seen_keys;
+        compound_keys(compound).all(|key| seen.contains(&key))
+    }
+
+    /// Whether an earlier sibling of a node let go might fit a compound:
+    /// one carried each element name, id, and class the compound requires.
+    fn gap_may_fit(&self, node: Node, compound: &Compound) -> bool {
+        let earlier = &self.earlier[node.depth];
+        earlier.gap_before(node.sibling.unwrap_or_else(|| earlier.len()))
+            && compound_keys(compound).all(|key| earlier.dropped_keys.contains(&key))
+    }
+}
+
+fn match_simple(simple: &Simple, tree: &Tree, node: Node, work: &mut u64) -> Tri {
+    let element = tree.element(node);
     match simple {
         Simple::Type {
             name: None,
@@ -1604,35 +1781,53 @@ fn match_simple(simple: &Simple, stack: &[Element], position: usize, work: &mut 
                 }
             }
             PseudoClass::Root => {
-                if position == 0 {
+                if node.depth == 0 {
                     Tri::Yes
                 } else {
                     Tri::No
                 }
             }
-            PseudoClass::FirstChild => {
-                if element.index == 1 {
-                    Tri::Yes
-                } else {
-                    Tri::No
+            PseudoClass::Nth {
+                step,
+                offset,
+                from_last,
+                of_type,
+            } => {
+                let position = element.position;
+                let (index, count) = match of_type {
+                    false => (position.index, position.count),
+                    true => (position.index_of_type, position.count_of_type),
+                };
+                let index = match from_last {
+                    false => Some(index),
+                    true => (count > 0).then(|| count + 1 - index),
+                };
+                match index {
+                    Some(index) if nth_matches(*step, *offset, index) => Tri::Yes,
+                    Some(_) => Tri::No,
+                    None => Tri::Maybe,
                 }
             }
-            PseudoClass::NthChild { step, offset } => {
-                if nth_matches(*step, *offset, element.index) {
-                    Tri::Yes
-                } else {
-                    Tri::No
+            PseudoClass::Only { of_type } => {
+                let count = match of_type {
+                    false => element.position.count,
+                    true => element.position.count_of_type,
+                };
+                match count {
+                    0 => Tri::Maybe,
+                    1 => Tri::Yes,
+                    _ => Tri::No,
                 }
             }
             PseudoClass::Not(list) => list
                 .iter()
-                .map(|selector| match_complex(selector, &stack[..=position], work))
+                .map(|selector| match_complex_at(selector, tree, node, work))
                 .max()
                 .unwrap_or(Tri::No)
                 .not(),
             PseudoClass::Is(list) => list
                 .iter()
-                .map(|selector| match_complex(selector, &stack[..=position], work))
+                .map(|selector| match_complex_at(selector, tree, node, work))
                 .max()
                 .unwrap_or(Tri::No),
             PseudoClass::Undecided => Tri::Maybe,
@@ -1641,11 +1836,11 @@ fn match_simple(simple: &Simple, stack: &[Element], position: usize, work: &mut 
     }
 }
 
-fn match_compound(compound: &Compound, stack: &[Element], position: usize, work: &mut u64) -> Tri {
+fn match_compound(compound: &Compound, tree: &Tree, node: Node, work: &mut u64) -> Tri {
     *work += 1;
     let mut result = Tri::Yes;
     for simple in &compound.parts {
-        result = result.min(match_simple(simple, stack, position, work));
+        result = result.min(match_simple(simple, tree, node, work));
         if result == Tri::No {
             break;
         }
@@ -1661,73 +1856,112 @@ enum MatchMode {
     Certain,
 }
 
-/// Walk a selector right to left from the element at the top of `stack`.
-/// A descendant step takes the nearest ancestor that fits; when a later
-/// child step then fails, a farther ancestor might have fitted, so a
-/// possible match cannot be ruled out.
+/// Whether a selector matches at `node`, walking it right to left.
 fn match_chain(
     selector: &ComplexSelector,
-    stack: &[Element],
+    tree: &Tree,
+    node: Node,
     mode: MatchMode,
     work: &mut u64,
 ) -> bool {
-    let accepts = |tri: Tri| match mode {
-        MatchMode::Possible => tri != Tri::No,
-        MatchMode::Certain => tri == Tri::Yes,
-    };
     let last = selector.compounds.len() - 1;
-    let mut position = stack.len() - 1;
-    if !accepts(match_compound(
-        &selector.compounds[last],
-        stack,
-        position,
-        work,
-    )) {
-        return false;
-    }
-    let mut chose_ancestor = false;
-    for step in (0..last).rev() {
-        let compound = &selector.compounds[step];
-        match selector.combinators[step] {
-            Combinator::Child => {
-                let fits = position > 0 && {
-                    position -= 1;
-                    accepts(match_compound(compound, stack, position, work))
-                };
-                if !fits {
-                    return mode == MatchMode::Possible && chose_ancestor;
-                }
-            }
-            Combinator::Descendant => {
-                let found = (0..position)
-                    .rev()
-                    .find(|&candidate| accepts(match_compound(compound, stack, candidate, work)));
-                match found {
-                    Some(candidate) => {
-                        position = candidate;
-                        chose_ancestor = true;
-                    }
-                    None => return false,
-                }
-            }
-            Combinator::Sibling => {
-                if mode == MatchMode::Certain {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    mode.accepts(match_compound(&selector.compounds[last], tree, node, work))
+        && match_before(selector, tree, node, last, mode, work)
 }
 
-fn match_complex(selector: &ComplexSelector, stack: &[Element], work: &mut u64) -> Tri {
-    if !match_chain(selector, stack, MatchMode::Possible, work) {
+impl MatchMode {
+    fn accepts(self, tri: Tri) -> bool {
+        match self {
+            MatchMode::Possible => tri != Tri::No,
+            MatchMode::Certain => tri == Tri::Yes,
+        }
+    }
+}
+
+/// Match the compounds before `step`, compound `step` having matched at
+/// `node`, trying each element a descendant or `~` step may take until one
+/// leads to a match. Where a step reaches siblings let go to bound memory,
+/// or the work runs out, the match is possible but not certain.
+fn match_before(
+    selector: &ComplexSelector,
+    tree: &Tree,
+    node: Node,
+    step: usize,
+    mode: MatchMode,
+    work: &mut u64,
+) -> bool {
+    let Some(previous) = step.checked_sub(1) else {
+        return true;
+    };
+    let undecided = mode == MatchMode::Possible;
+    if *work > MAX_MATCH_WORK {
+        return undecided;
+    }
+    let compound = &selector.compounds[previous];
+    let fits = |candidate: Node, work: &mut u64| {
+        mode.accepts(match_compound(compound, tree, candidate, work))
+            && match_before(selector, tree, candidate, previous, mode, work)
+    };
+    match selector.combinators[previous] {
+        Combinator::Child => tree.parent(node).is_some_and(|parent| fits(parent, work)),
+        Combinator::Descendant => {
+            // Where only descendant steps are left, the nearest ancestor
+            // that fits settles it: a farther one has fewer ancestors.
+            let nearest_settles = selector.combinators[..previous]
+                .iter()
+                .all(|combinator| *combinator == Combinator::Descendant);
+            let mut candidate = tree.parent(node);
+            while let Some(ancestor) = candidate {
+                if mode.accepts(match_compound(compound, tree, ancestor, work)) {
+                    if match_before(selector, tree, ancestor, previous, mode, work) {
+                        return true;
+                    }
+                    if nearest_settles {
+                        return false;
+                    }
+                }
+                if *work > MAX_MATCH_WORK {
+                    return undecided;
+                }
+                candidate = tree.parent(ancestor);
+            }
+            false
+        }
+        Combinator::Adjacent => match tree.before(node) {
+            Before::Element(before) => fits(before, work),
+            Before::Nothing => false,
+            Before::Unknown => undecided,
+        },
+        Combinator::General => {
+            if !tree.siblings_may_fit(node, compound) {
+                return false;
+            }
+            for sibling in tree.earlier(node) {
+                if fits(sibling, work) {
+                    return true;
+                }
+                if *work > MAX_MATCH_WORK {
+                    return undecided;
+                }
+            }
+            undecided && tree.gap_may_fit(node, compound)
+        }
+    }
+}
+
+fn match_complex_at(selector: &ComplexSelector, tree: &Tree, node: Node, work: &mut u64) -> Tri {
+    if !match_chain(selector, tree, node, MatchMode::Possible, work) {
         Tri::No
-    } else if match_chain(selector, stack, MatchMode::Certain, work) {
+    } else if match_chain(selector, tree, node, MatchMode::Certain, work) {
         Tri::Yes
     } else {
         Tri::Maybe
     }
+}
+
+/// How a selector matches the element at the top of the tree.
+fn match_complex(selector: &ComplexSelector, tree: &Tree, work: &mut u64) -> Tri {
+    match_complex_at(selector, tree, tree.top(), work)
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,24 +2001,29 @@ const KEY_CLASS: u8 = 2;
 fn ancestor_keys(selector: &ComplexSelector) -> Box<[u64]> {
     let mut keys: Vec<u64> = Vec::new();
     for (compound, combinator) in selector.compounds.iter().zip(&selector.combinators) {
-        if *combinator == Combinator::Sibling {
+        if matches!(combinator, Combinator::Adjacent | Combinator::General) {
             continue;
         }
-        for part in &compound.parts {
-            let key = match part {
-                Simple::Type {
-                    name: Some(name), ..
-                } => selector_key(KEY_TYPE, name),
-                Simple::Id(id) => selector_key(KEY_ID, id),
-                Simple::Class(class) => selector_key(KEY_CLASS, class),
-                _ => continue,
-            };
+        for key in compound_keys(compound) {
             if !keys.contains(&key) {
                 keys.push(key);
             }
         }
     }
     keys.into_boxed_slice()
+}
+
+/// The element name, ids, and classes an element must carry to fit a
+/// compound.
+fn compound_keys(compound: &Compound) -> impl Iterator<Item = u64> + '_ {
+    compound.parts.iter().filter_map(|part| match part {
+        Simple::Type {
+            name: Some(name), ..
+        } => Some(selector_key(KEY_TYPE, name)),
+        Simple::Id(id) => Some(selector_key(KEY_ID, id)),
+        Simple::Class(class) => Some(selector_key(KEY_CLASS, class)),
+        _ => None,
+    })
 }
 
 /// The element names, ids, and classes of the open elements, counted, so
@@ -2222,11 +2461,12 @@ fn resolve_flow(applied: &[(Precedence, Tri, Tri)], default: bool) -> Tri {
     }
 }
 
-/// Elements a reader shows as blocks by default (HTML's rendering section)
-/// that AnyDoc walks inline: its containers, and block elements it does not
-/// know.
-fn reader_block_by_default(local: &str) -> bool {
-    anydoc_container(local)
+/// Elements a reader shows as boxes of their own by default (HTML's
+/// rendering section and MathML's): AnyDoc's blocks and containers, block
+/// elements it does not know, the parts of a table, and a display formula.
+fn reader_block_by_default(element: &Element) -> bool {
+    let local = element.lower.as_str();
+    anydoc_block(local)
         || matches!(
             local,
             "address"
@@ -2241,7 +2481,18 @@ fn reader_block_by_default(local: &str) -> bool {
                 | "plaintext"
                 | "search"
                 | "xmp"
+                | "caption"
+                | "thead"
+                | "tbody"
+                | "tfoot"
+                | "tr"
+                | "td"
+                | "th"
         )
+        || (local == "math"
+            && element
+                .first("display")
+                .is_some_and(|display| display.eq_ignore_ascii_case("block")))
 }
 
 enum RuleKey {
@@ -2323,11 +2574,11 @@ impl Cascade {
     /// rules that hide content.
     fn evaluate(
         &self,
-        stack: &[Element],
+        tree: &Tree,
         ancestors: &AncestorKeys,
         work: &mut u64,
     ) -> Result<ReaderStyle, DocumentError> {
-        let element = stack.last().expect("an element to style");
+        let element = tree.stack.last().expect("an element to style");
         let mut candidates: Vec<usize> = Vec::new();
         for (_, id) in element.values("id") {
             candidates.extend(self.by_id.get(&id.to_lowercase()).into_iter().flatten());
@@ -2395,7 +2646,7 @@ impl Cascade {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, stack, work);
+            let certainty = match_complex(&rule.selector, tree, work);
             if certainty == Tri::No {
                 continue;
             }
@@ -2632,7 +2883,7 @@ impl Cascade {
             display: resolve(&applied[0]),
             visibility: resolve(&applied[1]),
             content_visibility: resolve(&applied[2]),
-            inline: resolve_flow(&flows[0], !reader_block_by_default(&element.lower)),
+            inline: resolve_flow(&flows[0], !reader_block_by_default(element)),
             // A box positioned out of the flow sits apart like a float.
             floats: resolve_flow(&flows[1], false).max(resolve_flow(&flows[3], false)),
             items: resolve_flow(&flows[2], false),
@@ -2847,7 +3098,6 @@ enum Exempt {
 }
 
 struct Open {
-    children: usize,
     reach: Reach,
     caption_seen: bool,
     /// The element is not rendered: `display: none` on it or an ancestor,
@@ -2895,6 +3145,8 @@ struct Effects {
 #[derive(Default)]
 struct Run {
     last: Option<char>,
+    /// The character before `last`, where both came from text.
+    before_last: Option<char>,
     boundary: bool,
     /// A reader starts a new line here only if a rule that may apply says
     /// so, or a float sits here: it counts where digits meet, which the
@@ -2991,8 +3243,9 @@ impl Run {
         });
     }
 
-    /// A block starts or ends inside a link, where a reader starts a new
-    /// line: the part ends, and white space waiting in it is dropped.
+    /// One of AnyDoc's blocks starts or ends inside a link: the part ends,
+    /// and white space waiting in it is dropped. Whether a reader starts a
+    /// new line there is the element's own layout.
     fn edge(&mut self) {
         if let Some(splice) = self.splices.last_mut() {
             splice.parts |= splice.kept;
@@ -3000,7 +3253,6 @@ impl Run {
             splice.trim = true;
             splice.pending = None;
         }
-        self.boundary = true;
     }
 
     /// Content arrives: in a link, each part it starts is first given its
@@ -3069,17 +3321,16 @@ impl Run {
     /// which read as one number, count as joined.
     fn take(&mut self, text: &str, alt: bool) -> bool {
         let kept = || text.chars().filter(|character| anydoc_keeps(*character));
-        let (Some(first), Some(last)) = (kept().next(), kept().next_back()) else {
+        let Some(last) = kept().next_back() else {
             return false;
         };
         if kept().all(char::is_whitespace) {
             self.space(' ');
             return false;
         }
-        let first = match self.at_space() {
-            true => kept().find(|character| !character.is_whitespace()),
-            false => Some(first),
-        };
+        let at_space = self.at_space();
+        let mut from_first = kept().skip_while(|character| at_space && character.is_whitespace());
+        let (first, second) = (from_first.next(), from_first.next());
         if std::mem::take(&mut self.sign_before)
             && kept()
                 .find(|character| !character.is_whitespace())
@@ -3088,17 +3339,16 @@ impl Run {
             self.lost_sign = true;
         }
         self.content();
-        let joined = self.last.is_some_and(|previous| !previous.is_whitespace())
-            && first.is_some_and(|first| !first.is_whitespace());
-        let digits = self.last.is_some_and(char::is_numeric) && first.is_some_and(char::is_numeric);
+        let (joined, number) = meeting([self.before_last, self.last], [first, second]);
         let beside = match self.beside_float {
             Some(DropCap::Any) => true,
             Some(DropCap::Lowercase) => first.is_some_and(char::is_lowercase),
             None => false,
         };
-        let alt_side = (alt || self.alt.is_some()) && !digits;
+        let alt_side = (alt || self.alt.is_some()) && !number;
         let fused =
-            joined && (self.boundary || (self.maybe_boundary && digits)) && !beside && !alt_side;
+            joined && (self.boundary || (self.maybe_boundary && number)) && !beside && !alt_side;
+        self.before_last = kept().rev().nth(1).or(self.last);
         self.last = Some(last);
         self.boundary = false;
         self.maybe_boundary = false;
@@ -3106,6 +3356,29 @@ impl Run {
         self.alt = None;
         fused
     }
+}
+
+/// How text reads where it meets the text before it with nothing between:
+/// whether it runs into it, and whether two numbers run together, digits
+/// meeting directly or across a decimal point or thousands separator ("12."
+/// and "5" reading "12.5"). Text that opens with closing punctuation, as a
+/// period set on a line of its own, joins the word before it as written.
+fn meeting(before: [Option<char>; 2], after: [Option<char>; 2]) -> (bool, bool) {
+    let [before_last, last] = before;
+    let [first, second] = after;
+    let (Some(last), Some(first)) = (last, first) else {
+        return (false, false);
+    };
+    let separator = |character: char| matches!(character, '.' | ',');
+    let number = (last.is_numeric() && first.is_numeric())
+        || (last.is_numeric() && separator(first) && second.is_some_and(char::is_numeric))
+        || (separator(last) && first.is_numeric() && before_last.is_some_and(char::is_numeric));
+    let closing = matches!(
+        first,
+        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\u{201d}' | '\u{2019}' | '\u{bb}'
+    );
+    let joined = !last.is_whitespace() && !first.is_whitespace() && (!closing || number);
+    (joined, number)
 }
 
 /// Whether AnyDoc keeps a character of text: `clean_text` drops soft hyphens,
@@ -3189,15 +3462,46 @@ fn anydoc_block(local: &str) -> bool {
         )
 }
 
-/// For each element of a chapter in document order, whether a child element
-/// is one of AnyDoc's blocks (`has_block_children`).
-fn block_children(chapter: &[u8]) -> Result<Vec<bool>, DocumentError> {
+/// What the pass before the walk finds for each element of a chapter.
+#[derive(Clone, Copy, Default)]
+struct Facts {
+    /// A child element is one of AnyDoc's blocks (`has_block_children`).
+    has_blocks: bool,
+    position: Position,
+}
+
+/// An open element in the pass before the walk, or the chapter's top
+/// level: its element children so far, each with the name it carries, and
+/// how many carry each name.
+#[derive(Default)]
+struct Family {
+    fact: Option<usize>,
+    children: Vec<(u32, u32)>,
+    names: HashMap<String, u32>,
+    counts: Vec<u32>,
+}
+
+impl Family {
+    /// Give each child the counts its siblings make.
+    fn finish(self, facts: &mut [Facts]) {
+        let count = self.children.len() as u32;
+        for (fact, name) in self.children {
+            let position = &mut facts[fact as usize].position;
+            position.count = count;
+            position.count_of_type = self.counts[name as usize];
+        }
+    }
+}
+
+/// For each element of a chapter in document order: whether a child is one
+/// of AnyDoc's blocks, and where it sits among its siblings.
+fn element_facts(chapter: &[u8]) -> Result<Vec<Facts>, DocumentError> {
     let mut xml = quick_xml::Reader::from_reader(std::io::Cursor::new(chapter));
     xml.config_mut().trim_text(false);
     xml.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
-    let mut flags: Vec<bool> = Vec::new();
-    let mut open: Vec<usize> = Vec::new();
+    let mut facts: Vec<Facts> = Vec::new();
+    let mut open: Vec<Family> = vec![Family::default()];
     loop {
         let event = xml
             .read_event_into(&mut buffer)
@@ -3206,25 +3510,51 @@ fn block_children(chapter: &[u8]) -> Result<Vec<bool>, DocumentError> {
             quick_xml::events::Event::Start(element) => (element, true),
             quick_xml::events::Event::Empty(element) => (element, false),
             quick_xml::events::Event::End(_) => {
-                open.pop();
+                if open.len() > 1 {
+                    open.pop().expect("an open element").finish(&mut facts);
+                }
                 buffer.clear();
                 continue;
             }
-            quick_xml::events::Event::Eof => return Ok(flags),
+            quick_xml::events::Event::Eof => {
+                while let Some(family) = open.pop() {
+                    family.finish(&mut facts);
+                }
+                return Ok(facts);
+            }
             _ => {
                 buffer.clear();
                 continue;
             }
         };
         let name = element.name();
-        let local = String::from_utf8_lossy(super::xml_local_name(name.as_ref()));
-        if let Some(&parent) = open.last() {
-            flags[parent] |= anydoc_block(&local);
+        let local = String::from_utf8_lossy(super::xml_local_name(name.as_ref())).into_owned();
+        let family = open.last_mut().expect("the chapter's top level");
+        if let Some(parent) = family.fact {
+            facts[parent].has_blocks |= anydoc_block(&local);
         }
+        let next = family.names.len() as u32;
+        let name = *family.names.entry(local).or_insert(next);
+        if name as usize == family.counts.len() {
+            family.counts.push(0);
+        }
+        family.counts[name as usize] += 1;
+        family.children.push((facts.len() as u32, name));
+        facts.push(Facts {
+            has_blocks: false,
+            position: Position {
+                index: family.children.len() as u32,
+                index_of_type: family.counts[name as usize],
+                count: 0,
+                count_of_type: 0,
+            },
+        });
         if start {
-            open.push(flags.len());
+            open.push(Family {
+                fact: Some(facts.len() - 1),
+                ..Family::default()
+            });
         }
-        flags.push(false);
         buffer.clear();
     }
 }
@@ -3377,7 +3707,7 @@ fn meet_run(
     // reader's defaults.
     let own = match style {
         Some(style) => style.flow(),
-        None if reader_block_by_default(local) => Flow::Block,
+        None if reader_block_by_default(element) => Flow::Block,
         None => Flow::Inline,
     };
     let placed = |name: &str| element.first(name).is_some();
@@ -3421,16 +3751,16 @@ fn meet_run(
         // joins its text to the next with a space.
         (Reach::List | Reach::Table | Reach::Row, Reach::Walk) if spliced => {
             run.edge();
+            keep_in_run(run, &mut effects, *glyphs);
             effects.edge_after = true;
         }
         (Reach::Walk, _) if anydoc_hidden => {
             // AnyDoc skips an element its styles hide as though it were not
-            // there, while a reader may show it: a line break, a rule, or a
-            // block, even an empty one, starts a new line.
+            // there, while a reader may show it: a line break, or a block,
+            // even an empty one, starts a new line.
             let shown = style.is_some_and(|style| style.display != Resolved::Hidden);
-            if shown && (matches!(local, "br" | "hr") || anydoc_block(local)) {
+            if shown && local == "br" {
                 run.boundary = true;
-                effects.boundary_after = Tri::Yes;
             } else if shown {
                 keep_in_run(run, &mut effects, *glyphs);
             }
@@ -3443,16 +3773,19 @@ fn meet_run(
             }
             ("p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6", Reach::Walk) if spliced => {
                 run.edge();
+                keep_in_run(run, &mut effects, *glyphs);
                 effects.edge_after = true;
             }
             ("blockquote", Reach::Walk) | (_, Reach::List | Reach::Table) if spliced => {
                 run.edge();
+                keep_in_run(run, &mut effects, *glyphs);
                 run.open_splice(' ', Whole::No);
                 effects.closes_splice = true;
                 effects.edge_after = true;
             }
             ("pre", Reach::Whole) if spliced => {
                 run.edge();
+                keep_in_run(run, &mut effects, *glyphs);
                 run.open_splice(' ', Whole::Pre);
                 effects.closes_splice = true;
                 effects.edge_after = true;
@@ -3461,6 +3794,7 @@ fn meet_run(
             // to the text on either side.
             ("math", Reach::Whole) if spliced && anydoc_display_math(element) => {
                 run.edge();
+                keep_in_run(run, &mut effects, *glyphs);
                 run.open_splice(' ', Whole::Tex);
                 effects.closes_splice = true;
                 effects.edge_after = true;
@@ -3473,6 +3807,7 @@ fn meet_run(
             }
             ("hr", _) if spliced => {
                 run.edge();
+                keep_in_run(run, &mut effects, *glyphs);
                 run.content();
                 effects.edge_after = true;
             }
@@ -3501,6 +3836,7 @@ fn meet_run(
             (container, Reach::Walk) if anydoc_container(container) && has_blocks => {
                 if spliced {
                     run.edge();
+                    keep_in_run(run, &mut effects, *glyphs);
                     effects.edge_after = true;
                 } else {
                     run.flush();
@@ -3571,13 +3907,15 @@ pub(super) fn chapter_text(
     xml.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     let mut elements: Vec<Element> = Vec::new();
+    // The earlier siblings of each open element, and of the next at the
+    // top: one more than the open elements.
+    let mut earlier: Vec<Earlier> = vec![Earlier::default()];
     let mut ancestors = AncestorKeys::default();
     let mut open: Vec<Open> = Vec::new();
-    let mut top_level = 0usize;
     let mut root_taken = false;
     let mut body_taken = false;
     let mut found = ChapterText::default();
-    let blocks = block_children(chapter)?;
+    let facts = element_facts(chapter)?;
     let mut element_index = 0usize;
     let mut runs: Vec<Run> = Vec::new();
     // Glyphs, and digits among them, taken into runs so far, to tell a
@@ -3593,6 +3931,10 @@ pub(super) fn chapter_text(
             quick_xml::events::Event::End(_) => {
                 if let Some(closed) = elements.pop() {
                     ancestors.pop(&closed);
+                    earlier.pop();
+                    if let Some(siblings) = earlier.last_mut() {
+                        siblings.push(closed);
+                    }
                 }
                 if let Some(closed) = open.pop() {
                     found.drops_shown |= end_element(&closed.effects, &mut runs, glyphs);
@@ -3678,7 +4020,8 @@ pub(super) fn chapter_text(
         if elements.len() >= MAX_CHAPTER_DEPTH {
             return Err(DocumentError::ResourceLimit);
         }
-        let has_blocks = blocks.get(element_index).copied().unwrap_or(false);
+        let fact = facts.get(element_index).copied().unwrap_or_default();
+        let has_blocks = fact.has_blocks;
         element_index += 1;
         let local =
             String::from_utf8_lossy(super::xml_local_name(start.name().as_ref())).into_owned();
@@ -3692,17 +4035,7 @@ pub(super) fn chapter_text(
                 )
             })
             .collect();
-        let index = match open.last_mut() {
-            Some(parent) => {
-                parent.children += 1;
-                parent.children
-            }
-            None => {
-                top_level += 1;
-                top_level
-            }
-        };
-        let element = Element::new(&local, attributes, index);
+        let element = Element::new(&local, attributes, fact.position);
         let reach = match open.last_mut() {
             None => {
                 if element.local == "html" && !root_taken {
@@ -3764,6 +4097,7 @@ pub(super) fn chapter_text(
             && anydoc.hides(&element);
         ancestors.push(&element);
         elements.push(element);
+        earlier.push(Earlier::default());
         let element = elements.last().expect("the element just pushed");
         // The reader's style: for the text below the element, for whether a
         // reader shows an element AnyDoc skips, a line break, or an image,
@@ -3776,7 +4110,11 @@ pub(super) fn chapter_text(
                 && matches!(local.as_str(), "br" | "img" | "image"))
             || (reach != Reach::Dropped && reader.styles_pseudo_boxes())
         {
-            Some(reader.evaluate(&elements, &ancestors, work)?)
+            let tree = Tree {
+                stack: &elements,
+                earlier: &earlier,
+            };
+            Some(reader.evaluate(&tree, &ancestors, work)?)
         } else {
             None
         };
@@ -3824,7 +4162,6 @@ pub(super) fn chapter_text(
         let mut state = match &style {
             // Nothing below converts or shows, so its style does not matter.
             None => Open {
-                children: 0,
                 reach,
                 caption_seen: false,
                 undisplayed: false,
@@ -3849,7 +4186,6 @@ pub(super) fn chapter_text(
                     _ => Exempt::None,
                 };
                 Open {
-                    children: 0,
                     reach,
                     caption_seen: false,
                     undisplayed: parent.is_some_and(|parent| {
@@ -3888,6 +4224,10 @@ pub(super) fn chapter_text(
         if !has_children {
             if let Some(closed) = elements.pop() {
                 ancestors.pop(&closed);
+                earlier.pop();
+                if let Some(siblings) = earlier.last_mut() {
+                    siblings.push(closed);
+                }
             }
             effects.opens_run = false;
             mark_sign(&mut runs);
@@ -4106,7 +4446,15 @@ mod tests {
             "@media not print { .secret { visibility: hidden } }",
             "@supports (display: grid) { .secret { visibility: hidden } }",
             ".secret { @media screen { visibility: hidden } }",
-            "h1 + p { visibility: hidden }",
+            // Siblings and positions among them.
+            "p + p { visibility: hidden }",
+            "p.secret ~ p { visibility: hidden }",
+            "p:last-child { visibility: hidden }",
+            "p:first-of-type { visibility: hidden }",
+            "p:nth-last-child(2) { visibility: hidden }",
+            "p:nth-of-type(2) { visibility: hidden }",
+            // A selector the walk cannot settle may hide.
+            "p:has(b) { visibility: hidden }",
         ] {
             assert!(converts_hidden(&[rule], body), "{rule}");
         }
@@ -4121,6 +4469,11 @@ mod tests {
             "div > p { visibility: hidden }",
             "p:not(p) { visibility: hidden }",
             "[hidden] { display: none !important }",
+            "h1 + p { visibility: hidden }",
+            "h1 ~ p { visibility: hidden }",
+            "p + p.secret { visibility: hidden }",
+            "p:only-of-type { visibility: hidden }",
+            "p:nth-last-child(3) { visibility: hidden }",
             "@media print { .secret { visibility: hidden } }",
             "@media amzn-mobi { .secret { visibility: hidden } }",
             "@font-face { font-family: x; visibility: hidden }",
@@ -4129,6 +4482,92 @@ mod tests {
         ] {
             assert!(!converts_hidden(&[rule], body), "{rule}");
         }
+    }
+
+    #[test]
+    fn sibling_selectors_match_exactly() {
+        let hidden = |rule: &str, body: &str| converts_hidden(&[rule], body);
+        // `+` passes over text between elements; `~` reaches back past
+        // other elements, and neither crosses to another parent.
+        assert!(hidden(
+            "h2 + p { visibility: hidden }",
+            "<h2>T</h2> text <p>SECRET</p>"
+        ));
+        assert!(!hidden(
+            "h2 + p { visibility: hidden }",
+            "<h2>T</h2><div/><p>SECRET</p>"
+        ));
+        assert!(hidden(
+            "h2 ~ p { visibility: hidden }",
+            "<h2>T</h2><div/><p>SECRET</p>"
+        ));
+        assert!(!hidden(
+            "h2 ~ p { visibility: hidden }",
+            "<div><h2>T</h2></div><p>SECRET</p>"
+        ));
+        assert!(hidden(
+            "div > h2 + p { visibility: hidden }",
+            "<div><h2>T</h2><p>SECRET</p></div>"
+        ));
+        assert!(!hidden(
+            "p:not(h2 + p) { visibility: hidden }",
+            "<h2>T</h2><p>SECRET</p>"
+        ));
+        // Far into a long chapter the first siblings are kept, and those
+        // let go between are known by name, id, and class.
+        let many = "<p>x</p>".repeat(500);
+        let long = |before: &str| format!(r#"{before}{many}<p class="s">SECRET</p>"#);
+        assert!(hidden(
+            "h1 ~ p.s { visibility: hidden }",
+            &long("<h1>T</h1>")
+        ));
+        assert!(!hidden(
+            "h2 ~ p.s { visibility: hidden }",
+            &long("<h1>T</h1>")
+        ));
+        let middle = format!(r#"{many}<h2>T</h2>{many}<p class="s">SECRET</p>"#);
+        assert!(hidden("h2 ~ p.s { visibility: hidden }", &middle));
+        assert!(hidden("p + p.s { visibility: hidden }", &middle));
+        assert!(!hidden("h2 + p.s { visibility: hidden }", &middle));
+        // A drop cap set by a sibling rule is settled.
+        let fuses = |sheets: &[&str], body: &str| walk(sheets, body).fuses_blocks;
+        let dropcap = r#"<h1>One</h1><p><span class="dc">W</span>hen the office opened</p>"#;
+        assert!(!fuses(&["h1 + p span.dc { float: left }"], dropcap));
+        assert!(fuses(
+            &[".dc { display: block } h2 + p span.dc { float: left }"],
+            dropcap
+        ));
+    }
+
+    #[test]
+    fn sibling_rules_for_absent_siblings_cost_a_lookup() {
+        // A long chapter and many `~` rules for siblings it lacks.
+        let sheet: String = (0..200)
+            .map(|i| format!("h2.v{i} ~ p {{ float: none }}\n"))
+            .collect();
+        let (reader, anydoc) = cascade_for(&[&sheet]);
+        let body = "<p>Line</p>".repeat(2000);
+        let mut work = 0;
+        chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
+        assert!(work <= 2 * 2000 * 200 + 10_000, "{work}");
+    }
+
+    #[test]
+    fn selector_backtracking_is_bounded() {
+        // A child step on the left keeps every choice of the thirty
+        // descendant steps open, which no chapter can afford to try.
+        let rule = format!("[data-x] > {}p {{ visibility: hidden }}", "div ".repeat(30));
+        let body = format!(
+            "{}<p>SECRET</p>{}",
+            "<div>".repeat(200),
+            "</div>".repeat(200)
+        );
+        let (reader, anydoc) = cascade_for(&[&rule]);
+        let started = std::time::Instant::now();
+        let mut work = 0;
+        let result = chapter_text(&chapter(&body), &reader, &anydoc, &mut work);
+        assert!(matches!(result, Err(DocumentError::ResourceLimit)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 
     #[test]
@@ -4159,7 +4598,7 @@ mod tests {
         ));
         // A showing rule that may not apply does not override.
         assert!(converts_hidden(
-            &[".secret { visibility: hidden } h1 + p { visibility: visible }"],
+            &[".secret { visibility: hidden } p:has(b) { visibility: visible }"],
             r#"<p class="secret">SECRET</p>"#
         ));
         // Visibility is inherited unless a child restores it.
@@ -4271,6 +4710,11 @@ mod tests {
             // other text where digits meet.
             r#"<figure><img src="chart.png" alt="Figure 2"/><figcaption>2023 revenue</figcaption></figure>"#,
             r#"<div><img src="total.png" alt="Total 12"/></div><div>50.00</div>"#,
+            // Digits meeting across a decimal point or separator, and a word
+            // after punctuation.
+            "<div>Rate 12.</div><div>5 percent</div>",
+            "<div>Total 1,250</div><div>.00 due</div>",
+            "<div>Paid in full.</div><div>Next year</div>",
         ] {
             assert!(fuses(body), "{body}");
         }
@@ -4294,6 +4738,10 @@ mod tests {
             r#"<figure><img src="chart.png" alt=" "/><figcaption>Figure 2</figcaption></figure>"#,
             r#"<figure><img src="chart.png"/><figcaption>Figure 2</figcaption></figure>"#,
             "<div>A</div><div>\u{200b}</div>",
+            // Closing punctuation set on a line of its own joins the word
+            // before it as written.
+            "<div>Paid in full</div><div>. Next year</div>",
+            "<div>See the note</div><div>), then continue</div>",
         ] {
             assert!(!fuses(body), "{body}");
         }
@@ -4413,14 +4861,24 @@ mod tests {
             &["br { display: none }"],
             "<p>Balance due<br/>1,250.00</p>"
         ));
-        // A rule that may not apply counts where digits meet, which the
-        // Markdown reads as one number.
+        // Sibling rules apply where the siblings are: the first box after
+        // the paragraph is a block, the second is not.
         assert!(fuses(
             &[".x { display: inline } p + .x { display: block }"],
+            r#"<p>A</p><div class="x">Balance due</div><div class="x">1,250.00</div>"#
+        ));
+        assert!(!fuses(
+            &[".x { display: inline } h1 + .x { display: block }"],
+            r#"<p>A</p><div class="x">Balance due</div><div class="x">1,250.00</div>"#
+        ));
+        // A rule the walk cannot settle counts where digits meet, which the
+        // Markdown reads as one number.
+        assert!(fuses(
+            &[".x { display: inline } .x:has(b) { display: block }"],
             r#"<p>A</p><div class="x">Units 12</div><div class="x">50 shipped</div>"#
         ));
         assert!(!fuses(
-            &[".x { display: inline } p + .x { display: block }"],
+            &[".x { display: inline } .x:has(b) { display: block }"],
             r#"<p>A</p><div class="x">Balance due</div><div class="x">1,250.00</div>"#
         ));
         // A block `::before` or `::after` box breaks the line around an
@@ -4483,6 +4941,10 @@ mod tests {
             (&[], "<p>Balance due<a><br/></a>1,250.00</p>".into()),
             (
                 &[],
+                "<p>Balance due<a><div><span>1,250.00</span><h3>Paid</h3></div></a></p>".into(),
+            ),
+            (
+                &[],
                 format!(r#"<p><a><math {math} display="block"><mn>12</mn></math></a>50 units</p>"#),
             ),
             (
@@ -4542,6 +5004,13 @@ mod tests {
             (
                 &[],
                 r#"<p><span style="float:left">Onc</span>e the office opened</p>"#.into(),
+            ),
+            // A box a reader keeps in the line, though AnyDoc splits a link's
+            // content at the heading inside it.
+            (
+                &[".il { display: inline }"],
+                r#"<p>Balance due<a><div class="il"><span>1,250.00</span><h3>Paid</h3></div></a></p>"#
+                    .into(),
             ),
             // A line feed collapsed to a space, or in a box that is not there.
             (
@@ -4628,7 +5097,7 @@ mod tests {
             ),
             // Content a rule may not give.
             (
-                r#"p + .n::before { content: "\2212" }"#,
+                r#".n:has(b)::before { content: "\2212" }"#,
                 r#"<p>A</p><p class="n">1</p>"#,
             ),
             // A sign beside words: a bullet, or parentheses around a note.
@@ -4758,7 +5227,7 @@ mod tests {
             Element::new(
                 "p",
                 vec![("class".to_string(), false, class.to_string())],
-                1,
+                Position::default(),
             )
         };
         assert!(anydoc.hides(&element("a")));

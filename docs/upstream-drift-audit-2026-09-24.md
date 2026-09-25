@@ -272,7 +272,7 @@ Run on Linux x86-64 with Rust 1.94.1:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo test --workspace --locked`: 255 tests pass (201 skillkit unit, 13
+- `cargo test --workspace --locked`: 258 tests pass (204 skillkit unit, 13
   skillkit integration, 29 document-tool and 9 PDF-tool MCP integration, 3
   MCP unit)
 - `cargo +1.88.0 check --workspace --all-targets --locked`, the declared
@@ -313,8 +313,12 @@ Run on Linux x86-64 with Rust 1.94.1:
   the walk cannot settle and a large book that ran out of match budget.
   Among 116 review EPUBs, 24 reproductions changed to refused and 22 false
   refusals to complete, and no EPUB outside the review sets changed; the
-  cost is 58 of 800 randomized chapters, each running words together under
-  a sibling rule, now converted (see the roadmap's next slices).
+  cost was 13 of 800 randomized chapters running words together under a
+  sibling rule, converted. Loop 16 matches sibling selectors exactly: an
+  oracle over Chromium's layout of the same 800 chapters finds every one
+  of the 417 in which AnyDoc runs words together refused and none of the
+  383 others, and among the 3,053 review and public EPUBs only one more
+  review false refusal changed, to complete.
 - Across 303 documents (the public corpus, 39 LibreOffice conversions, the
   round-four regression corpus, AnyDoc's 34 upstream fixtures, and the
   pull-request reproductions), every outcome change was traced to a check
