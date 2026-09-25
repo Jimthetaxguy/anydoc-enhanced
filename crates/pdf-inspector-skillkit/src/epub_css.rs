@@ -55,6 +55,12 @@ use super::DocumentError;
 const MAX_SELECTORS_PER_RULE: usize = 256;
 const MAX_COMPOUNDS: usize = 32;
 const MAX_SELECTOR_NESTING: usize = 8;
+/// Compound selectors one selector may hold, those of the lists in its
+/// pseudo-classes and of the rules its `&`s stand for counted, before it
+/// counts as undecidable: rules nested in each other share their parents'
+/// selectors, which `&`s taken twice at every level would multiply past
+/// what a match can walk.
+const MAX_SELECTOR_WEIGHT: u32 = 4096;
 /// `@import` statements one stylesheet may carry.
 pub(super) const MAX_IMPORTS_PER_SHEET: usize = 256;
 /// Style rules that set `display`, `visibility`, `content-visibility`,
@@ -1941,7 +1947,9 @@ enum PseudoClass {
         of_type: bool,
     },
     Not(Vec<ComplexSelector>),
-    Is(Vec<ComplexSelector>),
+    /// `:is()`, `:where()`, and `&`, which the rules nested in a rule share
+    /// (see [`Nest`]).
+    Is(Rc<[ComplexSelector]>),
     Undecided,
 }
 
@@ -1959,6 +1967,9 @@ struct ComplexSelector {
     specificity: (u32, u32, u32),
     /// Styles a pseudo-element, whose hiding hides no element text.
     pseudo_element: PseudoElement,
+    /// Its compound selectors, those of the lists in its pseudo-classes
+    /// counted (see [`MAX_SELECTOR_WEIGHT`]).
+    weight: u32,
 }
 
 /// The pseudo-element a selector styles.
@@ -1983,6 +1994,7 @@ impl ComplexSelector {
             combinators: Vec::new(),
             specificity: (0, 0, 0),
             pseudo_element: PseudoElement::None,
+            weight: 1,
         }
     }
 }
@@ -1993,15 +2005,53 @@ fn add_specificity(total: &mut (u32, u32, u32), other: (u32, u32, u32)) {
     total.2 += other.2;
 }
 
-fn parse_selector_list(tokens: &[Token], nesting: usize) -> Vec<ComplexSelector> {
+/// What `&` stands for in the selectors of the rules nested in a style
+/// rule: the elements the rule's selectors match, a selector of a
+/// pseudo-element matching none, with the highest specificity among them,
+/// as `:is()` takes them; and how many rules deep the rule is nested.
+#[derive(Clone)]
+struct Nest {
+    parent: Rc<[ComplexSelector]>,
+    specificity: (u32, u32, u32),
+    depth: usize,
+}
+
+/// Parse a selector list; `nest` says what `&` stands for in a nested
+/// rule's.
+fn parse_selector_list(
+    tokens: &[Token],
+    nesting: usize,
+    nest: Option<&Nest>,
+) -> Vec<ComplexSelector> {
     let parts = split_top_level(tokens, &Token::Comma);
     if parts.len() > MAX_SELECTORS_PER_RULE {
         return vec![ComplexSelector::undecided()];
     }
     parts
         .into_iter()
-        .map(|part| parse_complex(trim_whitespace(part), nesting))
+        .map(|part| parse_complex(trim_whitespace(part), nesting, nest))
         .collect()
+}
+
+/// A nested rule's selectors made whole, as a reader reads them: one that
+/// does not name the rule it is nested in (`&`) is one inside it, as
+/// though `& ` came first (`p` reads `& p`, and `> p` reads `& > p`).
+fn nested_selectors(prelude: &[Token]) -> Vec<Token> {
+    let mut tokens = Vec::with_capacity(prelude.len() + 2);
+    for (at, part) in split_top_level(prelude, &Token::Comma)
+        .into_iter()
+        .enumerate()
+    {
+        if at > 0 {
+            tokens.push(Token::Comma);
+        }
+        let part = trim_whitespace(part);
+        if !part.is_empty() && !part.contains(&Token::Delim('&')) {
+            tokens.extend([Token::Delim('&'), Token::Whitespace]);
+        }
+        tokens.extend_from_slice(part);
+    }
+    tokens
 }
 
 enum SelectorItem {
@@ -2009,7 +2059,7 @@ enum SelectorItem {
     Combinator(Combinator),
 }
 
-fn parse_complex(tokens: &[Token], nesting: usize) -> ComplexSelector {
+fn parse_complex(tokens: &[Token], nesting: usize, nest: Option<&Nest>) -> ComplexSelector {
     let mut items: Vec<SelectorItem> = Vec::new();
     let mut current = Compound::default();
     let mut specificity = (0, 0, 0);
@@ -2052,6 +2102,7 @@ fn parse_complex(tokens: &[Token], nesting: usize) -> ComplexSelector {
             tokens,
             index,
             nesting,
+            nest,
             &mut current,
             &mut specificity,
             &mut pseudo_element,
@@ -2069,7 +2120,16 @@ fn parse_complex(tokens: &[Token], nesting: usize) -> ComplexSelector {
             SelectorItem::Combinator(combinator) => combinators.push(combinator),
         }
     }
-    if compounds.is_empty() || compounds.len() > MAX_COMPOUNDS {
+    let weight = compounds
+        .iter()
+        .flat_map(|compound| compound.parts.iter())
+        .map(|part| match part {
+            Simple::Pseudo(PseudoClass::Is(list)) => list_weight(list),
+            Simple::Pseudo(PseudoClass::Not(list)) => list_weight(list),
+            _ => 0,
+        })
+        .fold(compounds.len() as u32, u32::saturating_add);
+    if compounds.is_empty() || compounds.len() > MAX_COMPOUNDS || weight > MAX_SELECTOR_WEIGHT {
         let mut undecided = ComplexSelector::undecided();
         undecided.pseudo_element = pseudo_element;
         return undecided;
@@ -2079,7 +2139,15 @@ fn parse_complex(tokens: &[Token], nesting: usize) -> ComplexSelector {
         combinators,
         specificity,
         pseudo_element,
+        weight,
     }
+}
+
+/// The compound selectors of a selector list, those nested in them counted.
+fn list_weight(list: &[ComplexSelector]) -> u32 {
+    list.iter()
+        .map(|selector| selector.weight)
+        .fold(0, u32::saturating_add)
 }
 
 /// Parse the simple selector at `index` into `compound`; return the index
@@ -2088,6 +2156,7 @@ fn parse_simple(
     tokens: &[Token],
     index: usize,
     nesting: usize,
+    nest: Option<&Nest>,
     compound: &mut Compound,
     specificity: &mut (u32, u32, u32),
     pseudo_element: &mut PseudoElement,
@@ -2178,7 +2247,8 @@ fn parse_simple(
                 }
                 Some(Token::Function(name)) => {
                     let (arguments, end) = block_at(tokens, index + 1);
-                    let pseudo = functional_pseudo_class(name, arguments, nesting, specificity);
+                    let pseudo =
+                        functional_pseudo_class(name, arguments, nesting, nest, specificity);
                     compound.parts.push(Simple::Pseudo(pseudo));
                     end
                 }
@@ -2187,6 +2257,24 @@ fn parse_simple(
                     index + 1
                 }
             }
+        }
+        // `&`: in a nested rule, what the rule it is nested in matches
+        // (see [`Nest`]), undecided past the nesting followed; in a rule
+        // of its own, the root.
+        Token::Delim('&') => {
+            let pseudo = match nest {
+                Some(nest) => {
+                    add_specificity(specificity, nest.specificity);
+                    if nest.depth < MAX_SELECTOR_NESTING {
+                        PseudoClass::Is(nest.parent.clone())
+                    } else {
+                        PseudoClass::Undecided
+                    }
+                }
+                None => PseudoClass::Root,
+            };
+            compound.parts.push(Simple::Pseudo(pseudo));
+            index + 1
         }
         _ => {
             compound.parts.push(Simple::Unknown);
@@ -2221,11 +2309,12 @@ fn functional_pseudo_class(
     name: &str,
     arguments: &[Token],
     nesting: usize,
+    nest: Option<&Nest>,
     specificity: &mut (u32, u32, u32),
 ) -> PseudoClass {
     let name = name.to_ascii_lowercase();
     let list = |specificity: &mut (u32, u32, u32), counts: bool| {
-        let list = parse_selector_list(arguments, nesting + 1);
+        let list = parse_selector_list(arguments, nesting + 1, nest);
         if counts {
             let highest = list
                 .iter()
@@ -2242,8 +2331,10 @@ fn functional_pseudo_class(
             PseudoClass::Undecided
         }
         "not" => PseudoClass::Not(list(specificity, true)),
-        "is" | "matches" | "-webkit-any" | "-moz-any" => PseudoClass::Is(list(specificity, true)),
-        "where" => PseudoClass::Is(list(specificity, false)),
+        "is" | "matches" | "-webkit-any" | "-moz-any" => {
+            PseudoClass::Is(list(specificity, true).into())
+        }
+        "where" => PseudoClass::Is(list(specificity, false).into()),
         "has" => {
             list(specificity, true);
             PseudoClass::Undecided
@@ -2833,6 +2924,8 @@ fn match_simple(simple: &Simple, tree: &Tree, node: Node, work: &mut u64) -> Tri
                     _ => Tri::No,
                 }
             }
+            // Past the work allowed, a list is not walked.
+            PseudoClass::Not(_) | PseudoClass::Is(_) if *work > MAX_MATCH_WORK => Tri::Maybe,
             PseudoClass::Not(list) => list
                 .iter()
                 .map(|selector| match_complex_at(selector, &[], tree, node, work))
@@ -3249,7 +3342,8 @@ fn parse_rule_list(
                     break;
                 }
                 let (block, end) = block_at(tokens, index);
-                parse_style_block(&tokens[start..index], block, context, sheet, nesting)?;
+                let selectors = RuleSelectors::new(&tokens[start..index], None);
+                parse_style_block(&selectors, block, context, sheet, nesting)?;
                 index = end;
             }
         }
@@ -3278,9 +3372,10 @@ fn layer_names(prelude: &[Token]) -> Result<Option<Vec<String>>, ()> {
     Ok(Some(names))
 }
 
-/// Parse the at-rule at `index`; return the index past it. `selectors` is
-/// the enclosing style rule's prelude for an at-rule nested in one, whose
-/// declarations style the same elements.
+/// Parse the at-rule at `index`; return the index past it. `selectors` are
+/// the enclosing style rule's for an at-rule nested in one, whose
+/// declarations style the same elements, and whose nested rules are nested
+/// in that rule.
 #[allow(clippy::too_many_arguments)]
 fn parse_at_rule(
     tokens: &[Token],
@@ -3288,7 +3383,7 @@ fn parse_at_rule(
     name: &str,
     top_level: bool,
     context: RuleContext,
-    selectors: Option<&[Token]>,
+    selectors: Option<&RuleSelectors>,
     sheet: &mut Stylesheet,
     nesting: usize,
 ) -> Result<usize, DocumentError> {
@@ -3411,11 +3506,61 @@ fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
     Some((target, supported.min(media_condition(rest)) != Tri::No))
 }
 
-/// A style rule's block: its declarations, and any nested rules, whose
-/// selectors are read on their own, which finds at least what nesting
-/// them under this rule would.
+/// A style rule's selectors, read once a declaration or a nested rule
+/// needs them; for a rule nested in another, with what `&` stands for.
+struct RuleSelectors<'a> {
+    prelude: &'a [Token],
+    parent: Option<Nest>,
+    list: std::cell::OnceCell<Vec<ComplexSelector>>,
+    nest: std::cell::OnceCell<Nest>,
+}
+
+impl<'a> RuleSelectors<'a> {
+    fn new(prelude: &'a [Token], parent: Option<Nest>) -> Self {
+        RuleSelectors {
+            prelude,
+            parent,
+            list: std::cell::OnceCell::new(),
+            nest: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn list(&self) -> &[ComplexSelector] {
+        self.list.get_or_init(|| match &self.parent {
+            Some(parent) => parse_selector_list(&nested_selectors(self.prelude), 0, Some(parent)),
+            None => parse_selector_list(self.prelude, 0, None),
+        })
+    }
+
+    /// What `&` stands for in the rules nested in this one.
+    fn nest(&self) -> Nest {
+        self.nest
+            .get_or_init(|| {
+                let list = self.list();
+                Nest {
+                    parent: list
+                        .iter()
+                        .filter(|selector| selector.pseudo_element == PseudoElement::None)
+                        .cloned()
+                        .collect(),
+                    specificity: list
+                        .iter()
+                        .map(|selector| selector.specificity)
+                        .max()
+                        .unwrap_or((0, 0, 0)),
+                    depth: self.parent.as_ref().map_or(0, |parent| parent.depth + 1),
+                }
+            })
+            .clone()
+    }
+}
+
+/// A style rule's block: its declarations, and the rules nested in it,
+/// whose selectors are read inside this rule's (see [`Nest`]). As a reader
+/// orders them, the declarations before a nested rule, or a nested
+/// at-rule, come before it in the cascade, and those after it after it.
 fn parse_style_block(
-    selectors: &[Token],
+    selectors: &RuleSelectors,
     block: &[Token],
     context: RuleContext,
     sheet: &mut Stylesheet,
@@ -3428,6 +3573,7 @@ fn parse_style_block(
         match &block[index] {
             Token::Whitespace | Token::Semicolon => index += 1,
             Token::AtKeyword(name) => {
+                push_style_rule(selectors, &mut declarations, &mut paintings, context, sheet)?;
                 index = parse_at_rule(
                     block,
                     index,
@@ -3450,8 +3596,10 @@ fn parse_style_block(
                     if nesting >= MAX_RULE_NESTING {
                         return Err(DocumentError::ResourceLimit);
                     }
+                    push_style_rule(selectors, &mut declarations, &mut paintings, context, sheet)?;
                     let (inner, end) = block_at(block, index);
-                    parse_style_block(&block[start..index], inner, context, sheet, nesting + 1)?;
+                    let nested = RuleSelectors::new(&block[start..index], Some(selectors.nest()));
+                    parse_style_block(&nested, inner, context, sheet, nesting + 1)?;
                     index = end;
                 } else {
                     declarations.extend(
@@ -3465,6 +3613,20 @@ fn parse_style_block(
             }
         }
     }
+    push_style_rule(selectors, &mut declarations, &mut paintings, context, sheet)
+}
+
+/// Keep the declarations read so far of a style rule's block as a rule of
+/// their own, where they set what the check reads, and start afresh.
+fn push_style_rule(
+    selectors: &RuleSelectors,
+    declarations: &mut Vec<Declaration>,
+    paintings: &mut Vec<Painting>,
+    context: RuleContext,
+    sheet: &mut Stylesheet,
+) -> Result<(), DocumentError> {
+    let declarations = std::mem::take(declarations);
+    let paintings = std::mem::take(paintings);
     if context.condition != Tri::No && !(declarations.is_empty() && paintings.is_empty()) {
         let declarations: Rc<[Declaration]> = declarations.into();
         let paintings: Rc<[Painting]> = paintings.into();
@@ -3503,7 +3665,7 @@ fn parse_style_block(
         let spaces = declarations
             .iter()
             .any(|declaration| declaration.property.spaces());
-        for selector in parse_selector_list(selectors, 0) {
+        for selector in selectors.list() {
             let kept = match selector.pseudo_element {
                 PseudoElement::None => styles_element,
                 PseudoElement::Before | PseudoElement::After => lays_out || spaces,
@@ -3513,9 +3675,9 @@ fn parse_style_block(
             let painting = !paintings.is_empty() && selector.pseudo_element == PseudoElement::None;
             let custom = customizes && selector.pseudo_element == PseudoElement::None;
             if kept || spacing || painting || custom {
-                let ancestor_keys = ancestor_keys(&selector, selector.compounds.len() - 1);
+                let ancestor_keys = ancestor_keys(selector, selector.compounds.len() - 1);
                 let rule = Rc::new(StyleRule {
-                    selector,
+                    selector: selector.clone(),
                     declarations: declarations.clone(),
                     paintings: paintings.clone(),
                     ancestor_keys,
@@ -3537,6 +3699,9 @@ fn parse_style_block(
                 }
             }
         }
+    }
+    if sheet.rule_count() > MAX_STYLE_RULES {
+        return Err(DocumentError::ResourceLimit);
     }
     Ok(())
 }
@@ -9360,6 +9525,95 @@ mod tests {
             assert!(walk(&[guarded], rows).fuses_blocks, "{guarded}");
         }
         assert!(!walk(&[".r { display: flex }"], rows).fuses_blocks);
+    }
+
+    #[test]
+    fn nested_rules_match_inside_the_rule_they_are_nested_in() {
+        let body = r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#;
+        let shown = |sheet: &str| drops_shown(&[sheet], body);
+        // `&` stands for what the rule nested in matches, and a selector
+        // without one matches inside that rule's elements.
+        for sheet in [
+            r#".s { &::before { content: "\2212" } }"#,
+            r#"p { .s::before { content: "\2212" } }"#,
+            r#"body { > p { > .s::before { content: "\2212" } } }"#,
+            r#".a { .s:not(&)::before { content: "\2212" } }"#,
+            r#"p { @media screen { .s::before { content: "\2212" } } }"#,
+            r#"body { p { .s { &::before { content: "\2212" } } } }"#,
+            // As much weight as the most specific selector it stands for.
+            r#"#i, p { & .s::before { content: "\2212" } } p span.s::before { content: none }"#,
+        ] {
+            assert!(shown(sheet), "{sheet}");
+        }
+        for sheet in [
+            r#".wrap { color: red; & .s::before { content: "\2212" } }"#,
+            r#".zz { &::before { content: "\2212" } }"#,
+            r#"div { .s::before { content: "\2212" } }"#,
+            r#"body { > .s::before { content: "\2212" } }"#,
+            // A pseudo-element's rule matches no element for `&`.
+            r#"p::before { & .s::before { content: "\2212" } }"#,
+        ] {
+            assert!(!shown(sheet), "{sheet}");
+        }
+        // Declarations after a nested rule come after it in the cascade.
+        assert!(shown(
+            r#".s::before { content: "\2212"; opacity: 0; @media screen { opacity: 1 } }"#
+        ));
+        assert!(!shown(
+            r#".s::before { content: "\2212"; @media screen { opacity: 1 } opacity: 0 }"#
+        ));
+        // Outside a rule, `&` is the root.
+        let blocks = r#"<p>Balance due<span class="s">Grand total</span></p>"#;
+        assert!(walk(&["p { & .s { display: block } }"], blocks).fuses_blocks);
+        assert!(walk(&["& .s { display: block }"], blocks).fuses_blocks);
+        assert!(!walk(&[".a { .s { display: block } }"], blocks).fuses_blocks);
+    }
+
+    #[test]
+    fn nested_rules_share_their_parents_selectors_within_bounds() {
+        // Rules nested in one share its parsed selectors.
+        let parent: Vec<String> = (0..200).map(|at| format!(".p{at}")).collect();
+        let css = format!(
+            "{} {{ {} }}",
+            parent.join(", "),
+            ".s { display: block } ".repeat(2_000)
+        );
+        let sheet = parse_stylesheet(&css).expect("sheet");
+        assert_eq!(sheet.rules.len(), 2_000);
+        let shared = |rule: &StyleRule| match &rule.selector.compounds[0].parts[..] {
+            [Simple::Pseudo(PseudoClass::Is(list))] => list.clone(),
+            parts => panic!("{parts:?}"),
+        };
+        let first = shared(&sheet.rules[0]);
+        assert_eq!(first.len(), 200);
+        assert!(sheet
+            .rules
+            .iter()
+            .all(|rule| Rc::ptr_eq(&shared(rule), &first)));
+        // `&`s taken twice at every level would stand for 8^12 compound
+        // selectors, which the work allowed would run out walking. Past the
+        // bounds, a selector is undecided: it may match, which shows no
+        // sign for certain, and the walk stays well within the work allowed.
+        let css = format!(
+            ".a, .b, .c, .d {{ {} .s::before {{ content: \"\\2212\" }} {} }}",
+            "display: block; & &, & &, & &, & & { ".repeat(12),
+            "} ".repeat(12)
+        );
+        let sheet = parse_stylesheet(&css).expect("sheet");
+        assert!(sheet
+            .rules
+            .iter()
+            .all(|rule| rule.selector.weight <= MAX_SELECTOR_WEIGHT));
+        let (reader, anydoc) = cascade_for(&[css.as_str()]);
+        let body = format!(
+            r#"{}<p>Net change <span class="s">1,250.00</span> this year.</p>{}"#,
+            r#"<div class="a">"#.repeat(40),
+            "</div>".repeat(40)
+        );
+        let mut work = 0;
+        let found = chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("walk");
+        assert!(!found.drops_shown);
+        assert!(work < MAX_MATCH_WORK / 10, "{work}");
     }
 
     #[test]
