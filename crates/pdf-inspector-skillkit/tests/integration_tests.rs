@@ -67,6 +67,7 @@ fn test_pdf_info_serialization() {
         layout: None,
         cmap_gaps: None,
         provenance: PdfProvenance::default(),
+        warnings: vec![],
     };
     let json = serde_json::to_string(&info).expect("serialize failed");
     assert!(json.contains("\"pdf_type\""));
@@ -82,6 +83,7 @@ fn test_pdf_info_serialization() {
     assert!(!json.contains("\"layout\""));
     assert!(!json.contains("\"cmap_gaps\""));
     assert!(!json.contains("\"provenance\""));
+    assert!(!json.contains("\"warnings\""));
 }
 
 #[test]

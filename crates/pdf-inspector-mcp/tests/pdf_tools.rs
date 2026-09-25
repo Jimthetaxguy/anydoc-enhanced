@@ -277,6 +277,78 @@ fn scans_whose_text_layer_is_dropped_are_reported_for_ocr() {
     assert!(!markdown.contains("Taxable interest"), "{markdown}");
 }
 
+/// A one-page card statement whose second purchase line is painted twice,
+/// as an overprint leaves it (pdf-inspector #317, #377).
+fn overprinted_statement_pdf() -> Vec<u8> {
+    let line = |y: u32, text: &str| format!("BT /F1 10 Tf 1 0 0 1 72 {y} Tm ({text}) Tj ET\n");
+    let mut content = line(740, "Card transactions for April");
+    for (index, text) in [
+        "04/02 Grocery store 84.19",
+        "04/05 Fuel 41.00",
+        "04/09 Pharmacy 12.35",
+    ]
+    .iter()
+    .enumerate()
+    {
+        content.push_str(&line(700 - 20 * index as u32, text));
+    }
+    content.push_str(&line(680, "04/05 Fuel 41.00"));
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", content.as_bytes()),
+    ])
+}
+
+#[test]
+fn text_the_markdown_repeats_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let pdf = temporary.path().join("overprinted.pdf");
+    std::fs::write(&pdf, overprinted_statement_pdf()).expect("write PDF");
+    let pdf = pdf.to_str().expect("UTF-8 path").to_string();
+    let sample = fixture("source/sample-2.pdf");
+    let results = call_tools(
+        &[
+            ("pdf_to_markdown", serde_json::json!({ "path": pdf })),
+            ("classify_pdf", serde_json::json!({ "path": pdf })),
+            ("pdf_to_markdown", serde_json::json!({ "path": sample })),
+        ],
+        None,
+    );
+    // A line painted twice over itself is repeated, and reported by page.
+    let warnings = results[0]["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "text_painted_twice"
+                && warning["pages"] == serde_json::json!([1])),
+        "{}",
+        results[0]
+    );
+    // Classification reads no text, so it reports nothing of it.
+    assert!(results[1].get("warnings").is_none(), "{}", results[1]);
+    // pdf-inspector 1.24.0 leaves a rate table's first row in the paragraph
+    // above it in the public Title 26 sample (#406); when a release fixes
+    // that, this expectation goes.
+    let warnings = results[2]["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "table_row_repeated"),
+        "{}",
+        results[2]
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning["code"] == "text_painted_twice"),
+        "{}",
+        results[2]
+    );
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

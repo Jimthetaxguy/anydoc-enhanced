@@ -55,6 +55,37 @@ pub struct PdfInfo {
     /// dictionary.
     #[serde(skip_serializing_if = "PdfProvenance::is_empty")]
     pub provenance: PdfProvenance,
+    /// Ways the Markdown is known to differ from the pages: text repeated
+    /// or placed in the wrong column. Absent when none was found.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<PdfWarning>,
+}
+
+/// A way the extracted text differs from the pages, with the pages it was
+/// found on where the check can tell.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PdfWarning {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<u32>,
+}
+
+/// Text a page paints twice over itself, which pdf-inspector repeats.
+pub const PDF_WARNING_TEXT_PAINTED_TWICE: &str = "text_painted_twice";
+/// A table's first rows also end the paragraph before it.
+pub const PDF_WARNING_TABLE_ROW_REPEATED: &str = "table_row_repeated";
+/// A table cell holds two or more amounts.
+pub const PDF_WARNING_TABLE_VALUES_MERGED: &str = "table_values_merged";
+
+impl PdfWarning {
+    fn new(code: &str, message: &str, pages: Vec<u32>) -> Self {
+        PdfWarning {
+            code: code.to_string(),
+            message: message.to_string(),
+            pages,
+        }
+    }
 }
 
 /// OCR reasons for one 1-indexed page.
@@ -174,12 +205,25 @@ impl PdfInfo {
                 })
                 .collect()
         });
+        // A text PDF whose full run produced no Markdown is not one to trust
+        // at the detector's confidence (open upstream #443); a page whose
+        // text looks garbled is an encoding issue.
+        let empty = matches!(mode, ProcessMode::Full)
+            && matches!(r.pdf_type, PdfType::TextBased)
+            && r.markdown
+                .as_deref()
+                .is_none_or(|markdown| markdown.trim().is_empty());
+        let garbled = r.ocr_reasons_by_page.iter().any(|page| {
+            page.reasons
+                .iter()
+                .any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT)
+        });
         Self {
             pdf_type: format!("{:?}", r.pdf_type),
-            confidence: r.confidence,
+            confidence: if empty { 0.0 } else { r.confidence },
             page_count: r.page_count,
             pages_needing_ocr: r.pages_needing_ocr,
-            has_encoding_issues: r.has_encoding_issues,
+            has_encoding_issues: r.has_encoding_issues || garbled,
             title: bounded(r.title, MAX_TITLE_CHARS),
             markdown: r.markdown,
             processing_time_ms: r.processing_time_ms,
@@ -197,37 +241,53 @@ impl PdfInfo {
                 creation_date: pdf_date(r.creation_date),
                 mod_date: pdf_date(r.mod_date),
             },
+            warnings: Vec::new(),
         }
     }
 }
 
 impl PdfInfo {
-    /// Report as needing OCR, with the reason, the pages whose text is
+    /// Scan what the pages paint (see `text_paints`). Pages whose text is
     /// mostly an invisible layer over a scan, which pdf-inspector reads as
-    /// text when the page also shows a little (see `hidden_text_layer`).
-    /// Pages it already gave a reason are not scanned; a page it listed for
-    /// sparse text alone is, so it gains the reason.
-    fn flag_hidden_text_layers(&mut self, buffer: &[u8], only: Option<&HashSet<u32>>) {
-        let skip: HashSet<u32> = self
+    /// text when the page also shows a little, are reported as needing OCR,
+    /// with the reason; pages it already gave a reason are not scanned for
+    /// that, and a page it listed for sparse text alone is, so it gains the
+    /// reason. In a full run with Markdown, pages not needing OCR are also
+    /// checked for text painted twice, which the Markdown repeats.
+    fn scan_text_paints(&mut self, buffer: &[u8], only: Option<&HashSet<u32>>, mode: &ProcessMode) {
+        let layer_skip: HashSet<u32> = self
             .ocr_reasons_by_page
             .iter()
             .filter(|entry| !entry.reasons.is_empty())
             .map(|entry| entry.page)
             .collect();
-        if skip.len() as u64 >= u64::from(self.page_count) {
+        let twice_skip: Option<HashSet<u32>> = (matches!(mode, ProcessMode::Full)
+            && self
+                .markdown
+                .as_deref()
+                .is_some_and(|markdown| !markdown.trim().is_empty()))
+        .then(|| self.pages_needing_ocr.iter().copied().collect());
+        if layer_skip.len() as u64 >= u64::from(self.page_count) && twice_skip.is_none() {
             return;
         }
-        // The scan only adds a signal: if it fails, the result stands as
+        // The scan only adds signals: if it fails, the result stands as
         // pdf-inspector gave it.
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            hidden_text_layer::pages_with_hidden_text_layer(buffer, &skip, only)
+            text_paints::scan(buffer, &layer_skip, twice_skip.as_ref(), only)
         }))
         .unwrap_or_default();
-        if found.is_empty() {
+        if !found.painted_twice.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TEXT_PAINTED_TWICE,
+                "Text these pages paint twice over itself appears twice in the Markdown, as in \"TToottaall\" or \"84.19 84.19\"; read it once.",
+                found.painted_twice,
+            ));
+        }
+        if found.hidden_layer.is_empty() {
             return;
         }
         let reason = pdf_inspector::OCR_REASON_INVISIBLE_TEXT_LAYER;
-        for page in found {
+        for page in found.hidden_layer {
             self.pages_needing_ocr.push(page);
             match self
                 .ocr_reasons_by_page
@@ -248,6 +308,29 @@ impl PdfInfo {
         self.pages_needing_ocr.sort_unstable();
         self.pages_needing_ocr.dedup();
         self.ocr_reasons_by_page.sort_by_key(|entry| entry.page);
+    }
+
+    /// Check the Markdown's tables for rows pdf-inspector repeats and
+    /// amounts it merges (see `markdown_tables`).
+    fn check_markdown_tables(&mut self) {
+        let Some(markdown) = self.markdown.as_deref() else {
+            return;
+        };
+        let found = markdown_tables::check(markdown);
+        if found.row_repeated {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TABLE_ROW_REPEATED,
+                "A table's first row also ends the paragraph before it, so its amounts appear twice; count them once.",
+                Vec::new(),
+            ));
+        }
+        if found.values_merged {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_TABLE_VALUES_MERGED,
+                "A table cell holds two or more amounts, as when adjacent columns merge; which column each belongs to is uncertain.",
+                Vec::new(),
+            ));
+        }
     }
 }
 
@@ -297,8 +380,9 @@ impl From<pdf_inspector::PageRegionResult> for PageRegionResultOutput {
 
 pub mod document;
 pub mod domain;
-mod hidden_text_layer;
+mod markdown_tables;
 pub mod pdf_worker;
+mod text_paints;
 
 /// Errors from the facade layer.
 #[derive(Debug, thiserror::Error)]
@@ -467,7 +551,8 @@ pub fn process_bytes_with_options(
     let pages = options.page_filter.clone();
     let result = pdf_inspector::process_pdf_mem_with_options(buffer, options)?;
     let mut info = PdfInfo::from_result(result, &mode);
-    info.flag_hidden_text_layers(buffer, pages.as_ref());
+    info.scan_text_paints(buffer, pages.as_ref(), &mode);
+    info.check_markdown_tables();
     Ok(info)
 }
 
@@ -524,6 +609,72 @@ pub fn extract_table_regions_bytes_in_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upstream(pdf_type: PdfType, markdown: Option<&str>, reasons: &[&str]) -> PdfProcessResult {
+        PdfProcessResult {
+            pdf_type,
+            markdown: markdown.map(str::to_string),
+            page_count: 1,
+            processing_time_ms: 1,
+            pages_needing_ocr: if reasons.is_empty() { vec![] } else { vec![1] },
+            ocr_reasons_by_page: if reasons.is_empty() {
+                vec![]
+            } else {
+                vec![pdf_inspector::PageOcrReasons {
+                    page: 1,
+                    reasons: reasons.iter().map(|reason| reason.to_string()).collect(),
+                }]
+            },
+            title: None,
+            author: None,
+            subject: None,
+            keywords: None,
+            creator: None,
+            producer: None,
+            creation_date: None,
+            mod_date: None,
+            confidence: 1.0,
+            layout: LayoutComplexity::default(),
+            has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_or_garbled_extraction_is_not_reported_as_sure() {
+        // A full run of a text PDF that produced no Markdown is no sure read
+        // (upstream #443); classification produces none by design.
+        for markdown in [None, Some(""), Some("  \n")] {
+            let info = PdfInfo::from_result(
+                upstream(PdfType::TextBased, markdown, &[]),
+                &ProcessMode::Full,
+            );
+            assert_eq!(info.confidence, 0.0, "{markdown:?}");
+        }
+        let classified = PdfInfo::from_result(
+            upstream(PdfType::TextBased, None, &[]),
+            &ProcessMode::DetectOnly,
+        );
+        assert_eq!(classified.confidence, 1.0);
+        let read = PdfInfo::from_result(
+            upstream(PdfType::TextBased, Some("# Title"), &[]),
+            &ProcessMode::Full,
+        );
+        assert_eq!(read.confidence, 1.0);
+        assert!(!read.has_encoding_issues);
+        // A page whose text looks garbled is an encoding issue.
+        let garbled = PdfInfo::from_result(
+            upstream(
+                PdfType::TextBased,
+                Some("text"),
+                &[pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT],
+            ),
+            &ProcessMode::Full,
+        );
+        assert!(garbled.has_encoding_issues);
+        // Warnings stay off the wire until one is found.
+        assert!(!serde_json::to_string(&read).unwrap().contains("warnings"));
+    }
 
     #[test]
     fn only_grammatical_pdf_dates_are_reported() {

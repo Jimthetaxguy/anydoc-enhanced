@@ -1,19 +1,30 @@
-//! Pages whose text sits mostly in an invisible layer over a scan.
+//! What pdf-inspector 1.24.0 misreads in the text a page paints.
 //!
-//! A scanned page made searchable carries its words as invisible text
-//! (render mode 3, or 7, which only adds to the clip) behind the page image.
-//! When the page also shows a little real text, such as a header or a Bates
-//! number, pdf-inspector 1.24.0 classifies it as text, extracts the visible
-//! text alone, and reports no page for OCR: it flags only a page whose every
-//! text operator is invisible. Upstream pull requests #479 and #501 are open
-//! against this.
+//! **An invisible layer over a scan.** A scanned page made searchable
+//! carries its words as invisible text (render mode 3, or 7, which only adds
+//! to the clip) behind the page image. When the page also shows a little
+//! real text, such as a header or a Bates number, pdf-inspector classifies
+//! it as text, extracts the visible text alone, and reports no page for OCR:
+//! it flags only a page whose every text operator is invisible. Upstream
+//! pull requests #479 and #501 are open against this. The scan finds the
+//! page it misses: images cover at least half of it, and invisible text
+//! carries most of the bytes it shows as text. Clip-only text through which
+//! an image or a shading is then painted, as in a heading filled with a
+//! picture or a gradient, is visible, as pdf-inspector's own scan counts it.
+//! The layer is never read into any output, since what it says need not be
+//! what the page shows; the page is reported as needing OCR instead.
 //!
-//! This scan finds the page it misses: images cover at least half of it, and
-//! invisible text carries most of the bytes it shows as text. The layer is
-//! never read into any output, since what it says need not be what the page
-//! shows; the page is reported as needing OCR instead.
+//! **Text painted twice.** A producer that paints a run again over itself,
+//! for emphasis, as an overprint, or as a replayed row, shows it once, but
+//! pdf-inspector keeps every paint, so its Markdown repeats the text:
+//! "TToottaall", or "84.19 84.19" (open upstream #317, #377). The scan notes
+//! where each visible run starts when its position was just set, and
+//! reports a page on which a run in the same font with the same bytes
+//! starts again within a tenth of its size of an earlier one.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
 
@@ -23,6 +34,11 @@ const MAX_STREAM_BYTES: usize = 32 << 20;
 /// the scan stops and reports the pages it has already found.
 const MAX_CONTENT_BYTES: usize = 128 << 20;
 const MAX_OPERATIONS: usize = 10_000_000;
+/// The same for pages read only for the repeat check, which reads every
+/// text page: past either, that check stops, and the layer check, which
+/// reads pages with images, goes on under its own limits.
+const MAX_REPEAT_CONTENT_BYTES: usize = 64 << 20;
+const MAX_REPEAT_OPERATIONS: usize = 4_000_000;
 /// Form XObjects executing inside one another.
 const MAX_FORM_DEPTH: usize = 12;
 /// Graphics states saved (`q`) and not yet restored, per content stream.
@@ -36,6 +52,12 @@ const MIN_LAYER_BYTES: u64 = 32;
 const COVERED_SHARE: f64 = 0.5;
 /// Parent links followed to find an inherited page attribute.
 const MAX_PAGE_TREE_DEPTH: usize = 32;
+/// Runs noted per page for the repeat check.
+const MAX_RUNS_PER_PAGE: usize = 100_000;
+/// How near a run must start again to repeat one, as a share of its size,
+/// and at least.
+const REPEAT_SHARE: f64 = 0.1;
+const MIN_REPEAT_DISTANCE: f64 = 0.3;
 
 const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
@@ -45,12 +67,27 @@ struct Exhausted;
 struct Budget {
     bytes: usize,
     operations: usize,
+    max_bytes: usize,
+    max_operations: usize,
 }
 
 impl Budget {
+    fn new(max_bytes: usize, max_operations: usize) -> Self {
+        Budget {
+            bytes: 0,
+            operations: 0,
+            max_bytes,
+            max_operations,
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.bytes > self.max_bytes || self.operations > self.max_operations
+    }
+
     fn take_bytes(&mut self, bytes: usize) -> Result<(), Exhausted> {
         self.bytes = self.bytes.saturating_add(bytes);
-        if self.bytes > MAX_CONTENT_BYTES {
+        if self.bytes > self.max_bytes {
             return Err(Exhausted);
         }
         Ok(())
@@ -58,17 +95,93 @@ impl Budget {
 
     fn take_operations(&mut self, operations: usize) -> Result<(), Exhausted> {
         self.operations = self.operations.saturating_add(operations);
-        if self.operations > MAX_OPERATIONS {
+        if self.operations > self.max_operations {
             return Err(Exhausted);
         }
         Ok(())
     }
 }
 
+/// A font as the repeat check tells fonts apart: its object, or, for a
+/// font dictionary written in place, its resource name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FontKey {
+    Object(ObjectId),
+    Name(u64),
+}
+
+/// The graphics state the scan follows, with the text state in it.
 #[derive(Clone, Copy)]
 struct State {
     ctm: [f64; 6],
     render_mode: i64,
+    font: Option<FontKey>,
+    size: f64,
+    leading: f64,
+    rise: f64,
+}
+
+impl State {
+    const START: State = State {
+        ctm: IDENTITY,
+        render_mode: 0,
+        font: None,
+        size: 0.0,
+        leading: 0.0,
+        rise: 0.0,
+    };
+}
+
+/// Where the visible runs of one page start, by font and a hash of their
+/// bytes.
+#[derive(Default)]
+struct Runs {
+    starts: HashMap<(FontKey, u64), Vec<[f64; 2]>>,
+    noted: usize,
+    repeated: bool,
+}
+
+impl Runs {
+    fn note(&mut self, font: FontKey, text: &[u8], at: [f64; 2], size: f64) {
+        if self.repeated || self.noted >= MAX_RUNS_PER_PAGE {
+            return;
+        }
+        let near = (REPEAT_SHARE * size).max(MIN_REPEAT_DISTANCE);
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        match self.starts.entry((font, hasher.finish())) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().iter().any(|start| {
+                    (start[0] - at[0]).abs() <= near && (start[1] - at[1]).abs() <= near
+                }) {
+                    self.repeated = true;
+                    return;
+                }
+                entry.get_mut().push(at);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(vec![at]);
+            }
+        }
+        self.noted += 1;
+    }
+}
+
+/// The bytes a text-showing operand holds: a string, or an array's strings.
+fn shown_bytes(text: Option<&Object>) -> Vec<u8> {
+    match text {
+        Some(Object::String(bytes, _)) => bytes.clone(),
+        Some(Object::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                Object::String(bytes, _) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// What one page's content shows.
@@ -79,26 +192,87 @@ struct PageText {
     /// Area of the page the drawn images cover, clipped to the page box,
     /// counting overlaps more than once.
     image_area: f64,
+    /// Clip-only (mode 7) text of the open text object, and, by graphics
+    /// state level, that whose clip is in force: hidden unless an image or
+    /// a shading is painted through it before its level is restored.
+    clip_open: u64,
+    clip_levels: Vec<u64>,
+    /// The runs noted for the repeat check, when it is made.
+    runs: Option<Runs>,
 }
 
 impl PageText {
-    fn show(&mut self, state: State, text: Option<&Object>) {
-        let bytes = match text {
-            Some(Object::String(bytes, _)) => bytes.len(),
-            Some(Object::Array(parts)) => parts
-                .iter()
-                .map(|part| match part {
-                    Object::String(bytes, _) => bytes.len(),
-                    _ => 0,
-                })
-                .sum(),
-            _ => 0,
-        } as u64;
-        // Mode 3 paints nothing; mode 7 only adds the glyphs to the clip.
-        if matches!(state.render_mode, 3 | 7) {
-            self.hidden_bytes += bytes;
-        } else {
-            self.visible_bytes += bytes;
+    fn show(&mut self, state: State, bytes: &[u8]) {
+        let bytes = bytes.len() as u64;
+        match state.render_mode {
+            // Mode 3 paints nothing.
+            3 => self.hidden_bytes += bytes,
+            // Mode 7 adds the glyphs to the clip once the text object ends.
+            7 => self.clip_open += bytes,
+            _ => self.visible_bytes += bytes,
+        }
+    }
+
+    fn text_object_ended(&mut self) {
+        let open = std::mem::take(&mut self.clip_open);
+        match self.clip_levels.last_mut() {
+            Some(level) => *level += open,
+            None => self.hidden_bytes += open,
+        }
+    }
+
+    fn save(&mut self) {
+        self.clip_levels.push(0);
+    }
+
+    /// Restore a level: its clip-only text with nothing painted through it
+    /// stays hidden.
+    fn restore(&mut self) {
+        if let Some(level) = self.clip_levels.pop() {
+            self.hidden_bytes += level;
+        }
+    }
+
+    /// Restore the levels past `depth`.
+    fn restore_to(&mut self, depth: usize) {
+        while self.clip_levels.len() > depth {
+            self.restore();
+        }
+    }
+
+    /// An image or a shading was painted through the clips in force: their
+    /// clip-only text shows it.
+    fn painted(&mut self) {
+        for level in &mut self.clip_levels {
+            self.visible_bytes += std::mem::take(level);
+        }
+    }
+
+    /// The content ended: what was never painted through stays hidden.
+    fn ended(&mut self) {
+        self.text_object_ended();
+        self.restore_to(0);
+    }
+
+    /// Note a visible run whose start the text matrix says.
+    fn note_run(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8]) {
+        let Some(runs) = self.runs.as_mut() else {
+            return;
+        };
+        let Some(font) = state.font else {
+            return;
+        };
+        if matches!(state.render_mode, 3 | 7) || !bytes.iter().any(|&byte| byte != b' ') {
+            return;
+        }
+        let matrix = multiply(text_matrix, state.ctm);
+        let at = [
+            matrix[2] * state.rise + matrix[4],
+            matrix[3] * state.rise + matrix[5],
+        ];
+        let size = state.size.abs() * matrix[2].hypot(matrix[3]);
+        if at.iter().all(|value| value.is_finite()) && size.is_finite() {
+            runs.note(font, bytes, at, size);
         }
     }
 
@@ -124,6 +298,7 @@ impl PageText {
         if area.is_finite() {
             self.image_area += area;
         }
+        self.painted();
     }
 
     fn is_hidden_layer(&self, page_box: [f64; 4]) -> bool {
@@ -135,57 +310,109 @@ impl PageText {
     }
 }
 
-/// The 1-indexed pages whose text is mostly an invisible layer over images
-/// covering the page. Pages in `skip` are not scanned, nor pages outside
-/// `only` when it is given. A document that does not load reports none.
-pub(crate) fn pages_with_hidden_text_layer(
+/// The 1-indexed pages the scan reports.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Findings {
+    /// Pages whose text is mostly an invisible layer over images covering
+    /// the page.
+    pub(crate) hidden_layer: Vec<u32>,
+    /// Pages that paint a visible run again over itself.
+    pub(crate) painted_twice: Vec<u32>,
+}
+
+/// Scan a document's pages. Pages in `layer_skip` are not checked for an
+/// invisible layer; pages are checked for text painted twice only when
+/// `twice_skip` is given, and not those in it. Pages outside `only`, when
+/// it is given, are not scanned. A document that does not load reports
+/// none.
+pub(crate) fn scan(
     buffer: &[u8],
-    skip: &HashSet<u32>,
+    layer_skip: &HashSet<u32>,
+    twice_skip: Option<&HashSet<u32>>,
     only: Option<&HashSet<u32>>,
-) -> Vec<u32> {
+) -> Findings {
     let options = lopdf::LoadOptions {
         max_decompressed_size: Some(MAX_OBJECT_STREAM_BYTES),
         ..Default::default()
     };
     let Ok(document) = Document::load_mem_with_options(buffer, options) else {
-        return Vec::new();
+        return Findings::default();
     };
-    let mut budget = Budget {
-        bytes: 0,
-        operations: 0,
-    };
-    let mut found = Vec::new();
+    let mut layer_budget = Budget::new(MAX_CONTENT_BYTES, MAX_OPERATIONS);
+    let mut repeat_budget = Budget::new(MAX_REPEAT_CONTENT_BYTES, MAX_REPEAT_OPERATIONS);
+    let mut repeats = twice_skip.is_some();
+    let mut found = Findings::default();
     for (&number, &page_id) in &document.get_pages() {
-        if skip.contains(&number) || only.is_some_and(|only| !only.contains(&number)) {
+        if only.is_some_and(|only| !only.contains(&number)) {
             continue;
         }
-        match scan_page(&document, page_id, &mut budget) {
-            Ok(true) => found.push(number),
-            Ok(false) => {}
+        let check_layer = !layer_skip.contains(&number);
+        let check_twice = repeats && twice_skip.is_some_and(|skip| !skip.contains(&number));
+        if !check_layer && !check_twice {
+            continue;
+        }
+        let budgets = Budgets {
+            layer: &mut layer_budget,
+            repeat: &mut repeat_budget,
+        };
+        match scan_page(&document, page_id, check_layer, check_twice, budgets) {
+            Ok(page) => {
+                if page.hidden_layer {
+                    found.hidden_layer.push(number);
+                }
+                if page.painted_twice {
+                    found.painted_twice.push(number);
+                }
+            }
+            // The repeat check's limits ran out on a page read for it alone:
+            // that check stops, and the layer check goes on.
+            Err(Exhausted) if repeat_budget.spent() => repeats = false,
             Err(Exhausted) => break,
         }
     }
     found
 }
 
+/// The limits a page is read under: the layer check's when the page is
+/// read for it, the repeat check's otherwise.
+struct Budgets<'a> {
+    layer: &'a mut Budget,
+    repeat: &'a mut Budget,
+}
+
+/// What the scan found on one page.
+#[derive(Default)]
+struct PageFindings {
+    hidden_layer: bool,
+    painted_twice: bool,
+}
+
 fn scan_page(
     document: &Document,
     page_id: ObjectId,
-    budget: &mut Budget,
-) -> Result<bool, Exhausted> {
+    check_layer: bool,
+    check_twice: bool,
+    budgets: Budgets<'_>,
+) -> Result<PageFindings, Exhausted> {
     let Some(page_box) = page_box(document, page_id) else {
-        return Ok(false);
+        return Ok(PageFindings::default());
     };
     let resources = page_resources(document, page_id);
-    // A scan is an image XObject; a page that binds none, directly or
-    // through its forms, is not read.
+    // A scan is an image XObject; for the layer check, a page that binds
+    // none, directly or through its forms, is not read.
     let mut seen = HashSet::new();
-    if !resources
-        .iter()
-        .any(|dictionary| binds_image(document, dictionary, 0, &mut seen))
-    {
-        return Ok(false);
+    let check_layer = check_layer
+        && resources
+            .iter()
+            .any(|dictionary| binds_image(document, dictionary, 0, &mut seen));
+    if !check_layer && !check_twice {
+        return Ok(PageFindings::default());
     }
+    let budget = if check_layer {
+        budgets.layer
+    } else {
+        budgets.repeat
+    };
     let mut content = Vec::new();
     for id in document.get_page_contents(page_id) {
         let Ok(stream) = document.get_object(id).and_then(Object::as_stream) else {
@@ -199,16 +426,27 @@ fn scan_page(
         // Streams are concatenated as if one, separated by white space.
         content.push(b'\n');
     }
-    let mut page = PageText::default();
-    let start = State {
-        ctm: IDENTITY,
-        render_mode: 0,
+    let mut page = PageText {
+        runs: check_twice.then(Runs::default),
+        ..PageText::default()
     };
+    page.save();
     let mut forms = Vec::new();
     execute(
-        document, &content, &resources, start, page_box, &mut page, &mut forms, budget,
+        document,
+        &content,
+        &resources,
+        State::START,
+        page_box,
+        &mut page,
+        &mut forms,
+        budget,
     )?;
-    Ok(page.is_hidden_layer(page_box))
+    page.ended();
+    Ok(PageFindings {
+        hidden_layer: check_layer && page.is_hidden_layer(page_box),
+        painted_twice: page.runs.is_some_and(|runs| runs.repeated),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,12 +468,25 @@ fn execute<'a>(
     let mut saved: Vec<State> = Vec::new();
     // Saves past the cap, so their restores are matched too.
     let mut unsaved = 0usize;
+    // The text matrix and line matrix, and whether the next run's start is
+    // known: its position was just set.
+    let mut text_matrix = IDENTITY;
+    let mut line_matrix = IDENTITY;
+    let mut placed = false;
     for operation in &content.operations {
         let operands = &operation.operands;
-        match operation.operator.as_str() {
+        let operator = operation.operator.as_str();
+        // `'` and `"` move to the next line before they show text.
+        if matches!(operator, "T*" | "'" | "\"") {
+            line_matrix = multiply([1.0, 0.0, 0.0, 1.0, 0.0, -state.leading], line_matrix);
+            text_matrix = line_matrix;
+            placed = true;
+        }
+        match operator {
             "q" => {
                 if saved.len() < MAX_SAVED_STATES {
                     saved.push(state);
+                    page.save();
                 } else {
                     unsaved += 1;
                 }
@@ -245,6 +496,7 @@ fn execute<'a>(
                     unsaved -= 1;
                 } else if let Some(previous) = saved.pop() {
                     state = previous;
+                    page.restore();
                 }
             }
             "cm" => {
@@ -257,9 +509,72 @@ fn execute<'a>(
                     state.render_mode = mode;
                 }
             }
-            "Tj" | "'" | "\"" => page.show(state, operands.last()),
-            "TJ" => page.show(state, operands.first()),
+            "Tf" => {
+                if let [name, size] = operands.as_slice() {
+                    state.font = name
+                        .as_name()
+                        .ok()
+                        .map(|name| font_key(document, resources, name));
+                    if let Some(size) = number(document, size) {
+                        state.size = size;
+                    }
+                }
+            }
+            "TL" => {
+                if let Some(leading) = operands.first().and_then(|value| number(document, value)) {
+                    state.leading = leading;
+                }
+            }
+            "Ts" => {
+                if let Some(rise) = operands.first().and_then(|value| number(document, value)) {
+                    state.rise = rise;
+                }
+            }
+            "BT" => {
+                text_matrix = IDENTITY;
+                line_matrix = IDENTITY;
+                placed = true;
+            }
+            "ET" => {
+                page.text_object_ended();
+                placed = false;
+            }
+            "Tm" => {
+                if let Some(matrix) = matrix(document, operands) {
+                    text_matrix = matrix;
+                    line_matrix = matrix;
+                    placed = true;
+                }
+            }
+            "Td" | "TD" => {
+                if let [x, y] = operands.as_slice() {
+                    if let (Some(x), Some(y)) = (number(document, x), number(document, y)) {
+                        if operator == "TD" {
+                            state.leading = -y;
+                        }
+                        line_matrix = multiply([1.0, 0.0, 0.0, 1.0, x, y], line_matrix);
+                        text_matrix = line_matrix;
+                        placed = true;
+                    }
+                }
+            }
+            "Tj" | "'" | "\"" | "TJ" => {
+                let text = if operator == "TJ" {
+                    operands.first()
+                } else {
+                    operands.last()
+                };
+                let bytes = shown_bytes(text);
+                page.show(state, &bytes);
+                // After a run, the next starts where it ended, which the
+                // glyph widths decide.
+                if placed {
+                    page.note_run(state, text_matrix, &bytes);
+                }
+                placed = false;
+            }
             "BI" => page.draw_image(state.ctm, page_box),
+            "sh" => page.painted(),
             "Do" => {
                 let Some(name) = operands.first().and_then(|name| name.as_name().ok()) else {
                     continue;
@@ -297,8 +612,11 @@ fn execute<'a>(
                         };
                         let inner = State {
                             ctm: multiply(form_matrix, state.ctm),
-                            render_mode: state.render_mode,
+                            ..state
                         };
+                        // A form runs in a saved state of its own.
+                        let depth = page.clip_levels.len();
+                        page.save();
                         forms.push(id);
                         let result = execute(
                             document,
@@ -311,6 +629,7 @@ fn execute<'a>(
                             budget,
                         );
                         forms.pop();
+                        page.restore_to(depth);
                         result?;
                     }
                     _ => {}
@@ -389,6 +708,28 @@ fn page_resources(document: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
                 .filter_map(|id| document.get_dictionary(id).ok()),
         )
         .collect()
+}
+
+/// The key the repeat check tells a font by: the object its resource name
+/// binds in the first resource dictionary naming it, or the name itself.
+fn font_key(document: &Document, resources: &[&Dictionary], name: &[u8]) -> FontKey {
+    for resources in resources {
+        let Some(fonts) = resources
+            .get(b"Font")
+            .ok()
+            .and_then(|fonts| dictionary(document, fonts))
+        else {
+            continue;
+        };
+        match fonts.get(name) {
+            Ok(Object::Reference(id)) => return FontKey::Object(*id),
+            Ok(_) => break,
+            Err(_) => continue,
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    FontKey::Name(hasher.finish())
 }
 
 /// The named XObject from the first resource dictionary that binds it, with
@@ -594,8 +935,21 @@ pub(crate) mod tests {
         "BT /F1 9 Tf 1 0 0 1 72 770 Tm (CONFIDENTIAL - CLIENT COPY) Tj ET \
          BT /F1 9 Tf 1 0 0 1 480 20 Tm (BATES-000123) Tj ET";
 
+    /// The pages the layer check reports.
+    fn layer_pages(pdf: &[u8], skip: &HashSet<u32>, only: Option<&HashSet<u32>>) -> Vec<u32> {
+        scan(pdf, skip, None, only).hidden_layer
+    }
+
     fn flagged(page: &str, form: &str) -> bool {
-        pages_with_hidden_text_layer(&scan_pdf(page, form), &HashSet::new(), None) == [1]
+        layer_pages(&scan_pdf(page, form), &HashSet::new(), None) == [1]
+    }
+
+    /// Whether the repeat check reports the page.
+    fn repeated(page: &str, form: &str) -> bool {
+        let pdf = scan_pdf(page, form);
+        let found = scan(&pdf, &HashSet::from([1]), Some(&HashSet::new()), None);
+        assert!(found.hidden_layer.is_empty());
+        found.painted_twice == [1]
     }
 
     #[test]
@@ -637,12 +991,86 @@ pub(crate) mod tests {
         assert!(!flagged(&format!("{SCAN} {} {visible}", text_layer(3)), ""));
         // A page skipped or outside the pages asked for is not scanned.
         let pdf = scan_pdf(&format!("{SCAN} {} {STAMP}", text_layer(3)), "");
-        assert!(pages_with_hidden_text_layer(&pdf, &HashSet::from([1]), None).is_empty());
-        assert!(
-            pages_with_hidden_text_layer(&pdf, &HashSet::new(), Some(&HashSet::from([2])))
-                .is_empty()
-        );
-        assert!(pages_with_hidden_text_layer(b"not a pdf", &HashSet::new(), None).is_empty());
+        assert!(layer_pages(&pdf, &HashSet::from([1]), None).is_empty());
+        assert!(layer_pages(&pdf, &HashSet::new(), Some(&HashSet::from([2]))).is_empty());
+        assert!(layer_pages(b"not a pdf", &HashSet::new(), None).is_empty());
+    }
+
+    #[test]
+    fn clip_only_text_painted_through_is_visible() {
+        // A heading filled with an image or a gradient: the image or the
+        // shading is painted through the text's clip.
+        let heading = text_layer(7);
+        assert!(!flagged(
+            &format!("{SCAN} q {heading} {SCAN} Q {STAMP}"),
+            ""
+        ));
+        assert!(!flagged(
+            &format!("{SCAN} q {heading} /Sh1 sh Q {STAMP}"),
+            ""
+        ));
+        // Painted before the text, or after its level is restored, the
+        // image shows through nothing.
+        assert!(flagged(&format!("{SCAN} q {heading} Q {SCAN} {STAMP}"), ""));
+        // A form paints through the clip it inherits.
+        assert!(!flagged(
+            &format!("{SCAN} q {heading} /Fm1 Do Q {STAMP}"),
+            "/Sh1 sh"
+        ));
+    }
+
+    #[test]
+    fn text_painted_twice_is_found() {
+        let line =
+            |x: f64| format!("BT /F1 11 Tf 1 0 0 1 {x} 700 Tm (Total amount due: $1,234.56) Tj ET");
+        // The same run again at the same place, or a fraction of a point
+        // off, as for emphasis.
+        assert!(repeated(&format!("{} {}", line(72.0), line(72.0)), ""));
+        assert!(repeated(&format!("{} {}", line(72.0), line(72.3)), ""));
+        // Glyph by glyph, each placed twice.
+        let glyphs: String = [("T", 72.0), ("o", 79.33), ("t", 86.0)]
+            .iter()
+            .map(|(glyph, x)| format!("BT /F1 12 Tf 1 0 0 1 {x} 700 Tm ({glyph}) Tj ET "))
+            .collect();
+        assert!(repeated(&format!("{glyphs}{glyphs}"), ""));
+        // Within one text object, placed by Td, and in a form drawn twice.
+        assert!(repeated(
+            "BT /F1 9 Tf 40 698 Td (84.19) Tj 0 0 Td (84.19) Tj ET",
+            ""
+        ));
+        assert!(repeated("/Fm1 Do /Fm1 Do", &line(72.0)));
+        // Different places, text, or fonts, text a run leaves unplaced, and
+        // invisible text are not repeats.
+        assert!(!repeated(&format!("{} {}", line(72.0), line(90.0)), ""));
+        assert!(!repeated(
+            &format!("{} {}", line(72.0), line(72.0).replace("1,234", "1,235")),
+            ""
+        ));
+        assert!(!repeated(
+            "BT /F1 11 Tf 1 0 0 1 72 700 Tm (A) Tj (A) Tj ET",
+            ""
+        ));
+        assert!(!repeated(
+            &format!(
+                "{} {}",
+                line(72.0),
+                line(72.0).replace("/F1 11 Tf", "3 Tr /F1 11 Tf")
+            ),
+            ""
+        ));
+        // Adjacent narrow glyphs are a tenth of their size apart or more.
+        assert!(!repeated(
+            "BT /F1 12 Tf 1 0 0 1 72 700 Tm (l) Tj 1 0 0 1 74.66 700 Tm (l) Tj ET",
+            ""
+        ));
+        // A page checked only for the layer is not checked for repeats.
+        let pdf = scan_pdf(&format!("{} {}", line(72.0), line(72.0)), "");
+        assert!(scan(&pdf, &HashSet::new(), None, None)
+            .painted_twice
+            .is_empty());
+        assert!(scan(&pdf, &HashSet::new(), Some(&HashSet::from([1])), None)
+            .painted_twice
+            .is_empty());
     }
 
     #[test]
@@ -652,10 +1080,7 @@ pub(crate) mod tests {
             &format!("{SCAN} /Fm1 Do {STAMP}"),
             &format!("{} /Fm1 Do", text_layer(3)),
         );
-        assert_eq!(
-            pages_with_hidden_text_layer(&pdf, &HashSet::new(), None),
-            [1]
-        );
+        assert_eq!(layer_pages(&pdf, &HashSet::new(), None), [1]);
         // Unbalanced saves and restores keep the state they can.
         let deep = "q ".repeat(MAX_SAVED_STATES + 10);
         let restores = "Q ".repeat(MAX_SAVED_STATES + 20);
@@ -663,10 +1088,8 @@ pub(crate) mod tests {
             &format!("{SCAN} {deep}{restores}{} {STAMP}", text_layer(3)),
             ""
         ));
-        let mut budget = Budget {
-            bytes: MAX_CONTENT_BYTES,
-            operations: 0,
-        };
+        let mut budget = Budget::new(MAX_CONTENT_BYTES, MAX_OPERATIONS);
+        budget.bytes = MAX_CONTENT_BYTES;
         assert!(budget.take_bytes(1).is_err());
         budget.operations = MAX_OPERATIONS;
         assert!(budget.take_operations(1).is_err());
