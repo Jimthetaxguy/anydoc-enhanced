@@ -661,10 +661,12 @@ struct PageText {
     invisible_text: Option<Noted>,
     /// Text shown in a font pdf-inspector reads without its collection's
     /// map, as the font says it (see `cjk_fonts`), and whether any of it
-    /// reads otherwise with no sign, when the page is read for repeats.
+    /// reads otherwise with no sign, when the page is read for repeats;
+    /// and text in a font it may read so, as it would read it.
     cjk_text: Option<Noted>,
     cjk_read: Option<Noted>,
     cjk_misread: bool,
+    cjk_evidence: Option<Noted>,
     cjk_fonts: crate::cjk_fonts::CjkFonts,
     /// Strings shown in fonts that write vertically, when the page is read
     /// for repeats, and the bytes of their text kept.
@@ -729,16 +731,23 @@ impl Start {
 }
 
 /// Text in fonts pdf-inspector finds no map for on a page: as it says it,
-/// as far as can be told, and as pdf-inspector reads it with no sign.
+/// as far as can be told, and as pdf-inspector reads it with no sign; and
+/// text in fonts it may find none for, as it would read it with none.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct CjkTexts {
     pub(crate) says: Vec<String>,
     pub(crate) read_as: Vec<String>,
+    pub(crate) evidence: Vec<String>,
 }
 
 impl CjkTexts {
     fn bytes(&self) -> usize {
-        self.says.iter().chain(&self.read_as).map(String::len).sum()
+        self.says
+            .iter()
+            .chain(&self.read_as)
+            .chain(&self.evidence)
+            .map(String::len)
+            .sum()
     }
 }
 
@@ -1138,14 +1147,31 @@ impl PageText {
         placed: bool,
         cjk: Option<crate::cjk_fonts::Unmapped>,
     ) {
-        let (Some(says), Some(read)) = (self.cjk_text.as_mut(), self.cjk_read.as_mut()) else {
+        let (Some(says), Some(read), Some(evidence)) = (
+            self.cjk_text.as_mut(),
+            self.cjk_read.as_mut(),
+            self.cjk_evidence.as_mut(),
+        ) else {
             return;
         };
         let Some(font) = cjk else {
             says.interrupt();
             read.interrupt();
+            evidence.interrupt();
             return;
         };
+        // A font not judged may have a map: its text is looked for only as
+        // pdf-inspector reads it with none.
+        if !font.judged {
+            says.interrupt();
+            read.interrupt();
+            match crate::cjk_fonts::read_as(font, bytes) {
+                Some(text) => evidence.note(&text, placed, None, None, true),
+                None => evidence.interrupt(),
+            }
+            return;
+        }
+        evidence.interrupt();
         self.cjk_misread |= crate::cjk_fonts::misread(font, bytes);
         says.note(
             &crate::cjk_fonts::says(font, bytes).unwrap_or_default(),
@@ -1572,8 +1598,11 @@ pub(crate) fn scan_document(
                 if page.cjk_misread {
                     found.cjk_pages.push(number);
                 }
-                // Text left out cannot tell the page read right.
-                if page.cjk_misread && fits(page.cjk_text.bytes()) {
+                // Text left out cannot tell the page read right; text that
+                // may read right is looked for only where it fits.
+                if (page.cjk_misread || !page.cjk_text.evidence.is_empty())
+                    && fits(page.cjk_text.bytes())
+                {
                     found.cjk_texts.push((number, page.cjk_text));
                 }
                 let mut readings = page.vertical_readings;
@@ -1754,6 +1783,7 @@ fn scan_page(
         cjk_text: check_twice.then(Noted::default),
         cjk_read: check_twice.then(Noted::default),
         cjk_misread: false,
+        cjk_evidence: check_twice.then(Noted::default),
         cjk_fonts: std::mem::take(cjk_fonts),
         vertical: check_twice.then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
@@ -1836,6 +1866,11 @@ fn scan_page(
                 .unwrap_or_default(),
             read_as: page
                 .cjk_read
+                .take()
+                .map(|noted| noted.notes.into_iter().map(|note| note.text).collect())
+                .unwrap_or_default(),
+            evidence: page
+                .cjk_evidence
                 .take()
                 .map(|noted| noted.notes.into_iter().map(|note| note.text).collect())
                 .unwrap_or_default(),

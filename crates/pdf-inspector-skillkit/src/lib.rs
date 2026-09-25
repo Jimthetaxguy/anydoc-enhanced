@@ -820,11 +820,20 @@ impl PdfInfo {
         let Some(markdown) = self.markdown.as_deref() else {
             return;
         };
-        let pages: Vec<u32> = pages
+        let within = |page: &u32| only.is_none_or(|only| only.contains(page));
+        let misread: HashSet<u32> = pages.iter().copied().filter(within).collect();
+        let mut pages: Vec<u32> = misread
             .iter()
             .copied()
-            .filter(|page| only.is_none_or(|only| only.contains(page)))
+            .chain(
+                texts
+                    .iter()
+                    .map(|(page, _)| *page)
+                    .filter(|page| within(page)),
+            )
             .collect();
+        pages.sort_unstable();
+        pages.dedup();
         if pages.is_empty() {
             return;
         }
@@ -835,28 +844,49 @@ impl PdfInfo {
                 .filter(|text| text.chars().count() >= MIN_CJK_CHARS)
                 .collect()
         };
-        let by_page: HashMap<u32, (Vec<String>, Vec<String>)> = texts
+        type Looked = (Vec<String>, Vec<String>, Vec<String>);
+        let by_page: HashMap<u32, Looked> = texts
             .iter()
             .filter(|(page, _)| pages.contains(page))
-            .map(|(page, texts)| (*page, (looked_for(&texts.read_as), looked_for(&texts.says))))
+            .map(|(page, texts)| {
+                (
+                    *page,
+                    (
+                        looked_for(&texts.read_as),
+                        looked_for(&texts.says),
+                        looked_for(&texts.evidence),
+                    ),
+                )
+            })
             .collect();
         let mut patterns: Vec<&str> = by_page
             .values()
-            .flat_map(|(read_as, says)| read_as.iter().chain(says))
+            .flat_map(|(read_as, says, evidence)| read_as.iter().chain(says).chain(evidence))
             .map(String::as_str)
             .collect();
         patterns.sort_unstable();
         patterns.dedup();
         let found = repeated_lines::found_in(&patterns, markdown);
+        let shown = |texts: &[String]| texts.iter().any(|text| found.contains(text.as_str()));
         let reported: Vec<u32> = pages
             .into_iter()
             .filter(|page| {
-                // A page whose text was left out cannot be told read right.
-                let Some((read_as, says)) = by_page.get(page) else {
+                let texts = by_page.get(page);
+                // Text in a font that may have a map is reported where the
+                // Markdown shows it as read with none.
+                if texts.is_some_and(|(_, _, evidence)| shown(evidence)) {
+                    return true;
+                }
+                if !misread.contains(page) {
+                    return false;
+                }
+                // A page whose text was left out, or that says nothing to
+                // look for, cannot be told read right.
+                let Some((read_as, says, _)) = texts else {
                     return true;
                 };
-                read_as.iter().any(|text| found.contains(text.as_str()))
-                    || (read_as.is_empty() && says.is_empty())
+                shown(read_as)
+                    || says.is_empty()
                     || !says.iter().all(|text| found.contains(text.as_str()))
             })
             .collect();
@@ -1583,6 +1613,7 @@ mod tests {
             text_paints::CjkTexts {
                 says: vec!["Total wages 52,000.00".to_owned()],
                 read_as: vec!["5PUBMXBHFT".to_owned()],
+                evidence: Vec::new(),
             },
         )];
         let cjk = || [(PDF_WARNING_CJK_TEXT_MISREAD.to_owned(), vec![1])];
@@ -1603,6 +1634,34 @@ mod tests {
         assert_eq!(reported(&info), cjk());
         let mut info = read("Total wages\n");
         info.check_cjk_text(&[1], &[], None);
+        assert_eq!(reported(&info), cjk());
+        // Text that says nothing to look for, such as kanji alone, is
+        // reported though its reading is not found.
+        let kanji = [(
+            1,
+            text_paints::CjkTexts {
+                says: Vec::new(),
+                read_as: vec!["Ayd5P@fj".to_owned()],
+                evidence: Vec::new(),
+            },
+        )];
+        let mut info = read("Total wages\n");
+        info.check_cjk_text(&[1], &kanji, None);
+        assert_eq!(reported(&info), cjk());
+        // Text in a font that may have a map is reported only where the
+        // Markdown shows it as read with none.
+        let doubtful = [(
+            1,
+            text_paints::CjkTexts {
+                evidence: vec!["5PUBMXBHFT".to_owned()],
+                ..text_paints::CjkTexts::default()
+            },
+        )];
+        let mut info = read("Total wages\n");
+        info.check_cjk_text(&[], &doubtful, None);
+        assert!(info.warnings.is_empty());
+        let mut info = read("5PUBMXBHFT\n");
+        info.check_cjk_text(&[], &doubtful, None);
         assert_eq!(reported(&info), cjk());
     }
 

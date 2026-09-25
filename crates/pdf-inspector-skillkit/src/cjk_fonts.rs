@@ -33,11 +33,12 @@ const TABLED_COLLECTION: &[u8] = b"Korea1";
 const ASCII_CIDS: std::ops::RangeInclusive<u16> = 1..=95;
 
 /// Bytes of maps and font programs read per document to tell whether
-/// pdf-inspector finds a map; past them, a font is taken to have one.
-const MAX_READ_BYTES: usize = 64 << 20;
-/// Bytes one map or program may decode to; one larger is taken to hold a
-/// map.
-const MAX_STREAM_BYTES: usize = 16 << 20;
+/// pdf-inspector finds a map; past them, a font is not judged (see
+/// `Unmapped::judged`).
+const MAX_READ_BYTES: usize = 256 << 20;
+/// Bytes one map or program may decode to; past them, its font is not
+/// judged.
+const MAX_STREAM_BYTES: usize = 64 << 20;
 /// Distinct CIDs of a font's widths pdf-inspector reads, at most.
 const MAX_WIDTH_CIDS: usize = 65_536;
 
@@ -51,14 +52,23 @@ pub(crate) struct Unmapped {
     /// Whether the codes are UCS-2, under a predefined `Uni*-UCS2` CMap,
     /// not the collection's CIDs.
     pub(crate) ucs2: bool,
+    /// Whether it is told to have no map; else it may have one, as its
+    /// program was past the bytes read (`MAX_STREAM_BYTES`,
+    /// `MAX_READ_BYTES`), and its text is looked for only as pdf-inspector
+    /// reads it with none.
+    pub(crate) judged: bool,
 }
 
-/// Fonts judged so far, by the address of their dictionary, and the bytes
-/// read to judge them.
+/// Fonts judged so far, by the address of their dictionary; the programs
+/// read to judge them, by object, whether each gives a map, where it was
+/// read; the bytes read; and the keys pdf-inspector files maps under (see
+/// `collected_keys`), once read.
 #[derive(Default)]
 pub(crate) struct CjkFonts {
     known: HashMap<usize, Option<Unmapped>>,
+    programs: HashMap<ObjectId, Option<bool>>,
     read: usize,
+    collected: Option<HashSet<u32>>,
 }
 
 impl CjkFonts {
@@ -69,10 +79,169 @@ impl CjkFonts {
         if let Some(known) = self.known.get(&key) {
             return *known;
         }
-        let found = unmapped(document, font, &mut self.read);
+        let found = unmapped(document, font, self);
         self.known.insert(key, found);
         found
     }
+
+    /// Whether the program `file` gives pdf-inspector a map (see
+    /// `program_maps`), read once however many fonts embed it.
+    fn program_maps(&mut self, document: &Document, file: ObjectId) -> Option<bool> {
+        if let Some(maps) = self.programs.get(&file) {
+            return *maps;
+        }
+        let maps = program_maps(document, file, &mut self.read);
+        self.programs.insert(file, maps);
+        maps
+    }
+
+    /// Whether pdf-inspector files a map under `key` (see `collected_keys`).
+    fn collected(&mut self, document: &Document, key: u32) -> bool {
+        self.collected
+            .get_or_insert_with(|| collected_keys(document))
+            .contains(&key)
+    }
+}
+
+/// The keys pdf-inspector files the maps of fonts with no `/ToUnicode`
+/// under, as `FontCMaps::from_doc` collects fonts: those of each page's
+/// resources, its own and those it inherits, the first of each name; and
+/// those of the forms these resources name, and the forms theirs name,
+/// where a form gives its `/Resources` in place. A font it does not collect
+/// finds a map only where one it does is filed under the same key.
+fn collected_keys(document: &Document) -> HashSet<u32> {
+    fn in_place_or_by_reference<'a>(
+        document: &'a Document,
+        object: &'a Object,
+    ) -> Option<&'a Dictionary> {
+        match object {
+            Object::Reference(id) => document.get_dictionary(*id).ok(),
+            Object::Dictionary(dictionary) => Some(dictionary),
+            _ => None,
+        }
+    }
+    let mut keys = HashSet::new();
+    let mut visited = HashSet::new();
+    for page in document.get_pages().into_values() {
+        if let Ok(fonts) = document.get_page_fonts(page) {
+            keys.extend(
+                fonts
+                    .values()
+                    .filter_map(|font| collection_key(document, font)),
+            );
+        }
+        let Ok((own, inherited)) = document.get_page_resources(page) else {
+            continue;
+        };
+        let mut pending: Vec<&Dictionary> = own
+            .into_iter()
+            .chain(
+                inherited
+                    .into_iter()
+                    .filter_map(|id| document.get_dictionary(id).ok()),
+            )
+            .collect();
+        while let Some(resources) = pending.pop() {
+            let xobjects = match resources.get(b"XObject") {
+                Ok(Object::Reference(id)) => {
+                    document.get_object(*id).and_then(Object::as_dict).ok()
+                }
+                Ok(Object::Dictionary(xobjects)) => Some(xobjects),
+                _ => None,
+            };
+            for (_, xobject) in xobjects.into_iter().flat_map(Dictionary::iter) {
+                let Object::Reference(id) = xobject else {
+                    continue;
+                };
+                if !visited.insert(*id) {
+                    continue;
+                }
+                let Ok(form) = document.get_object(*id).and_then(Object::as_stream) else {
+                    continue;
+                };
+                if !form
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .is_ok_and(|subtype| subtype == b"Form")
+                {
+                    continue;
+                }
+                let Ok(resources) = form.dict.get(b"Resources").and_then(Object::as_dict) else {
+                    continue;
+                };
+                let fonts = match resources.get(b"Font") {
+                    Ok(Object::Reference(id)) => {
+                        document.get_object(*id).and_then(Object::as_dict).ok()
+                    }
+                    Ok(Object::Dictionary(fonts)) => Some(fonts),
+                    _ => None,
+                };
+                keys.extend(
+                    fonts
+                        .into_iter()
+                        .flat_map(Dictionary::iter)
+                        .filter_map(|(_, font)| in_place_or_by_reference(document, font))
+                        .filter_map(|font| collection_key(document, font)),
+                );
+                pending.push(resources);
+            }
+        }
+    }
+    keys
+}
+
+/// The first of a font's descendants, and whether it is given by
+/// reference.
+fn first_descendant<'a>(document: &'a Document, font: &'a Dictionary) -> Option<&'a Object> {
+    let descendants = match font.get(b"DescendantFonts").ok()? {
+        Object::Array(descendants) => descendants,
+        Object::Reference(id) => document.get_object(*id).ok()?.as_array().ok()?,
+        _ => return None,
+    };
+    descendants.first()
+}
+
+/// Whether a font's encoding is an Identity CMap named in place.
+fn named_identity(font: &Dictionary) -> bool {
+    font.get(b"Encoding")
+        .and_then(Object::as_name)
+        .is_ok_and(|name| matches!(name, b"Identity-H" | b"Identity-V"))
+}
+
+/// The key pdf-inspector files a map of `font` under as it collects it,
+/// where the font has no `/ToUnicode` and is under an Identity CMap named
+/// in place: its descendant's program given by reference, else the
+/// descendant, where it is given by reference.
+fn collection_key(document: &Document, font: &Dictionary) -> Option<u32> {
+    if font.get(b"ToUnicode").is_ok() || !named_identity(font) {
+        return None;
+    }
+    let first = first_descendant(document, font)?;
+    let descendant = dictionary(document, first)?;
+    let file = descendant
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|descriptor| dictionary(document, descriptor))
+        .and_then(program_of);
+    file.map(|file| file.0)
+        .or_else(|| first.as_reference().ok().map(|id| id.0))
+        .filter(|key| *key != 0)
+}
+
+/// The key pdf-inspector looks the map of `font` up under as it reads the
+/// font's text: as it files it (see `collection_key`), but only for a
+/// descendant with a font descriptor.
+fn lookup_key(document: &Document, font: &Dictionary) -> Option<u32> {
+    if !named_identity(font) {
+        return None;
+    }
+    let first = first_descendant(document, font)?;
+    let descendant = dictionary(document, first)?;
+    let descriptor = dictionary(document, descendant.get(b"FontDescriptor").ok()?)?;
+    program_of(descriptor)
+        .map(|file| file.0)
+        .or_else(|| first.as_reference().ok().map(|id| id.0))
 }
 
 fn resolved<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
@@ -126,7 +295,14 @@ fn program_maps(document: &Document, file: ObjectId, read: &mut usize) -> Option
 /// The program a descendant font embeds, as pdf-inspector finds it: the
 /// first of `/FontFile2` and `/FontFile3` given by reference.
 fn program(document: &Document, descendant: &Dictionary) -> Option<ObjectId> {
-    let descriptor = dictionary(document, descendant.get(b"FontDescriptor").ok()?)?;
+    program_of(dictionary(
+        document,
+        descendant.get(b"FontDescriptor").ok()?,
+    )?)
+}
+
+/// The program a font descriptor names (see `program`).
+fn program_of(descriptor: &Dictionary) -> Option<ObjectId> {
     [&b"FontFile2"[..], b"FontFile3"]
         .into_iter()
         .find_map(|key| {
@@ -201,22 +377,18 @@ pub(crate) fn ucs2_cmap(encoding: &[u8]) -> bool {
 /// for, as it looks for one: a `/ToUnicode` stream it parses; one it cannot
 /// parse, under an Identity CMap, the descendant's program or the Korean
 /// table; with no `/ToUnicode` at all, under an Identity CMap named in
-/// place, the same, keyed by the program or by a descendant given by
-/// reference, and last its widths, taken for Unicode.
-fn unmapped(document: &Document, font: &Dictionary, read: &mut usize) -> Option<Unmapped> {
+/// place, the same, and last its widths, taken for Unicode, looked up by
+/// the program or by a descendant given by reference, where the
+/// descendant has a font descriptor and a font it collects is filed under
+/// that key (see `collected_keys`).
+fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Option<Unmapped> {
     fn name(object: &Object) -> Option<&[u8]> {
         object.as_name().ok()
     }
     if font.get(b"Subtype").ok().and_then(name) != Some(b"Type0".as_slice()) {
         return None;
     }
-    let first = font
-        .get(b"DescendantFonts")
-        .ok()
-        .and_then(|fonts| resolved(document, fonts))
-        .and_then(|fonts| fonts.as_array().ok())
-        .and_then(|fonts| fonts.first())?;
-    let by_reference = matches!(first, Object::Reference(_));
+    let first = first_descendant(document, font)?;
     let descendant = dictionary(document, first)?;
     let ordering = descendant
         .get(b"CIDSystemInfo")
@@ -243,10 +415,14 @@ fn unmapped(document: &Document, font: &Dictionary, read: &mut usize) -> Option<
     if matches!(named, Some(b"UniGB-UCS2-H")) {
         return None;
     }
-    let bytes = Some(Unmapped {
-        passthrough: false,
-        ucs2,
-    });
+    let unmapped = |passthrough: bool, judged: bool| {
+        Some(Unmapped {
+            passthrough,
+            ucs2,
+            judged,
+        })
+    };
+    let bytes = unmapped(false, true);
     let identity = |encoding: Option<&Object>| {
         matches!(encoding.and_then(name), Some(b"Identity-H" | b"Identity-V"))
     };
@@ -259,18 +435,31 @@ fn unmapped(document: &Document, font: &Dictionary, read: &mut usize) -> Option<
             else {
                 return bytes;
             };
-            if ToUnicodeCMap::parse(&content(stream, read)?).is_some_and(|cmap| holds(&cmap)) {
+            let identity = identity(encoding.and_then(|encoding| resolved(document, encoding)));
+            let Some(map) = content(stream, &mut fonts.read) else {
+                // A map past the bytes read may parse; else, the Korean
+                // table reads the font.
+                return if tabled && identity {
+                    None
+                } else {
+                    unmapped(false, false)
+                };
+            };
+            if ToUnicodeCMap::parse(&map).is_some_and(|cmap| holds(&cmap)) {
                 return None;
             }
             // A map it cannot parse, or that is empty, leaves it the
             // program's or the table, under an Identity CMap named in place
             // or by reference.
-            if !identity(encoding.and_then(|encoding| resolved(document, encoding))) {
+            if !identity {
                 return bytes;
             }
             if let Some(file) = program(document, descendant) {
-                if program_maps(document, file, read)? {
-                    return None;
+                match fonts.program_maps(document, file) {
+                    Some(true) => return None,
+                    Some(false) => {}
+                    None if tabled => return None,
+                    None => return unmapped(false, false),
                 }
             }
             return if tabled { None } else { bytes };
@@ -288,22 +477,27 @@ fn unmapped(document: &Document, font: &Dictionary, read: &mut usize) -> Option<
         // An encoding given by reference or as a stream of its own.
         _ => return bytes,
     }
-    let file = program(document, descendant);
-    if file.is_none() && !by_reference {
+    // No map is looked up for a descendant with no font descriptor, nor
+    // found for a font no page or form it collects fonts from names.
+    let Some(key) = lookup_key(document, font) else {
+        return bytes;
+    };
+    if !fonts.collected(document, key) {
         return bytes;
     }
-    if let Some(file) = file {
-        if program_maps(document, file, read)? {
-            return None;
+    let passthrough = widths_look_like_unicode(descendant);
+    if let Some(file) = program(document, descendant) {
+        match fonts.program_maps(document, file) {
+            Some(true) => return None,
+            Some(false) => {}
+            None if tabled => return None,
+            None => return unmapped(passthrough, false),
         }
     }
     if tabled {
         return None;
     }
-    Some(Unmapped {
-        passthrough: widths_look_like_unicode(descendant),
-        ucs2,
-    })
+    unmapped(passthrough, true)
 }
 
 /// The codes of a string, two bytes each; None for an odd byte.
@@ -371,8 +565,8 @@ fn score(text: &str) -> i32 {
 /// with an odd byte, or, in a font whose codes it does not take for
 /// Unicode, one with a byte past 0x7F, which it marks with U+FFFD. A string
 /// of null-heavy codes it reads as UTF-16 where that scores as text; any
-/// other byte by byte, under the standard encoding, or, for UCS-2, as
-/// Latin-1.
+/// other byte by byte, under the standard encoding, which gives control
+/// codes and 0x7F no character, or, for UCS-2, as Latin-1.
 pub(crate) fn read_as(font: Unmapped, bytes: &[u8]) -> Option<String> {
     let codes = codes(bytes)?;
     if font.passthrough {
@@ -389,7 +583,7 @@ pub(crate) fn read_as(font: Unmapped, bytes: &[u8]) -> Option<String> {
     Some(
         bytes
             .iter()
-            .filter(|&&byte| byte >= 0x20)
+            .filter(|&&byte| (0x20..0x7F).contains(&byte))
             .map(|&byte| match byte {
                 0x27 if !font.ucs2 => '\u{2019}',
                 0x60 if !font.ucs2 => '\u{2018}',
@@ -490,15 +684,60 @@ mod tests {
         }
     }
 
-    fn judged(build: impl FnOnce(&mut Document) -> Dictionary) -> Option<Unmapped> {
+    /// How `font` is judged where a page names it, or, `on_page` false,
+    /// where only a form giving its resources by reference names it.
+    fn judged_where(
+        build: impl FnOnce(&mut Document) -> Dictionary,
+        on_page: bool,
+    ) -> Option<Unmapped> {
         let mut document = Document::with_version("1.7");
         let font = build(&mut document);
-        CjkFonts::default().font(&document, &font)
+        let font = document.add_object(font);
+        let fonts = dictionary! { "F1" => font };
+        let resources = if on_page {
+            dictionary! { "Font" => fonts }
+        } else {
+            let own = document.add_object(dictionary! { "Font" => fonts });
+            let form = document.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => own,
+                },
+                b"BT /F1 12 Tf <0035> Tj ET".to_vec(),
+            ));
+            dictionary! { "XObject" => dictionary! { "Fm1" => form } }
+        };
+        let pages = document.new_object_id();
+        let page = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+        });
+        document.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        document.trailer.set("Root", catalog);
+        let font = document.get_dictionary(font).unwrap();
+        CjkFonts::default().font(&document, font)
+    }
+
+    fn judged(build: impl FnOnce(&mut Document) -> Dictionary) -> Option<Unmapped> {
+        judged_where(build, true)
     }
 
     const BYTES: Option<Unmapped> = Some(Unmapped {
         passthrough: false,
         ucs2: false,
+        judged: true,
     });
 
     #[test]
@@ -552,7 +791,8 @@ mod tests {
             font,
             Some(Unmapped {
                 passthrough: false,
-                ucs2: true
+                ucs2: true,
+                judged: true,
             })
         );
         // Widths given mostly past 0x41 take the codes for Unicode.
@@ -580,7 +820,72 @@ mod tests {
             font,
             Some(Unmapped {
                 passthrough: true,
-                ucs2: false
+                ucs2: false,
+                judged: true,
+            })
+        );
+    }
+
+    #[test]
+    fn fonts_pdf_inspector_looks_up_no_map_for_are_unmapped() {
+        // Korean, which its table reads on a page, and a program with a map,
+        // named only by a form giving its resources by reference, which
+        // pdf-inspector collects no fonts from.
+        let korean = |document: &mut Document| {
+            type0(cid_font(document, "Korea1", None), "Identity-H".into())
+        };
+        assert_eq!(judged_where(korean, true), None);
+        assert_eq!(judged_where(korean, false), BYTES);
+        // Korean whose descendant has no font descriptor, which it looks up
+        // no map for.
+        let font = judged(|document| {
+            let descendants = cid_font(document, "Korea1", None);
+            let Object::Array(descendants) = &descendants else {
+                unreachable!()
+            };
+            let id = descendants[0].as_reference().unwrap();
+            let descendant = document.get_object_mut(id).unwrap().as_dict_mut().unwrap();
+            descendant.remove(b"FontDescriptor");
+            type0(Object::Array(descendants.clone()), "Identity-H".into())
+        });
+        assert_eq!(font, BYTES);
+    }
+
+    #[test]
+    fn fonts_whose_programs_are_past_the_bytes_read_are_not_judged() {
+        // A program decoding past `MAX_STREAM_BYTES` may hold a map.
+        let font = judged(|document| {
+            let mut program = Stream::new(dictionary! {}, vec![0; MAX_STREAM_BYTES + 1]);
+            program.compress().unwrap();
+            let program = document.add_object(program);
+            let descendants = cid_font(document, "Japan1", None);
+            let Object::Array(descendants) = &descendants else {
+                unreachable!()
+            };
+            let id = descendants[0].as_reference().unwrap();
+            let descriptor = document
+                .get_object(id)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"FontDescriptor")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            let descriptor = document
+                .get_object_mut(descriptor)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap();
+            descriptor.set("FontFile2", program);
+            type0(Object::Array(descendants.clone()), "Identity-H".into())
+        });
+        assert_eq!(
+            font,
+            Some(Unmapped {
+                passthrough: false,
+                ucs2: false,
+                judged: false,
             })
         );
     }
@@ -645,10 +950,16 @@ mod tests {
         assert_eq!(read_as(font, &[0x04, 0x9F, 0x00, 0x16]), None);
         assert!(!misread(font, &[0x04, 0x9F, 0x00, 0x16]));
         assert_eq!(says(font, &[0x00]), None);
+        // The standard encoding gives 0x7F no character.
+        assert_eq!(
+            read_as(font, &[0x31, 0x7F, 0x7F, 0x41]).as_deref(),
+            Some("1A")
+        );
         // Codes taken for Unicode read as the characters of their values.
         let passthrough = Unmapped {
             passthrough: true,
             ucs2: false,
+            judged: true,
         };
         assert_eq!(
             read_as(passthrough, &[0x04, 0xB0, 0x04, 0xB1]).as_deref(),
@@ -659,6 +970,7 @@ mod tests {
         let ucs2 = Unmapped {
             passthrough: false,
             ucs2: true,
+            judged: true,
         };
         assert!(!misread(ucs2, &[0x00, 0x41, 0x00, 0x42]));
         assert_eq!(
