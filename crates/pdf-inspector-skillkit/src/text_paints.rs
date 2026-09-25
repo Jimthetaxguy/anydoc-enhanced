@@ -52,6 +52,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use lopdf::{content::Content, Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::glyph_words::{Glyph, GlyphFonts, GlyphWords, KeptWords, ShownWord};
+use crate::repeated_lines::EdgeRun;
 use crate::word_gaps::{leading_travel, shows_glyphs, Candidate, GapFont, GapFonts, Shown};
 
 /// Bytes any one content stream may decode to.
@@ -619,6 +620,9 @@ struct PageText {
     /// such text pdf-inspector misses or misreads.
     forms: bool,
     form_text_unread: bool,
+    /// The runs pdf-inspector reads, for the running-header check's gate,
+    /// when the page is read for repeats.
+    edges: Option<Vec<EdgeRun>>,
 }
 
 impl PageText {
@@ -824,6 +828,48 @@ impl PageText {
         }
     }
 
+    /// Note a run pdf-inspector reads for the running-header check's gate:
+    /// where it starts, when the text matrix was just set, else as more of
+    /// the run before; with its text, where its font can be read.
+    fn note_edge(&mut self, state: State, text_matrix: [f64; 6], bytes: &[u8], placed: bool) {
+        let room = self
+            .edges
+            .as_ref()
+            .is_some_and(|edges| edges.len() < MAX_RUNS_PER_PAGE);
+        if !(room && state.font && state.reached && state.read_mode != 3) {
+            return;
+        }
+        let text = state
+            .glyph_font
+            .and_then(|font| self.glyph_fonts.text(font, bytes));
+        let Some(edges) = self.edges.as_mut() else {
+            return;
+        };
+        if !placed {
+            if let Some(last) = edges.last_mut() {
+                last.text = last.text.take().zip(text).map(|(mut before, text)| {
+                    before.push_str(&text);
+                    before
+                });
+                return;
+            }
+        }
+        let matrix = multiply(text_matrix, state.ctm);
+        let at = [
+            matrix[2] * state.rise + matrix[4],
+            matrix[3] * state.rise + matrix[5],
+        ];
+        let size = state.size.abs() * matrix[2].hypot(matrix[3]);
+        if at.iter().all(|value| value.is_finite()) && size.is_finite() {
+            edges.push(EdgeRun {
+                y: at[1] as f32,
+                x: at[0] as f32,
+                size: size as f32,
+                text,
+            });
+        }
+    }
+
     /// Note a visible run pdf-inspector reads whose start the text matrix
     /// says, and the string it strikes over itself, if any.
     fn note_run(
@@ -943,6 +989,10 @@ pub(crate) struct Findings {
     /// The files the document embeds, which pdf-inspector never reads, and
     /// whether it is a portfolio of them, when the whole document is read.
     pub(crate) embedded_files: (usize, bool),
+    /// The runs at each page's edges, for the running-header check's gate,
+    /// when every page pdf-inspector reads, to `MAX_REPEAT_PAGES`, is read
+    /// for repeats; else `None`.
+    pub(crate) edges: Option<Vec<(u32, Vec<EdgeRun>)>>,
 }
 
 /// Scan a document's pages. Pages in `layer_skip` are not checked for an
@@ -994,12 +1044,21 @@ pub(crate) fn scan_document(
     // Words shown glyph by glyph, kept while their fonts may yet be seen
     // painting their spaces.
     let mut glyph_words = KeptWords::default();
+    // The runs at the edges of the pages read, while every page is: a page
+    // not read for repeats, as one needing OCR is not, leaves the gate
+    // nothing to go by.
+    let mut edges = twice_skip
+        .filter(|skip| skip.is_empty())
+        .map(|_| Vec::new());
     for (&number, &page_id) in &document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
             continue;
         }
         let check_layer = !layer_skip.contains(&number);
         let check_twice = repeats && twice_skip.is_some_and(|skip| !skip.contains(&number));
+        if !check_twice {
+            edges = None;
+        }
         // Forms without resources are checked on every page of a full run.
         let check_forms = repeats && twice_skip.is_some();
         if !check_layer && !check_twice && !check_forms {
@@ -1028,6 +1087,12 @@ pub(crate) fn scan_document(
                     found.gaps_misread.push(number);
                 }
                 glyph_words.page(number, page.glyph_words, page.glyph_spaces);
+                if let Some(edges) = edges
+                    .as_mut()
+                    .filter(|edges| edges.len() < crate::repeated_lines::MAX_REPEAT_PAGES)
+                {
+                    edges.push((number, page.edges));
+                }
                 let room = MAX_PLACED_RUNS.saturating_sub(found.placed.len());
                 found.placed.extend(
                     page.placed
@@ -1048,11 +1113,18 @@ pub(crate) fn scan_document(
             }
             // The repeat check's limits ran out on a page read for it alone:
             // that check stops, and the layer check goes on.
-            Err(Exhausted) if repeat_budget.spent() => repeats = false,
-            Err(Exhausted) => break,
+            Err(Exhausted) if repeat_budget.spent() => {
+                repeats = false;
+                edges = None;
+            }
+            Err(Exhausted) => {
+                edges = None;
+                break;
+            }
         }
     }
     found.glyph_words = glyph_words.finish();
+    found.edges = edges;
     found
 }
 
@@ -1089,6 +1161,9 @@ struct PageFindings {
     /// fonts seen painting their spaces.
     glyph_words: Vec<(String, usize, f64)>,
     glyph_spaces: HashSet<usize>,
+    /// The runs at the page's edges, measured from the visible box, when
+    /// it is read for repeats.
+    edges: Vec<EdgeRun>,
 }
 
 fn scan_page(
@@ -1140,6 +1215,7 @@ fn scan_page(
     let content = without_comments(&content);
     let mut page = PageText {
         runs: check_twice.then(Runs::default),
+        edges: check_twice.then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
@@ -1182,7 +1258,20 @@ fn scan_page(
         .take()
         .map(GlyphWords::finish)
         .unwrap_or_default();
+    let edges = crate::repeated_lines::edge_runs(
+        page.edges
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|run| EdgeRun {
+                x: run.x - page_box[0] as f32,
+                y: run.y - page_box[1] as f32,
+                ..run
+            })
+            .collect(),
+    );
     Ok(PageFindings {
+        edges,
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
@@ -1427,6 +1516,9 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
+                if in_text {
+                    page.note_edge(state, text_matrix, &bytes, placed);
+                }
                 if in_text && !forms.is_empty() {
                     page.note_form_text(state, text, &bytes);
                 }

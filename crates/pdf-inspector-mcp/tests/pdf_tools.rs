@@ -1117,6 +1117,14 @@ fn lines_dropped_as_running_headers_that_differ_are_reported() {
         (1..=4)
             .map(|page| format!("Account number 12345678, page {page}"))
             .collect(),
+        // Invoices numbered in turn, one to a page.
+        (1..=4)
+            .map(|page| format!("Invoice number {}", 100_230 + page))
+            .collect(),
+        // Statements bundled, each numbering its pages afresh.
+        ["1 of 2", "2 of 2", "1 of 1", "1 of 1"]
+            .map(|count| format!("Statement page {count}"))
+            .to_vec(),
     ];
     let mut calls = Vec::new();
     for (index, headers) in documents.iter().enumerate() {
@@ -1149,9 +1157,106 @@ fn lines_dropped_as_running_headers_that_differ_are_reported() {
         results[0]
     );
     // A header repeated as it is, or numbering its pages, drops nothing
-    // the Markdown lacks.
+    // the Markdown lacks, however the pages are numbered; numbers that run
+    // on with the pages but far from them are not page numbers.
     assert_eq!(reported(&results[1]), None, "{}", results[1]);
     assert_eq!(reported(&results[2]), None, "{}", results[2]);
+    assert_eq!(
+        reported(&results[3]),
+        Some(serde_json::json!([2, 3, 4])),
+        "{}",
+        results[3]
+    );
+    assert_eq!(reported(&results[4]), None, "{}", results[4]);
+}
+
+/// A statement of three accounts whose header takes five lines, the last
+/// the account's number, below a logo when `logo`.
+fn branded_statement_pdf(logo: bool) -> Vec<u8> {
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        Vec::new(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            b"\x80",
+        ),
+    ];
+    let mut kids = Vec::new();
+    for (page, number) in ["12345678", "87654321", "55501234"].iter().enumerate() {
+        let mut content = if logo {
+            "q 120 0 0 30 72 756 cm /Im1 Do Q\n".to_string()
+        } else {
+            String::new()
+        };
+        for (line, text) in [
+            "Example Bank N.A.",
+            "PO Box 1234 Springfield ST 00000",
+            "Customer service 1-800-555-0100",
+            "Statement period March 1 - March 31, 2025",
+            &format!("Account number {number}"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            content.push_str(&format!(
+                "BT /F1 10 Tf 1 0 0 1 72 {} Tm ({text}) Tj ET\n",
+                740 - 12 * line
+            ));
+        }
+        // Each account's purchases, at its own stores, repeat no line.
+        let store = ["Alder", "Birch", "Cedar"][page];
+        for row in 0..12 {
+            content.push_str(&format!(
+                "BT /F1 10 Tf 1 0 0 1 72 {} Tm (Purchase at {store} store {}) Tj ET\n",
+                660 - 16 * row,
+                row + 1
+            ));
+        }
+        objects.push(stream("", content.as_bytes()));
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Im1 4 0 R >> >> /Contents {} 0 R >>",
+                objects.len()
+            )
+            .into_bytes(),
+        );
+        kids.push(format!("{} 0 R", objects.len()));
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        kids.len()
+    )
+    .into_bytes();
+    pdf_file(&objects)
+}
+
+#[test]
+fn lines_dropped_beneath_a_logo_are_reported_as_without_it() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let mut calls = Vec::new();
+    for logo in [false, true] {
+        let path = temporary.path().join(format!("branded-{logo}.pdf"));
+        std::fs::write(&path, branded_statement_pdf(logo)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    // pdf-inspector sets images aside before it looks for running headers,
+    // so the logo does not keep the account's number from being dropped.
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(!markdown.contains("87654321"), "{markdown}");
+        let pages = result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "header_footer_dropped")
+                .map(|warning| warning["pages"].clone())
+        });
+        assert_eq!(pages, Some(serde_json::json!([2, 3])), "{result}");
+    }
 }
 
 /// A filled one-page form whose fields are `fields`, objects 6 on, each
