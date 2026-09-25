@@ -2959,111 +2959,168 @@ fn css_rules(css: &str) -> Vec<(String, String)> {
     rules
 }
 
-/// Whether a selector could match an element of the chapter, judged by its
-/// rightmost compound selector's element name and classes. Ids, attribute
-/// conditions, and pseudo-classes are treated as matching; a rule for a
-/// pseudo-element styles generated content and hides nothing.
-fn css_selector_may_match(selector: &str, styles: &EpubChapterStyles) -> bool {
-    let Some(compound) = selector
-        .split(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '+' | '~'))
-        .rfind(|part| !part.is_empty())
-    else {
-        return false;
-    };
-    let lower = compound.to_ascii_lowercase();
-    if lower.contains("::")
-        || [
-            ":before",
-            ":after",
-            ":first-line",
-            ":first-letter",
-            ":marker",
-        ]
-        .iter()
-        .any(|pseudo| lower.contains(pseudo))
-    {
-        return false;
-    }
-    let mut simple = String::new();
-    let mut depth = 0usize;
-    for character in compound.chars() {
-        match character {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => simple.push(character),
-            _ => {}
+/// A hiding rule's selector, reduced to what the chapter check matches: the
+/// element name and classes of its rightmost compound selector. Ids,
+/// attribute conditions, and pseudo-classes are treated as matching.
+struct CssTarget {
+    tag: String,
+    classes: Vec<String>,
+}
+
+impl CssTarget {
+    /// `None` for a selector that styles generated content (a pseudo-element),
+    /// which hides nothing in the chapter.
+    fn parse(selector: &str) -> Option<Self> {
+        let compound = selector
+            .split(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '+' | '~'))
+            .rfind(|part| !part.is_empty())?;
+        let lower = compound.to_ascii_lowercase();
+        if lower.contains("::")
+            || [
+                ":before",
+                ":after",
+                ":first-line",
+                ":first-letter",
+                ":marker",
+            ]
+            .iter()
+            .any(|pseudo| lower.contains(pseudo))
+        {
+            return None;
         }
+        let mut simple = String::new();
+        let mut depth = 0usize;
+        for character in compound.chars() {
+            match character {
+                '[' | '(' => depth += 1,
+                ']' | ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => simple.push(character),
+                _ => {}
+            }
+        }
+        let simple = simple.split(':').next().unwrap_or_default();
+        let mut parts = simple.split('.');
+        let head = parts.next().unwrap_or_default();
+        let tag = head
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let classes = parts
+            .map(|class| class.split('#').next().unwrap_or_default().to_string())
+            .filter(|class| !class.is_empty())
+            .collect();
+        Some(Self { tag, classes })
     }
-    let simple = simple.split(':').next().unwrap_or_default();
-    let mut parts = simple.split('.');
-    let head = parts.next().unwrap_or_default();
-    let tag = head
-        .split('#')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let tag_matches = tag.is_empty() || tag == "*" || styles.tags.contains(&tag);
-    tag_matches
-        && parts.all(|class| {
-            let class = class.split('#').next().unwrap_or_default();
-            class.is_empty() || styles.classes.contains(class)
-        })
+
+    fn matches(&self, styles: &EpubChapterStyles) -> bool {
+        (self.tag.is_empty() || self.tag == "*" || styles.tags.contains(&self.tag))
+            && self
+                .classes
+                .iter()
+                .all(|class| styles.classes.contains(class))
+    }
 }
 
-/// Whether a chapter's stylesheets hide any of its elements.
-fn epub_css_hides_content(styles: &EpubChapterStyles, css: &[String]) -> bool {
-    css.iter()
-        .flat_map(|sheet| css_rules(sheet))
-        .any(|(prelude, body)| {
-            !prelude.starts_with('@')
-                && css_declarations_hide(&body)
-                && prelude
-                    .split(',')
-                    .any(|selector| css_selector_may_match(selector, styles))
+/// The selectors of a stylesheet's rules that hide what they style.
+fn css_hiding_targets(css: &str) -> Vec<CssTarget> {
+    css_rules(css)
+        .into_iter()
+        .filter(|(prelude, body)| !prelude.starts_with('@') && css_declarations_hide(body))
+        .flat_map(|(prelude, _)| {
+            prelude
+                .split(',')
+                .filter_map(CssTarget::parse)
+                .collect::<Vec<_>>()
         })
+        .collect()
 }
 
-/// Most stylesheets one chapter may pull in through links and imports.
-const MAX_EPUB_STYLESHEETS: usize = 64;
+/// Distinct stylesheets a package may link or import, and hiding selectors
+/// it may carry across them. Real books have a few sheets with a handful of
+/// hiding rules.
+const MAX_EPUB_STYLESHEETS: usize = 256;
+const MAX_EPUB_HIDING_SELECTORS: usize = 16_384;
 
-/// The text of every stylesheet a chapter applies: its `<style>` elements,
-/// its linked sheets, and the local sheets those import. AnyDoc applies the
-/// first two; readers also follow imports. A sheet that names an external
-/// resource marks the chapter external.
-fn epub_chapter_stylesheets(
+/// Linked stylesheets, read and reduced once per package however many
+/// chapters apply them: each sheet's hiding selectors and the local sheets
+/// it imports.
+#[derive(Default)]
+struct EpubStylesheets {
+    sheets: HashMap<String, (Vec<CssTarget>, Vec<String>)>,
+    selectors: usize,
+}
+
+impl EpubStylesheets {
+    /// Load a sheet on first use. A missing sheet is reported by the
+    /// reference check and hides nothing here; a sheet that names an
+    /// external resource marks the package external.
+    fn load(
+        &mut self,
+        archive: &mut ZipArchive<Cursor<&[u8]>>,
+        path: &str,
+        result: &mut PackagePreflight,
+    ) -> Result<(), DocumentError> {
+        if self.sheets.contains_key(path) {
+            return Ok(());
+        }
+        if self.sheets.len() >= MAX_EPUB_STYLESHEETS {
+            return Err(DocumentError::ResourceLimit);
+        }
+        let (targets, imports) = match epub_read_part(archive, path) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                if epub_text_has_external(text.as_bytes()) {
+                    result.external_relationships = true;
+                }
+                (css_hiding_targets(&text), css_imports(&text, path))
+            }
+            Err(DocumentError::Malformed) => (Vec::new(), Vec::new()),
+            Err(error) => return Err(error),
+        };
+        self.selectors += targets.len();
+        if self.selectors > MAX_EPUB_HIDING_SELECTORS {
+            return Err(DocumentError::ResourceLimit);
+        }
+        self.sheets.insert(path.to_string(), (targets, imports));
+        Ok(())
+    }
+}
+
+/// Whether a chapter's stylesheets hide any of its elements: its `<style>`
+/// elements, its linked sheets, and the local sheets those import. AnyDoc
+/// applies the first two; readers also follow imports.
+fn epub_chapter_css_hides_content(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
     chapter_path: &str,
     styles: &EpubChapterStyles,
+    stylesheets: &mut EpubStylesheets,
     result: &mut PackagePreflight,
-) -> Result<Vec<String>, DocumentError> {
-    let mut sheets = styles.css.clone();
+) -> Result<bool, DocumentError> {
     // An `@import` in a `<style>` element resolves against the chapter.
-    let mut pending: Vec<String> = styles
-        .css
-        .iter()
-        .flat_map(|sheet| css_imports(sheet, chapter_path))
-        .chain(styles.linked.iter().cloned())
-        .collect();
+    let mut pending: Vec<String> = styles.linked.clone();
+    for sheet in &styles.css {
+        if css_hiding_targets(sheet)
+            .iter()
+            .any(|target| target.matches(styles))
+        {
+            return Ok(true);
+        }
+        pending.extend(css_imports(sheet, chapter_path));
+    }
     let mut seen: HashSet<String> = HashSet::new();
     while let Some(path) = pending.pop() {
         if !seen.insert(path.clone()) {
             continue;
         }
-        if seen.len() > MAX_EPUB_STYLESHEETS {
-            return Err(DocumentError::ResourceLimit);
+        stylesheets.load(archive, &path, result)?;
+        let (targets, imports) = &stylesheets.sheets[&path];
+        if targets.iter().any(|target| target.matches(styles)) {
+            return Ok(true);
         }
-        let Ok(bytes) = epub_read_part(archive, &path) else {
-            // A missing linked sheet is reported by the reference check.
-            continue;
-        };
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        if epub_text_has_external(text.as_bytes()) {
-            result.external_relationships = true;
-        }
-        pending.extend(css_imports(&text, &path));
-        sheets.push(text);
+        pending.extend(imports.iter().cloned());
     }
-    Ok(sheets)
+    Ok(false)
 }
 
 /// The local stylesheets an `@import` names, resolved against the sheet.
@@ -3299,6 +3356,7 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
     }
 
     let mut seen_spine = HashSet::new();
+    let mut stylesheets = EpubStylesheets::default();
     let mut spine_targets = Vec::new();
     for idref in &spine {
         let Some(item) = manifest.get(idref) else {
@@ -3337,8 +3395,13 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
                 result.external_relationships |= chapter_result.external_relationships;
                 result.hidden_content |= chapter_result.hidden_content;
                 result.missing_required_content |= chapter_result.missing_required_content;
-                let sheets = epub_chapter_stylesheets(&mut archive, &target, &styles, &mut result)?;
-                result.hidden_content |= epub_css_hides_content(&styles, &sheets);
+                result.hidden_content |= epub_chapter_css_hides_content(
+                    &mut archive,
+                    &target,
+                    &styles,
+                    &mut stylesheets,
+                    &mut result,
+                )?;
             }
             Err(DocumentError::Malformed) => result.missing_required_content = true,
             Err(error) => return Err(error),
@@ -5768,6 +5831,24 @@ mod tests {
             marked,
             &[("OPS/Styles/main.css", b".h { color: gray }")]
         ));
+
+        // Sheets are reduced once per package, under a cap on hiding rules.
+        let crowded: String = (0..=MAX_EPUB_HIDING_SELECTORS)
+            .map(|index| format!(".x{index}{{display:none}}"))
+            .collect();
+        let result = preflight_package(
+            &epub_package(
+                &chapter(link, marked),
+                Some(EPUB_CHAPTER_TWO),
+                &[
+                    ("OPS/images/logo.png", b"png"),
+                    ("OPS/Styles/main.css", crowded.as_bytes()),
+                ],
+            ),
+            DocumentKind::Epub,
+            DocumentVariant::Epub,
+        );
+        assert!(matches!(result, Err(DocumentError::ResourceLimit)));
     }
 
     #[test]
