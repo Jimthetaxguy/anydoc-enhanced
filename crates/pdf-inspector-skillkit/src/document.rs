@@ -7347,15 +7347,66 @@ enum EpubStyleSource {
 }
 
 /// The stylesheets a chapter applies, in document order: as a reading
-/// system applies them (every `rel` and `href` spelling, `<?xml-stylesheet?>`
-/// instructions, and only where their media may apply on its screen, each
-/// with how they do), and as AnyDoc applies them (`epub::chapter_stylesheet`:
-/// the first `rel` and `href` of a `link`, and every `style`, whatever
-/// their media).
+/// system applies them (see [`EpubSheetCandidate`]), only where their media
+/// may apply on its screen, each with how they do; and as AnyDoc applies
+/// them (`epub::chapter_stylesheet`: the first `rel` and `href` of a
+/// `link`, and every `style`, whatever their type, title, and media).
 #[derive(Default)]
 struct EpubChapterStyles {
     reader: Vec<(EpubStyleSource, epub_css::Applies)>,
     anydoc: Vec<EpubStyleSource>,
+}
+
+/// A stylesheet a chapter offers a reader, as Chromium reads one: a `link`
+/// by its unprefixed `rel`, `href`, `type`, `title`, and `disabled`, a
+/// `style` by its `type` and `title`, and an `<?xml-stylesheet?>`
+/// instruction by its pseudo-attributes, each with a type that names CSS,
+/// and a link not disabled. Its media, its title, and whether it is an
+/// alternate decide whether the reader applies it: one without a title
+/// unless it is an alternate, and one of the preferred set, whose title
+/// the first titled sheet that is not an alternate gives, whatever its
+/// media.
+struct EpubSheetCandidate {
+    source: EpubStyleSource,
+    media: epub_css::Applies,
+    title: String,
+    alternate: bool,
+}
+
+/// The sheets a reader applies of those a chapter offers (see
+/// [`EpubSheetCandidate`]), each with how its media apply.
+fn epub_enabled_sheets(
+    candidates: Vec<EpubSheetCandidate>,
+) -> Vec<(EpubStyleSource, epub_css::Applies)> {
+    let preferred = candidates
+        .iter()
+        .find(|candidate| !candidate.alternate && !candidate.title.is_empty())
+        .map(|candidate| candidate.title.clone());
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.media != epub_css::Applies::No
+                && if candidate.title.is_empty() {
+                    !candidate.alternate
+                } else {
+                    preferred.as_ref() == Some(&candidate.title)
+                }
+        })
+        .map(|candidate| (candidate.source, candidate.media))
+        .collect()
+}
+
+/// Whether a `link`'s `type` names CSS as Chromium reads it: a MIME type
+/// whose essence is `text/css`, in any case, or none.
+fn epub_link_type_is_css(kind: &str) -> bool {
+    let essence = kind.split(';').next().unwrap_or_default().trim();
+    kind.trim().is_empty() || essence.eq_ignore_ascii_case("text/css")
+}
+
+/// Whether a `style` element's `type` names CSS as Chromium reads it:
+/// `text/css` alone, in any case, or none.
+fn epub_style_type_is_css(kind: &str) -> bool {
+    kind.is_empty() || kind.eq_ignore_ascii_case("text/css")
 }
 
 /// The pseudo-attributes of a processing instruction's content, such as
@@ -7395,11 +7446,14 @@ fn epub_inspect_chapter(
     let mut buffer = Vec::new();
     let mut result = PackagePreflight::default();
     let mut styles = EpubChapterStyles::default();
+    let mut candidates: Vec<EpubSheetCandidate> = Vec::new();
     let mut has_html = false;
     let mut has_body = false;
-    // The `<style>` element being read: its text, how its media apply, and
-    // whether AnyDoc reads it (an exact `style` name).
-    let mut style_text: Option<(String, epub_css::Applies, bool)> = None;
+    // The `<style>` element being read: its text; how its media apply and
+    // its title, and whether a reader applies it (an exact `style` name and
+    // a type that names CSS); and whether AnyDoc reads it (an exact `style`
+    // name).
+    let mut style_text: Option<(String, epub_css::Applies, String, bool, bool)> = None;
     let mut depth = 0usize;
     let mut style_depth = 0usize;
     loop {
@@ -7439,27 +7493,35 @@ fn epub_inspect_chapter(
                     .map(|attribute| epub_css::media_attribute(&attribute.value))
                     .max()
                     .unwrap_or(epub_css::Applies::Yes);
+                let unprefixed = |name: &[u8]| {
+                    attributes
+                        .iter()
+                        .find(|attribute| !attribute.prefixed() && attribute.local() == name)
+                        .map(|attribute| attribute.value.as_str())
+                };
+                let title = || unprefixed(b"title").unwrap_or_default().to_string();
                 if local == b"link" {
-                    let stylesheet = |rel: &str| {
+                    let has_rel = |rel: &str, wanted: &str| {
                         rel.split_whitespace()
-                            .any(|rel| rel.eq_ignore_ascii_case("stylesheet"))
+                            .any(|rel| rel.eq_ignore_ascii_case(wanted))
                     };
-                    // A reader follows the unprefixed attributes; every
-                    // spelling is followed here, which finds more.
-                    if media != epub_css::Applies::No
-                        && attributes.iter().any(|attribute| {
-                            attribute.local() == b"rel" && stylesheet(&attribute.value)
-                        })
+                    let stylesheet = |rel: &str| has_rel(rel, "stylesheet");
+                    if exact == b"link"
+                        && unprefixed(b"rel").is_some_and(stylesheet)
+                        && unprefixed(b"type").is_none_or(epub_link_type_is_css)
+                        && unprefixed(b"disabled").is_none()
                     {
-                        styles.reader.extend(
-                            attributes
-                                .iter()
-                                .filter(|attribute| attribute.local() == b"href")
-                                .filter_map(|attribute| {
-                                    anydoc_resolve(chapter_path, &attribute.value)
-                                })
-                                .map(|target| (EpubStyleSource::Linked(target), media)),
-                        );
+                        if let Some(target) =
+                            unprefixed(b"href").and_then(|href| anydoc_resolve(chapter_path, href))
+                        {
+                            candidates.push(EpubSheetCandidate {
+                                source: EpubStyleSource::Linked(target),
+                                media,
+                                title: title(),
+                                alternate: unprefixed(b"rel")
+                                    .is_some_and(|rel| has_rel(rel, "alternate")),
+                            });
+                        }
                     }
                     // AnyDoc reads the first `rel` and `href` of an exact
                     // `link`, as `attr_any` does.
@@ -7477,9 +7539,26 @@ fn epub_inspect_chapter(
                         }
                     }
                 }
+                let styles_reader =
+                    exact == b"style" && unprefixed(b"type").is_none_or(epub_style_type_is_css);
                 if local == b"style" && start && style_text.is_none() {
-                    style_text = Some((String::new(), media, exact == b"style"));
+                    style_text = Some((
+                        String::new(),
+                        media,
+                        title(),
+                        styles_reader,
+                        exact == b"style",
+                    ));
                     style_depth = depth;
+                } else if styles_reader && !start && !title().is_empty() {
+                    // An empty `style` shows nothing, but its title may
+                    // name the preferred set.
+                    candidates.push(EpubSheetCandidate {
+                        source: EpubStyleSource::Embedded(String::new()),
+                        media,
+                        title: title(),
+                        alternate: false,
+                    });
                 }
                 if start {
                     depth += 1;
@@ -7489,15 +7568,20 @@ fn epub_inspect_chapter(
             Ok(quick_xml::events::Event::End(_)) => {
                 depth = depth.saturating_sub(1);
                 if depth == style_depth {
-                    if let Some((text, media, anydoc)) = style_text.take() {
+                    if let Some((text, media, title, reader, anydoc)) = style_text.take() {
                         if epub_css::references_external(&text) {
                             result.external_relationships = true;
                         }
                         if anydoc {
                             styles.anydoc.push(EpubStyleSource::Embedded(text.clone()));
                         }
-                        if media != epub_css::Applies::No {
-                            styles.reader.push((EpubStyleSource::Embedded(text), media));
+                        if reader {
+                            candidates.push(EpubSheetCandidate {
+                                source: EpubStyleSource::Embedded(text),
+                                media,
+                                title,
+                                alternate: false,
+                            });
                         }
                     }
                 }
@@ -7506,19 +7590,19 @@ fn epub_inspect_chapter(
             // Chapter text loads nothing: a URL written in it is only
             // text, and the Markdown sanitizer replaces it.
             Ok(quick_xml::events::Event::Text(event)) => {
-                if let Some((text, _, _)) = style_text.as_mut() {
+                if let Some((text, ..)) = style_text.as_mut() {
                     text.push_str(&String::from_utf8_lossy(event.as_ref()));
                 }
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::CData(event)) => {
-                if let Some((text, _, _)) = style_text.as_mut() {
+                if let Some((text, ..)) = style_text.as_mut() {
                     text.push_str(&String::from_utf8_lossy(event.as_ref()));
                 }
                 buffer.clear();
             }
             Ok(quick_xml::events::Event::GeneralRef(event)) => {
-                if let Some((text, _, _)) = style_text.as_mut() {
+                if let Some((text, ..)) = style_text.as_mut() {
                     text.push_str(&anydoc_entity_text(&String::from_utf8_lossy(
                         event.as_ref(),
                     )));
@@ -7531,20 +7615,30 @@ fn epub_inspect_chapter(
                 let content = String::from_utf8_lossy(event.as_ref()).into_owned();
                 if let Some(rest) = content.strip_prefix("xml-stylesheet") {
                     let attributes = pseudo_attributes(rest);
-                    let media = attributes
-                        .iter()
-                        .find(|(name, _)| name == "media")
-                        .map_or(epub_css::Applies::Yes, |(_, media)| {
-                            epub_css::media_attribute(media)
-                        });
+                    let value = |wanted: &str| {
+                        attributes
+                            .iter()
+                            .find(|(name, _)| name == wanted)
+                            .map(|(_, value)| value.as_str())
+                    };
+                    let media = value("media").map_or(epub_css::Applies::Yes, |media| {
+                        epub_css::media_attribute(media)
+                    });
+                    // Chromium reads a type of exactly `text/css`, or none.
+                    let css =
+                        value("type").is_none_or(|kind| kind.is_empty() || kind == "text/css");
                     for (name, href) in &attributes {
                         if name == "href" {
                             epub_check_reference(href, chapter_path, archive_names, &mut result);
-                            if media != epub_css::Applies::No {
-                                styles.reader.extend(
-                                    anydoc_resolve(chapter_path, href)
-                                        .map(|target| (EpubStyleSource::Linked(target), media)),
-                                );
+                            if css {
+                                candidates.extend(anydoc_resolve(chapter_path, href).map(
+                                    |target| EpubSheetCandidate {
+                                        source: EpubStyleSource::Linked(target),
+                                        media,
+                                        title: value("title").unwrap_or_default().to_string(),
+                                        alternate: value("alternate") == Some("yes"),
+                                    },
+                                ));
                             }
                         }
                     }
@@ -7555,6 +7649,7 @@ fn epub_inspect_chapter(
                 if !has_html || !has_body {
                     result.missing_required_content = true;
                 }
+                styles.reader = epub_enabled_sheets(candidates);
                 return Ok((result, styles));
             }
             Ok(_) => buffer.clear(),
@@ -7789,7 +7884,6 @@ impl EpubStylesheets {
                         }
                     }
                     reader.push_sheet(&sheet, condition);
-
                     if reader.rule_count() > epub_css::MAX_STYLE_RULES {
                         return Err(DocumentError::ResourceLimit);
                     }
@@ -11174,7 +11268,6 @@ mod tests {
             reader: vec![(linked.clone(), epub_css::Applies::Yes)],
             anydoc: vec![linked],
         };
-
         let first = stylesheets
             .chapter_cascade(&mut archive, "OPS/Text/ch1.xhtml", &styles, &mut result)
             .unwrap();
@@ -11193,6 +11286,71 @@ mod tests {
         assert!(!Rc::ptr_eq(&first, &other));
         assert_eq!(stylesheets.linked.len(), 1);
         assert_eq!(stylesheets.rules, 1);
+    }
+
+    #[test]
+    fn epub_readers_apply_only_the_stylesheets_chromium_enables() {
+        let preflight = |prolog: &str, head: &str| {
+            let chapter = format!(
+                r#"<?xml version="1.0"?>{prolog}<html xmlns="http://www.w3.org/1999/xhtml"><head>{head}</head><body><h1>Chapter One</h1><p>Refund due <span class="x">1,250.00</span> by April.</p><img src="../images/logo.png" alt="logo"/></body></html>"#
+            );
+            preflight_package(
+                &epub_package(
+                    chapter.as_bytes(),
+                    Some(EPUB_CHAPTER_TWO),
+                    &[
+                        ("OPS/images/logo.png", b"png"),
+                        ("OPS/Styles/hide.css", b".x { display: none }"),
+                        ("OPS/Styles/plain.css", b".d { color: red }"),
+                    ],
+                ),
+                DocumentKind::Epub,
+                DocumentVariant::Epub,
+            )
+            .unwrap()
+        };
+        let dropped = |head: &str| preflight("", head).unsupported_content;
+        // AnyDoc applies every `link` to a stylesheet and every `style`;
+        // Chromium no alternate sheet, none of a type other than CSS, no
+        // disabled link, and of the titled sheets only those the first
+        // titled one names, whatever its media.
+        for head in [
+            r#"<link rel="alternate stylesheet" title="Alt" href="../Styles/hide.css"/>"#,
+            r#"<link rel="alternate stylesheet" href="../Styles/hide.css"/>"#,
+            r#"<link rel="stylesheet" type="text/plain" href="../Styles/hide.css"/>"#,
+            r#"<link rel="stylesheet" disabled="disabled" href="../Styles/hide.css"/>"#,
+            r#"<style type="text/plain">.x { display: none }</style>"#,
+            r#"<style type="text/css; charset=utf-8">.x { display: none }</style>"#,
+            r#"<link rel="stylesheet" title="Main" href="../Styles/plain.css"/><link rel="stylesheet" title="Other" href="../Styles/hide.css"/>"#,
+            r#"<style title="Main">.d { color: red }</style><style title="Other">.x { display: none }</style>"#,
+            r#"<link rel="stylesheet" title="Main" media="print" href="../Styles/plain.css"/><style title="Other">.x { display: none }</style>"#,
+        ] {
+            assert!(dropped(head), "{head}");
+        }
+        // It applies those without a title, those of the preferred set,
+        // and a type naming CSS as it reads one.
+        for head in [
+            r#"<link rel="stylesheet" href="../Styles/hide.css"/>"#,
+            r#"<link rel="StyleSheet" type=" text/CSS; charset=utf-8" href="../Styles/hide.css"/>"#,
+            r#"<link rel="stylesheet" title="Main" href="../Styles/plain.css"/><link rel="stylesheet" href="../Styles/hide.css"/>"#,
+            r#"<link rel="stylesheet" title="Main" href="../Styles/plain.css"/><link rel="alternate stylesheet" title="Main" href="../Styles/hide.css"/>"#,
+            r#"<link rel="stylesheet" type="text/plain" title="Main" href="../Styles/plain.css"/><link rel="stylesheet" title="Other" href="../Styles/hide.css"/>"#,
+            r#"<style type="TEXT/CSS" disabled="disabled">.x { display: none }</style>"#,
+        ] {
+            assert!(!dropped(head), "{head}");
+        }
+        // An `<?xml-stylesheet?>` instruction AnyDoc does not follow: of a
+        // type exactly `text/css`, or none, and not an alternate.
+        let converts_hidden = |prolog: &str| preflight(prolog, "").hidden_content;
+        assert!(converts_hidden(
+            r#"<?xml-stylesheet href="../Styles/hide.css"?>"#
+        ));
+        for prolog in [
+            r#"<?xml-stylesheet href="../Styles/hide.css" type="TEXT/CSS"?>"#,
+            r#"<?xml-stylesheet href="../Styles/hide.css" type="text/css" alternate="yes" title="Alt"?>"#,
+        ] {
+            assert!(!converts_hidden(prolog), "{prolog}");
+        }
     }
 
     #[test]
