@@ -70,7 +70,9 @@ pub(super) const MAX_IMPORTS_PER_SHEET: usize = 256;
 pub(super) const MAX_STYLE_RULES: usize = 16_384;
 /// Compound-selector evaluations across a package: one element tested
 /// against one rule costs one per compound it reaches, and one when the
-/// ancestor filter sets the rule aside.
+/// ancestor filter sets the rule aside. Reading an inline style costs one
+/// for each token, and looking a custom property up in it one for each
+/// declaration.
 pub(super) const MAX_MATCH_WORK: u64 = 50_000_000;
 /// Nesting depth of a chapter's elements, as AnyDoc's parser allows.
 const MAX_CHAPTER_DEPTH: usize = 256;
@@ -1854,15 +1856,6 @@ fn transparent(value: &[Token]) -> Option<Tri> {
     }
 }
 
-/// The declarations of an inline `style` attribute.
-fn inline_declarations(style: &str) -> Result<Vec<Declaration>, DocumentError> {
-    let tokens = tokenize(style)?;
-    Ok(split_top_level(&tokens, &Token::Semicolon)
-        .into_iter()
-        .flat_map(|tokens| parse_declarations(tokens).into_iter().flatten())
-        .collect())
-}
-
 // ---------------------------------------------------------------------------
 // Selectors
 
@@ -2466,6 +2459,13 @@ pub(super) struct Element {
     /// filtered by (see [`selector_key`]).
     name_key: u64,
     other_keys: Box<[u64]>,
+    /// The declarations of its inline style the check reads, each with
+    /// whether its `style` attribute is prefixed, parsed when first needed
+    /// (see [`Element::inline_style`]).
+    inline: std::cell::OnceCell<Box<[(bool, Declaration)]>>,
+    /// What the custom properties looked up at it say there, by name (see
+    /// [`Cascade::custom_value`]).
+    customs: std::cell::RefCell<HashMap<u64, Option<Tri>>>,
 }
 
 impl Element {
@@ -2482,6 +2482,8 @@ impl Element {
             attributes,
             position,
             other_keys: Box::default(),
+            inline: std::cell::OnceCell::new(),
+            customs: std::cell::RefCell::default(),
         };
         let classes = || {
             element
@@ -2514,6 +2516,36 @@ impl Element {
             .iter()
             .find(|(attribute, _, _)| attribute == name)
             .map(|(_, _, value)| value.as_str())
+    }
+
+    /// The declarations of its inline style (see [`Element::inline`]),
+    /// parsed the first time they are needed, a unit of work for each token.
+    fn inline_style(&self, work: &mut u64) -> Result<&[(bool, Declaration)], DocumentError> {
+        if let Some(parsed) = self.inline.get() {
+            return Ok(parsed);
+        }
+        let mut parsed = Vec::new();
+        for (prefixed, style) in self.values("style") {
+            let tokens = tokenize(style)?;
+            *work += tokens.len() as u64;
+            parsed.extend(
+                split_top_level(&tokens, &Token::Semicolon)
+                    .into_iter()
+                    .flat_map(|tokens| parse_declarations(tokens).into_iter().flatten())
+                    .map(|declaration| (prefixed, declaration)),
+            );
+        }
+        Ok(self.inline.get_or_init(|| parsed.into_boxed_slice()))
+    }
+
+    /// What a custom property says at it, where looked up before: `Some`
+    /// of what [`Cascade::custom_value`] found.
+    fn custom(&self, name: u64) -> Option<Option<Tri>> {
+        self.customs.borrow().get(&name).copied()
+    }
+
+    fn note_custom(&self, name: u64, value: Option<Tri>) {
+        self.customs.borrow_mut().insert(name, value);
     }
 }
 
@@ -3790,6 +3822,20 @@ const TIER_INLINE: u8 = 2;
 const TIER_AUTHOR_IMPORTANT: u8 = 3;
 const TIER_INLINE_IMPORTANT: u8 = 4;
 
+/// Where a declaration of an inline style stands in the cascade.
+fn inline_precedence(important: bool) -> Precedence {
+    Precedence {
+        tier: if important {
+            TIER_INLINE_IMPORTANT
+        } else {
+            TIER_INLINE
+        },
+        layer: 0,
+        specificity: (0, 0, 0),
+        order: 0,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Applied {
     precedence: Precedence,
@@ -4085,9 +4131,9 @@ pub(super) struct Cascade {
     painting_by_key: HashMap<u64, Vec<usize>>,
     painting_anywhere: Vec<usize>,
     painted_ids: std::collections::HashSet<Rc<str>>,
-    /// Rules that set a custom property, by its name, each with its place
-    /// among them and its layer (see [`Cascade::custom_value`]).
-    custom_rules: HashMap<u64, Vec<(Rc<StyleRule>, u32, u32)>>,
+    /// Rules that set a custom property, by its name (see
+    /// [`Cascade::custom_value`]).
+    custom_rules: HashMap<u64, CustomRules>,
     custom_order: u32,
     /// The rules kept only for their spacing, painting, or custom
     /// properties.
@@ -4107,6 +4153,17 @@ struct CascadeRule {
     order: u32,
     layer: u32,
     recorded: Box<[Option<u32>]>,
+}
+
+/// The rules that set one custom property, each with its place among the
+/// rules setting custom properties and its layer, indexed by an id, class,
+/// or element name their rightmost compound requires, and those that
+/// require none.
+#[derive(Default)]
+struct CustomRules {
+    rules: Vec<(Rc<StyleRule>, u32, u32)>,
+    by_key: HashMap<u64, Vec<u32>>,
+    anywhere: Vec<u32>,
 }
 
 /// A `~` step of a rule: the rule, the compound before the combinator, and
@@ -4212,12 +4269,17 @@ impl Cascade {
                 .collect();
             names.sort_unstable();
             names.dedup();
+            let key = rule.selector.compounds.last().and_then(rarest_key);
             for name in names {
-                self.custom_rules.entry(name).or_default().push((
-                    rule.clone(),
-                    self.custom_order,
-                    layer(rule),
-                ));
+                let rules = self.custom_rules.entry(name).or_default();
+                let index = rules.rules.len() as u32;
+                match key {
+                    Some(key) => rules.by_key.entry(key).or_default().push(index),
+                    None => rules.anywhere.push(index),
+                }
+                rules
+                    .rules
+                    .push((rule.clone(), self.custom_order, layer(rule)));
             }
         }
         for rule in &sheet.painting {
@@ -4353,13 +4415,15 @@ impl Cascade {
         &self,
         declaration: &Declaration,
         tree: &Tree,
+        ancestors: &AncestorKeys,
         work: &mut u64,
     ) -> Result<Declaration, DocumentError> {
         match declaration.var {
             Some(name) if declaration.property != Property::Custom => {
                 let unset = declaration.flow.unwrap_or(Tri::Maybe);
+                let value = self.custom_value(tree, ancestors, name, work)?;
                 Ok(Declaration {
-                    flow: Some(self.custom_value(tree, name, work)?.unwrap_or(unset)),
+                    flow: Some(value.unwrap_or(unset)),
                     var: None,
                     ..*declaration
                 })
@@ -4370,23 +4434,73 @@ impl Cascade {
 
     /// What the custom property of this name says at the element at the
     /// top of the tree: set by a rule or its inline style, or inherited
-    /// from the nearest element around it that sets it; `Maybe` where only
-    /// a rule that may apply sets it there, or one above the one that
-    /// certainly does says otherwise; `None` where nothing sets it.
+    /// from the nearest element around it that sets it (see
+    /// [`Cascade::custom_set`]); `None` where nothing sets it. Each element
+    /// keeps what it found, so a property is settled once at each.
     fn custom_value(
         &self,
         tree: &Tree,
+        ancestors: &AncestorKeys,
         name: u64,
         work: &mut u64,
     ) -> Result<Option<Tri>, DocumentError> {
-        let rules = self.custom_rules.get(&name);
+        let mut inheriting = Vec::new();
+        let mut value = None;
         for depth in (0..tree.stack.len()).rev() {
-            let node = Node {
-                depth,
-                sibling: None,
-            };
-            let mut applied: Vec<(Precedence, Tri, Tri)> = Vec::new();
-            for (rule, order, layer) in rules.into_iter().flatten() {
+            let element = &tree.stack[depth];
+            if let Some(known) = element.custom(name) {
+                value = known;
+                break;
+            }
+            if let Some(set) = self.custom_set(tree, ancestors, depth, name, work)? {
+                value = Some(set);
+                element.note_custom(name, value);
+                break;
+            }
+            inheriting.push(depth);
+        }
+        for depth in inheriting {
+            tree.stack[depth].note_custom(name, value);
+        }
+        Ok(value)
+    }
+
+    /// What the custom property of this name says where the open element
+    /// at `depth` sets it, by a rule or its inline style: `Maybe` where
+    /// only a rule that may apply sets it there, or one above the one that
+    /// certainly does says otherwise; `None` where nothing sets it there.
+    /// The rules tried are those whose rightmost compound the element may
+    /// fit, and trying each, and reading its inline style, counts as work.
+    fn custom_set(
+        &self,
+        tree: &Tree,
+        ancestors: &AncestorKeys,
+        depth: usize,
+        name: u64,
+        work: &mut u64,
+    ) -> Result<Option<Tri>, DocumentError> {
+        let element = &tree.stack[depth];
+        let node = Node {
+            depth,
+            sibling: None,
+        };
+        let mut applied: Vec<(Precedence, Tri, Tri)> = Vec::new();
+        if let Some(rules) = self.custom_rules.get(&name) {
+            let mut candidates: Vec<u32> = element
+                .keys()
+                .filter_map(|key| rules.by_key.get(&key))
+                .flatten()
+                .chain(&rules.anywhere)
+                .copied()
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            for index in candidates {
+                let (rule, order, layer) = &rules.rules[index as usize];
+                if !ancestors.hold(&rule.ancestor_keys) {
+                    *work += 1;
+                    continue;
+                }
                 let certainty =
                     match_complex_at(&rule.selector, &[], tree, node, work).min(rule.condition);
                 if certainty == Tri::No {
@@ -4400,47 +4514,35 @@ impl Cascade {
                     applied.push((precedence, certainty, says));
                 }
             }
-            if *work > MAX_MATCH_WORK {
-                return Err(DocumentError::ResourceLimit);
-            }
-            for (prefixed, style) in tree.stack[depth].values("style") {
-                let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
-                for declaration in inline_declarations(style)? {
-                    if declaration.property != Property::Custom || declaration.var != Some(name) {
-                        continue;
-                    }
-                    let tier = if declaration.important {
-                        TIER_INLINE_IMPORTANT
-                    } else {
-                        TIER_INLINE
-                    };
-                    let precedence = Precedence {
-                        tier,
-                        layer: 0,
-                        specificity: (0, 0, 0),
-                        order: 0,
-                    };
-                    applied.push((
-                        precedence,
-                        certainty,
-                        declaration.flow.unwrap_or(Tri::Maybe),
-                    ));
-                }
-            }
-            if applied.is_empty() {
+        }
+        let inline = element.inline_style(work)?;
+        *work += inline.len() as u64;
+        if *work > MAX_MATCH_WORK {
+            return Err(DocumentError::ResourceLimit);
+        }
+        for (prefixed, declaration) in inline {
+            if declaration.property != Property::Custom || declaration.var != Some(name) {
                 continue;
             }
-            let certain = applied
-                .iter()
-                .any(|(_, certainty, _)| *certainty == Tri::Yes);
-            let (value, contested) = resolve_value(&applied, Tri::Maybe);
-            return Ok(Some(if certain && !contested {
-                value
-            } else {
-                Tri::Maybe
-            }));
+            let certainty = if *prefixed { Tri::Maybe } else { Tri::Yes };
+            applied.push((
+                inline_precedence(declaration.important),
+                certainty,
+                declaration.flow.unwrap_or(Tri::Maybe),
+            ));
         }
-        Ok(None)
+        if applied.is_empty() {
+            return Ok(None);
+        }
+        let certain = applied
+            .iter()
+            .any(|(_, certainty, _)| *certainty == Tri::Yes);
+        let (value, contested) = resolve_value(&applied, Tri::Maybe);
+        Ok(Some(if certain && !contested {
+            value
+        } else {
+            Tri::Maybe
+        }))
     }
 
     /// Whether a rule may name the SVG resource of this id to paint with,
@@ -4621,7 +4723,7 @@ impl Cascade {
             for declaration in rule.declarations.iter() {
                 let precedence = self.precedence(declaration, rule, *order, *layer);
                 add(
-                    &self.resolved(declaration, tree, work)?,
+                    &self.resolved(declaration, tree, ancestors, work)?,
                     precedence,
                     certainty,
                 );
@@ -4630,26 +4732,13 @@ impl Cascade {
         if *work > MAX_MATCH_WORK {
             return Err(DocumentError::ResourceLimit);
         }
-        for (prefixed, style) in element.values("style") {
-            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
-            for declaration in inline_declarations(style)? {
-                let tier = if declaration.important {
-                    TIER_INLINE_IMPORTANT
-                } else {
-                    TIER_INLINE
-                };
-                let precedence = Precedence {
-                    tier,
-                    layer: 0,
-                    specificity: (0, 0, 0),
-                    order: 0,
-                };
-                add(
-                    &self.resolved(&declaration, tree, work)?,
-                    precedence,
-                    certainty,
-                );
-            }
+        for (prefixed, declaration) in element.inline_style(work)? {
+            let certainty = if *prefixed { Tri::Maybe } else { Tri::Yes };
+            add(
+                &self.resolved(declaration, tree, ancestors, work)?,
+                inline_precedence(declaration.important),
+                certainty,
+            );
         }
         // A reader's own margins and padding (HTML's rendering section): a
         // definition's, a quote's, and a figure's margins, and a list's
@@ -4937,8 +5026,18 @@ impl Cascade {
             if let Some(slot) = pseudo {
                 pseudo_styled[slot] = true;
                 for declaration in rule.declarations.iter() {
+                    // A box's margin and padding are read on the side that
+                    // faces the element's content.
+                    let facing = match declaration.property {
+                        Property::MarginRight | Property::PaddingRight => slot == 0,
+                        Property::MarginLeft | Property::PaddingLeft => slot == 1,
+                        _ => true,
+                    };
+                    if !facing {
+                        continue;
+                    }
                     let precedence = self.precedence(declaration, rule, *order, *layer);
-                    let declaration = &self.resolved(declaration, tree, work)?;
+                    let declaration = &self.resolved(declaration, tree, ancestors, work)?;
                     match (declaration.property, declaration.flow) {
                         (Property::Content, _) => {
                             pseudo_content[slot].push((
@@ -5015,9 +5114,14 @@ impl Cascade {
                 continue;
             }
             for declaration in rule.declarations.iter() {
+                // Margins, padding, widths, and flex bases are read for
+                // items alone (see [`Cascade::item_box`]).
+                if declaration.property.spaces() {
+                    continue;
+                }
                 let precedence = self.precedence(declaration, rule, *order, *layer);
                 add(
-                    &self.resolved(declaration, tree, work)?,
+                    &self.resolved(declaration, tree, ancestors, work)?,
                     precedence,
                     certainty,
                 );
@@ -5026,25 +5130,16 @@ impl Cascade {
         if *work > MAX_MATCH_WORK {
             return Err(DocumentError::ResourceLimit);
         }
-        for (prefixed, style) in element.values("style") {
-            let certainty = if prefixed { Tri::Maybe } else { Tri::Yes };
-            for declaration in inline_declarations(style)? {
-                let tier = if declaration.important {
-                    TIER_INLINE_IMPORTANT
-                } else {
-                    TIER_INLINE
-                };
-                add(
-                    &self.resolved(&declaration, tree, work)?,
-                    Precedence {
-                        tier,
-                        layer: 0,
-                        specificity: (0, 0, 0),
-                        order: 0,
-                    },
-                    certainty,
-                );
+        for (prefixed, declaration) in element.inline_style(work)? {
+            if declaration.property.spaces() {
+                continue;
             }
+            let certainty = if *prefixed { Tri::Maybe } else { Tri::Yes };
+            add(
+                &self.resolved(declaration, tree, ancestors, work)?,
+                inline_precedence(declaration.important),
+                certainty,
+            );
         }
         // SVG presentation attributes: author styles that every rule beats.
         let presentation = Precedence {
@@ -9269,6 +9364,39 @@ mod tests {
             &[".r { display: flex; --g: 0; gap: var(--g) }"],
             rows
         ));
+    }
+
+    #[test]
+    fn custom_properties_are_settled_once_at_each_element() {
+        // Long inline styles on the ancestors are read once each, however
+        // many elements below take their spacing from a custom property.
+        let style: String = (0..2_000).map(|at| format!("--p{at}: {at}px;")).collect();
+        let body = format!(
+            r#"{}<p>{}</p><p style="display:flex">{}</p>{}"#,
+            format!(r#"<div style="{style}">"#).repeat(20),
+            "<span>w</span>".repeat(2_000),
+            "<span>w</span>".repeat(2_000),
+            "</div>".repeat(20)
+        );
+        let (reader, anydoc) = cascade_for(&["span { margin-left: var(--gap) }"]);
+        let started = std::time::Instant::now();
+        let mut work = 0;
+        chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("chapter walk");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert!(work < 1_000_000, "{work}");
+        // Rules setting one property for many classes, as Bootstrap's
+        // gutters are set, are tried only at the elements carrying each.
+        let sheet: String = (0..400)
+            .map(|at| format!(".g{at} {{ --gap: {at}px }}\n"))
+            .chain([".r { display: flex } .r > * { padding-left: var(--gap) }".to_string()])
+            .collect();
+        let body = r#"<div class="r g3"><span>Balance due</span><span>Grand total</span></div>"#
+            .repeat(500);
+        let (reader, anydoc) = cascade_for(&[&sheet]);
+        let mut work = 0;
+        let found = chapter_text(&chapter(&body), &reader, &anydoc, &mut work).expect("walk");
+        assert!(found.fuses_blocks);
+        assert!(work < 100_000, "{work}");
     }
 
     #[test]
