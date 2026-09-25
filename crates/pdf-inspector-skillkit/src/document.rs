@@ -4628,7 +4628,8 @@ impl DocxNumberings {
             let word_label = match resolved.word {
                 // A level past the ninth, which ECMA-376 leaves undefined:
                 // LibreOffice numbers the tenth as a level of its own that
-                // shows nothing, and a deeper one at the first.
+                // shows nothing, and a deeper one at the first. So too a
+                // level Word's readings part on (`DOCX_UNCERTAIN_LEVEL`).
                 Some((_, level)) if level >= DOCX_LIST_LEVELS => DocxLabel::Unknown,
                 Some((list, level)) => match word.instance(list) {
                     Some(instance) => {
@@ -4888,10 +4889,13 @@ impl<'a> DocxStyleChains<'a> {
     /// The level a paragraph style numbers at in a list whose levels are
     /// bound to `bound`. AnyDoc takes the level bound to the first style
     /// along the chain that a level names, else the first, reading no
-    /// style's own level, as ECMA-376 says. Word, as LibreOffice shows it,
-    /// takes the nearest style along the chain that is bound or names its
-    /// own level (`w:numPr/w:ilvl`); a style that does both is numbered at
-    /// the level bound to it.
+    /// style's own level, as ECMA-376 says. Word takes the nearest style
+    /// along the chain that is bound or names its own level
+    /// (`w:numPr/w:ilvl`), a style that does both at the level bound to it.
+    /// LibreOffice reads no binding: it takes the level the chain names,
+    /// else the first, so a style bound to level 2 that names none is
+    /// numbered at level 0. Where the two part, what Word shows is
+    /// uncertain ([`DOCX_UNCERTAIN_LEVEL`]).
     fn level(&self, style: &str, bound: &[(usize, usize)], word: bool) -> usize {
         let Some(&style) = self.index.get(style) else {
             return 0;
@@ -4905,7 +4909,7 @@ impl<'a> DocxStyleChains<'a> {
             .filter(|&&(ancestor, _)| on_chain(ancestor))
             .max_by_key(|&&(ancestor, _)| self.depth[ancestor]);
         let named = self.named[style].filter(|_| word);
-        match (binding, named) {
+        let level = match (binding, named) {
             (Some(&(ancestor, level)), Some((nearer, own))) => {
                 if self.depth[ancestor] >= self.depth[nearer] {
                     level
@@ -4916,9 +4920,19 @@ impl<'a> DocxStyleChains<'a> {
             (Some(&(_, level)), None) => level,
             (None, Some((_, own))) => own,
             (None, None) => 0,
+        };
+        if word && level != named.map_or(0, |(_, own)| own) {
+            DOCX_UNCERTAIN_LEVEL
+        } else {
+            level
         }
     }
 }
+
+/// A level Word shows uncertainly, past every level a list defines: one a
+/// style's binding and its own numbering name apart (see
+/// [`DocxStyleChains::level`]).
+const DOCX_UNCERTAIN_LEVEL: usize = usize::MAX;
 
 /// A style definition AnyDoc keeps, as it is read: its id, what it says,
 /// and how many `w:basedOn` and `w:pPr` children have opened, `w:numPr` in
@@ -12655,17 +12669,42 @@ mod tests {
             .map(|ilvl| level(ilvl, "bullet", "o", ""))
             .collect::<String>();
         assert!(!differs(items.clone(), bullets, named.clone()));
-        // A style bound to one level and naming another is numbered at the
-        // one bound to it.
+        // A style bound to one level and naming another, or naming none, is
+        // numbered at the one bound to it by AnyDoc and, as ECMA-376 says, by
+        // Word; LibreOffice reads no binding and numbers it at the level it
+        // names, else the first ("(a)" or "2." where AnyDoc shows "1.1."). Which
+        // Word shows is uncertain, and disclosed; a style bound to the level it
+        // names is not.
         let conflicting = [
             style("Level1", "", r#"<w:numId w:val="1"/>"#),
             style("Level2", "", r#"<w:ilvl w:val="2"/><w:numId w:val="1"/>"#),
         ]
         .concat();
-        assert!(!differs(
-            ["Level1", "Level2", "Level2"].map(styled).concat(),
+        let bound_items = ["Level1", "Level2", "Level2"].map(styled).concat();
+        assert!(differs(
+            bound_items.clone(),
             template(&bound("Level2"), ""),
             conflicting
+        ));
+        let unnamed = [
+            style("Level1", "", r#"<w:numId w:val="1"/>"#),
+            style("Level2", "", r#"<w:numId w:val="1"/>"#),
+        ]
+        .concat();
+        assert!(differs(
+            bound_items.clone(),
+            template(&bound("Level2"), ""),
+            unnamed
+        ));
+        let agreeing = [
+            style("Level1", "", r#"<w:numId w:val="1"/>"#),
+            style("Level2", "", r#"<w:ilvl w:val="1"/><w:numId w:val="1"/>"#),
+        ]
+        .concat();
+        assert!(!differs(
+            bound_items,
+            template(&bound("Level2"), ""),
+            agreeing
         ));
         // A composite label shows a shallower level in its format: one
         // AnyDoc writes otherwise, zero-padded, ordinal, or a bullet, differs
