@@ -177,6 +177,7 @@ this audit named some by their latest commit, and listed #160, closed on
 | Issue | Report | Local disposition |
 |---|---|---|
 | #127 | An EPUB's title page is missing from the Markdown | Its cause is the bare `&` or `<` of #158 above; such a chapter is refused. |
+| #156 | Real workbooks exceed AnyDoc's grid or XML-node limits: a lone cell far from the content, or a column of spaces filled to the sheet's last row | Past the limits AnyDoc refuses the workbook, so the XLSX lane returns `resource_limit` and nothing converts in part. Below them the lone cell widens every row of its sheet's table: a sheet of five rows with one cell in column XEP converts completely, as 393 KB of Markdown, mostly empty cells. Not reported; nothing is lost, but a caller with a small context may not read it whole. |
 | #81 | "1. 1. first item" where a list item's text repeats its number | AnyDoc 0.2.4 shows what Word shows, the label and the text both, so nothing is reported. Pull request #80 would strip the text's own number; if a release adopts it, the DOCX list comparison must model the stripping, or it would disclose a difference Word does not show as none. |
 
 ### Older open pull requests
