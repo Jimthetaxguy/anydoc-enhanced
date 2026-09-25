@@ -76,6 +76,9 @@ pub const PDF_WARNING_TEXT_PAINTED_TWICE: &str = "text_painted_twice";
 /// Pages with gaps between glyphs that pdf-inspector 1.24.0 judges against
 /// the wrong space width (open upstream #532).
 pub const PDF_WARNING_WORD_GAPS_MISREAD: &str = "word_gaps_misread";
+/// Pages showing text through a form that pdf-inspector 1.24.0 does not
+/// reach or reads without its font (open upstream #312).
+pub const PDF_WARNING_FORM_TEXT_UNREAD: &str = "form_text_unread";
 
 /// Pages painting text twice whose text is read again to confirm the
 /// repeat in the Markdown.
@@ -357,6 +360,13 @@ impl PdfInfo {
                 PDF_WARNING_WORD_GAPS_MISREAD,
                 "On these pages pdf-inspector 1.24.0 misjudges word gaps, so some words or amounts run together or split apart: against the wrong space width, as in \"CBDOffice\" or \"8 5,000 .00\", or at the advances of text a browser printed glyph by glyph, as in \"LIAB ILITIES\"; check amounts against the PDF.",
                 gaps_misread,
+            ));
+        }
+        if !found.forms_unread.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_FORM_TEXT_UNREAD,
+                "On these pages pdf-inspector 1.24.0 misses or garbles text drawn through a form: a form drawn by a form without resources of its own is not read, and text a form shows in a font it does not set itself is read byte by byte; read these pages another way.",
+                found.forms_unread.clone(),
             ));
         }
         let painted_twice =

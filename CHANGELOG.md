@@ -187,14 +187,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Text pdf-inspector 1.24.0 misses or garbles when a form XObject draws it
+  is reported (open upstream #312). A form without `/Resources` of its own
+  draws with its invoker's, as renderers read the specification, but
+  pdf-inspector gives it none, so a form such a form draws is never read: a
+  W-2 whose box lines sit in a form drawn through a bare form converted
+  with only its heading, at confidence 1.0. pdf-inspector also starts every
+  form with no font, so text a form shows in the font it was drawn with is
+  read byte by byte, and a subset font's space at code 3 is lost ("Total
+  deposits85,000.00"). A page showing such text now carries the
+  `form_text_unread` warning; the Markdown is not changed. Among 551
+  corpus, upstream-fixture, replica, and review PDFs, only the five
+  reproductions changed.
 - Words pdf-inspector 1.24.0 splits in text a browser printed glyph by glyph
   (open upstream #531) are reported. Chromium's print to PDF shows each
   glyph as a string of its own, placed at the whole-pixel advance hinting
   gave it, while the font's widths keep the unhinted advance; a glyph set
   wider than its width crosses pdf-inspector's word-gap threshold, so the
   upstream fixture read "LIAB ILITIES" and a statement "B ALANCE DUE". Where
-  a font paints its word spaces as glyphs, which say where its words end,
-  the page scan collects the words it shows glyph by glyph. When the
+  a font paints its word spaces as glyphs anywhere in the document, which
+  say where its words end, the page scan collects the words it shows glyph
+  by glyph. When the
   Markdown shows one split by a space or a cell edge, the pages showing it
   are read again as pdf-inspector places their text, and each page whose
   own text splits it carries the `word_gaps_misread` warning; the Markdown
@@ -461,24 +474,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Other pdf-inspector 1.24.0 defects from its open pull requests are not
   detected: amounts pushed out of their rows after a table (#424); a receipt
   with few text operators and a logo read as a scan (#445); forms with
-  indirect or missing resources (#407, #312), reported only through the
-  garbled-text reason where it applies; rotated column headers scattered
+  indirect resources (#407), reported only through the garbled-text reason
+  where it applies; rotated column headers scattered
   into cells (#298); and blank pages that turn the sparse-extraction rule
-  on for every page (#339). The table checks read the Markdown and name no page; the repeat
-  check reads runs whose position is set, and stops after 4 million
-  operations per document. A repeat is confirmed in the Markdown on up to
-  64 pages; a later page is named while doubled text is left in the
+  on for every page (#339). The table checks read the Markdown and name no
+  page; the repeat check reads runs whose position is set, and stops after
+  4 million operations per document. A repeat is confirmed in the Markdown
+  on up to 64 pages; a later page is named for its own repeated text when
+  its fonts read it, and otherwise while doubled text is left in the
   Markdown, so an amount a paragraph legitimately repeats ("0.00 0.00") can
-  name one. A table cell's amounts are placed from the first 64 pages
-  converted; past them, and where the amounts are not read as runs of
-  their own, a cell counts beside an empty cell or in a column whose other
-  rows hold one amount. The word-gap check runs on
-  the same pages; a page listed as needing OCR is not checked, and a
+  name one. A shadow offset along the baseline by less than a third of the
+  size is a repeat only for runs of two glyphs or more. A table cell's
+  amounts are placed from the first 64 pages converted; past them, where
+  the amounts are not read as runs of their own, and where no line above
+  heads a column over the second amount, a cell counts beside an empty cell
+  or in a column whose other rows hold one amount. The word-gap check runs
+  on the same pages; a page listed as needing OCR is not checked, and a
   dependent sign's placement and return count as two gaps, where
-  pdf-inspector nets them into one. Words printed glyph by glyph are read
-  only in a font that paints a word space as a glyph after a word on the
-  page, so a page whose words stand alone on their lines, or whose spaces
-  are gaps, is not checked. A split word's pages are read again up to 64
+  pdf-inspector nets them into one. A split between digits on a line
+  outside a table reads the same as a space, but is reported. Tracked runs
+  of single glyphs, such as a letter-spaced heading, are judged with some
+  error either way: over 2,900 randomized files, 13 unchanged pages were
+  named and 33 changed ones missed. Composite (Type0) fonts are not
+  checked: pdf-inspector reads their space width at code 32 or 3, which
+  may be another glyph, so words shown with offsets can run together
+  ("Thebalanceoftheaccountwas") with no warning. Words printed glyph by
+  glyph are read only in a font that paints a word space as a glyph after a
+  word somewhere in the document, so a document whose words all stand
+  alone on their lines, or whose spaces are gaps, is not checked. A split word's pages are read again up to 64
   pages; past them, a page is named only when the Markdown never shows the
   word whole. A word set in small capitals, its first letter a glyph of
   its own and the rest one string, is not read, so the public Title 26

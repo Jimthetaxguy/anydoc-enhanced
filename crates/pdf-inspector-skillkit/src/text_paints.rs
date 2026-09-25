@@ -32,6 +32,15 @@
 //! shown in a subset font whose differences name the space at another code
 //! than 32 is checked for gaps pdf-inspector judges otherwise than its open
 //! fix would (open upstream #532; see `word_gaps`).
+//!
+//! **Text drawn through a form.** A form XObject without `/Resources` of
+//! its own draws with its invoker's, as renderers read the specification,
+//! but pdf-inspector gives it none (open upstream #312): a form it draws is
+//! never read. pdf-inspector also starts every form with no font, so text a
+//! form shows before setting a font of its own, in the font it was drawn
+//! with, is read byte by byte. A page is reported when it shows text in a
+//! form pdf-inspector does not reach, or text read byte by byte that its
+//! font reads otherwise.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -145,6 +154,15 @@ struct State {
     /// Whether `Tf` finds fonts pdf-inspector reads text by: not in a form
     /// without resources of its own, where it finds none.
     fonts: bool,
+    /// Whether pdf-inspector reads the text here at all: not in a form it
+    /// reaches only through a form without resources of its own.
+    reached: bool,
+    /// Whether pdf-inspector reads the text here byte by byte, with no
+    /// font: in a form, until the form sets a font among its own resources.
+    raw: bool,
+    /// How the font in force reads its codes, when the page is read for
+    /// forms.
+    decoded: Option<Decoded>,
     /// The font, when pdf-inspector and its fix take different word-gap
     /// thresholds from it and the page is checked for them.
     gaps: Option<GapFont>,
@@ -167,6 +185,9 @@ impl State {
         read_mode: 0,
         font: false,
         fonts: true,
+        reached: true,
+        raw: false,
+        decoded: None,
         gaps: None,
         glyph_font: None,
         size: 0.0,
@@ -176,6 +197,15 @@ impl State {
         leading: 0.0,
         rise: 0.0,
     };
+}
+
+/// How a font reads its codes.
+#[derive(Clone, Copy, Debug)]
+enum Decoded {
+    /// Two bytes a code, which read byte by byte make two characters.
+    TwoBytes,
+    /// Through the font's own maps (see `GlyphFonts`).
+    Glyphs(usize),
 }
 
 /// Where the visible runs of one page start, by a hash of their bytes and
@@ -468,6 +498,10 @@ struct PageText {
     /// the fonts read for that so far in the document.
     glyph_words: Option<GlyphWords>,
     glyph_fonts: GlyphFonts,
+    /// Whether the page is read for text drawn through forms, and whether
+    /// such text pdf-inspector misses or misreads.
+    forms: bool,
+    form_text_unread: bool,
 }
 
 impl PageText {
@@ -521,6 +555,41 @@ impl PageText {
     fn ended(&mut self) {
         self.text_object_ended();
         self.restore_to(0);
+    }
+
+    /// Note visible text for the check of forms: text pdf-inspector does
+    /// not reach, or reads byte by byte otherwise than its font does.
+    fn note_form_text(&mut self, state: State, bytes: &[u8]) {
+        if !self.forms
+            || self.form_text_unread
+            || !state.font
+            || state.read_mode == 3
+            || !bytes.iter().any(|&byte| byte != b' ')
+        {
+            return;
+        }
+        self.form_text_unread = if !state.reached {
+            true
+        } else if !state.raw {
+            false
+        } else {
+            match state.decoded {
+                Some(Decoded::TwoBytes) => true,
+                Some(Decoded::Glyphs(font)) => {
+                    self.glyph_fonts.text(font, bytes).is_some_and(|text| {
+                        let raw: String = bytes
+                            .iter()
+                            .map(|&byte| match byte {
+                                0x20..=0x7E => char::from(byte),
+                                _ => '\u{FFFD}',
+                            })
+                            .collect();
+                        text != raw
+                    })
+                }
+                None => false,
+            }
+        };
     }
 
     /// Note a string for the words shown glyph by glyph: one glyph placed
@@ -652,6 +721,9 @@ pub(crate) struct Findings {
     /// Pages with a gap between glyphs that pdf-inspector judges against
     /// the wrong space width.
     pub(crate) gaps_misread: Vec<u32>,
+    /// Pages showing text through a form without resources of its own that
+    /// pdf-inspector misses or misreads.
+    pub(crate) forms_unread: Vec<u32>,
     /// Where the visible runs placed on the pages read for repeats start,
     /// up to `MAX_PLACED_RUNS`.
     pub(crate) placed: Vec<Placed>,
@@ -698,7 +770,9 @@ pub(crate) fn scan(
         }
         let check_layer = !layer_skip.contains(&number);
         let check_twice = repeats && twice_skip.is_some_and(|skip| !skip.contains(&number));
-        if !check_layer && !check_twice {
+        // Forms without resources are checked on every page of a full run.
+        let check_forms = repeats && twice_skip.is_some();
+        if !check_layer && !check_twice && !check_forms {
             continue;
         }
         let budgets = Budgets {
@@ -707,10 +781,18 @@ pub(crate) fn scan(
             gap_fonts: &mut gap_fonts,
             glyph_fonts: &mut glyph_fonts,
         };
-        match scan_page(&document, page_id, check_layer, check_twice, budgets) {
+        let checks = Checks {
+            layer: check_layer,
+            twice: check_twice,
+            forms: check_forms,
+        };
+        match scan_page(&document, page_id, checks, budgets) {
             Ok(page) => {
                 if page.hidden_layer {
                     found.hidden_layer.push(number);
+                }
+                if page.form_text_unread {
+                    found.forms_unread.push(number);
                 }
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
@@ -769,11 +851,21 @@ struct Budgets<'a> {
     glyph_fonts: &'a mut GlyphFonts,
 }
 
+/// What a page is read for: an invisible layer, text painted twice (with
+/// word gaps and words shown glyph by glyph), and forms without resources.
+#[derive(Clone, Copy)]
+struct Checks {
+    layer: bool,
+    twice: bool,
+    forms: bool,
+}
+
 /// What the scan found on one page.
 #[derive(Default)]
 struct PageFindings {
     hidden_layer: bool,
     gaps_misread: bool,
+    form_text_unread: bool,
     /// Runs painted again over themselves, measured from the visible box.
     repeats: Vec<Repeat>,
     /// Where placed runs start, measured from the visible box, and whether
@@ -788,22 +880,27 @@ struct PageFindings {
 fn scan_page(
     document: &Document,
     page_id: ObjectId,
-    check_layer: bool,
-    check_twice: bool,
+    checks: Checks,
     budgets: Budgets<'_>,
 ) -> Result<PageFindings, Exhausted> {
     let Some(page_box) = page_box(document, page_id) else {
         return Ok(PageFindings::default());
     };
     let resources = page_resources(document, page_id);
+    let check_twice = checks.twice;
     // A scan is an image XObject; for the layer check, a page that binds
-    // none, directly or through its forms, is not read.
+    // none, directly or through its forms, is not read. Nor is a page that
+    // binds no form read for forms.
     let mut seen = HashSet::new();
-    let check_layer = check_layer
+    let check_layer = checks.layer
         && resources
             .iter()
             .any(|dictionary| binds_image(document, dictionary, 0, &mut seen));
-    if !check_layer && !check_twice {
+    let check_forms = checks.forms
+        && resources
+            .iter()
+            .any(|dictionary| binds_form(document, dictionary));
+    if !check_layer && !check_twice && !check_forms {
         return Ok(PageFindings::default());
     }
     let Budgets {
@@ -832,6 +929,7 @@ fn scan_page(
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
+        forms: check_forms,
         ..PageText::default()
     };
     page.save();
@@ -868,6 +966,7 @@ fn scan_page(
     Ok(PageFindings {
         hidden_layer: check_layer && page.is_hidden_layer(page_box),
         gaps_misread: page.gaps_misread,
+        form_text_unread: page.form_text_unread,
         placed,
         glyph_words,
         glyph_spaces,
@@ -989,20 +1088,33 @@ fn execute<'a>(
             "Tf" => {
                 if let [name, size] = operands.as_slice() {
                     state.font = name.as_name().is_ok();
+                    let resolved = name
+                        .as_name()
+                        .ok()
+                        .and_then(|name| font(document, resources, name));
                     // Word gaps are checked with the repeats, on the pages
                     // read for them.
-                    state.gaps = name
-                        .as_name()
-                        .ok()
+                    state.gaps = resolved
                         .filter(|_| page.runs.is_some() && state.fonts)
-                        .and_then(|name| font(document, resources, name))
                         .and_then(|font| page.gap_fonts.font(document, font));
-                    state.glyph_font = name
-                        .as_name()
-                        .ok()
+                    state.glyph_font = resolved
                         .filter(|_| page.glyph_words.is_some() && state.fonts)
-                        .and_then(|name| font(document, resources, name))
                         .and_then(|font| page.glyph_fonts.font(document, font));
+                    // pdf-inspector finds a font only among the resources
+                    // of the page or form drawing it, and none for a form
+                    // without its own.
+                    state.raw = !state.fonts || resolved.is_none();
+                    state.decoded = resolved.filter(|_| page.forms).and_then(|font| {
+                        let two_bytes = font
+                            .get(b"Subtype")
+                            .and_then(Object::as_name)
+                            .is_ok_and(|subtype| subtype == b"Type0");
+                        if two_bytes {
+                            Some(Decoded::TwoBytes)
+                        } else {
+                            page.glyph_fonts.font(document, font).map(Decoded::Glyphs)
+                        }
+                    });
                     if let Some(size) = number(document, size) {
                         state.size = size;
                     }
@@ -1086,6 +1198,9 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
+                if in_text {
+                    page.note_form_text(state, &bytes);
+                }
                 // Inside a span giving the text its glyphs stand for,
                 // pdf-inspector reads that text and not the glyphs.
                 let glyphs_read = !spans.contains(&true);
@@ -1186,6 +1301,11 @@ fn execute<'a>(
                         // no spacing, with the fonts of its own resources.
                         let inner = State {
                             ctm: multiply(form_matrix, state.ctm),
+                            // pdf-inspector finds a form drawn by a form only
+                            // among that form's own resources, and starts it
+                            // with no font.
+                            reached: state.reached && state.fonts,
+                            raw: true,
                             fonts: stream.dict.has(b"Resources"),
                             gaps: None,
                             glyph_font: None,
@@ -1410,6 +1530,31 @@ fn xobject<'a>(
             .map(|stream| (*id, stream));
     }
     None
+}
+
+/// Whether a resource dictionary binds a form XObject.
+fn binds_form(document: &Document, resources: &Dictionary) -> bool {
+    resources
+        .get(b"XObject")
+        .ok()
+        .and_then(|xobjects| dictionary(document, xobjects))
+        .is_some_and(|xobjects| {
+            xobjects.iter().any(|(_, entry)| {
+                let Object::Reference(id) = entry else {
+                    return false;
+                };
+                document
+                    .get_object(*id)
+                    .and_then(Object::as_stream)
+                    .is_ok_and(|stream| {
+                        stream
+                            .dict
+                            .get(b"Subtype")
+                            .and_then(Object::as_name)
+                            .is_ok_and(|subtype| subtype == b"Form")
+                    })
+            })
+        })
 }
 
 /// Whether a resource dictionary binds an image XObject, directly or in the
@@ -1868,6 +2013,93 @@ pub(crate) mod tests {
         assert!(scan(&pdf, &HashSet::new(), Some(&HashSet::from([1])), None)
             .painted_twice
             .is_empty());
+    }
+
+    /// A one-page document drawing `/Outer`, a form with the given entries
+    /// drawing `/Inner`, bound on the page with Helvetica, which shows the
+    /// page's one line of text.
+    fn nested_form_pdf(outer_entries: &str) -> Vec<u8> {
+        let form = "/Type /XObject /Subtype /Form /BBox [0 0 612 792]";
+        let objects: Vec<Vec<u8>> =
+            vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> /XObject << /Outer 6 0 R /Inner 7 0 R >> >> \
+              /Contents 5 0 R >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_vec(),
+            stream("", b"BT /F1 12 Tf 72 740 Td (Payroll summary) Tj ET q /Outer Do Q"),
+            stream(&format!("{form} {outer_entries}"), b"q /Inner Do Q"),
+            stream(
+                &format!("{form} /Resources << /Font << /F1 4 0 R >> >>"),
+                b"BT /F1 10 Tf 72 700 Td (Box 1 Wages 85,000.00) Tj ET",
+            ),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn text_drawn_through_forms_pdf_inspector_misses_is_found() {
+        let unread =
+            |pdf: &[u8]| scan(pdf, &HashSet::new(), Some(&HashSet::new()), None).forms_unread;
+        // A form drawn by a form without resources of its own is not read;
+        // bound in the drawing form's own resources, it is.
+        assert_eq!(unread(&nested_form_pdf("")), vec![1]);
+        assert!(unread(&nested_form_pdf(
+            "/Resources << /XObject << /Inner 7 0 R >> >>"
+        ))
+        .is_empty());
+        // Only a full run with Markdown reads forms.
+        let pdf = nested_form_pdf("");
+        assert!(scan(&pdf, &HashSet::new(), None, None)
+            .forms_unread
+            .is_empty());
+        // Text a form shows in the font it was drawn with is read byte by
+        // byte: plain text reads the same, a space named at code 26 does not.
+        let subset = "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+SubsetSans \
+             /FirstChar 26 /LastChar 57 /Widths [278 556 556 556 556 556 556 556 556 556 556 \
+             556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 556 \
+             556] /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+             /Differences [26 /space] >> >>";
+        let found = |page: &str, form: &str, font: &str, entries: &str| {
+            let pdf = scan_pdf_with(page, form, font, entries);
+            scan(&pdf, &HashSet::new(), Some(&HashSet::new()), None).forms_unread
+        };
+        let page = "BT /F1 10 Tf ET /Fm1 Do";
+        let plain = "BT 72 700 Td (Total deposits 85,000.00) Tj ET";
+        let coded = "BT 72 700 Td (Total deposits\\03285,000.00) Tj ET";
+        let helvetica =
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+        assert!(found(page, plain, helvetica, "").is_empty());
+        assert_eq!(found(page, coded, subset, ""), vec![1]);
+        assert_eq!(found(page, coded, subset, "/Resources << >>"), vec![1]);
+        // A form setting the font from its own resources is read with it.
+        let own = "BT /F1 10 Tf 72 700 Td (Total deposits\\03285,000.00) Tj ET";
+        assert!(found(page, own, subset, "/Resources << /Font << /F1 4 0 R >> >>").is_empty());
     }
 
     #[test]

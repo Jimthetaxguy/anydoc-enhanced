@@ -628,6 +628,89 @@ fn words_split_at_hinted_glyph_advances_are_reported() {
     );
 }
 
+/// A W-2 summary page whose box lines a form draws, reached through
+/// `/Outer`, a form with the given entries (pdf-inspector #312).
+fn nested_form_pdf(outer_entries: &str) -> Vec<u8> {
+    let form = "/Type /XObject /Subtype /Form /BBox [0 0 612 792]";
+    let lines = [
+        "Box 1 Wages, tips, other compensation 85,000.00",
+        "Box 2 Federal income tax withheld 12,400.00",
+        "Box 3 Social security wages 88,000.00",
+    ];
+    let inner: String = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("BT /F1 10 Tf 72 {} Td ({line}) Tj ET\n", 700 - 18 * index))
+        .collect();
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Outer 6 0 R /Inner 7 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 14 Tf 72 740 Td (Employer payroll summary for 2025) Tj ET q /Outer Do Q",
+        ),
+        stream(&format!("{form} {outer_entries}"), b"q /Inner Do Q"),
+        stream(
+            &format!("{form} /Resources << /Font << /F1 4 0 R >> >>"),
+            inner.as_bytes(),
+        ),
+    ])
+}
+
+#[test]
+fn text_drawn_through_forms_pdf_inspector_misses_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let bare = temporary.path().join("bare.pdf");
+    std::fs::write(&bare, nested_form_pdf("")).expect("write PDF");
+    let bound = temporary.path().join("bound.pdf");
+    std::fs::write(
+        &bound,
+        nested_form_pdf("/Resources << /XObject << /Inner 7 0 R >> >>"),
+    )
+    .expect("write PDF");
+    let results = call_tools(
+        &[
+            (
+                "pdf_to_markdown",
+                serde_json::json!({ "path": bare.to_str().expect("UTF-8 path") }),
+            ),
+            (
+                "pdf_to_markdown",
+                serde_json::json!({ "path": bound.to_str().expect("UTF-8 path") }),
+            ),
+        ],
+        None,
+    );
+    let reported = |result: &serde_json::Value| {
+        result["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning["code"] == "form_text_unread" && warning["pages"] == serde_json::json!([1])
+            })
+        })
+    };
+    assert!(reported(&results[0]), "{}", results[0]);
+    // pdf-inspector 1.24.0 does not read the form the bare form draws; when
+    // a release fixes #312, this expectation goes.
+    assert!(
+        results[0]["markdown"]
+            .as_str()
+            .is_some_and(|markdown| !markdown.contains("85,000.00")),
+        "{}",
+        results[0]
+    );
+    // Bound in the drawing form's own resources, the form is read.
+    assert!(!reported(&results[1]), "{}", results[1]);
+    assert!(
+        results[1]["markdown"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("85,000.00")),
+        "{}",
+        results[1]
+    );
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");
