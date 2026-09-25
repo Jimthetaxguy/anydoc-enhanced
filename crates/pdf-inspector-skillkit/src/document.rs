@@ -3389,14 +3389,16 @@ fn docx_numbering_labels(
 /// as the numbers they show differ.
 #[derive(Default)]
 struct DocxNumbering {
-    /// Each abstract definition (`w:abstractNum`) by id: AnyDoc matches the
-    /// id's text, and Word the integer it reads, so `01` and `+1` name
-    /// definition 1 for Word only.
-    definitions: HashMap<String, DocxDefinition>,
+    /// Each abstract definition (`w:abstractNum`), in the order first read.
+    definitions: Vec<DocxDefinition>,
+    /// Each definition's index by id: AnyDoc matches the id's text, and
+    /// Word the integer it reads, so `01` and `+1` name definition 1 for
+    /// Word only.
+    definition_ids: HashMap<String, usize>,
     /// Each list instance (`w:num`) by id.
     lists: HashMap<u64, DocxList>,
     /// The first definition declaring each list style (`w:styleLink`).
-    style_definitions: HashMap<String, String>,
+    style_definitions: HashMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -3417,12 +3419,13 @@ struct DocxList {
     starts: [Option<u64>; DOCX_LIST_LEVELS],
 }
 
-/// One list level (`w:lvl`).
+/// One list level (`w:lvl`). Its text is shared, not copied, by the list
+/// instances that use it.
 #[derive(Clone, Default)]
 struct DocxLevel {
     /// `w:numFmt`: `None` for a level defined without one, which Word
     /// numbers and AnyDoc renders as bullets.
-    format: Option<String>,
+    format: Option<Rc<str>>,
     /// `w:start`, clamped as AnyDoc clamps it. When it is absent AnyDoc
     /// starts at 1 and Word at 0.
     start: Option<u64>,
@@ -3430,13 +3433,27 @@ struct DocxLevel {
     /// 0 never, `n` after a level shallower than `n`.
     restart: Option<u32>,
     /// The paragraph style bound to the level (`w:pStyle`).
-    style: Option<String>,
+    style: Option<Rc<str>>,
     /// The number text (`w:lvlText`), `%1` to `%9` standing for levels'
     /// numbers: `None` when absent, and then Word shows no number.
-    text: Option<String>,
+    text: Option<DocxLevelText>,
     /// Legal numbering (`w:isLgl`): every level's number shows in decimal.
     legal: bool,
 }
+
+/// A level's number text (`w:lvlText`).
+#[derive(Clone)]
+enum DocxLevelText {
+    Text(Rc<str>),
+    /// Longer than the replay reads (see [`MAX_DOCX_LEVEL_TEXT_BYTES`]).
+    Oversized,
+}
+
+/// The longest level number text the replay reads. Word's number texts run
+/// to a few characters; a longer one would cost its length for every
+/// paragraph numbered at the level, on each side, so a paragraph numbered
+/// there is disclosed instead of compared.
+const MAX_DOCX_LEVEL_TEXT_BYTES: usize = 1024;
 
 impl DocxLevel {
     fn start(&self) -> u64 {
@@ -3446,6 +3463,16 @@ impl DocxLevel {
     /// The level's start as Word reads it: 0 when `w:start` is absent.
     fn word_start(&self) -> u64 {
         self.start.unwrap_or(0)
+    }
+
+    /// The level's number text, empty where it has none; `None` where it is
+    /// longer than the replay reads.
+    fn number_text(&self) -> Option<&str> {
+        match &self.text {
+            None => Some(""),
+            Some(DocxLevelText::Text(text)) => Some(text),
+            Some(DocxLevelText::Oversized) => None,
+        }
     }
 }
 
@@ -3638,9 +3665,8 @@ impl DocxMarker {
             return DocxMarker::Nothing;
         };
         if level
-            .text
-            .as_deref()
-            .is_none_or(|text| text.trim().is_empty())
+            .number_text()
+            .is_some_and(|text| text.trim().is_empty())
             && level.format.as_deref() != Some("bullet")
         {
             return DocxMarker::Nothing;
@@ -3665,19 +3691,31 @@ impl DocxMarker {
 }
 
 /// A list instance as one side of the replay counts it: the definition its
-/// levels come from, which Word shares counters through, its levels and
-/// markers, the levels it restarts (`w:startOverride`), and the styles its
-/// levels are bound to, each with the first level bound to it.
+/// levels come from, which Word shares counters through, the levels as
+/// the instance shows them, and the levels it restarts
+/// (`w:startOverride`).
 struct DocxInstance {
-    definition: String,
+    definition: usize,
+    shape: Rc<DocxShape>,
+    starts: [Option<u64>; DOCX_LIST_LEVELS],
+}
+
+/// A list's levels and their markers, and the styles its levels are bound
+/// to, each with the first level bound to it. The instances of a definition
+/// that replace none of its levels share one.
+struct DocxShape {
     levels: [DocxLevel; DOCX_LIST_LEVELS],
     markers: [DocxMarker; DOCX_LIST_LEVELS],
-    starts: [Option<u64>; DOCX_LIST_LEVELS],
     bound: Vec<(usize, usize)>,
 }
 
-/// The list instances the replay has read, for one side.
-type DocxInstances = HashMap<u64, Option<DocxInstance>>;
+/// The list instances the replay has read for one side, and the shapes of
+/// the definitions they share.
+#[derive(Default)]
+struct DocxInstances {
+    lists: HashMap<u64, Option<DocxInstance>>,
+    shapes: HashMap<usize, Rc<DocxShape>>,
+}
 
 /// A paragraph's list label as one side shows it.
 #[derive(Debug, PartialEq, Eq)]
@@ -3726,14 +3764,15 @@ fn docx_number_text(text: &str) -> Vec<DocxTextPiece> {
     pieces
 }
 
-impl DocxInstance {
+impl DocxShape {
     /// The label Word shows for a paragraph numbered `value` at `level`,
     /// with `counters` holding the shallower levels' numbers. Legal
     /// numbering (`w:isLgl`) shows the levels in decimal, but a format
     /// beyond decimal, Roman numerals, and letters stays unknown at the
     /// paragraph's own level, as it does at a shallower level without legal
     /// numbering; past `z` Word doubles the letter (`aa`, `bb`) where AnyDoc
-    /// counts on (`aa`, `ab`).
+    /// counts on (`aa`, `ab`). A level whose text is longer than the replay
+    /// reads is unknown.
     fn word_label(&self, level: usize, value: u64, counters: &DocxCounters) -> DocxLabel {
         match self.markers[level] {
             DocxMarker::Nothing => return self.word_literal(level),
@@ -3741,8 +3780,11 @@ impl DocxInstance {
             DocxMarker::Count(_) | DocxMarker::Other => {}
         }
         let own = &self.levels[level];
+        let Some(text) = own.number_text() else {
+            return DocxLabel::Unknown;
+        };
         let mut label = String::new();
-        for piece in docx_number_text(own.text.as_deref().unwrap_or("")) {
+        for piece in docx_number_text(text) {
             let shown = match piece {
                 DocxTextPiece::Literal(literal) => {
                     label.push_str(&literal);
@@ -3785,7 +3827,10 @@ impl DocxInstance {
         if own.format.as_deref() != Some("none") {
             return DocxLabel::Nothing;
         }
-        let literal: String = docx_number_text(own.text.as_deref().unwrap_or(""))
+        let Some(text) = own.number_text() else {
+            return DocxLabel::Unknown;
+        };
+        let literal: String = docx_number_text(text)
             .into_iter()
             .filter_map(|piece| match piece {
                 DocxTextPiece::Literal(text) => Some(text),
@@ -3803,7 +3848,8 @@ impl DocxInstance {
     /// full stop where the level has none, with every level in the level's
     /// own marker, a bullet level as `-`, or in decimal for legal numbering.
     /// A shallower level shows its count, or its start before it counts and
-    /// while it waits to restart.
+    /// while it waits to restart. A level whose text is longer than the
+    /// replay reads is unknown.
     fn anydoc_label(
         &self,
         level: usize,
@@ -3817,7 +3863,10 @@ impl DocxInstance {
             DocxMarker::Nothing | DocxMarker::Other => return DocxLabel::Nothing,
         };
         let own = &self.levels[level];
-        let pieces = docx_number_text(own.text.as_deref().unwrap_or(""));
+        let Some(text) = own.number_text() else {
+            return DocxLabel::Unknown;
+        };
+        let pieces = docx_number_text(text);
         if pieces.is_empty() {
             return DocxLabel::Text(format!("{}.", own_count.text(value)));
         }
@@ -3869,16 +3918,15 @@ impl DocxNumbering {
     /// of that style's list instance, as AnyDoc resolves it. Word, as
     /// LibreOffice shows it, also finds the definition that declares the
     /// style (`w:styleLink`) when the style names no list instance.
-    fn resolve_definition<'a>(
-        &'a self,
-        definition: &'a str,
+    fn resolve_definition(
+        &self,
+        definition: &str,
         chains: &DocxStyleChains,
         word: bool,
-    ) -> Option<&'a str> {
-        let mut current = definition;
+    ) -> Option<usize> {
+        let mut current = *self.definition_ids.get(definition)?;
         for _ in 0..MAX_DOCX_DEFINITION_LINKS {
-            let found = self.definitions.get(current)?;
-            let Some(style) = &found.style_link else {
+            let Some(style) = &self.definitions[current].style_link else {
                 return Some(current);
             };
             let through_style = chains
@@ -3886,8 +3934,9 @@ impl DocxNumbering {
                 .and_then(|list| self.lists.get(&list))
                 .and_then(|list| list.definition.as_deref());
             let next = match through_style {
-                Some(next) => Some(next),
-                None if word => self.style_definitions.get(style).map(String::as_str),
+                // A list naming no definition read ends the link unresolved.
+                Some(next) => Some(*self.definition_ids.get(next)?),
+                None if word => self.style_definitions.get(style).copied(),
                 None => None,
             };
             match next {
@@ -3900,29 +3949,31 @@ impl DocxNumbering {
 
     /// A list instance's effective levels from a resolved definition, with
     /// the instance's replacements applied; a level neither defines is
-    /// `None`.
+    /// `None`. The levels share their text with the definition's.
     fn levels_from(
         &self,
         instance: &DocxList,
-        definition: &str,
-    ) -> Option<[Option<DocxLevel>; DOCX_LIST_LEVELS]> {
-        let mut levels = self.definitions.get(definition)?.levels.clone();
+        definition: usize,
+    ) -> [Option<DocxLevel>; DOCX_LIST_LEVELS] {
+        let mut levels = self.definitions[definition].levels.clone();
         for (level, replaced) in instance.levels.iter().enumerate() {
             if replaced.is_some() {
                 levels[level] = replaced.clone();
             }
         }
-        Some(levels)
+        levels
     }
 
-    /// A list instance as Word or as AnyDoc counts it.
-    fn instance(&self, list: u64, chains: &DocxStyleChains, word: bool) -> Option<DocxInstance> {
-        let instance = self.lists.get(&list)?;
-        let definition = self.resolve_definition(instance.definition.as_deref()?, chains, word)?;
-        let levels = self.levels_from(instance, definition)?;
-        Some(DocxInstance {
-            definition: definition.to_string(),
-            starts: instance.starts,
+    /// A list's levels as Word or as AnyDoc shows them.
+    fn shape(
+        &self,
+        instance: &DocxList,
+        definition: usize,
+        chains: &DocxStyleChains,
+        word: bool,
+    ) -> DocxShape {
+        let levels = self.levels_from(instance, definition);
+        DocxShape {
             bound: chains.bound(&levels),
             markers: levels.each_ref().map(|level| {
                 if word {
@@ -3932,6 +3983,33 @@ impl DocxNumbering {
                 }
             }),
             levels: levels.map(Option::unwrap_or_default),
+        }
+    }
+
+    /// A list instance as Word or as AnyDoc counts it. An instance that
+    /// replaces none of its definition's levels shares the definition's
+    /// shape with the definition's other instances.
+    fn instance(
+        &self,
+        list: u64,
+        chains: &DocxStyleChains,
+        word: bool,
+        shapes: &mut HashMap<usize, Rc<DocxShape>>,
+    ) -> Option<DocxInstance> {
+        let instance = self.lists.get(&list)?;
+        let definition = self.resolve_definition(instance.definition.as_deref()?, chains, word)?;
+        let shape = if instance.levels.iter().any(Option::is_some) {
+            Rc::new(self.shape(instance, definition, chains, word))
+        } else {
+            shapes
+                .entry(definition)
+                .or_insert_with(|| Rc::new(self.shape(instance, definition, chains, word)))
+                .clone()
+        };
+        Some(DocxInstance {
+            definition,
+            shape,
+            starts: instance.starts,
         })
     }
 }
@@ -3956,7 +4034,7 @@ impl<'a> DocxReading<'a> {
             word,
             numbering,
             chains: DocxStyleChains::new(styles),
-            instances: DocxInstances::new(),
+            instances: DocxInstances::default(),
         }
     }
 
@@ -3966,11 +4044,11 @@ impl<'a> DocxReading<'a> {
             word,
             numbering,
             chains,
-            instances,
+            instances: DocxInstances { lists, shapes },
         } = self;
-        instances
+        lists
             .entry(list)
-            .or_insert_with(|| numbering.instance(list, chains, *word))
+            .or_insert_with(|| numbering.instance(list, chains, *word, shapes))
             .as_ref()
     }
 
@@ -3991,7 +4069,7 @@ impl<'a> DocxReading<'a> {
         if list == 0 {
             return None;
         }
-        let bound = self.instance(list)?.bound.clone();
+        let bound = self.instance(list)?.shape.bound.clone();
         let level = match (level, style) {
             (Some(level), _) => level,
             (None, Some(style)) => self.chains.level(style, &bound, self.word),
@@ -4083,7 +4161,7 @@ impl DocxNumberings {
             return true;
         }
         // Word's stories: a part, or `None` for the text boxes.
-        let mut word_counters: HashMap<(Option<DocxPart>, String), DocxCounters> = HashMap::new();
+        let mut word_counters: HashMap<(Option<DocxPart>, usize), DocxCounters> = HashMap::new();
         let mut anydoc_counters: HashMap<u64, DocxCounters> = HashMap::new();
         let mut restarted: HashSet<(Option<DocxPart>, u64)> = HashSet::new();
         let in_order = [DocxPart::Body, DocxPart::Footnotes, DocxPart::Endnotes]
@@ -4100,15 +4178,18 @@ impl DocxNumberings {
                 .unwrap_or_default();
             let anydoc_label = match resolved.anydoc.filter(|_| paragraph.anydoc) {
                 Some((list, level)) => match anydoc.instance(list) {
-                    Some(instance) if matches!(instance.markers[level], DocxMarker::Count(_)) => {
+                    Some(instance)
+                        if matches!(instance.shape.markers[level], DocxMarker::Count(_)) =>
+                    {
+                        let shape = &instance.shape;
                         let start = |level: usize| {
-                            instance.starts[level].unwrap_or_else(|| instance.levels[level].start())
+                            instance.starts[level].unwrap_or_else(|| shape.levels[level].start())
                         };
                         let counters = anydoc_counters.entry(list).or_default();
-                        let value = counters.next(level, start(level), None, &instance.levels);
-                        instance.anydoc_label(level, value, counters, start)
+                        let value = counters.next(level, start(level), None, &shape.levels);
+                        shape.anydoc_label(level, value, counters, start)
                     }
-                    Some(instance) if instance.markers[level] == DocxMarker::Bullet => {
+                    Some(instance) if instance.shape.markers[level] == DocxMarker::Bullet => {
                         DocxLabel::Bullet
                     }
                     _ => DocxLabel::Nothing,
@@ -4118,7 +4199,7 @@ impl DocxNumberings {
             if !paragraph.word {
                 // A paragraph Word does not show still takes a number in
                 // AnyDoc.
-                if matches!(anydoc_label, DocxLabel::Text(_)) {
+                if matches!(anydoc_label, DocxLabel::Text(_) | DocxLabel::Unknown) {
                     return true;
                 }
                 continue;
@@ -4126,20 +4207,21 @@ impl DocxNumberings {
             let word_label = match resolved.word {
                 Some((list, level)) => match word.instance(list) {
                     Some(instance) => {
+                        let shape = &instance.shape;
                         let story = (!paragraph.in_text_box).then_some(paragraph.part);
                         let restart_at =
                             instance.starts[level].filter(|_| restarted.insert((story, list)));
                         let counters = word_counters
-                            .entry((story, instance.definition.clone()))
+                            .entry((story, instance.definition))
                             .or_default();
-                        counters.imply_parents(level, &instance.levels);
+                        counters.imply_parents(level, &shape.levels);
                         let value = counters.next(
                             level,
-                            instance.levels[level].word_start(),
+                            shape.levels[level].word_start(),
                             restart_at,
-                            &instance.levels,
+                            &shape.levels,
                         );
-                        instance.word_label(level, value, counters)
+                        shape.word_label(level, value, counters)
                     }
                     None => DocxLabel::Nothing,
                 },
@@ -4154,7 +4236,8 @@ impl DocxNumberings {
             // the same text; a bullet shows no count to differ.
             let differs = match (&word_label, &anydoc_label) {
                 (DocxLabel::Text(shown), DocxLabel::Text(converted)) => shown != converted,
-                (DocxLabel::Text(_) | DocxLabel::Unknown, _) | (_, DocxLabel::Text(_)) => true,
+                (DocxLabel::Text(_) | DocxLabel::Unknown, _)
+                | (_, DocxLabel::Text(_) | DocxLabel::Unknown) => true,
                 _ => false,
             };
             if differs {
@@ -4566,7 +4649,7 @@ fn docx_numbering_definitions(
     let mut numbering = DocxNumbering::default();
     // The open definition or list instance, the level an open
     // `w:lvlOverride` names, and the open `w:lvl`.
-    let mut definition: Option<String> = None;
+    let mut definition: Option<usize> = None;
     let mut list: Option<u64> = None;
     let mut override_level: Option<usize> = None;
     let mut open_level: Option<DocxOpenLevel> = None;
@@ -4600,7 +4683,7 @@ fn docx_numbering_definitions(
         (level < DOCX_LIST_LEVELS).then_some(level)
     };
     let commit = |numbering: &mut DocxNumbering,
-                  definition: &Option<String>,
+                  definition: Option<usize>,
                   list: Option<u64>,
                   open: DocxOpenLevel| {
         if open.replaces {
@@ -4608,11 +4691,7 @@ fn docx_numbering_definitions(
                 numbering.lists.entry(list).or_default().levels[open.index] = Some(open.level);
             }
         } else if let Some(definition) = definition {
-            numbering
-                .definitions
-                .entry(definition.clone())
-                .or_default()
-                .levels[open.index] = Some(open.level);
+            numbering.definitions[definition].levels[open.index] = Some(open.level);
         }
     };
     loop {
@@ -4626,7 +4705,7 @@ fn docx_numbering_definitions(
                     Some(b"lvlOverride") => override_level = None,
                     Some(b"lvl") => {
                         if let Some(open) = open_level.take() {
-                            commit(&mut numbering, &definition, list, open);
+                            commit(&mut numbering, definition, list, open);
                         }
                     }
                     _ => {}
@@ -4655,15 +4734,20 @@ fn docx_numbering_definitions(
         let numeric = |name: &[u8]| raw(name).map(number);
         match local.as_slice() {
             b"abstractNum" if stack.len() == 1 => {
-                definition = numeric(b"abstractNumId").and_then(definition_id);
-                if let Some(id) = &definition {
+                definition = None;
+                if let Some(id) = numeric(b"abstractNumId").and_then(definition_id) {
                     if id.len() > MAX_STYLE_ID_BYTES
                         || (numbering.definitions.len() >= MAX_DOCX_STYLES
-                            && !numbering.definitions.contains_key(id))
+                            && !numbering.definition_ids.contains_key(&id))
                     {
                         return Err(DocumentError::ResourceLimit);
                     }
-                    numbering.definitions.entry(id.clone()).or_default();
+                    let next = numbering.definitions.len();
+                    let index = *numbering.definition_ids.entry(id).or_insert(next);
+                    if index == next {
+                        numbering.definitions.push(DocxDefinition::default());
+                    }
+                    definition = Some(index);
                 }
             }
             b"num" if stack.len() == 1 => {
@@ -4684,16 +4768,12 @@ fn docx_numbering_definitions(
                 }
             }
             b"numStyleLink" if xml_path_ends_with(&stack, &[b"abstractNum"]) => {
-                if let (Some(definition), Some(style)) = (&definition, value(b"val")) {
-                    numbering
-                        .definitions
-                        .entry(definition.clone())
-                        .or_default()
-                        .style_link = Some(style);
+                if let (Some(definition), Some(style)) = (definition, value(b"val")) {
+                    numbering.definitions[definition].style_link = Some(style);
                 }
             }
             b"styleLink" if xml_path_ends_with(&stack, &[b"abstractNum"]) => {
-                if let (Some(definition), Some(style)) = (&definition, value(b"val")) {
+                if let (Some(definition), Some(style)) = (definition, value(b"val")) {
                     if numbering.style_definitions.len() >= MAX_DOCX_STYLES
                         && !numbering.style_definitions.contains_key(&style)
                     {
@@ -4702,7 +4782,7 @@ fn docx_numbering_definitions(
                     numbering
                         .style_definitions
                         .entry(style)
-                        .or_insert_with(|| definition.clone());
+                        .or_insert(definition);
                 }
             }
             b"lvlOverride" if list.is_some() && xml_path_ends_with(&stack, &[b"num"]) => {
@@ -4736,14 +4816,19 @@ fn docx_numbering_definitions(
                     if start {
                         open_level = Some(open);
                     } else {
-                        commit(&mut numbering, &definition, list, open);
+                        commit(&mut numbering, definition, list, open);
                     }
                 }
             }
             b"lvlText" if xml_path_ends_with(&stack, &[b"lvl"]) => {
                 if let Some(open) = open_level.as_mut() {
                     if open.level.text.is_none() {
-                        open.level.text = Some(raw(b"val").unwrap_or_default());
+                        let text = raw(b"val").unwrap_or_default();
+                        open.level.text = Some(if text.len() > MAX_DOCX_LEVEL_TEXT_BYTES {
+                            DocxLevelText::Oversized
+                        } else {
+                            DocxLevelText::Text(text.into())
+                        });
                     }
                 }
             }
@@ -4759,14 +4844,14 @@ fn docx_numbering_definitions(
                     let level = &mut open.level;
                     let found_number = numeric(b"val").unwrap_or_default();
                     match local.as_slice() {
-                        b"numFmt" if level.format.is_none() => level.format = Some(found),
+                        b"numFmt" if level.format.is_none() => level.format = Some(found.into()),
                         b"start" if level.start.is_none() => {
                             level.start = docx_start_value(&found_number);
                         }
                         b"lvlRestart" if level.restart.is_none() => {
                             level.restart = found_number.parse().ok();
                         }
-                        b"pStyle" if level.style.is_none() => level.style = Some(found),
+                        b"pStyle" if level.style.is_none() => level.style = Some(found.into()),
                         _ => {}
                     }
                 }
@@ -12038,6 +12123,96 @@ mod tests {
             ]);
             assert!(preflight.unsupported_content, "{target}");
         }
+    }
+
+    #[test]
+    fn docx_list_instances_share_their_definitions_levels() {
+        // A definition whose unused levels carry text past the bound, and
+        // instances that restart it, replace a level, or neither.
+        let long = "A".repeat(MAX_DOCX_LEVEL_TEXT_BYTES + 1);
+        let levels: String = (0..DOCX_LIST_LEVELS)
+            .map(|ilvl| {
+                let text = if ilvl == 0 {
+                    "%1.".to_string()
+                } else {
+                    format!("%{}.{long}", ilvl + 1)
+                };
+                format!(
+                    r#"<w:lvl w:ilvl="{ilvl}"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="{text}"/></w:lvl>"#
+                )
+            })
+            .collect();
+        let instances: String = (1..=200)
+            .map(|id| {
+                let overrides = match id {
+                    2 => r#"<w:lvlOverride w:ilvl="0"><w:startOverride w:val="4"/></w:lvlOverride>"#,
+                    3 => r#"<w:lvlOverride w:ilvl="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1)"/></w:lvl></w:lvlOverride>"#,
+                    _ => "",
+                };
+                format!(r#"<w:num w:numId="{id}"><w:abstractNumId w:val="0"/>{overrides}</w:num>"#)
+            })
+            .collect();
+        let numbering = format!(
+            r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{levels}</w:abstractNum>{instances}</w:numbering>"#
+        );
+        let read = docx_numbering_definitions(numbering.as_bytes(), false).expect("numbering");
+        // Text past the bound is not kept.
+        assert!(matches!(
+            read.definitions[0].levels[1]
+                .as_ref()
+                .and_then(|level| level.text.as_ref()),
+            Some(DocxLevelText::Oversized)
+        ));
+        let styles = HashMap::new();
+        let mut reading = DocxReading::new(false, &read, &styles);
+        let shape = |reading: &mut DocxReading, list: u64| {
+            Rc::clone(&reading.instance(list).expect("instance").shape)
+        };
+        let first = shape(&mut reading, 1);
+        // Instances that replace no level share one shape, restarted or not,
+        // and a replaced level keeps sharing the others' text.
+        for list in [2, 4, 200] {
+            assert!(Rc::ptr_eq(&first, &shape(&mut reading, list)), "{list}");
+        }
+        let replaced = shape(&mut reading, 3);
+        assert!(!Rc::ptr_eq(&first, &replaced));
+        let text = |shape: &DocxShape, level: usize| match &shape.levels[level].text {
+            Some(DocxLevelText::Text(text)) => Rc::clone(text),
+            _ => panic!("level text"),
+        };
+        assert_eq!(&*text(&replaced, 0), "%1)");
+        let definition_text = match read.definitions[0].levels[0]
+            .as_ref()
+            .map(|level| &level.text)
+        {
+            Some(Some(DocxLevelText::Text(text))) => Rc::clone(text),
+            _ => panic!("definition text"),
+        };
+        assert!(Rc::ptr_eq(&definition_text, &text(&first, 0)));
+        assert_eq!(reading.instances.shapes.len(), 1);
+
+        // A paragraph numbered at a level whose text is past the bound is
+        // disclosed; the same level unused, or a bullet there, is not.
+        let item = |ilvl: u32| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#
+            )
+        };
+        let differs = |body: String, format: &str| {
+            let document = word_part("document", &body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="{format}"/><w:lvlText w:val="{long}"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+            );
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        assert!(!differs([item(0), item(0)].concat(), "decimal"));
+        assert!(differs([item(0), item(1)].concat(), "decimal"));
+        assert!(differs([item(0), item(1)].concat(), "none"));
+        assert!(!differs([item(0), item(1)].concat(), "bullet"));
     }
 
     #[test]
