@@ -903,15 +903,12 @@ const DISPLAY_KEYWORDS: [&str; 44] = [
     "unset",
 ];
 
-/// The declaration a token run holds, if it sets `display`, `visibility`,
-/// `content-visibility`, or `float`. A value computed at run time (`var()`,
-/// `env()`, `attr()`, `if()`) may hide, so it counts as hiding.
-fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
-    let tokens = trim_whitespace(tokens);
-    let [Token::Ident(name), rest @ ..] = tokens else {
-        return None;
-    };
-    let property = match name.to_ascii_lowercase().as_str() {
+/// The declaration of a property, named in lower case, with the tokens
+/// after its name, if it sets `display`, `visibility`, `content-visibility`,
+/// or `float`. A value computed at run time (`var()`, `env()`, `attr()`,
+/// `if()`) may hide, so it counts as hiding.
+fn parse_declaration(name: &str, rest: &[Token]) -> Option<Declaration> {
+    let property = match name {
         "display" => Property::Display,
         "visibility" => Property::Visibility,
         "content-visibility" => Property::ContentVisibility,
@@ -1058,13 +1055,57 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
     })
 }
 
+/// What a declaration of flex items' layout, or a margin or padding, says
+/// (see [`parse_declarations`]): one property; the left and the right of a
+/// margin or padding, from one to four lengths from the top clockwise, or
+/// one or two from the start; a flex box's direction and wrapping; or the
+/// gap between columns, after that between rows.
+#[derive(Clone, Copy)]
+enum Reads {
+    One(Property, fn(&[&[Token]]) -> Option<Tri>),
+    Sides(Property, Property, bool),
+    FlexFlow,
+    Gap,
+}
+
 /// The declarations a token run holds that the check reads. Most set one
 /// property; `margin`, `padding`, and their inline forms set a box's left
 /// and right, `flex-flow` a flex box's direction and wrapping.
 fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
-    let tokens = trim_whitespace(tokens);
-    let [Token::Ident(name), rest @ ..] = tokens else {
+    let [Token::Ident(name), rest @ ..] = trim_whitespace(tokens) else {
         return [None, None];
+    };
+    let name = name.to_ascii_lowercase();
+    let reads = match name.as_str() {
+        "flex-direction" | "-webkit-flex-direction" => {
+            Reads::One(Property::FlexDirection, flex_direction)
+        }
+        "flex-wrap" | "-webkit-flex-wrap" => Reads::One(Property::FlexWrap, flex_wrap),
+        "flex-flow" | "-webkit-flex-flow" => Reads::FlexFlow,
+        "-webkit-box-orient" => Reads::One(Property::BoxOrient, box_orient),
+        "justify-content" | "-webkit-justify-content" => {
+            Reads::One(Property::JustifyContent, spreads)
+        }
+        "gap" | "grid-gap" => Reads::Gap,
+        "column-gap" | "grid-column-gap" => Reads::One(Property::ColumnGap, one_positive_length),
+        "-webkit-line-clamp" => Reads::One(Property::LineClamp, line_clamp),
+        "margin" => Reads::Sides(Property::MarginLeft, Property::MarginRight, true),
+        "padding" => Reads::Sides(Property::PaddingLeft, Property::PaddingRight, true),
+        "margin-inline" => Reads::Sides(Property::MarginLeft, Property::MarginRight, false),
+        "padding-inline" => Reads::Sides(Property::PaddingLeft, Property::PaddingRight, false),
+        "margin-left" | "margin-inline-start" | "-webkit-margin-start" => {
+            Reads::One(Property::MarginLeft, one_positive_length)
+        }
+        "margin-right" | "margin-inline-end" | "-webkit-margin-end" => {
+            Reads::One(Property::MarginRight, one_positive_length)
+        }
+        "padding-left" | "padding-inline-start" | "-webkit-padding-start" => {
+            Reads::One(Property::PaddingLeft, one_positive_length)
+        }
+        "padding-right" | "padding-inline-end" | "-webkit-padding-end" => {
+            Reads::One(Property::PaddingRight, one_positive_length)
+        }
+        _ => return [parse_declaration(&name, rest), None],
     };
     let [Token::Colon, value @ ..] = trim_whitespace(rest) else {
         return [None, None];
@@ -1097,63 +1138,32 @@ fn parse_declarations(tokens: &[Token]) -> [Option<Declaration>; 2] {
             generated: None,
         })
     };
-    // The left and right a list of one to four lengths sets, from the top
-    // clockwise, and those of one or two for the start and the end.
-    let sides = |left: Property, right: Property, clockwise: bool| {
-        let (start, end) = match (clockwise, parts.as_slice()) {
-            (true, [all]) | (false, [all]) => (all, all),
-            (true, [_, across] | [_, across, _]) => (across, across),
-            (true, [_, right, _, left]) => (left, right),
-            (false, [start, end]) => (start, end),
-            _ => return [None, None],
-        };
-        [
-            declare(left, positive_length(start)),
-            declare(right, positive_length(end)),
-        ]
-    };
-    let one = |property: Property, says: fn(&[&[Token]]) -> Option<Tri>| {
-        [declare(property, says(&parts)), None]
-    };
-    match name.to_ascii_lowercase().as_str() {
-        "flex-direction" | "-webkit-flex-direction" => one(Property::FlexDirection, flex_direction),
-        "flex-wrap" | "-webkit-flex-wrap" => one(Property::FlexWrap, flex_wrap),
-        "flex-flow" | "-webkit-flex-flow" => [
+    match reads {
+        Reads::One(property, says) => [declare(property, says(&parts)), None],
+        Reads::Sides(left, right, clockwise) => {
+            let (start, end) = match (clockwise, parts.as_slice()) {
+                (true, [all]) | (false, [all]) => (all, all),
+                (true, [_, across] | [_, across, _]) => (across, across),
+                (true, [_, right, _, left]) => (left, right),
+                (false, [start, end]) => (start, end),
+                _ => return [None, None],
+            };
+            [
+                declare(left, positive_length(start)),
+                declare(right, positive_length(end)),
+            ]
+        }
+        Reads::FlexFlow => [
             declare(Property::FlexDirection, flex_direction(&parts)),
             declare(Property::FlexWrap, flex_wrap(&parts)),
         ],
-        "-webkit-box-orient" => one(Property::BoxOrient, box_orient),
-        "justify-content" | "-webkit-justify-content" => one(Property::JustifyContent, spreads),
-        // `gap` sets the gap between rows, then between columns.
-        "gap" | "grid-gap" => [
+        Reads::Gap => [
             declare(
                 Property::ColumnGap,
                 parts.last().and_then(|gap| positive_length(gap)),
             ),
             None,
         ],
-        "column-gap" | "grid-column-gap" => one(Property::ColumnGap, |parts| match parts {
-            [gap] => positive_length(gap),
-            _ => None,
-        }),
-        "-webkit-line-clamp" => one(Property::LineClamp, line_clamp),
-        "margin" => sides(Property::MarginLeft, Property::MarginRight, true),
-        "padding" => sides(Property::PaddingLeft, Property::PaddingRight, true),
-        "margin-inline" => sides(Property::MarginLeft, Property::MarginRight, false),
-        "padding-inline" => sides(Property::PaddingLeft, Property::PaddingRight, false),
-        "margin-left" | "margin-inline-start" | "-webkit-margin-start" => {
-            one(Property::MarginLeft, one_positive_length)
-        }
-        "margin-right" | "margin-inline-end" | "-webkit-margin-end" => {
-            one(Property::MarginRight, one_positive_length)
-        }
-        "padding-left" | "padding-inline-start" | "-webkit-padding-start" => {
-            one(Property::PaddingLeft, one_positive_length)
-        }
-        "padding-right" | "padding-inline-end" | "-webkit-padding-end" => {
-            one(Property::PaddingRight, one_positive_length)
-        }
-        _ => [parse_declaration(tokens), None],
     }
 }
 
@@ -1820,9 +1830,10 @@ pub(super) struct Element {
     /// decoded values, in document order.
     attributes: Vec<(String, bool, String)>,
     position: Position,
-    /// Its element name, ids, and classes as the keys rules are filtered by
-    /// (see [`selector_key`]).
-    keys: Box<[u64]>,
+    /// Its element name, and its ids and classes, as the keys rules are
+    /// filtered by (see [`selector_key`]).
+    name_key: u64,
+    other_keys: Box<[u64]>,
 }
 
 impl Element {
@@ -1831,22 +1842,30 @@ impl Element {
         attributes: Vec<(String, bool, String)>,
         position: Position,
     ) -> Self {
+        let lower = local.to_ascii_lowercase();
         let mut element = Element {
             local: local.to_string(),
-            lower: local.to_ascii_lowercase(),
+            name_key: selector_key(KEY_TYPE, &lower),
+            lower,
             attributes,
             position,
-            keys: Box::default(),
+            other_keys: Box::default(),
         };
-        element.keys = std::iter::once(selector_key(KEY_TYPE, &element.lower))
-            .chain(element.values("id").map(|(_, id)| selector_key(KEY_ID, id)))
-            .chain(element.values("class").flat_map(|(_, classes)| {
-                classes
-                    .split_ascii_whitespace()
-                    .map(|class| selector_key(KEY_CLASS, class))
-            }))
-            .collect();
+        let classes = || {
+            element
+                .values("class")
+                .flat_map(|(_, classes)| classes.split_ascii_whitespace())
+        };
+        let mut other_keys = Vec::with_capacity(element.values("id").count() + classes().count());
+        other_keys.extend(element.values("id").map(|(_, id)| selector_key(KEY_ID, id)));
+        other_keys.extend(classes().map(|class| selector_key(KEY_CLASS, class)));
+        element.other_keys = other_keys.into_boxed_slice();
         element
+    }
+
+    /// Its keys (see [`selector_key`]).
+    fn keys(&self) -> impl Iterator<Item = u64> + '_ {
+        std::iter::once(self.name_key).chain(self.other_keys.iter().copied())
     }
 
     fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (bool, &'a str)> + 'a {
@@ -1884,6 +1903,45 @@ fn attribute_test(operator: AttributeOperator, actual: &str, wanted: &str) -> bo
         AttributeOperator::Prefix => !wanted.is_empty() && actual.starts_with(wanted),
         AttributeOperator::Suffix => !wanted.is_empty() && actual.ends_with(wanted),
         AttributeOperator::Substring => !wanted.is_empty() && actual.contains(wanted),
+    }
+}
+
+/// [`attribute_test`] without regard to case, as `to_lowercase` folds it:
+/// ASCII values, as nearly all are, compared in place.
+fn attribute_test_folded(operator: AttributeOperator, actual: &str, wanted: &str) -> bool {
+    if !actual.is_ascii() || !wanted.is_ascii() {
+        return attribute_test(operator, &actual.to_lowercase(), &wanted.to_lowercase());
+    }
+    let (actual, wanted) = (actual.as_bytes(), wanted.as_bytes());
+    let starts = |text: &[u8]| {
+        text.len() >= wanted.len() && text[..wanted.len()].eq_ignore_ascii_case(wanted)
+    };
+    match operator {
+        AttributeOperator::Exists => true,
+        AttributeOperator::Equals => actual.eq_ignore_ascii_case(wanted),
+        AttributeOperator::Includes => {
+            !wanted.is_empty()
+                && !wanted.iter().any(|byte| char::from(*byte).is_whitespace())
+                && actual
+                    .split(u8::is_ascii_whitespace)
+                    .any(|word| word.eq_ignore_ascii_case(wanted))
+        }
+        AttributeOperator::DashMatch => {
+            actual.eq_ignore_ascii_case(wanted)
+                || (starts(actual) && actual.get(wanted.len()) == Some(&b'-'))
+        }
+        AttributeOperator::Prefix => !wanted.is_empty() && starts(actual),
+        AttributeOperator::Suffix => {
+            !wanted.is_empty()
+                && actual.len() >= wanted.len()
+                && actual[actual.len() - wanted.len()..].eq_ignore_ascii_case(wanted)
+        }
+        AttributeOperator::Substring => {
+            !wanted.is_empty()
+                && actual
+                    .windows(wanted.len())
+                    .any(|window| window.eq_ignore_ascii_case(wanted))
+        }
     }
 }
 
@@ -2174,7 +2232,7 @@ fn match_simple(simple: &Simple, tree: &Tree, node: Node, work: &mut u64) -> Tri
                 name,
                 |actual, loose| {
                     if loose || *case_insensitive {
-                        attribute_test(*operator, &actual.to_lowercase(), &value.to_lowercase())
+                        attribute_test_folded(*operator, actual, value)
                     } else {
                         attribute_test(*operator, actual, value)
                     }
@@ -2462,6 +2520,11 @@ const KEY_TYPE: u8 = 0;
 const KEY_ID: u8 = 1;
 const KEY_CLASS: u8 = 2;
 
+/// Where a key sets its bit in a filter of 256 bits: by its lowest byte.
+fn key_bit(key: u64) -> (usize, u64) {
+    (usize::from(key as u8 >> 6), 1 << (key & 63))
+}
+
 /// The keys the ancestor compounds of a selector's compounds up to `last`
 /// require: those joined to the compound on their right by a descendant or
 /// child combinator, whose element names, ids, and classes some ancestor
@@ -2497,19 +2560,31 @@ fn compound_keys(compound: &Compound) -> impl Iterator<Item = u64> + '_ {
 
 /// The element names, ids, and classes of the open elements, counted, so
 /// that a rule for another part of a book is set aside with a lookup per
-/// key, as browsers filter rules by their ancestors.
-#[derive(Default)]
+/// key, as browsers filter rules by their ancestors; and those counted by
+/// the lowest byte of their keys, which sets most such rules aside without
+/// one.
 pub(super) struct AncestorKeys {
     counts: HashMap<u64, u32>,
+    bytes: [u32; 256],
+}
+
+impl Default for AncestorKeys {
+    fn default() -> Self {
+        AncestorKeys {
+            counts: HashMap::new(),
+            bytes: [0; 256],
+        }
+    }
 }
 
 impl AncestorKeys {
     fn keys(element: &Element) -> impl Iterator<Item = u64> + '_ {
-        element.keys.iter().copied()
+        element.keys()
     }
 
     fn push(&mut self, element: &Element) {
         for key in Self::keys(element) {
+            self.bytes[usize::from(key as u8)] += 1;
             *self.counts.entry(key).or_default() += 1;
         }
     }
@@ -2517,6 +2592,7 @@ impl AncestorKeys {
     fn pop(&mut self, element: &Element) {
         for key in Self::keys(element) {
             if let Some(count) = self.counts.get_mut(&key) {
+                self.bytes[usize::from(key as u8)] -= 1;
                 *count -= 1;
                 if *count == 0 {
                     self.counts.remove(&key);
@@ -2527,7 +2603,8 @@ impl AncestorKeys {
 
     /// Whether some open element carries each key.
     fn hold(&self, keys: &[u64]) -> bool {
-        keys.iter().all(|key| self.counts.contains_key(key))
+        keys.iter()
+            .all(|key| self.bytes[usize::from(*key as u8)] > 0 && self.counts.contains_key(key))
     }
 }
 
@@ -3066,9 +3143,11 @@ pub(super) struct Cascade {
     /// The `~` steps of the rules, which the walk records as siblings end.
     sibling_steps: Vec<SiblingStep>,
     /// Those steps by an id, class, or element name their compound
-    /// requires, and those that require none.
+    /// requires, and those that require none; and a bit for the lowest byte
+    /// of each key, which sets most siblings aside without a lookup.
     steps_by_key: HashMap<u64, Vec<u32>>,
     steps_anywhere: Vec<u32>,
+    step_key_bits: [u64; 4],
     /// Rules that set a margin or padding, each with its place among them,
     /// by an id, class, or element name their rightmost compound requires,
     /// and those that require none (see [`Cascade::spacing`]); and how many
@@ -3114,7 +3193,11 @@ impl Cascade {
                             ancestor_keys: ancestor_keys(&rule.selector, at),
                         });
                         match rarest_key(&rule.selector.compounds[at]) {
-                            Some(key) => self.steps_by_key.entry(key).or_default().push(step),
+                            Some(key) => {
+                                let (word, bit) = key_bit(key);
+                                self.step_key_bits[word] |= bit;
+                                self.steps_by_key.entry(key).or_default().push(step);
+                            }
                             None => self.steps_anywhere.push(step),
                         }
                         step
@@ -3192,9 +3275,8 @@ impl Cascade {
     ) -> Result<(Tri, Tri), DocumentError> {
         let element = tree.stack.last().expect("an element to style");
         let mut candidates: Vec<usize> = element
-            .keys
-            .iter()
-            .filter_map(|key| self.spacing_by_key.get(key))
+            .keys()
+            .filter_map(|key| self.spacing_by_key.get(&key))
             .flatten()
             .chain(&self.spacing_anywhere)
             .copied()
@@ -3304,6 +3386,10 @@ impl Cascade {
                 sibling: Some(siblings.len() - 1),
             };
             let keyed = AncestorKeys::keys(tree.element(node))
+                .filter(|key| {
+                    let (word, bit) = key_bit(*key);
+                    self.step_key_bits[word] & bit != 0
+                })
                 .filter_map(|key| self.steps_by_key.get(&key))
                 .flatten();
             let mut fits = Vec::new();
@@ -3460,6 +3546,8 @@ impl Cascade {
         let mut pseudo_line_feeds: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
         let mut pseudo_hidden: [Vec<(Precedence, Tri, Option<Tri>)>; 2] = Default::default();
         let mut pseudo_clear: [Vec<(Precedence, Tri, Tri)>; 2] = Default::default();
+        // Whether a rule for each box may apply at all.
+        let mut pseudo_styled = [false; 2];
         for index in candidates {
             let CascadeRule {
                 rule,
@@ -3481,6 +3569,7 @@ impl Cascade {
                 PseudoElement::Other => continue,
             };
             if let Some(slot) = pseudo {
+                pseudo_styled[slot] = true;
                 for declaration in rule.declarations.iter() {
                     let tier = if declaration.important {
                         TIER_AUTHOR_IMPORTANT
@@ -3693,6 +3782,9 @@ impl Cascade {
         // unseen only where `opacity: 0` or `visibility` certainly keeps
         // it so.
         let pseudo = |slot: usize| {
+            if !pseudo_styled[slot] {
+                return PseudoBox::default();
+            }
             let (content, contested) =
                 resolve_value(&pseudo_content[slot], Some(Generated::Nothing));
             let given = match content {
@@ -4702,7 +4794,10 @@ struct ChapterFacts {
     /// The ids an SVG `use` element draws.
     used: std::collections::HashSet<String>,
     /// The ids a fill, stroke, clip path, mask, or marker paints
-    /// (`url(#id)`), in an attribute or a `style` element.
+    /// (`url(#id)`), in an SVG element's attribute or inline style, or in
+    /// a `style` element. An HTML element's inline style is not read: a
+    /// resource only it refers to, as a clip path on a box, counts as
+    /// unpainted.
     painted: std::collections::HashSet<String>,
 }
 
@@ -4832,34 +4927,39 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
         let local = String::from_utf8_lossy(super::xml_local_name(name.as_ref())).into_owned();
         let family = open.last_mut().expect("the chapter's top level");
         let svg = family.svg || local == "svg";
-        for attribute in element.attributes().flatten() {
-            let key = attribute.key.as_ref();
-            if key == b"xmlns" || key.starts_with(b"xmlns:") {
-                continue;
-            }
-            let key = super::xml_local_name(key);
-            let used = key == b"href" && svg && local == "use";
-            let styled = key.eq_ignore_ascii_case(b"style");
-            let painting = PAINTING_PROPERTIES
-                .iter()
-                .any(|property| key.eq_ignore_ascii_case(property.as_bytes()));
-            if !(used || styled || painting) {
-                continue;
-            }
-            let value = attribute
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map(|value| value.into_owned())
-                .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned());
-            if used {
-                if let Some(id) = value.trim().strip_prefix('#') {
-                    found.used.insert(id.to_string());
+        // Only an SVG element paints a resource through an attribute.
+        if svg {
+            for attribute in element.attributes().flatten() {
+                let key = attribute.key.as_ref();
+                if key == b"xmlns" || key.starts_with(b"xmlns:") {
+                    continue;
                 }
-            } else if styled {
-                painted_by_style(&value, &mut found.painted);
-            } else {
-                found
-                    .painted
-                    .extend(url_fragments(&value).map(str::to_string));
+                let key = super::xml_local_name(key);
+                let used = key == b"href" && local == "use";
+                let styled = key.eq_ignore_ascii_case(b"style");
+                let painting = PAINTING_PROPERTIES
+                    .iter()
+                    .any(|property| key.eq_ignore_ascii_case(property.as_bytes()));
+                if !(used || styled || painting) {
+                    continue;
+                }
+                let value = attribute
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .map(|value| value.into_owned())
+                    .unwrap_or_else(|_| {
+                        String::from_utf8_lossy(attribute.value.as_ref()).into_owned()
+                    });
+                if used {
+                    if let Some(id) = value.trim().strip_prefix('#') {
+                        found.used.insert(id.to_string());
+                    }
+                } else if styled {
+                    painted_by_style(&value, &mut found.painted);
+                } else {
+                    found
+                        .painted
+                        .extend(url_fragments(&value).map(str::to_string));
+                }
             }
         }
         if let Some(parent) = family.fact {
@@ -6940,6 +7040,50 @@ mod tests {
             ),
         ] {
             assert!(!fuses(sheets, &body), "{body}");
+        }
+    }
+
+    #[test]
+    fn attribute_values_compare_without_case_as_lowercase_does() {
+        let values = [
+            "",
+            "a",
+            "A",
+            "note",
+            "Note",
+            "NOTE",
+            "noteref",
+            "footnote NoteRef",
+            "en-US",
+            "EN",
+            "en",
+            "z3998:Roman",
+            "a\u{b}b",
+            "a b",
+            "\u{c4}rger",
+            "\u{e4}RGER",
+            "-",
+            "x-",
+        ];
+        let operators = [
+            AttributeOperator::Exists,
+            AttributeOperator::Equals,
+            AttributeOperator::Includes,
+            AttributeOperator::DashMatch,
+            AttributeOperator::Prefix,
+            AttributeOperator::Suffix,
+            AttributeOperator::Substring,
+        ];
+        for operator in operators {
+            for actual in values {
+                for wanted in values {
+                    assert_eq!(
+                        attribute_test_folded(operator, actual, wanted),
+                        attribute_test(operator, &actual.to_lowercase(), &wanted.to_lowercase()),
+                        "{operator:?} {actual:?} {wanted:?}"
+                    );
+                }
+            }
         }
     }
 
