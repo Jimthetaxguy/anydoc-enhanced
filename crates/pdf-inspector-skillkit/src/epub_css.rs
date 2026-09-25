@@ -4584,12 +4584,27 @@ pub(super) struct Stylesheet {
     /// The rules kept only for their spacing, painting, or custom
     /// properties.
     others: usize,
-    pub(super) imports: Vec<(String, Applies)>,
+    pub(super) imports: Vec<Import>,
+    /// Whether a rule other than `@charset`, `@import`, or `@layer` naming
+    /// layers has come, after which Chromium ignores an `@import`.
+    imports_closed: bool,
     /// The cascade layers it declares, in the order they are first declared.
     layers: Vec<SheetLayer>,
     /// The namespace prefixes it declares (`@namespace`), by the names
     /// they are bound to.
     namespaces: Rc<[(String, Rc<str>)]>,
+}
+
+/// An `@import` a sheet keeps: its target; how its conditions hold; the
+/// cascade layer it puts the target's rules in (`layer`, `layer(name)`),
+/// as an index into [`Stylesheet::layers`]; and how many layers the sheet
+/// has declared up to it.
+#[derive(Debug)]
+pub(super) struct Import {
+    pub(super) target: String,
+    pub(super) applies: Applies,
+    layer: Option<u32>,
+    declared: usize,
 }
 
 /// A cascade layer a sheet declares: its names from the outermost, an
@@ -4707,6 +4722,9 @@ fn parse_rule_list(
                 if index >= tokens.len() {
                     break;
                 }
+                if top_level {
+                    sheet.imports_closed = true;
+                }
                 let (block, end) = block_at(tokens, index);
                 let selectors = RuleSelectors::new(
                     &tokens[start..index],
@@ -4764,6 +4782,10 @@ fn parse_at_rule(
         end = skip_component(tokens, end);
     }
     let prelude = &tokens[index + 1..end];
+    let block = end < tokens.len() && tokens[end] == Token::OpenCurly;
+    if top_level && selectors.is_none() && closes_imports(&name, block) {
+        sheet.imports_closed = true;
+    }
     let within = |condition: Applies| RuleContext {
         condition: context.condition.min(condition),
         ..context
@@ -4772,7 +4794,7 @@ fn parse_at_rule(
         declared: context.declared.min(condition),
         ..within(condition)
     };
-    if end < tokens.len() && tokens[end] == Token::OpenCurly {
+    if block {
         let (block, after) = block_at(tokens, end);
         let mut scope = scope.cloned();
         let inner = match name.as_str() {
@@ -4866,18 +4888,61 @@ fn parse_at_rule(
             }
         }
     }
-    if name == "import" && top_level && selectors.is_none() {
-        if let Some((target, applies)) = import_target(prelude) {
+    if name == "import" && top_level && selectors.is_none() && !sheet.imports_closed {
+        if let Some((target, applies, layer)) = import_target(prelude) {
             let applies = applies.min(context.condition);
             if applies != Applies::No {
-                if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET {
+                if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET
+                    || (layer.is_some() && sheet.layers.len() >= MAX_LAYERS_PER_SHEET)
+                {
                     return Err(DocumentError::ResourceLimit);
                 }
-                sheet.imports.push((target, applies));
+                // Its layer is declared where it stands, where its
+                // conditions hold.
+                let layer = layer.map(|names| sheet.layer(None, names, applies));
+                sheet.imports.push(Import {
+                    target,
+                    applies,
+                    layer,
+                    declared: sheet.layers.len(),
+                });
             }
         }
     }
     Ok((end + 1).min(tokens.len()))
+}
+
+/// At-rules Chromium knows besides `@charset`, `@import`, and `@layer`.
+const KNOWN_AT_RULES: [&str; 17] = [
+    "media",
+    "supports",
+    "container",
+    "scope",
+    "starting-style",
+    "font-face",
+    "page",
+    "keyframes",
+    "-webkit-keyframes",
+    "namespace",
+    "property",
+    "counter-style",
+    "font-feature-values",
+    "font-palette-values",
+    "view-transition",
+    "position-try",
+    "function",
+];
+
+/// Whether an at-rule at the top of a sheet, `block` telling whether it
+/// has one, ends the `@import` rules Chromium reads: one it knows other
+/// than `@charset`, `@import`, and `@layer` naming layers. One it does not
+/// know it drops, as if it were not there.
+fn closes_imports(name: &str, block: bool) -> bool {
+    match name {
+        "charset" | "import" => false,
+        "layer" => block,
+        _ => KNOWN_AT_RULES.contains(&name),
+    }
 }
 
 /// The root an `@scope` rule's style rules match inside, as what `&` and
@@ -4909,9 +4974,12 @@ fn scope_prelude(prelude: &[Token], namespaces: &[(String, Rc<str>)]) -> Option<
     Some((nest, limited))
 }
 
-/// An `@import`'s target, and how its `supports()` condition and media list
-/// hold on the readers the check follows.
-fn import_target(prelude: &[Token]) -> Option<(String, Applies)> {
+/// An `@import`'s target; how its `supports()` condition and media list
+/// hold on the readers the check follows; and the cascade layer it puts
+/// the target's rules in: `Some(None)` for an anonymous one (`layer`), the
+/// names of a named one (`layer(base)`). `None` for a rule Chromium drops.
+#[allow(clippy::type_complexity)]
+fn import_target(prelude: &[Token]) -> Option<(String, Applies, Option<Option<Vec<String>>>)> {
     let tokens = trim_whitespace(prelude);
     let (target, rest) = match tokens {
         [Token::Str(target) | Token::Url(target), rest @ ..] => (target.clone(), rest),
@@ -4924,35 +4992,38 @@ fn import_target(prelude: &[Token]) -> Option<(String, Applies)> {
         }
         _ => return None,
     };
+    // The layer, then the `supports()` condition, then the media list.
     let mut rest = trim_whitespace(rest);
+    let mut layer = None;
+    match rest {
+        [Token::Ident(word), tail @ ..] if word.eq_ignore_ascii_case("layer") => {
+            layer = Some(None);
+            rest = trim_whitespace(tail);
+        }
+        [Token::Function(function), ..] if function.eq_ignore_ascii_case("layer") => {
+            let (arguments, end) = block_at(rest, 0);
+            layer = Some(Some(layer_names(arguments).ok().flatten()?));
+            rest = trim_whitespace(&rest[end..]);
+        }
+        _ => {}
+    }
     let mut supported = Applies::Yes;
-    loop {
-        match rest {
-            [Token::Ident(word), tail @ ..] if word.eq_ignore_ascii_case("layer") => {
-                rest = trim_whitespace(tail);
-            }
-            [Token::Function(function), ..]
-                if function.eq_ignore_ascii_case("layer")
-                    || function.eq_ignore_ascii_case("supports") =>
-            {
-                let (arguments, end) = block_at(rest, 0);
-                if function.eq_ignore_ascii_case("supports") {
-                    // A declaration, or a condition in its own right.
-                    let arguments = trim_whitespace(arguments);
-                    supported = match arguments {
-                        [Token::Ident(name), tail @ ..] => match trim_whitespace(tail) {
-                            [Token::Colon, value @ ..] => supports_declaration(name, value),
-                            _ => supports_condition(arguments),
-                        },
-                        _ => supports_condition(arguments),
-                    };
-                }
-                rest = trim_whitespace(&rest[end..]);
-            }
-            _ => break,
+    if let [Token::Function(function), ..] = rest {
+        if function.eq_ignore_ascii_case("supports") {
+            let (arguments, end) = block_at(rest, 0);
+            // A declaration, or a condition in its own right.
+            let arguments = trim_whitespace(arguments);
+            supported = match arguments {
+                [Token::Ident(name), tail @ ..] => match trim_whitespace(tail) {
+                    [Token::Colon, value @ ..] => supports_declaration(name, value),
+                    _ => supports_condition(arguments),
+                },
+                _ => supports_condition(arguments),
+            };
+            rest = trim_whitespace(&rest[end..]);
         }
     }
-    Some((target, supported.min(media_condition(rest))))
+    Some((target, supported.min(media_condition(rest)), layer))
 }
 
 /// A style rule's selectors, read once a declaration or a nested rule
@@ -5723,12 +5794,71 @@ struct SiblingStep {
     ancestor_keys: Box<[u64]>,
 }
 
+/// A sheet a cascade is taking in (see [`Cascade::open_sheet`]): how the
+/// link, `style` element, or import applying it holds; the layer its
+/// unlayered rules stand in; and the nodes of the layers it has declared so
+/// far, by its layers, and of its anonymous ones, by their names.
+pub(super) struct OpenSheet {
+    condition: Applies,
+    within: u32,
+    nodes: Vec<u32>,
+    anonymous: HashMap<String, u32>,
+}
+
 impl Cascade {
-    /// Take in a sheet's rules, their conditions capped by `condition`, how
-    /// the link, `style` element, or import applying it holds.
+    /// Take in a sheet that imports none (see [`Cascade::open_sheet`]).
+    #[cfg(test)]
     pub(super) fn push_sheet(&mut self, sheet: &Stylesheet, condition: Applies) {
-        let layers = self.push_layers(sheet, condition);
-        let layer = |rule: &StyleRule| rule.layer.map_or(0, |layer| layers[layer as usize]);
+        let open = self.open_sheet(condition, None);
+        self.close_sheet(sheet, open);
+    }
+
+    /// Begin taking in a sheet, its rules' conditions capped by
+    /// `condition`, how the link, `style` element, or import applying it
+    /// holds, in steps that let the sheets it imports come in between, in
+    /// the layers its imports name (see [`Cascade::import_layer`]);
+    /// `within` is the layer an import of the sheet itself puts it in.
+    pub(super) fn open_sheet(&mut self, condition: Applies, within: Option<u32>) -> OpenSheet {
+        if self.layer_children.is_empty() {
+            self.layer_names.push(String::new());
+            self.layer_children.push(Vec::new());
+            self.layer_declared.push(Applies::Yes);
+            self.layer_unsettled.push(false);
+        }
+        OpenSheet {
+            condition,
+            within: within.unwrap_or(0),
+            nodes: Vec::new(),
+            anonymous: HashMap::new(),
+        }
+    }
+
+    /// The layer one of an open sheet's imports puts its target's rules in,
+    /// after the layers the sheet declares before it: the one it names, or
+    /// the sheet's own.
+    pub(super) fn import_layer(
+        &mut self,
+        sheet: &Stylesheet,
+        open: &mut OpenSheet,
+        import: &Import,
+    ) -> u32 {
+        self.declare_layers(sheet, open, import.declared);
+        import
+            .layer
+            .map_or(open.within, |layer| open.nodes[layer as usize])
+    }
+
+    /// Finish taking in an open sheet: the rest of its layers, then its
+    /// rules.
+    pub(super) fn close_sheet(&mut self, sheet: &Stylesheet, mut open: OpenSheet) {
+        self.declare_layers(sheet, &mut open, sheet.layers.len());
+        let OpenSheet {
+            condition,
+            within,
+            nodes,
+            ..
+        } = open;
+        let layer = |rule: &StyleRule| rule.layer.map_or(within, |layer| nodes[layer as usize]);
         let ranked = |rule: &Rc<StyleRule>, order: u32| Ranked {
             rule: rule.clone(),
             order,
@@ -5852,27 +5982,22 @@ impl Cascade {
         self.others += sheet.others;
     }
 
-    /// Take in the cascade layers a sheet declares, in its order: a named
-    /// layer is the one of that name inside its parent, wherever declared
-    /// before, and an anonymous one is new to this sheet. `condition` is
-    /// how the link, `style` element, or import applying the sheet holds,
-    /// where it declares them. Their nodes, by the sheet's layers.
-    fn push_layers(&mut self, sheet: &Stylesheet, condition: Applies) -> Vec<u32> {
-        if self.layer_children.is_empty() {
-            self.layer_names.push(String::new());
-            self.layer_children.push(Vec::new());
-            self.layer_declared.push(Applies::Yes);
-            self.layer_unsettled.push(false);
+    /// Take in the cascade layers an open sheet declares, in its order, up
+    /// to its `end`th, inside the layer it stands in: a named layer is the
+    /// one of that name inside its parent, wherever declared before, and an
+    /// anonymous one is new to this sheet.
+    fn declare_layers(&mut self, sheet: &Stylesheet, open: &mut OpenSheet, end: usize) {
+        let start = open.nodes.len();
+        if start >= end {
+            return;
         }
         self.layer_ranks.take();
-        let mut anonymous: HashMap<&str, u32> = HashMap::new();
-        let mut nodes = Vec::with_capacity(sheet.layers.len());
-        for layer in &sheet.layers {
-            let declared = layer.declared.min(condition);
-            let mut node = 0u32;
+        for layer in &sheet.layers[start..end] {
+            let declared = layer.declared.min(open.condition);
+            let mut node = open.within;
             for name in layer.path.iter() {
                 let known = if name.starts_with(' ') {
-                    anonymous.get(name.as_str()).copied()
+                    open.anonymous.get(name.as_str()).copied()
                 } else {
                     self.layer_children[node as usize]
                         .iter()
@@ -5897,15 +6022,14 @@ impl Cascade {
                         self.layer_unsettled
                             .push(declared != Applies::Yes && layer.again);
                         if name.starts_with(' ') {
-                            anonymous.insert(name, child);
+                            open.anonymous.insert(name.clone(), child);
                         }
                         child
                     }
                 };
             }
-            nodes.push(node);
+            open.nodes.push(node);
         }
-        nodes
     }
 
     /// Where a rule's cascade layer places it among the author rules (CSS
@@ -12080,6 +12204,87 @@ mod tests {
         let mut work = 0;
         let found = chapter_text(&chapter(refund), &reader, &anydoc, &mut work).expect("walk");
         assert!(found.drops_shown);
+    }
+
+    /// Take a sheet into a cascade after the sheets it imports, found by
+    /// name among `files`, as a chapter's link applies it.
+    fn push_importing(
+        reader: &mut Cascade,
+        sheet: &str,
+        condition: Applies,
+        within: Option<u32>,
+        files: &[(&str, &str)],
+    ) {
+        let parsed = parse_stylesheet(sheet).expect("stylesheet");
+        let mut open = reader.open_sheet(condition, within);
+        for import in &parsed.imports {
+            let layer = reader.import_layer(&parsed, &mut open, import);
+            if let Some((_, text)) = files.iter().find(|(name, _)| *name == import.target) {
+                let applies = condition.min(import.applies);
+                push_importing(reader, text, applies, Some(layer), files);
+            }
+        }
+        reader.close_sheet(&parsed, open);
+    }
+
+    #[test]
+    fn imports_put_their_sheets_in_the_layers_they_name() {
+        let refund = r#"<p>Refund due <span class="x">1,250.00</span> by April.</p>"#;
+        let files = [
+            ("hide.css", ".x { display: none }"),
+            ("show.css", "p > .x { display: inline }"),
+            ("base.css", "body p > span.x { display: none }"),
+            ("inner.css", "@layer z { p > .x { display: inline } }"),
+        ];
+        let walk = |sheet: &str| {
+            let mut reader = Cascade::default();
+            push_importing(&mut reader, sheet, Applies::Yes, None, &files);
+            let mut anydoc = AnyDocCascade::default();
+            anydoc.add(sheet);
+            let mut work = 0;
+            chapter_text(&chapter(refund), &reader, &anydoc, &mut work).expect("walk")
+        };
+        // An imported sheet's rules stand in the layer the import names, or
+        // a new anonymous one, which every unlayered rule beats.
+        let shows = ".d { color: red } .x { display: none } p > .x { display: inline }";
+        for sheet in [
+            format!(r#"@import url("base.css") layer(base); {shows}"#),
+            format!(r#"@import url("base.css") layer; {shows}"#),
+        ] {
+            assert!(walk(&sheet).drops_shown, "{sheet}");
+        }
+        assert!(!walk(&format!(r#"@import url("base.css"); {shows}"#)).drops_shown);
+        // The layer is declared where the import stands, if its conditions
+        // hold; the sheet's own layers stand inside it.
+        let over = r#"@import url("hide.css") layer(over); @layer base { .d { color: red } p > .x { display: inline } }"#;
+        assert!(walk(&format!("@layer base, over; {over}")).converts_hidden);
+        assert!(!walk(&format!("@layer over, base; {over}")).converts_hidden);
+        assert!(walk(
+            r#"@import url("show.css") layer(b) print; @layer a { .d { color: red } .x { display: none } } @layer b { .d { color: red } p > .x { display: inline } }"#
+        )
+        .drops_shown);
+        assert!(!walk(
+            r#"@import url("inner.css") layer(base); @layer z { .d { color: red } .x { display: none } }"#
+        )
+        .drops_shown);
+        // Chromium ignores an import after any rule but `@charset`, another
+        // import, or `@layer` naming layers, and drops an at-rule it does
+        // not know.
+        for (sheet, applies) in [
+            (r#"@layer a; @import url("hide.css");"#, true),
+            (r#"@foo bar; @import url("hide.css");"#, true),
+            (r#".d { color: red } @import url("hide.css");"#, false),
+            (
+                r#"@namespace epub "http://www.idpf.org/2007/ops"; @import url("hide.css");"#,
+                false,
+            ),
+            (
+                r#"@layer a { .d { color: red } } @import url("hide.css");"#,
+                false,
+            ),
+        ] {
+            assert_eq!(walk(sheet).converts_hidden, applies, "{sheet}");
+        }
     }
 
     #[test]

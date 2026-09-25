@@ -7698,9 +7698,9 @@ fn decode_stylesheet(bytes: &[u8]) -> String {
 /// A linked stylesheet as both models read it.
 struct EpubLoadedSheet {
     reader: epub_css::Stylesheet,
-    /// The local sheets it imports, resolved against it, each with how the
-    /// import's conditions hold.
-    imports: Vec<(String, epub_css::Applies)>,
+    /// The local sheets it imports, resolved against it, each by the
+    /// import naming it, as an index into its imports.
+    imports: Vec<(usize, String)>,
     /// The text AnyDoc adds: the part read as lossy UTF-8.
     anydoc_text: String,
 }
@@ -7759,11 +7759,12 @@ impl EpubStylesheets {
                 let reader = epub_css::parse_stylesheet(&text)?;
                 self.count_rules(&reader)?;
                 let mut imports = Vec::new();
-                for (target, applies) in &reader.imports {
-                    if epub_is_external_uri(target) {
+                for (index, import) in reader.imports.iter().enumerate() {
+                    if epub_is_external_uri(&import.target) {
                         result.external_relationships = true;
                     } else {
-                        imports.extend(anydoc_resolve(path, target).map(|path| (path, *applies)));
+                        imports
+                            .extend(anydoc_resolve(path, &import.target).map(|path| (index, path)));
                     }
                 }
                 Some(Rc::new(EpubLoadedSheet {
@@ -7791,8 +7792,9 @@ impl EpubStylesheets {
 
     /// Apply a linked sheet to a reader cascade, after the sheets it
     /// imports, as a reader orders them, its rules holding no more surely
-    /// than `condition`, how the link or import applying it holds. An
-    /// import cycle stops at the repeat, as readers stop it.
+    /// than `condition`, how the link or import applying it holds, and
+    /// standing in the cascade layer `within` where an import puts them in
+    /// one. An import cycle stops at the repeat, as readers stop it.
     #[allow(clippy::too_many_arguments)]
     fn apply_linked(
         &mut self,
@@ -7800,6 +7802,7 @@ impl EpubStylesheets {
         archive: &mut ZipArchive<Cursor<&[u8]>>,
         path: &str,
         condition: epub_css::Applies,
+        within: Option<u32>,
         depth: usize,
         visiting: &mut Vec<String>,
         applications: &mut usize,
@@ -7816,12 +7819,16 @@ impl EpubStylesheets {
             return Ok(());
         };
         visiting.push(path.to_string());
-        for (import, applies) in &loaded.imports {
+        let mut open = cascade.open_sheet(condition, within);
+        for (index, import) in &loaded.imports {
+            let rule = &loaded.reader.imports[*index];
+            let layer = cascade.import_layer(&loaded.reader, &mut open, rule);
             self.apply_linked(
                 cascade,
                 archive,
                 import,
-                condition.min(*applies),
+                condition.min(rule.applies),
+                Some(layer),
                 depth + 1,
                 visiting,
                 applications,
@@ -7829,7 +7836,7 @@ impl EpubStylesheets {
             )?;
         }
         visiting.pop();
-        cascade.push_sheet(&loaded.reader, condition);
+        cascade.close_sheet(&loaded.reader, open);
         if cascade.rule_count() > epub_css::MAX_STYLE_RULES {
             return Err(DocumentError::ResourceLimit);
         }
@@ -7860,6 +7867,7 @@ impl EpubStylesheets {
                     archive,
                     path,
                     condition,
+                    None,
                     0,
                     &mut Vec::new(),
                     &mut applications,
@@ -7867,15 +7875,18 @@ impl EpubStylesheets {
                 )?,
                 EpubStyleSource::Embedded(text) => {
                     let sheet = self.embedded(text)?;
-                    for (target, applies) in &sheet.imports {
-                        if epub_is_external_uri(target) {
+                    let mut open = reader.open_sheet(condition, None);
+                    for rule in &sheet.imports {
+                        if epub_is_external_uri(&rule.target) {
                             result.external_relationships = true;
-                        } else if let Some(path) = anydoc_resolve(chapter_path, target) {
+                        } else if let Some(path) = anydoc_resolve(chapter_path, &rule.target) {
+                            let layer = reader.import_layer(&sheet, &mut open, rule);
                             self.apply_linked(
                                 &mut reader,
                                 archive,
                                 &path,
-                                condition.min(*applies),
+                                condition.min(rule.applies),
+                                Some(layer),
                                 1,
                                 &mut Vec::new(),
                                 &mut applications,
@@ -7883,7 +7894,7 @@ impl EpubStylesheets {
                             )?;
                         }
                     }
-                    reader.push_sheet(&sheet, condition);
+                    reader.close_sheet(&sheet, open);
                     if reader.rule_count() > epub_css::MAX_STYLE_RULES {
                         return Err(DocumentError::ResourceLimit);
                     }
@@ -11232,6 +11243,21 @@ mod tests {
             link,
             marked,
             &[("OPS/Styles/main.css", b".h { color: gray }")]
+        ));
+        // An import's layer holds the rules it imports, which the importing
+        // sheet's unlayered rules beat.
+        let layered = [
+            (
+                "OPS/Styles/main.css",
+                b"@import url(\"more.css\") layer(base); p.h { visibility: visible }".as_slice(),
+            ),
+            ("OPS/Styles/more.css", b"body p.h { visibility: hidden }"),
+        ];
+        assert!(!hidden(link, marked, &layered));
+        assert!(!hidden(
+            r#"<style>@import url("../Styles/more.css") layer; p.h { visibility: visible }</style>"#,
+            marked,
+            &layered
         ));
 
         // Sheets are reduced once per package, under a cap on the rules
