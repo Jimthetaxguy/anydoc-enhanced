@@ -659,6 +659,9 @@ struct Declaration {
     /// For `display`, whether the box lays its children out as flex or
     /// grid items, each a block of its own.
     items: Option<Tri>,
+    /// For `float`, whether the box floats to the start of the line (`left`
+    /// or `inline-start`), where a drop cap stands.
+    side: Option<Tri>,
     /// For `content`, what the box shows; `None` when not known until run
     /// time.
     generated: Option<Generated>,
@@ -960,6 +963,15 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         }),
         _ => None,
     };
+    let side = match (property, flow) {
+        (Property::Float, Some(Tri::Yes)) => Some(if has(&["left", "inline-start"]) {
+            Tri::Yes
+        } else {
+            Tri::No
+        }),
+        (Property::Float, Some(floats)) => Some(floats),
+        _ => None,
+    };
     let generated = match property {
         Property::Content if computed => None,
         Property::Content => generated_content(value),
@@ -974,6 +986,7 @@ fn parse_declaration(tokens: &[Token]) -> Option<Declaration> {
         important,
         flow,
         items,
+        side,
         generated,
     })
 }
@@ -2533,9 +2546,13 @@ pub(super) struct ReaderStyle {
     content_visibility: Resolved,
     /// Whether the box is inline-level.
     inline: Tri,
-    /// Whether it floats, or is positioned out of the flow (`absolute`,
-    /// `fixed`), apart from the lines around it.
+    /// Whether it floats beside the lines around it, and whether to their
+    /// start, where a drop cap stands.
     floats: Tri,
+    floats_to_start: Tri,
+    /// Whether it is positioned out of the flow (`absolute`, `fixed`),
+    /// apart from the lines around it.
+    positioned: Tri,
     /// Whether it lays its children out as flex or grid items.
     items: Tri,
     /// Its `::before` and `::after` boxes.
@@ -2570,16 +2587,20 @@ enum Flow {
     Block,
     /// Floated beside the lines after it.
     Float,
-    /// A block, or floated, only if a rule that may apply does.
+    /// Positioned out of the flow, where its style sets it.
+    Positioned,
+    /// A block, floated, or positioned only if a rule that may apply does.
     MaybeApart,
 }
 
 impl ReaderStyle {
     fn flow(&self) -> Flow {
-        match (self.inline, self.floats) {
-            (_, Tri::Yes) => Flow::Float,
-            (Tri::No, Tri::No) => Flow::Block,
-            (Tri::Yes, Tri::No) => Flow::Inline,
+        match (self.inline, self.floats, self.positioned) {
+            // A positioned box leaves the flow, floated or not.
+            (_, _, Tri::Yes) => Flow::Positioned,
+            (_, Tri::Yes, _) => Flow::Float,
+            (Tri::No, Tri::No, Tri::No) => Flow::Block,
+            (Tri::Yes, Tri::No, Tri::No) => Flow::Inline,
             _ => Flow::MaybeApart,
         }
     }
@@ -2904,8 +2925,9 @@ impl Cascade {
 
         let mut applied: [Vec<Applied>; 3] = Default::default();
         // Whether the box is inline-level, floats, lays its children out as
-        // items, and is positioned out of the flow.
-        let mut flows: [Vec<(Precedence, Tri, Tri)>; 4] = Default::default();
+        // items, is positioned out of the flow, and floats to the start of
+        // the line.
+        let mut flows: [Vec<(Precedence, Tri, Tri)>; 5] = Default::default();
         let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Tri| {
             let slot = match declaration.property {
                 Property::Display => 0,
@@ -2918,6 +2940,9 @@ impl Cascade {
                     };
                     if let Some(flow) = declaration.flow {
                         flows[flow_slot].push((precedence, certainty, flow));
+                    }
+                    if let Some(side) = declaration.side {
+                        flows[4].push((precedence, certainty, side));
                     }
                     return;
                 }
@@ -3103,6 +3128,7 @@ impl Cascade {
                     important: false,
                     flow: None,
                     items: None,
+                    side: None,
                     generated: None,
                 },
                 presentation,
@@ -3124,6 +3150,7 @@ impl Cascade {
                     important: false,
                     flow: None,
                     items: None,
+                    side: None,
                     generated: None,
                 },
                 presentation,
@@ -3166,6 +3193,7 @@ impl Cascade {
                     important: false,
                     flow: None,
                     items: None,
+                    side: None,
                     generated: None,
                 },
                 user_agent,
@@ -3236,8 +3264,9 @@ impl Cascade {
             visibility: resolve(&applied[1]),
             content_visibility: resolve(&applied[2]),
             inline: resolve_flow(&flows[0], !reader_block_by_default(element)),
-            // A box positioned out of the flow sits apart like a float.
-            floats: resolve_flow(&flows[1], false).max(resolve_flow(&flows[3], false)),
+            floats: resolve_flow(&flows[1], false),
+            floats_to_start: resolve_flow(&flows[4], false),
+            positioned: resolve_flow(&flows[3], false),
             items: resolve_flow(&flows[2], false),
             before,
             after,
@@ -3489,12 +3518,21 @@ struct Effects {
     closes_splice: bool,
     /// It is a block inside a link (see [`Run::edge`]).
     edge_after: bool,
-    /// A reader floats it: the glyphs and digits taken in before it, to
-    /// tell a drop cap, beside which the text after it continues.
-    glyphs_at: Option<(u64, u64)>,
+    /// A reader floats or positions it: where it began, to tell a drop
+    /// cap, beside which the text after it continues.
+    glyphs_at: Option<FloatStart>,
     /// Its `::after` box shows a sign, lost beside a digit: the one the text
     /// before it ends in, or the one the text after it starts with.
     sign_after: Option<Sign>,
+}
+
+/// Where a floated or positioned box began: the glyphs and digits taken in
+/// before it, and whether it is a float to the line's start that opens its
+/// paragraph.
+#[derive(Clone, Copy)]
+struct FloatStart {
+    glyphs: (u64, u64),
+    opens: bool,
 }
 
 /// One inline run of AnyDoc's walker (a `Builder`): the text it last
@@ -4140,12 +4178,14 @@ fn count_glyphs(glyphs: &mut (u64, u64), text: &str) {
 }
 
 /// The drop cap a floated box that took in the glyphs between `start` and
-/// `end` makes: never with a digit, which reads as a number beside the
-/// next.
-fn drop_cap(start: (u64, u64), end: (u64, u64)) -> Option<DropCap> {
-    let (characters, digits) = (end.0 - start.0, end.1 - start.1);
+/// `end` makes. A digit reads as a number beside the next, so one holding
+/// a digit is a drop cap only as a single figure floated to the line's
+/// start to open its paragraph, as a year's first ("1" and "914 began");
+/// floated to the end, it is a line number in the margin.
+fn drop_cap(start: FloatStart, end: (u64, u64)) -> Option<DropCap> {
+    let (characters, digits) = (end.0 - start.glyphs.0, end.1 - start.glyphs.1);
     if digits > 0 {
-        None
+        (start.opens && characters == 1).then_some(DropCap::Any)
     } else if characters <= MAX_DROP_CAP_LETTERS {
         Some(DropCap::Any)
     } else if characters <= MAX_DROP_CAP_WORD_LETTERS {
@@ -4255,12 +4295,16 @@ fn meet_run(
             run.boundary = true;
             effects.boundary_after = Tri::Yes;
         }
-        // A float starts no line of its own before it; a number beside it
-        // stays apart from one in it.
-        Flow::Float => {
+        // A float, or a positioned box, starts no line of its own before
+        // it; a number beside it stays apart from one in it.
+        Flow::Float | Flow::Positioned => {
+            let to_start = style.is_some_and(|style| style.floats_to_start == Tri::Yes);
+            effects.glyphs_at = Some(FloatStart {
+                glyphs,
+                opens: flow == Flow::Float && to_start && run.last.is_none(),
+            });
             run.maybe_boundary = true;
             effects.boundary_after = Tri::Yes;
-            effects.glyphs_at = Some(glyphs);
         }
         Flow::MaybeApart => {
             run.maybe_boundary = true;
@@ -5633,10 +5677,23 @@ mod tests {
                 &[],
                 r#"<div style="display:flex">Balance due<span>1,250.00</span></div>"#.into(),
             ),
-            // A floated or positioned box holding digits is no drop cap.
+            // A floated or positioned box holding digits is no drop cap,
+            // unless a single figure floated to open its paragraph.
             (
                 &[".f { float: left }"],
                 r#"<p><span class="f">10</span>250 units received</p>"#.into(),
+            ),
+            (
+                &[".f { float: left }"],
+                r#"<p>Total <span class="f">1</span>914 units</p>"#.into(),
+            ),
+            (
+                &[".ln { float: right }"],
+                r#"<p><span class="ln">5</span>And then the river rose.</p>"#.into(),
+            ),
+            (
+                &[],
+                r#"<p><span style="position:absolute">1</span>914 units</p>"#.into(),
             ),
             (
                 &[],
@@ -5710,10 +5767,15 @@ mod tests {
                 &[],
                 format!(r#"<p>due<a><math {math}><mn>12</mn></math></a>50 units</p>"#),
             ),
-            // A drop cap of a word's first letters, going on in lower case.
+            // A drop cap of a word's first letters, going on in lower case,
+            // and a year's first figure opening its paragraph.
             (
                 &[],
                 r#"<p><span style="float:left">Onc</span>e the office opened</p>"#.into(),
+            ),
+            (
+                &[".dc { float: left; font-size: 3em }"],
+                r#"<h1>Four</h1><p><span class="dc">1</span>914 began quietly.</p>"#.into(),
             ),
             // A box a reader keeps in the line, though AnyDoc splits a link's
             // content at the heading inside it.
