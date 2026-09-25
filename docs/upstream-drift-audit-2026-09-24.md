@@ -96,7 +96,7 @@ reach this repository:
 | #506 | Bound a cubic cost on dense rectangle clusters | Bounded here by the PDF worker's 25-second deadline, which returns `resource_limit`. |
 | #583 | Explicit invisible-text inclusion in positioned extraction | Not exposed; the region tools keep upstream's default. |
 | #584 | A fork's fixes: CIDs a ToUnicode CMap never names, filled per code from the embedded font's cmap; Hebrew right-to-left order and number separators | From the 1.24.0 source: a code without an entry is read from the codes around it where they spell it out and is otherwise U+FFFD, both counted per font in `cmap_gaps`, which the PDF tools return, and U+FFFD also sets `has_encoding_issues`. The fork's recovery from the embedded font is not adopted, so such a letter stays visible as lost. The right-to-left fixes concern Hebrew text order, outside this repository's corpus. |
-| #586 | Release build of the Node binding with a lower glibc floor, merged after 1.24.0 | Packaging only: the Rust crate the PDF tools use is unchanged, so nothing is adopted. Checked on 2026-09-25 with the round-eight review; no other pull request was opened on either repository since this audit. |
+| #586 | Release build of the Node binding with a lower glibc floor, merged after 1.24.0 | Packaging only: the Rust crate the PDF tools use is unchanged, so nothing is adopted. Checked on 2026-09-25 with the round-eight review; #589 and #590, opened later that day, are listed below. |
 | #578 | Render link annotations as Markdown links | On adoption, PDF Markdown gains destinations and must pass through the sanitizer. |
 | #589 | Escape literal HTML in rendered text; so far a regression test only | 1.24.0 writes literal text such as `<a test>` or `<u>underline</u>` as is, so it reads as the engine's own markup and an HTML-aware renderer hides it. Not detected; the text stays in the Markdown an agent reads. |
 | #590 | Keep a monospace code listing's indentation; so far a regression test only | 1.24.0 fences the listing but drops each line's leading spaces. Not detected; no characters are lost. |
@@ -121,6 +121,20 @@ still present; #299 is mostly fixed by 1.24.0's superscript handling.
 Fixtures and generators for all thirteen are kept with the review notes, not in
 the corpus: they reproduce a dependency's defects, and the repository's own
 tests generate the ones they need.
+
+### Open issues after 1.24.0
+
+Issues report defects no pull request addresses yet. Those that reach the PDF
+tools were checked against 1.24.0 on 2026-09-25 with generated files run
+through the server:
+
+| Issue | Report | Local disposition |
+|---|---|---|
+| #483 | Page content dropped when three or more pages share near-identical text | Reproduced, and wider than reported: pdf-inspector drops, from every page but the first, a line it finds near the top or bottom of three pages and three in ten at about the same height, comparing lines with the digits at either end left out, and drops the lines beside it with it. A consolidated statement's second and third accounts lose their "Account number" lines; a payroll register's later employees lose their IDs and hour totals. Reported as `header_footer_dropped` (Loop 20) where a dropped line says what no kept line says, other than by a page number, and the Markdown does not show it. Identical copies, such as a W-2's Copy C and Copy 2, keep their lines on the first copy only; that is not reported. |
+| #588 | A table row continuing onto the next page loses its continuation | Not reproduced as a loss: in a generated statement whose last row wraps onto the next page, the continuation reads there, as a heading of its own, apart from its row. |
+| #587 | Expose a one-parse structured page result | Would let the checks that read pages again (repeats, word gaps, tables, and dropped headers) reuse the conversion's own positioned text instead of reading it a second time. |
+| #565 | Literal `<`, `>`, and `&` are not escaped | The same defect as pull request #589. |
+| #526 | Code listings lose newlines and indentation | Pull request #590 addresses it; see there. |
 
 Disposition: **adopted.** The new fields are additive. `layout` and `cmap_gaps`
 are omitted when a mode did not compute them, so absence is never reported as
@@ -380,7 +394,9 @@ When pdf-inspector publishes a release after 1.24.0:
    `text_painted_twice`, `table_row_repeated`, `table_values_merged`, or
    `table_values_detached` warning only for a defect the release reads
    right, and update the `sample-2.pdf` and card-statement expectations in
-   the PDF integration tests.
+   the PDF integration tests. If the release changes how it strips running
+   headers and footers (#483), re-check `header_footer_dropped` against its
+   rule, and update the consolidated-statement expectation.
 4. Re-run the sixth-round furniture, white-copy, and clip fixtures: the
    repeat warning is confirmed against the Markdown, so a release that
    strips or hides differently changes which pages it names.

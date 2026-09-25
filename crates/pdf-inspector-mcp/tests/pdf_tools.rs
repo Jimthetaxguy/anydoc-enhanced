@@ -778,6 +778,103 @@ fn table_amounts_pushed_out_of_their_rows_are_reported() {
     assert!(!reported(&results[1]), "{}", results[1]);
 }
 
+/// A consolidated statement with a page for each account, each headed by
+/// its account number under the bank's name, given by `headers`, and
+/// listing its deposits (pdf-inspector issue #483).
+fn consolidated_statement_pdf(headers: &[String]) -> Vec<u8> {
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        Vec::new(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    ];
+    let mut kids = Vec::new();
+    for (page, header) in headers.iter().enumerate() {
+        let mut content = format!(
+            "BT /F1 10 Tf 1 0 0 1 72 740 Tm (Example Bank consolidated statement) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 72 722 Tm ({header}) Tj ET\n"
+        );
+        for row in 0..12 {
+            let y = 690 - 16 * row;
+            content.push_str(&format!(
+                "BT /F1 10 Tf 1 0 0 1 72 {y} Tm (03/{:02} Deposit {}) Tj ET\n\
+                 BT /F1 10 Tf 1 0 0 1 450 {y} Tm ({}.00) Tj ET\n",
+                row + 1,
+                row + 1,
+                100 + 7 * row + 13 * page
+            ));
+        }
+        objects.push(stream("", content.as_bytes()));
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                objects.len()
+            )
+            .into_bytes(),
+        );
+        kids.push(format!("{} 0 R", objects.len()));
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        kids.len()
+    )
+    .into_bytes();
+    pdf_file(&objects)
+}
+
+#[test]
+fn lines_dropped_as_running_headers_that_differ_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let accounts = ["12345678", "87654321", "55501234"];
+    let documents = [
+        // A page for each of three accounts.
+        accounts
+            .map(|number| format!("Account number {number}"))
+            .to_vec(),
+        // One account on every page.
+        vec!["Account number 12345678".to_string(); 3],
+        // A header numbering its pages.
+        (1..=4)
+            .map(|page| format!("Account number 12345678, page {page}"))
+            .collect(),
+    ];
+    let mut calls = Vec::new();
+    for (index, headers) in documents.iter().enumerate() {
+        let pdf = temporary.path().join(format!("consolidated-{index}.pdf"));
+        std::fs::write(&pdf, consolidated_statement_pdf(headers)).expect("write PDF");
+        let path = pdf.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "header_footer_dropped")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // pdf-inspector 1.24.0 keeps the first account's number and drops the
+    // others' as the same running header; when a release fixes #483, this
+    // expectation goes.
+    let markdown = results[0]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("Account number 12345678") && !markdown.contains("87654321"),
+        "{markdown}"
+    );
+    assert_eq!(
+        reported(&results[0]),
+        Some(serde_json::json!([2, 3])),
+        "{}",
+        results[0]
+    );
+    // A header repeated as it is, or numbering its pages, drops nothing
+    // the Markdown lacks.
+    assert_eq!(reported(&results[1]), None, "{}", results[1]);
+    assert_eq!(reported(&results[2]), None, "{}", results[2]);
+}
+
 #[test]
 fn region_tools_read_rectangles_in_the_requested_frame() {
     let temporary = tempfile::tempdir().expect("temporary PDF directory");

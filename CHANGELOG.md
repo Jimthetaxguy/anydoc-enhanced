@@ -50,8 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that pdf-inspector 1.24.0 does not read (see Fixed).
 - PDF results carry a `warnings` list, absent when empty, naming text the
   Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
-  form text it does not read, and tables whose amounts may sit in the wrong
-  row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
+  form text it does not read, pages that lose a line it takes for a running
+  header, and tables whose amounts may sit in the wrong row or column or
+  after the table (see Fixed). A full run that yields no Markdown for a text PDF
   reports confidence 0, and a page whose text looks garbled sets
   `has_encoding_issues`.
 
@@ -192,6 +193,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
 ### Fixed
+- Lines pdf-inspector 1.24.0 drops as running headers or footers, though
+  they say what the line it keeps does not, are reported (upstream issue
+  #483). In a document of three pages or more, pdf-inspector drops from
+  every page but the first a line it finds near the top or bottom of three
+  pages, and three in ten, at about the same height. It compares lines with
+  the digits at either end left out, and drops the lines beside such a line
+  with it. So a consolidated statement's second and third accounts lost the
+  "Account number" line heading their pages, and every page read as the
+  first account's; a payroll register's later employees lost their IDs and
+  hour totals, all at confidence 1.0. The pages converted are read again as
+  pdf-inspector groups their lines, and its rule is applied to them. A page
+  where a dropped line says what no kept line says, other than by a page
+  number, and where the Markdown shows the line kept in its place but not
+  the dropped one, carries the new `header_footer_dropped` warning; the
+  Markdown is not changed. Headers repeated as they are, such as a bank's
+  name, and those numbering their pages are dropped by design and not
+  reported. No PDF among 551 corpus, fixture, replica, and review files and
+  3,970 fuzz and review files is named. The reading costs about a third
+  more CPU on documents of three pages or more; it covers up to 2,000 pages
+  and stops, reporting nothing, after 4 seconds.
 - Amounts pdf-inspector 1.24.0 pushes out of a table's rows are reported
   (open upstream #424). The table grid can drop a column: a 1099-B's sparse
   wash-sale adjustments, or the Amount column of a long card statement,

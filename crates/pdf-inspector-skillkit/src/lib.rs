@@ -89,6 +89,17 @@ pub const PDF_WARNING_TABLE_ROW_REPEATED: &str = "table_row_repeated";
 pub const PDF_WARNING_TABLE_VALUES_MERGED: &str = "table_values_merged";
 /// Amounts a table's rows hold appear after the table.
 pub const PDF_WARNING_TABLE_VALUES_DETACHED: &str = "table_values_detached";
+/// A line pdf-inspector drops as a running header or footer says what no
+/// line it keeps says.
+pub const PDF_WARNING_HEADER_FOOTER_DROPPED: &str = "header_footer_dropped";
+
+/// Pages read again for lines dropped as running headers and footers, how
+/// many are read at a time and grouped into lines at a time, and the time
+/// the reading may take before it stops, reporting nothing.
+const MAX_REPEAT_PAGES: u32 = 2_000;
+const REPEAT_READ_PAGES: usize = 512;
+const REPEAT_GROUP_PAGES: usize = 64;
+const MAX_REPEAT_READ: std::time::Duration = std::time::Duration::from_secs(4);
 
 impl PdfWarning {
     fn new(code: &str, message: &str, pages: Vec<u32>) -> Self {
@@ -474,6 +485,94 @@ impl PdfInfo {
         .ok()
     }
 
+    /// Report the pages on which pdf-inspector drops a line as a running
+    /// header or footer that says what no line it keeps says (see
+    /// `repeated_lines`), in a full run of three pages or more that strips
+    /// them. The pages converted, but those needing OCR, are read again as
+    /// pdf-inspector groups their text into lines, up to
+    /// `MAX_REPEAT_PAGES`; if they cannot be read, or not within
+    /// `MAX_REPEAT_READ`, nothing is reported.
+    fn check_repeated_lines(
+        &mut self,
+        buffer: &[u8],
+        only: Option<&HashSet<u32>>,
+        mode: &ProcessMode,
+        strips: bool,
+    ) {
+        if !strips || !matches!(mode, ProcessMode::Full) || self.page_count < 3 {
+            return;
+        }
+        let Some(markdown) = self
+            .markdown
+            .as_deref()
+            .filter(|markdown| !markdown.trim().is_empty())
+        else {
+            return;
+        };
+        let scanned: HashSet<u32> = self.pages_needing_ocr.iter().copied().collect();
+        let wanted: Vec<u32> = (1..=self.page_count.min(MAX_REPEAT_PAGES))
+            .filter(|page| only.is_none_or(|only| only.contains(page)) && !scanned.contains(page))
+            .collect();
+        let started = std::time::Instant::now();
+        let mut pages = Vec::new();
+        for chunk in wanted.chunks(REPEAT_READ_PAGES) {
+            let chunk: HashSet<u32> = chunk.iter().copied().collect();
+            let read = std::panic::catch_unwind(|| {
+                pdf_inspector::extract_text_with_positions_and_rotations_mem_in_frame(
+                    buffer,
+                    Some(&chunk),
+                    pdf_inspector::PositionFrame::Sheet,
+                )
+            });
+            let Ok(Ok((items, _))) = read else {
+                return;
+            };
+            // pdf-inspector groups lines page by page, looking through all
+            // the items it is given for each page's, so they go in parts.
+            let mut by_page: std::collections::BTreeMap<u32, Vec<pdf_inspector::TextItem>> =
+                std::collections::BTreeMap::new();
+            for item in items {
+                by_page.entry(item.page).or_default().push(item);
+            }
+            let by_page: Vec<Vec<pdf_inspector::TextItem>> = by_page.into_values().collect();
+            for part in by_page.chunks(REPEAT_GROUP_PAGES) {
+                if started.elapsed() > MAX_REPEAT_READ {
+                    return;
+                }
+                let items: Vec<pdf_inspector::TextItem> = part.concat();
+                let Ok(lines) =
+                    std::panic::catch_unwind(|| pdf_inspector::extractor::group_into_lines(items))
+                else {
+                    return;
+                };
+                let mut lines_by_page: std::collections::BTreeMap<u32, Vec<(f32, String)>> =
+                    std::collections::BTreeMap::new();
+                for line in lines {
+                    lines_by_page
+                        .entry(line.page)
+                        .or_default()
+                        .push((line.y, line.text()));
+                }
+                pages.extend(
+                    lines_by_page
+                        .into_iter()
+                        .map(|(page, lines)| repeated_lines::PageLines::new(page, lines)),
+                );
+            }
+        }
+        if started.elapsed() > MAX_REPEAT_READ {
+            return;
+        }
+        let lost = repeated_lines::lost(&pages, self.page_count, markdown);
+        if !lost.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_HEADER_FOOTER_DROPPED,
+                "On these pages pdf-inspector 1.24.0 drops a line it takes for a running header or footer, though the line says what the one it keeps on an earlier page does not, as with a second account's number or another person's name heading its pages; read the top and bottom of these pages with extract_text_regions.",
+                lost,
+            ));
+        }
+    }
+
     /// Scan what the pages paint and report what the scan finds but a
     /// repeat, which the Markdown confirms.
     fn scan_text_paints(
@@ -605,6 +704,7 @@ mod doubled_text;
 mod glyph_words;
 mod markdown_tables;
 pub mod pdf_worker;
+mod repeated_lines;
 mod text_paints;
 mod word_gaps;
 
@@ -773,9 +873,11 @@ pub fn process_bytes_with_options(
     check_size(buffer)?;
     let mode = options.mode.clone();
     let pages = options.page_filter.clone();
+    let strips = options.markdown.strip_headers_footers;
     let result = pdf_inspector::process_pdf_mem_with_options(buffer, options)?;
     let mut info = PdfInfo::from_result(result, &mode);
     info.check_pages(buffer, pages.as_ref(), &mode);
+    info.check_repeated_lines(buffer, pages.as_ref(), &mode, strips);
     Ok(info)
 }
 
