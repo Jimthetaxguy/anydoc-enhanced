@@ -14,9 +14,16 @@ into local fail-closed checks:
   pinned parser: the 20 opened since the previous audit, and the 38 older ones,
   of which those touching an enabled lane were reproduced. Each is
   dispositioned below.
-- pdf-inspector's open pull requests (111) were scanned for defects in
-  1.24.0 that reach this repository's PDF tools. Two confirmed one: a scanned
-  page whose OCR text layer 1.24.0 drops without a signal.
+- pdf-inspector's open pull requests (113) and its open issues were scanned
+  for defects in 1.24.0 that reach this repository's PDF tools. Most that
+  reproduce and lose or change text are now disclosed by page warnings,
+  checked against the Markdown where it can tell: text repeated, merged,
+  split, or dropped as a running header; form values, annotations, dynamic
+  XFA, and embedded files never read; text read from hidden layers or
+  painted invisibly (#572); and Japanese and Chinese text read without its
+  font's map (#573) or across vertical columns (#575). The rest are listed
+  below with the reason each is not detected. The first pass confirmed a
+  scanned page whose OCR text layer 1.24.0 drops without a signal.
 - `rmcp` moves from 3.1.4 to 3.4.1, and every tool declares read-only MCP
   annotations. Tool names and input schemas are unchanged.
 - The document lanes gain checks for AnyDoc 0.2.4 behaviors that the local
