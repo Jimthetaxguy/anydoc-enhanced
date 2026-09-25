@@ -4,16 +4,18 @@
 //! AnyDoc would still convert it. Two models answer those questions.
 //!
 //! - The reader model follows CSS as reading systems apply it: the CSS
-//!   Syntax 3 tokenizer (comments, escapes, strings), media queries, the
-//!   selector grammar, the cascade, and the user-agent rules that hide
-//!   content. Sibling combinators and positions among siblings are matched
-//!   exactly: positions from a pass over the chapter before the walk, `+`
-//!   from the earlier siblings the walk keeps, and a rule's `~` step from
-//!   the first sibling that fits it, noted as each sibling ends, which
-//!   costs a lookup however far back that sibling is. Where it cannot
-//!   decide (`:has()`, an unknown pseudo-class, a value set through
-//!   `var()`), it lets a hiding rule apply and keeps a showing rule from
-//!   overriding one, so it errs toward finding hidden text.
+//!   Syntax 3 tokenizer (comments, escapes, strings), media queries and
+//!   `@supports` conditions, the selector grammar, the cascade with its
+//!   layers, and the user-agent rules that hide content. Sibling
+//!   combinators and positions among siblings are matched exactly:
+//!   positions from a pass over the chapter before the walk, `+` from the
+//!   earlier siblings the walk keeps, and a rule's `~` step from the first
+//!   sibling that fits it, noted as each sibling ends, which costs a lookup
+//!   however far back that sibling is. Where it cannot decide (`:has()`,
+//!   an unknown pseudo-class, a value set through `var()`, a condition on
+//!   the reader's screen or a container's size), it lets a hiding rule
+//!   apply and keeps a showing rule from overriding one, so it errs toward
+//!   finding hidden text.
 //! - The AnyDoc model ports AnyDoc 0.2.4's own subset (`shared::html`):
 //!   `display` from bare `tag`, `.class`, and `tag.class` rules and from
 //!   inline styles, applied only to the elements its walker styles.
@@ -542,20 +544,20 @@ fn split_top_level<'a>(tokens: &'a [Token], separator: &Token) -> Vec<&'a [Token
 // ---------------------------------------------------------------------------
 // Media queries
 
-/// Whether a media query list can apply on a reading system's screen. An
-/// empty list applies. A query applies when its media type is `all`,
-/// `screen`, or absent; feature conditions are assumed to hold. `print`,
-/// `speech`, the deprecated types, and unknown types such as `amzn-mobi`
-/// never match on a screen. A negated query applies unless it negates only
-/// `all` or `screen`.
-fn media_applies(tokens: &[Token]) -> bool {
+/// Whether a media query list applies on a reading system's screen. An
+/// empty list applies. A query whose media type is `all`, `screen`, or
+/// absent applies, and may apply where it tests features: a reader's
+/// screen size, resolution, and the rest are not known. `print`, `speech`,
+/// the deprecated types, and unknown types such as `amzn-mobi` never match
+/// on a screen. A negated query applies where what it negates does not.
+fn media_condition(tokens: &[Token]) -> Tri {
     let tokens = trim_whitespace(tokens);
     if tokens.is_empty() {
-        return true;
+        return Tri::Yes;
     }
     split_top_level(tokens, &Token::Comma)
         .into_iter()
-        .any(|query| {
+        .map(|query| {
             let query = trim_whitespace(query);
             let mut words = Vec::new();
             let mut conditions = false;
@@ -573,22 +575,175 @@ fn media_applies(tokens: &[Token]) -> bool {
                 }
                 index = skip_component(query, index);
             }
+            let features = if conditions { Tri::Maybe } else { Tri::Yes };
+            let kind = |kind: &str| match kind {
+                "all" | "screen" => features,
+                _ => Tri::No,
+            };
             match words.as_slice() {
-                [not, rest @ ..] if not == "not" => {
-                    conditions || !matches!(rest, [kind] if kind == "all" || kind == "screen")
-                }
-                [] => true,
-                [kind, ..] => kind == "all" || kind == "screen",
+                [not] if not == "not" => features.not(),
+                [not, kind_word, ..] if not == "not" => kind(kind_word).not(),
+                [] => features,
+                [kind_word, ..] => kind(kind_word),
             }
         })
+        .max()
+        .unwrap_or(Tri::No)
 }
 
 /// Whether a `media` attribute or pseudo-attribute can apply on a screen.
 pub(super) fn media_attribute_applies(value: &str) -> bool {
     // A media list too long to read counts as applying.
     match tokenize(value) {
-        Ok(tokens) => media_applies(&tokens),
+        Ok(tokens) => media_condition(&tokens) != Tri::No,
         Err(_) => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature queries
+
+/// `display` values every reading system this check follows supports.
+const SUPPORTED_DISPLAY_KEYWORDS: [&str; 34] = [
+    "block",
+    "inline",
+    "inline-block",
+    "flex",
+    "inline-flex",
+    "grid",
+    "inline-grid",
+    "flow-root",
+    "contents",
+    "none",
+    "table",
+    "inline-table",
+    "table-row-group",
+    "table-header-group",
+    "table-footer-group",
+    "table-row",
+    "table-cell",
+    "table-column-group",
+    "table-column",
+    "table-caption",
+    "list-item",
+    "ruby",
+    "ruby-text",
+    "math",
+    "-webkit-box",
+    "-webkit-inline-box",
+    "-webkit-flex",
+    "-webkit-inline-flex",
+    "inherit",
+    "initial",
+    "unset",
+    "revert",
+    "revert-layer",
+    "block flow",
+];
+
+/// Parentheses an `@supports` condition may nest before it counts as one
+/// that may hold.
+const MAX_SUPPORTS_NESTING: usize = 16;
+
+/// Whether an `@supports` condition holds on a reading system. It reads
+/// `not`, `and`, and `or` as written, and of the features it tests, only
+/// `display`: a value every reader supports holds, one no reader knows
+/// (`display: bogus`) does not. Anything else may hold.
+fn supports_condition(tokens: &[Token]) -> Tri {
+    supports_condition_within(tokens, 0)
+}
+
+fn supports_condition_within(tokens: &[Token], nesting: usize) -> Tri {
+    if nesting >= MAX_SUPPORTS_NESTING {
+        return Tri::Maybe;
+    }
+    let parts: Vec<&[Token]> = {
+        let tokens = trim_whitespace(tokens);
+        let mut parts = Vec::new();
+        let mut index = 0;
+        while index < tokens.len() {
+            let end = skip_component(tokens, index);
+            if tokens[index] != Token::Whitespace {
+                parts.push(&tokens[index..end]);
+            }
+            index = end;
+        }
+        parts
+    };
+    let word = |part: &[Token], wanted: &str| matches!(part, [Token::Ident(word)] if word.eq_ignore_ascii_case(wanted));
+    let in_parens = |part: &[Token]| supports_in_parens(part, nesting + 1);
+    match parts.as_slice() {
+        [not, part] if word(not, "not") => in_parens(part).not(),
+        [first, rest @ ..] if rest.len().is_multiple_of(2) => {
+            let joined_by = |joiner: &str| {
+                rest.chunks(2)
+                    .all(|pair| word(pair[0], joiner) && !word(pair[1], "not"))
+            };
+            let operands = std::iter::once(*first)
+                .chain(rest.chunks(2).map(|pair| pair[1]))
+                .map(in_parens);
+            if rest.is_empty() {
+                in_parens(first)
+            } else if joined_by("and") {
+                operands.min().unwrap_or(Tri::Maybe)
+            } else if joined_by("or") {
+                operands.max().unwrap_or(Tri::Maybe)
+            } else {
+                Tri::Maybe
+            }
+        }
+        _ => Tri::Maybe,
+    }
+}
+
+/// A parenthesized part of an `@supports` condition: a declaration, or a
+/// condition of its own. A function (`selector()`, `font-tech()`) may hold.
+fn supports_in_parens(part: &[Token], nesting: usize) -> Tri {
+    let [Token::OpenParen, inner @ ..] = part else {
+        return Tri::Maybe;
+    };
+    let inner = match inner {
+        [inner @ .., Token::CloseParen] => inner,
+        inner => inner,
+    };
+    match trim_whitespace(inner) {
+        [Token::Ident(name), rest @ ..] => match trim_whitespace(rest) {
+            [Token::Colon, value @ ..] => supports_declaration(name, value),
+            _ => supports_condition_within(inner, nesting),
+        },
+        _ => supports_condition_within(inner, nesting),
+    }
+}
+
+/// Whether a reading system supports a declaration, as far as this check
+/// knows: for `display`, whether every reader supports its value, or none
+/// knows it; otherwise it may.
+fn supports_declaration(name: &str, value: &[Token]) -> Tri {
+    if !name.eq_ignore_ascii_case("display") {
+        return Tri::Maybe;
+    }
+    let words: Option<Vec<String>> = trim_whitespace(value)
+        .iter()
+        .filter(|token| **token != Token::Whitespace)
+        .map(|token| match token {
+            Token::Ident(word) => Some(word.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let Some(words) = words.filter(|words| !words.is_empty()) else {
+        return Tri::Maybe;
+    };
+    let known = |word: &String| {
+        DISPLAY_KEYWORDS.contains(&word.as_str())
+            || SUPPORTED_DISPLAY_KEYWORDS.contains(&word.as_str())
+            || word.starts_with('-')
+    };
+    if !words.iter().all(known) {
+        Tri::No
+    } else if SUPPORTED_DISPLAY_KEYWORDS.contains(&words.join(" ").as_str()) {
+        Tri::Yes
+    } else {
+        Tri::Maybe
     }
 }
 
@@ -2635,6 +2790,12 @@ struct StyleRule {
     /// The classes, ids, and element names its ancestor compounds require
     /// (see [`AncestorKeys`]).
     ancestor_keys: Box<[u64]>,
+    /// Whether the conditions of the at-rules around it hold: `Yes`, or
+    /// `Maybe`, which caps how surely it applies (see [`RuleContext`]).
+    condition: Tri,
+    /// The cascade layer it belongs to, in its sheet's
+    /// [`Stylesheet::layers`].
+    layer: Option<u32>,
 }
 
 /// A class, id, or element name, hashed without regard to ASCII case. Two
@@ -2742,40 +2903,75 @@ impl AncestorKeys {
 }
 
 /// A stylesheet reduced to what the check reads: its rules that set
-/// `display`, `visibility`, or `content-visibility` where their media
-/// apply, and the stylesheets it imports for a screen, in order. Rules that
-/// set a margin or padding are kept apart as well, and counted where they
-/// set nothing else.
+/// `display`, `visibility`, or `content-visibility` where their conditions
+/// may hold, and the stylesheets it imports for a screen, in order. Rules
+/// that set a margin or padding are kept apart as well, and counted where
+/// they set nothing else.
 #[derive(Debug, Default)]
 pub(super) struct Stylesheet {
     rules: Vec<Rc<StyleRule>>,
     spacing: Vec<Rc<StyleRule>>,
     spacing_only: usize,
     pub(super) imports: Vec<String>,
+    /// The cascade layers it declares, in order, each by its names from the
+    /// outermost; an anonymous one by a name no sheet can write.
+    layers: Vec<Box<[String]>>,
 }
 
 impl Stylesheet {
     pub(super) fn rule_count(&self) -> usize {
         self.rules.len() + self.spacing_only
     }
+
+    /// The layer named `names` inside `parent` (an anonymous one where
+    /// `names` is `None`), declared where it first comes.
+    fn layer(&mut self, parent: Option<u32>, names: Option<Vec<String>>) -> u32 {
+        let mut path: Vec<String> =
+            parent.map_or_else(Vec::new, |parent| self.layers[parent as usize].to_vec());
+        match names {
+            Some(names) => path.extend(names),
+            None => path.push(format!(" {}", self.layers.len())),
+        }
+        if let Some(known) = self.layers.iter().position(|layer| **layer == *path) {
+            return known as u32;
+        }
+        self.layers.push(path.into_boxed_slice());
+        self.layers.len() as u32 - 1
+    }
 }
 
 /// Nesting of at-rules and nested style rules followed before a sheet is
 /// refused as a resource limit.
 const MAX_RULE_NESTING: usize = 32;
+/// Cascade layers one stylesheet may declare.
+const MAX_LAYERS_PER_SHEET: usize = 256;
+
+/// What the at-rules around a rule say of it: whether their conditions
+/// hold on a reading system's screen (`@media`, `@supports`, and the size
+/// of a container, not read, which may), and the cascade layer it belongs
+/// to, as an index into [`Stylesheet::layers`].
+#[derive(Clone, Copy)]
+struct RuleContext {
+    condition: Tri,
+    layer: Option<u32>,
+}
 
 /// Parse a stylesheet the way a reading system reads it.
 pub(super) fn parse_stylesheet(css: &str) -> Result<Stylesheet, DocumentError> {
     let tokens = tokenize(css)?;
     let mut sheet = Stylesheet::default();
-    parse_rule_list(&tokens, true, true, &mut sheet, 0)?;
+    let context = RuleContext {
+        condition: Tri::Yes,
+        layer: None,
+    };
+    parse_rule_list(&tokens, true, context, &mut sheet, 0)?;
     Ok(sheet)
 }
 
 fn parse_rule_list(
     tokens: &[Token],
     top_level: bool,
-    media: bool,
+    context: RuleContext,
     sheet: &mut Stylesheet,
     nesting: usize,
 ) -> Result<(), DocumentError> {
@@ -2784,7 +2980,9 @@ fn parse_rule_list(
         match &tokens[index] {
             Token::Whitespace | Token::Cdo | Token::Cdc | Token::Semicolon => index += 1,
             Token::AtKeyword(name) => {
-                index = parse_at_rule(tokens, index, name, top_level, media, None, sheet, nesting)?;
+                index = parse_at_rule(
+                    tokens, index, name, top_level, context, None, sheet, nesting,
+                )?;
             }
             _ => {
                 let start = index;
@@ -2795,12 +2993,33 @@ fn parse_rule_list(
                     break;
                 }
                 let (block, end) = block_at(tokens, index);
-                parse_style_block(&tokens[start..index], block, media, sheet, nesting)?;
+                parse_style_block(&tokens[start..index], block, context, sheet, nesting)?;
                 index = end;
             }
         }
     }
     Ok(())
+}
+
+/// The names of a cascade layer (`base`, `theme.dark`), or `None` for an
+/// anonymous one; `Err` for a prelude that names none.
+fn layer_names(prelude: &[Token]) -> Result<Option<Vec<String>>, ()> {
+    let prelude = trim_whitespace(prelude);
+    if prelude.is_empty() {
+        return Ok(None);
+    }
+    let mut names = Vec::new();
+    for (at, token) in prelude.iter().enumerate() {
+        match (at % 2, token) {
+            (0, Token::Ident(name)) => names.push(name.clone()),
+            (1, Token::Delim('.')) => {}
+            _ => return Err(()),
+        }
+    }
+    if prelude.len().is_multiple_of(2) {
+        return Err(());
+    }
+    Ok(Some(names))
 }
 
 /// Parse the at-rule at `index`; return the index past it. `selectors` is
@@ -2812,7 +3031,7 @@ fn parse_at_rule(
     index: usize,
     name: &str,
     top_level: bool,
-    media: bool,
+    context: RuleContext,
     selectors: Option<&[Token]>,
     sheet: &mut Stylesheet,
     nesting: usize,
@@ -2823,32 +3042,63 @@ fn parse_at_rule(
         end = skip_component(tokens, end);
     }
     let prelude = &tokens[index + 1..end];
+    let within = |condition: Tri| RuleContext {
+        condition: context.condition.min(condition),
+        ..context
+    };
     if end < tokens.len() && tokens[end] == Token::OpenCurly {
         let (block, after) = block_at(tokens, end);
-        let applies = match name.as_str() {
-            "media" => Some(media_applies(prelude)),
-            "supports" | "layer" | "container" | "document" | "-moz-document" | "scope"
-            | "starting-style" => Some(true),
-            // `@font-face`, `@page`, `@keyframes`, and unknown at-rules
-            // style no elements.
+        let inner = match name.as_str() {
+            "media" => Some(within(media_condition(prelude))),
+            "supports" => Some(within(supports_condition(prelude))),
+            // A container's size, and whether an element stands inside a
+            // scope's root and short of its limits, are not read.
+            "container" | "scope" => Some(within(Tri::Maybe)),
+            "layer" => match layer_names(prelude) {
+                Ok(names) => {
+                    if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
+                        return Err(DocumentError::ResourceLimit);
+                    }
+                    Some(RuleContext {
+                        layer: Some(sheet.layer(context.layer, names)),
+                        ..context
+                    })
+                }
+                Err(()) => None,
+            },
+            // Starting styles apply only as a transition begins, not to
+            // what a reader then shows; no reader this check follows
+            // applies `@document` rules. `@font-face`, `@page`,
+            // `@keyframes`, and unknown at-rules style no elements.
             _ => None,
         };
-        if let Some(applies) = applies {
+        if let Some(inner) = inner.filter(|inner| inner.condition != Tri::No) {
             if nesting >= MAX_RULE_NESTING {
                 return Err(DocumentError::ResourceLimit);
             }
             match selectors {
                 Some(selectors) => {
-                    parse_style_block(selectors, block, media && applies, sheet, nesting + 1)?;
+                    parse_style_block(selectors, block, inner, sheet, nesting + 1)?;
                 }
-                None => parse_rule_list(block, false, media && applies, sheet, nesting + 1)?,
+                None => parse_rule_list(block, false, inner, sheet, nesting + 1)?,
             }
         }
         return Ok(after);
     }
+    if name == "layer" && context.condition != Tri::No {
+        // `@layer a, b;` declares the layers, in that order.
+        for names in split_top_level(prelude, &Token::Comma) {
+            if let Ok(Some(names)) = layer_names(names) {
+                if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                sheet.layer(context.layer, Some(names));
+            }
+        }
+    }
     if name == "import" && top_level && selectors.is_none() {
         if let Some((target, applies)) = import_target(prelude) {
-            if media && applies {
+            if context.condition != Tri::No && applies {
                 if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET {
                     return Err(DocumentError::ResourceLimit);
                 }
@@ -2859,7 +3109,8 @@ fn parse_at_rule(
     Ok((end + 1).min(tokens.len()))
 }
 
-/// An `@import`'s target, and whether its media list applies on a screen.
+/// An `@import`'s target, and whether its media list and `supports()`
+/// condition may apply on a screen.
 fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
     let tokens = trim_whitespace(prelude);
     let (target, rest) = match tokens {
@@ -2874,6 +3125,7 @@ fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
         _ => return None,
     };
     let mut rest = trim_whitespace(rest);
+    let mut supported = Tri::Yes;
     loop {
         match rest {
             [Token::Ident(word), tail @ ..] if word.eq_ignore_ascii_case("layer") => {
@@ -2883,13 +3135,24 @@ fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
                 if function.eq_ignore_ascii_case("layer")
                     || function.eq_ignore_ascii_case("supports") =>
             {
-                let (_, end) = block_at(rest, 0);
+                let (arguments, end) = block_at(rest, 0);
+                if function.eq_ignore_ascii_case("supports") {
+                    // A declaration, or a condition in its own right.
+                    let arguments = trim_whitespace(arguments);
+                    supported = match arguments {
+                        [Token::Ident(name), tail @ ..] => match trim_whitespace(tail) {
+                            [Token::Colon, value @ ..] => supports_declaration(name, value),
+                            _ => supports_condition(arguments),
+                        },
+                        _ => supports_condition(arguments),
+                    };
+                }
                 rest = trim_whitespace(&rest[end..]);
             }
             _ => break,
         }
     }
-    Some((target, media_applies(rest)))
+    Some((target, supported.min(media_condition(rest)) != Tri::No))
 }
 
 /// A style rule's block: its declarations, and any nested rules, whose
@@ -2898,7 +3161,7 @@ fn import_target(prelude: &[Token]) -> Option<(String, bool)> {
 fn parse_style_block(
     selectors: &[Token],
     block: &[Token],
-    media: bool,
+    context: RuleContext,
     sheet: &mut Stylesheet,
     nesting: usize,
 ) -> Result<(), DocumentError> {
@@ -2913,7 +3176,7 @@ fn parse_style_block(
                     index,
                     name,
                     false,
-                    media,
+                    context,
                     Some(selectors),
                     sheet,
                     nesting,
@@ -2931,7 +3194,7 @@ fn parse_style_block(
                         return Err(DocumentError::ResourceLimit);
                     }
                     let (inner, end) = block_at(block, index);
-                    parse_style_block(&block[start..index], inner, media, sheet, nesting + 1)?;
+                    parse_style_block(&block[start..index], inner, context, sheet, nesting + 1)?;
                     index = end;
                 } else {
                     declarations.extend(
@@ -2944,7 +3207,7 @@ fn parse_style_block(
             }
         }
     }
-    if media && !declarations.is_empty() {
+    if context.condition != Tri::No && !declarations.is_empty() {
         let declarations: Rc<[Declaration]> = declarations.into();
         // A `::before` or `::after` box matters for where a reader breaks
         // lines, which its `display`, `content`, `float`, `position`, and
@@ -2989,6 +3252,8 @@ fn parse_style_block(
                     selector,
                     declarations: declarations.clone(),
                     ancestor_keys,
+                    condition: context.condition,
+                    layer: context.layer,
                 });
                 if spacing {
                     sheet.spacing.push(rule.clone());
@@ -3009,6 +3274,10 @@ fn parse_style_block(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Precedence {
     tier: u8,
+    /// An author rule's cascade layer, by its place (see
+    /// [`Cascade::layer_order`]); 0 for presentational hints, inline
+    /// styles, and the user agent's rules.
+    layer: u32,
     specificity: (u32, u32, u32),
     order: u32,
 }
@@ -3289,17 +3558,24 @@ pub(super) struct Cascade {
     /// by an id, class, or element name their rightmost compound requires,
     /// and those that require none (see [`Cascade::spacing`]); and how many
     /// of them set nothing else.
-    spacing_rules: Vec<(Rc<StyleRule>, u32)>,
+    spacing_rules: Vec<(Rc<StyleRule>, u32, u32)>,
     spacing_by_key: HashMap<u64, Vec<usize>>,
     spacing_anywhere: Vec<usize>,
     spacing_only: usize,
+    /// The cascade layers of its sheets, by the names and sublayers of
+    /// each, the unlayered rules' first; and each layer's place, found
+    /// once all the sheets are in (see [`Cascade::layer_order`]).
+    layer_names: Vec<String>,
+    layer_children: Vec<Vec<u32>>,
+    layer_ranks: std::cell::OnceCell<Box<[u32]>>,
 }
 
-/// A rule in a chapter's cascade: its place in the cascade order, and the
-/// ids of its `~` steps by combinator.
+/// A rule in a chapter's cascade: its place in the cascade order, its
+/// cascade layer, and the ids of its `~` steps by combinator.
 struct CascadeRule {
     rule: Rc<StyleRule>,
     order: u32,
+    layer: u32,
     recorded: Box<[Option<u32>]>,
 }
 
@@ -3314,6 +3590,8 @@ struct SiblingStep {
 
 impl Cascade {
     pub(super) fn push_sheet(&mut self, sheet: &Stylesheet) {
+        let layers = self.push_layers(sheet);
+        let layer = |rule: &StyleRule| rule.layer.map_or(0, |layer| layers[layer as usize]);
         for rule in &sheet.rules {
             let index = self.rules.len();
             let recorded = rule
@@ -3381,6 +3659,7 @@ impl Cascade {
             self.rules.push(CascadeRule {
                 rule: rule.clone(),
                 order: index as u32 + 1,
+                layer: layer(rule),
                 recorded,
             });
         }
@@ -3390,9 +3669,110 @@ impl Cascade {
                 Some(key) => self.spacing_by_key.entry(key).or_default().push(index),
                 None => self.spacing_anywhere.push(index),
             }
-            self.spacing_rules.push((rule.clone(), index as u32 + 1));
+            self.spacing_rules
+                .push((rule.clone(), index as u32 + 1, layer(rule)));
         }
         self.spacing_only += sheet.spacing_only;
+    }
+
+    /// Take in the cascade layers a sheet declares, in its order: a named
+    /// layer is the one of that name inside its parent, wherever declared
+    /// before, and an anonymous one is new to this sheet. Their nodes, by
+    /// the sheet's layers.
+    fn push_layers(&mut self, sheet: &Stylesheet) -> Vec<u32> {
+        if self.layer_children.is_empty() {
+            self.layer_names.push(String::new());
+            self.layer_children.push(Vec::new());
+        }
+        self.layer_ranks.take();
+        let mut anonymous: HashMap<&str, u32> = HashMap::new();
+        let mut nodes = Vec::with_capacity(sheet.layers.len());
+        for path in &sheet.layers {
+            let mut node = 0u32;
+            for name in path.iter() {
+                let known = if name.starts_with(' ') {
+                    anonymous.get(name.as_str()).copied()
+                } else {
+                    self.layer_children[node as usize]
+                        .iter()
+                        .copied()
+                        .find(|child| self.layer_names[*child as usize] == *name)
+                };
+                node = match known {
+                    Some(child) => child,
+                    None => {
+                        let child = self.layer_names.len() as u32;
+                        self.layer_names.push(name.clone());
+                        self.layer_children.push(Vec::new());
+                        self.layer_children[node as usize].push(child);
+                        if name.starts_with(' ') {
+                            anonymous.insert(name, child);
+                        }
+                        child
+                    }
+                };
+            }
+            nodes.push(node);
+        }
+        nodes
+    }
+
+    /// Where a rule's cascade layer places it among the author rules (CSS
+    /// Cascade 5): each layer after its sublayers, which come in the order
+    /// they were first declared, and the unlayered rules last. A later
+    /// place wins for normal declarations; for `!important` ones, an
+    /// earlier.
+    fn layer_order(&self, layer: u32, important: bool) -> u32 {
+        let ranks = self.layer_ranks.get_or_init(|| {
+            let mut ranks = vec![0u32; self.layer_children.len().max(1)];
+            let mut next = 1;
+            let mut stack = vec![(0u32, 0usize)];
+            while let Some((node, child)) = stack.pop() {
+                match self
+                    .layer_children
+                    .get(node as usize)
+                    .and_then(|children| children.get(child))
+                {
+                    Some(&first) => {
+                        stack.push((node, child + 1));
+                        stack.push((first, 0));
+                    }
+                    None => {
+                        ranks[node as usize] = next;
+                        next += 1;
+                    }
+                }
+            }
+            ranks.into_boxed_slice()
+        });
+        let rank = ranks.get(layer as usize).copied().unwrap_or(0);
+        if important {
+            u32::MAX - rank
+        } else {
+            rank
+        }
+    }
+
+    /// Where an author rule's declaration stands in the cascade: its tier,
+    /// its layer's place, its selector's specificity, and its order.
+    fn precedence(
+        &self,
+        declaration: &Declaration,
+        rule: &StyleRule,
+        order: u32,
+        layer: u32,
+    ) -> Precedence {
+        let tier = if declaration.important {
+            TIER_AUTHOR_IMPORTANT
+        } else {
+            TIER_AUTHOR
+        };
+        Precedence {
+            tier,
+            layer: self.layer_order(layer, declaration.important),
+            specificity: rule.selector.specificity,
+            order,
+        }
     }
 
     pub(super) fn rule_count(&self) -> usize {
@@ -3436,30 +3816,18 @@ impl Cascade {
             }
         };
         for index in candidates {
-            let (rule, order) = &self.spacing_rules[index];
+            let (rule, order, layer) = &self.spacing_rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, &[], tree, work);
+            let certainty = match_complex(&rule.selector, &[], tree, work).min(rule.condition);
             if certainty == Tri::No {
                 continue;
             }
             for declaration in rule.declarations.iter() {
-                let tier = if declaration.important {
-                    TIER_AUTHOR_IMPORTANT
-                } else {
-                    TIER_AUTHOR
-                };
-                add(
-                    declaration,
-                    Precedence {
-                        tier,
-                        specificity: rule.selector.specificity,
-                        order: *order,
-                    },
-                    certainty,
-                );
+                let precedence = self.precedence(declaration, rule, *order, *layer);
+                add(declaration, precedence, certainty);
             }
         }
         if *work > MAX_MATCH_WORK {
@@ -3475,6 +3843,7 @@ impl Cascade {
                 };
                 let precedence = Precedence {
                     tier,
+                    layer: 0,
                     specificity: (0, 0, 0),
                     order: 0,
                 };
@@ -3727,13 +4096,14 @@ impl Cascade {
             let CascadeRule {
                 rule,
                 order,
+                layer,
                 recorded,
             } = &self.rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let certainty = match_complex(&rule.selector, recorded, tree, work);
+            let certainty = match_complex(&rule.selector, recorded, tree, work).min(rule.condition);
             if certainty == Tri::No {
                 continue;
             }
@@ -3746,16 +4116,7 @@ impl Cascade {
             if let Some(slot) = pseudo {
                 pseudo_styled[slot] = true;
                 for declaration in rule.declarations.iter() {
-                    let tier = if declaration.important {
-                        TIER_AUTHOR_IMPORTANT
-                    } else {
-                        TIER_AUTHOR
-                    };
-                    let precedence = Precedence {
-                        tier,
-                        specificity: rule.selector.specificity,
-                        order: *order,
-                    };
+                    let precedence = self.precedence(declaration, rule, *order, *layer);
                     match (declaration.property, declaration.flow) {
                         (Property::Content, _) => {
                             pseudo_content[slot].push((
@@ -3832,20 +4193,8 @@ impl Cascade {
                 continue;
             }
             for declaration in rule.declarations.iter() {
-                let tier = if declaration.important {
-                    TIER_AUTHOR_IMPORTANT
-                } else {
-                    TIER_AUTHOR
-                };
-                add(
-                    declaration,
-                    Precedence {
-                        tier,
-                        specificity: rule.selector.specificity,
-                        order: *order,
-                    },
-                    certainty,
-                );
+                let precedence = self.precedence(declaration, rule, *order, *layer);
+                add(declaration, precedence, certainty);
             }
         }
         if *work > MAX_MATCH_WORK {
@@ -3863,6 +4212,7 @@ impl Cascade {
                     &declaration,
                     Precedence {
                         tier,
+                        layer: 0,
                         specificity: (0, 0, 0),
                         order: 0,
                     },
@@ -3873,6 +4223,7 @@ impl Cascade {
         // SVG presentation attributes: author styles that every rule beats.
         let presentation = Precedence {
             tier: TIER_AUTHOR,
+            layer: 0,
             specificity: (0, 0, 0),
             order: 0,
         };
@@ -3925,6 +4276,7 @@ impl Cascade {
         // User-agent rules (HTML's rendering section) that hide content.
         let user_agent = Precedence {
             tier: TIER_USER_AGENT,
+            layer: 0,
             specificity: (0, 0, 0),
             order: 0,
         };
@@ -7729,6 +8081,147 @@ mod tests {
         ] {
             assert!(!drops_shown(&[sheets], body), "{sheets} {body}");
         }
+    }
+
+    #[test]
+    fn conditions_hold_as_far_as_the_check_can_tell() {
+        let media = |text: &str| media_condition(&tokenize(text).expect("tokens"));
+        for (query, holds) in [
+            ("", Tri::Yes),
+            ("screen", Tri::Yes),
+            ("all, print", Tri::Yes),
+            ("not print", Tri::Yes),
+            ("print", Tri::No),
+            ("amzn-kf8", Tri::No),
+            ("not screen", Tri::No),
+            ("print and (color)", Tri::No),
+            ("screen and (min-width: 600px)", Tri::Maybe),
+            ("(min-resolution: 2dppx)", Tri::Maybe),
+            ("not all and (monochrome)", Tri::Maybe),
+        ] {
+            assert_eq!(media(query), holds, "@media {query}");
+        }
+        let supports = |text: &str| supports_condition(&tokenize(text).expect("tokens"));
+        for (condition, holds) in [
+            ("(display: grid)", Tri::Yes),
+            ("((display: flex))", Tri::Yes),
+            ("(display: bogus-value)", Tri::No),
+            ("not (display: bogus-value)", Tri::Yes),
+            ("not (display: grid)", Tri::No),
+            ("(display: grid) and (display: bogus)", Tri::No),
+            ("(display: grid) or (display: bogus)", Tri::Yes),
+            ("(display: flex) and (gap: 1em)", Tri::Maybe),
+            ("(display: run-in)", Tri::Maybe),
+            ("selector(:has(a))", Tri::Maybe),
+            // `not` must stand in parentheses beside `and`.
+            ("(display: grid) and not (display: bogus)", Tri::Maybe),
+        ] {
+            assert_eq!(supports(condition), holds, "@supports {condition}");
+        }
+        // Parentheses nested deep are not followed far.
+        let deep = format!(
+            "{}(display: grid){}",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        assert_eq!(supports(&deep), Tri::Maybe);
+    }
+
+    #[test]
+    fn rules_whose_conditions_may_not_hold_neither_hide_nor_show() {
+        let body = r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#;
+        let sign = r#".s::before { content: "\2212" }"#;
+        // A rule a condition guards that may not hold, or never holds,
+        // keeps no sign from showing.
+        for guarded in [
+            "@supports (display: bogus-value) { .s::before { opacity: 0 } }",
+            "@supports not (display: grid) { .s::before { opacity: 0 } }",
+            "@media (min-width: 5000px) { .s::before { visibility: hidden } }",
+            "@media print { .s::before { visibility: hidden } }",
+            "@container (min-width: 5000px) { .s::before { opacity: 0 } }",
+            "@scope (.nothing) { .s::before { opacity: 0 } }",
+            "@starting-style { .s::before { opacity: 0 } }",
+            "@-moz-document url-prefix() { .s::before { opacity: 0 } }",
+        ] {
+            assert!(drops_shown(&[sign, guarded], body), "{guarded}");
+        }
+        assert!(!drops_shown(
+            &[
+                sign,
+                "@supports (display: grid) { .s::before { opacity: 0 } }"
+            ],
+            body
+        ));
+        // Nor shows a sign it gives.
+        for guarded in [
+            r#"@supports (display: totally-bogus) { .s::before { content: "\2212" } }"#,
+            r#"@media (min-width: 40em) { .s::before { content: "\2212" } }"#,
+            r#"@starting-style { .s::before { content: "\2212" } }"#,
+        ] {
+            assert!(!drops_shown(&[guarded], body), "{guarded}");
+        }
+        assert!(drops_shown(
+            &[r#"@media screen { .s::before { content: "\2212" } }"#],
+            body
+        ));
+        // Blocks a flex box that may not be one lays out stand apart.
+        let rows = r#"<div class="r"><div>Balance due</div><div>Grand total</div></div>"#;
+        for guarded in [
+            "@media (min-width: 900px) { .r { display: flex } }",
+            "@supports (display: bogus-value) { .r { display: flex } }",
+            "@-moz-document url-prefix() { .r { display: flex } }",
+            "@starting-style { .r { display: flex } }",
+        ] {
+            assert!(walk(&[guarded], rows).fuses_blocks, "{guarded}");
+        }
+        assert!(!walk(&[".r { display: flex }"], rows).fuses_blocks);
+    }
+
+    #[test]
+    fn cascade_layers_order_the_rules_in_them() {
+        let body = r#"<p>Net change <span class="s">1,250.00</span> this year.</p>"#;
+        let shown = |sheet: &str| drops_shown(&[sheet], body);
+        // Unlayered rules beat layered ones, whatever their specificity, and
+        // a later layer an earlier one; for `!important`, the reverse.
+        assert!(shown(
+            r#"@layer l { p .s::before { opacity: 0 } } .s::before { content: "\2212"; opacity: 1 }"#
+        ));
+        assert!(!shown(
+            r#"@layer l { .s::before { opacity: 0 !important } } .s::before { content: "\2212"; opacity: 1 !important }"#
+        ));
+        assert!(!shown(
+            r#"@layer a, b; @layer b { .s::before { opacity: 0 } } @layer a { p .s::before { opacity: 1 } } .s::before { content: "\2212" }"#
+        ));
+        assert!(shown(
+            r#"@layer b, a; @layer b { .s::before { opacity: 0 } } @layer a { p .s::before { opacity: 1 } } .s::before { content: "\2212" }"#
+        ));
+        // A layer's own rules beat its sublayers', and layers of one name
+        // across sheets are one.
+        assert!(shown(
+            r#"@layer a { .s::before { opacity: 1 } @layer b { p .s::before { opacity: 0 } } } .s::before { content: "\2212" }"#
+        ));
+        assert!(drops_shown(
+            &[
+                r#"@layer x, y; @layer y { .s::before { content: "\2212" } }"#,
+                "@layer x { p .s::before { content: none } }",
+            ],
+            body
+        ));
+        let rows = r#"<div class="r"><div>Balance due</div><div>Grand total</div></div>"#;
+        assert!(
+            walk(
+                &["@layer l { body .r { display: flex } } .r { display: block }"],
+                rows
+            )
+            .fuses_blocks
+        );
+        assert!(
+            !walk(
+                &["@layer l { .r { display: block } } body .r { display: flex }"],
+                rows
+            )
+            .fuses_blocks
+        );
     }
 
     #[test]
