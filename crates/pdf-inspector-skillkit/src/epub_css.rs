@@ -6420,7 +6420,7 @@ impl Cascade {
         tree: &Tree,
         ancestors: &AncestorKeys,
         work: &mut u64,
-    ) -> Result<Vec<Rc<str>>, DocumentError> {
+    ) -> Result<Vec<(u8, Rc<str>)>, DocumentError> {
         let element = tree.stack.last().expect("an element to style");
         // The fill, the stroke, the clip path, the mask, and the start,
         // middle, and end markers, which `marker` sets together.
@@ -6517,11 +6517,10 @@ impl Cascade {
                 add(&painting, precedence, certainty);
             }
         }
-        let mut targets: Vec<Rc<str>> =
-            slots.iter().filter_map(|slot| names_surely(slot)).collect();
-        targets.sort_unstable();
-        targets.dedup();
-        Ok(targets)
+        Ok((0u8..)
+            .zip(&slots)
+            .filter_map(|(at, slot)| Some((at, names_surely(slot)?)))
+            .collect())
     }
 
     pub(super) fn rule_count(&self) -> usize {
@@ -8617,6 +8616,9 @@ struct ChapterFacts {
     /// a resource only it refers to, as a clip path on a box, counts as
     /// unpainted.
     painted: std::collections::HashSet<String>,
+    /// The ids SVG elements carry, one of which a `textPath` must name to
+    /// set its glyphs.
+    svg_ids: std::collections::HashSet<String>,
 }
 
 /// Properties that paint the SVG resource they refer to: a pattern as a
@@ -8769,6 +8771,12 @@ fn element_facts(chapter: &[u8]) -> Result<ChapterFacts, DocumentError> {
                     continue;
                 }
                 let key = super::xml_local_name(key);
+                if key == b"id" {
+                    found
+                        .svg_ids
+                        .insert(String::from_utf8_lossy(attribute.value.as_ref()).into_owned());
+                    continue;
+                }
                 let used = key == b"href" && local == "use";
                 let styled = key.eq_ignore_ascii_case(b"style");
                 let painting = PAINTING_PROPERTIES
@@ -8903,6 +8911,9 @@ fn svg_draws(element: &Element, has_children: bool, has_elements: bool) -> bool 
             .first(name)
             .is_some_and(|value| value.trim().is_empty())
     };
+    if element.first("transform").is_some_and(scales_to_nothing) {
+        return false;
+    }
     match element.local.as_str() {
         "use" | "line" | "image" => true,
         "path" => !empty("d"),
@@ -8913,6 +8924,20 @@ fn svg_draws(element: &Element, has_children: bool, has_elements: bool) -> bool 
         "text" | "tspan" | "textPath" => has_children,
         _ => has_elements,
     }
+}
+
+/// Whether an SVG `transform` scales what it moves to nothing: a `scale()`
+/// with a factor of zero.
+fn scales_to_nothing(transform: &str) -> bool {
+    let lower = transform.to_ascii_lowercase();
+    lower.match_indices("scale(").any(|(at, _)| {
+        let arguments = &lower[at + "scale(".len()..];
+        let arguments = &arguments[..arguments.find(')').unwrap_or(arguments.len())];
+        arguments
+            .split(|character: char| character.is_ascii_whitespace() || character == ',')
+            .filter(|part| !part.is_empty())
+            .any(|part| part.parse::<f64>() == Ok(0.0))
+    })
 }
 
 /// SVG resources a reader paints only where a fill, stroke, clip, mask,
@@ -9018,7 +9043,23 @@ impl Resources {
             Some(slot) if !painting => self.either(slot, placed),
             _ => placed,
         };
-        let paint = if painting || local == "symbol" {
+        // A pattern tile sized zero shows nothing, and a `textPath` that
+        // names no element of the image sets no glyphs.
+        let zero = |name: &str| element.first(name).and_then(svg_number) == Some(0.0);
+        let path_named = || {
+            element.first("path").is_some()
+                || element
+                    .values("href")
+                    .find(|(prefixed, _)| !prefixed)
+                    .or_else(|| element.values("href").next())
+                    .and_then(|(_, href)| fragment(href.trim()))
+                    .is_some_and(|id| facts.svg_ids.contains(id))
+        };
+        let paint = if (local == "pattern" && (zero("width") || zero("height")))
+            || (local == "textPath" && !path_named())
+        {
+            Paint::No
+        } else if painting || local == "symbol" {
             slot.map_or(Paint::No, |slot| self.either(slot, Paint::No))
         } else if svg_paints(local) {
             position
@@ -9812,11 +9853,33 @@ pub(super) fn chapter_text(
                     stack: &elements,
                     earlier: &earlier,
                 };
+                // A fill shows nothing on a line, which has no inside, or
+                // where its opacity is zero, as a stroke of no width does;
+                // markers stand only on paths, lines, polylines, and
+                // polygons, and on what may hold or draw them.
+                let zero = |name: &str| {
+                    let [inline] = inline_numbers(element, [name]);
+                    inline
+                        .as_deref()
+                        .or(element.first(name))
+                        .and_then(svg_number)
+                        == Some(0.0)
+                };
+                let markable = matches!(
+                    element.local.as_str(),
+                    "path" | "line" | "polyline" | "polygon" | "use" | "svg" | "g" | "a" | "switch"
+                );
                 references.extend(
                     reader
                         .references(&tree, &ancestors, work)?
                         .into_iter()
-                        .map(|id| (true, id)),
+                        .filter(|(slot, _)| match slot {
+                            0 => element.local != "line" && !zero("fill-opacity"),
+                            1 => !zero("stroke-width"),
+                            4.. => markable,
+                            _ => true,
+                        })
+                        .map(|(_, id)| (true, id)),
                 );
             }
             references
@@ -10682,6 +10745,29 @@ mod tests {
             format!(
                 r#"<svg {svg}><defs><foreignObject><p {html}>SECRET</p></foreignObject></defs></svg>"#
             ),
+            // A marker on a shape that takes none, a fill on a line, which
+            // has no inside, a fill without opacity, a stroke without width,
+            // a pattern tile sized zero, a `use` scaled to nothing, and a
+            // `textPath` naming no path paint nothing.
+            format!(
+                r##"<svg {svg}><marker id="k"><text>SECRET</text></marker><rect width="100" height="50" marker-start="url(#k)"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p" width="400" height="60"><text>SECRET</text></pattern><line x2="400" fill="url(#p)"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p" width="400" height="60"><text>SECRET</text></pattern><rect width="400" height="60" fill="url(#p)" fill-opacity="0"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p" width="400" height="60"><text>SECRET</text></pattern><rect width="400" height="60" fill="none" stroke="url(#p)" style="stroke-width: 0"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p" width="0" height="0"><text>SECRET</text></pattern><rect width="400" height="60" fill="url(#p)"/></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><defs><text id="t">SECRET</text></defs><use href="#t" transform="translate(10) scale(0)"/></svg>"##
+            ),
+            format!(r##"<svg {svg}><text><textPath href="#none">SECRET</textPath></text></svg>"##),
         ] {
             assert!(converts_hidden(&[], &body), "{body}");
         }
@@ -10697,6 +10783,9 @@ mod tests {
                 r##"<svg {svg}><pattern id="p"><text>Shown</text></pattern><rect fill="url(#p)"/></svg>"##
             ),
             format!(
+                r##"<svg {svg}><marker id="k"><text>Shown</text></marker><path d="M10 60 L200 60" marker-start="url(#k)"/></svg>"##
+            ),
+            format!(
                 r##"<svg {svg}><clipPath id="c"><text>Shown</text></clipPath><rect clip-path="url('#c')"/></svg>"##
             ),
             format!(
@@ -10704,7 +10793,7 @@ mod tests {
             ),
             // Text in text elements, links, and paths, and HTML in an SVG image.
             format!(
-                r##"<svg {svg}><a href="#x"><text>Shown <tspan>more</tspan><textPath href="#p">on a path</textPath></text></a></svg>"##
+                r##"<svg {svg}><defs><path id="p" d="M10 30 H290"/></defs><a href="#x"><text>Shown <tspan>more</tspan><textPath href="#p">on a path</textPath></text></a></svg>"##
             ),
             format!(
                 r#"<svg {svg}><foreignObject>Shown <p {html}>and more</p></foreignObject></svg>"#
