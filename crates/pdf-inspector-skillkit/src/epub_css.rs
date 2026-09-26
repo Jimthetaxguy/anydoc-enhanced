@@ -8981,6 +8981,9 @@ struct Resources {
     edges: Vec<(u32, u32)>,
     /// Links text a reader hides stands under, unless the link paints.
     pending: Vec<u32>,
+    /// Links text AnyDoc drops stands under, which a reader shows where
+    /// the link paints.
+    dropped: Vec<u32>,
     /// By slot: whether a `symbol` or `svg` element takes it, whose
     /// viewport a `use` element sized zero draws nothing in.
     viewport: Vec<bool>,
@@ -9103,14 +9106,22 @@ impl Resources {
         }
     }
 
+    /// Note text AnyDoc drops that a reader shows where `link` paints.
+    fn dropped(&mut self, link: u32) {
+        if self.dropped.last() != Some(&link) {
+            self.dropped.push(link);
+        }
+    }
+
     /// Settle what paints once the walk has noted every resource and
     /// reference: a slot is live where something certainly rendered refers
     /// to it, or something rendered under a link that paints; a link paints
-    /// where its slot is live or what it stands in paints. Whether text
-    /// under a link that does not paint remains.
-    fn settle(&self) -> bool {
-        if self.pending.is_empty() {
-            return false;
+    /// where its slot is live or what it stands in paints. Whether text a
+    /// reader hides under a link that does not paint remains, and whether
+    /// text AnyDoc drops stands under one that does.
+    fn settle(&self) -> (bool, bool) {
+        if self.pending.is_empty() && self.dropped.is_empty() {
+            return (false, false);
         }
         let mut live = self.live.clone();
         let mut painted = vec![false; self.links.len()];
@@ -9152,7 +9163,10 @@ impl Resources {
                 }
             }
         }
-        self.pending.iter().any(|link| !painted[*link as usize])
+        (
+            self.pending.iter().any(|link| !painted[*link as usize]),
+            self.dropped.iter().any(|link| painted[*link as usize]),
+        )
     }
 }
 
@@ -9606,7 +9620,9 @@ pub(super) fn chapter_text(
                 ))),
             ),
             quick_xml::events::Event::Eof => {
-                found.converts_hidden |= resources.settle();
+                let (hidden, shown) = resources.settle();
+                found.converts_hidden |= hidden;
+                found.drops_shown |= shown;
                 return Ok(found);
             }
             _ => {
@@ -9691,9 +9707,16 @@ pub(super) fn chapter_text(
                     | Reach::Table
                     | Reach::RowGroup
                     | Reach::Row
-                    | Reach::Omitted => {
-                        found.drops_shown |= hidden != Tri::Yes && state.exempt == Exempt::None;
-                    }
+                    | Reach::Omitted => match state.paint {
+                        // Text in a resource shows where something a reader
+                        // renders draws it.
+                        Paint::If(link) if hidden != Tri::Yes && state.exempt == Exempt::None => {
+                            resources.dropped(link);
+                        }
+                        _ => {
+                            found.drops_shown |= hidden != Tri::Yes && state.exempt == Exempt::None;
+                        }
+                    },
                 }
                 if found.converts_hidden && found.drops_shown && found.fuses_blocks {
                     return Ok(found);
@@ -9829,6 +9852,22 @@ pub(super) fn chapter_text(
         let parent_in_svg = open.last().is_some_and(|parent| parent.in_svg);
         let svg_element = parent_in_svg || element.lower == "svg";
         let first_id = resources.first_with_id(element, &facts, reader);
+        // An element a `use` draws, a `symbol` or one inside `defs`, is
+        // drawn as an instance where the `use` stands, which takes nothing
+        // from the elements around it: where they hide it, as a sprite
+        // sheet hidden with `display: none` does, it paints only there.
+        let detached = parent_in_svg
+            && first_id
+            && !svg_painted_resource(&element.local)
+            && element
+                .first("id")
+                .is_some_and(|id| facts.used.contains(id))
+            && open.last().is_some_and(|parent| {
+                parent.undisplayed.max(parent.contents_hidden) != Tri::No
+                    || parent.invisible != Tri::No
+                    || parent.fallback
+                    || parent.transparent
+            });
         // What an SVG element refers to: the element a `use` element draws
         // (by `href`, before `xlink:href`), and the resources its painting
         // properties name.
@@ -9903,7 +9942,10 @@ pub(super) fn chapter_text(
                 stack: &elements,
                 earlier: &earlier,
             };
-            let inherited_invisible = open.last().map_or(Tri::No, |parent| parent.invisible);
+            let inherited_invisible = open
+                .last()
+                .filter(|_| !detached)
+                .map_or(Tri::No, |parent| parent.invisible);
             Some(reader.evaluate(&tree, &ancestors, inherited_invisible, work)?)
         } else {
             None
@@ -10013,7 +10055,7 @@ pub(super) fn chapter_text(
         let in_svg = svg_element;
         let parent_paint = parent.map_or(Paint::Yes, |parent| parent.paint);
         let (position, paint) = if parent_in_svg {
-            let placed = if rendered == Tri::Yes {
+            let placed = if rendered == Tri::Yes && !detached {
                 parent_paint
             } else {
                 Paint::No
@@ -10093,6 +10135,7 @@ pub(super) fn chapter_text(
                     reach,
                     caption_seen: false,
                     undisplayed: parent
+                        .filter(|_| !detached)
                         .map_or(Tri::No, |parent| {
                             let fallback = if parent.fallback { Tri::Yes } else { Tri::No };
                             parent.undisplayed.max(parent.contents_hidden).max(fallback)
@@ -10101,7 +10144,7 @@ pub(super) fn chapter_text(
                     invisible: style.visibility,
                     contents_hidden: style.content_visibility,
                     fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
-                    transparent: parent.is_some_and(|parent| parent.transparent)
+                    transparent: parent.is_some_and(|parent| parent.transparent && !detached)
                         || style.transparent != Tri::No,
                     in_svg: children_in_svg,
                     paint,
@@ -10806,6 +10849,22 @@ mod tests {
             ),
         ] {
             assert!(!converts_hidden(&[], &body), "{body}");
+        }
+        // A sprite sheet hidden with `display: none` still paints what a
+        // `use` elsewhere draws from it, which AnyDoc drops with the sheet;
+        // what no `use` draws, or one hidden with it, it does not.
+        let sprite = format!(
+            r#"<svg {svg} style="display:none"><symbol id="s"><text>Wire 1,250.00</text></symbol>"#
+        );
+        assert!(drops_shown(
+            &[],
+            &format!(r##"{sprite}</svg><svg {svg}><use href="#s"/></svg>"##)
+        ));
+        for body in [
+            format!("{sprite}</svg>"),
+            format!(r##"{sprite}<use href="#s"/></svg>"##),
+        ] {
+            assert!(!drops_shown(&[], &body), "{body}");
         }
         // A stylesheet's rule names a resource for the elements it matches.
         assert!(!converts_hidden(
