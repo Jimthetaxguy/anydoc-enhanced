@@ -4450,13 +4450,15 @@ struct DocxCounters {
 impl DocxCounters {
     /// Count a paragraph at `level` and return its number: `start` when the
     /// level first counts or restarts, one more otherwise. Deeper levels
-    /// restart as their `w:lvlRestart` says.
+    /// restart as their `w:lvlRestart` says, where `follow_restart`, and
+    /// otherwise after any shallower level, as LibreOffice restarts them.
     fn next(
         &mut self,
         level: usize,
         start: u64,
         restart_at: Option<u64>,
         levels: &[DocxLevel; DOCX_LIST_LEVELS],
+        follow_restart: bool,
     ) -> u64 {
         if let Some(start) = restart_at {
             self.value[level] = start;
@@ -4468,7 +4470,7 @@ impl DocxCounters {
         self.started[level] = true;
         self.restart_pending[level] = false;
         for (deeper, definition) in levels.iter().enumerate().skip(level + 1) {
-            let restarts = match definition.restart {
+            let restarts = match definition.restart.filter(|_| follow_restart) {
                 None => true,
                 Some(0) => false,
                 Some(shallower) => (level as u64) < u64::from(shallower),
@@ -5142,7 +5144,10 @@ impl DocxNumberings {
     /// the endnotes; it advances only the levels it numbers, restarts a
     /// level at its override whenever it restarts, and starts at 1 where a
     /// level names no start. A paragraph Word does not show, such as one
-    /// whose mark is deleted, still takes a number in AnyDoc.
+    /// whose mark is deleted, still takes a number in AnyDoc. Word restarts
+    /// a level as its `w:lvlRestart` says, and LibreOffice after any
+    /// shallower level: where the two count a label apart, what Word shows
+    /// is uncertain.
     fn numbers_differ(&self, scan: &DocxStoryScan, styles: &DocxStyleNumbering) -> bool {
         let mut word = DocxReading::new(true, &self.word, &styles.styles);
         let mut anydoc = DocxReading::new(false, &self.anydoc, &styles.anydoc_styles);
@@ -5160,8 +5165,10 @@ impl DocxNumberings {
         if Self::notes_out_of_order(scan, &resolved) {
             return true;
         }
-        // Word's stories: a part, or `None` for the text boxes.
+        // Word's stories: a part, or `None` for the text boxes; its counters,
+        // and LibreOffice's.
         let mut word_counters: HashMap<(Option<DocxPart>, usize), DocxCounters> = HashMap::new();
+        let mut libre_counters: HashMap<(Option<DocxPart>, usize), DocxCounters> = HashMap::new();
         let mut anydoc_counters: HashMap<u64, DocxCounters> = HashMap::new();
         let mut restarted: HashSet<(Option<DocxPart>, u64)> = HashSet::new();
         let in_order = [DocxPart::Body, DocxPart::Footnotes, DocxPart::Endnotes]
@@ -5186,7 +5193,7 @@ impl DocxNumberings {
                             instance.starts[level].unwrap_or_else(|| shape.levels[level].start())
                         };
                         let counters = anydoc_counters.entry(list).or_default();
-                        let value = counters.next(level, start(level), None, &shape.levels);
+                        let value = counters.next(level, start(level), None, &shape.levels, true);
                         shape.anydoc_label(level, value, counters, start)
                     }
                     Some(instance) if instance.shape.markers[level] == DocxMarker::Bullet => {
@@ -5216,17 +5223,34 @@ impl DocxNumberings {
                         let story = (!paragraph.in_text_box).then_some(paragraph.part);
                         let restart_at =
                             instance.starts[level].filter(|_| restarted.insert((story, list)));
-                        let counters = word_counters
-                            .entry((story, instance.definition))
-                            .or_default();
-                        counters.imply_parents(level, &shape.levels);
-                        let value = counters.next(
-                            level,
-                            shape.levels[level].word_start(),
-                            restart_at,
-                            &shape.levels,
+                        let label = |counters: &mut DocxCounters, follow_restart: bool| {
+                            counters.imply_parents(level, &shape.levels);
+                            let value = counters.next(
+                                level,
+                                shape.levels[level].word_start(),
+                                restart_at,
+                                &shape.levels,
+                                follow_restart,
+                            );
+                            shape.word_label(level, value, counters)
+                        };
+                        let shown = label(
+                            word_counters
+                                .entry((story, instance.definition))
+                                .or_default(),
+                            true,
                         );
-                        shape.word_label(level, value, counters)
+                        let libre = label(
+                            libre_counters
+                                .entry((story, instance.definition))
+                                .or_default(),
+                            false,
+                        );
+                        if shown == libre {
+                            shown
+                        } else {
+                            DocxLabel::Unknown
+                        }
                     }
                     None => DocxLabel::Nothing,
                 },
@@ -15592,6 +15616,23 @@ mod tests {
             &format!("{decimal}{letters}"),
             &overridden_twice
         ));
+        // LibreOffice applies no `w:lvlRestart`, where Word and AnyDoc do: a
+        // level never restarting counts on in Word ("b)") and afresh in
+        // LibreOffice ("a)"), so what Word shows is uncertain; a restart
+        // after level 0, as by default, counts alike.
+        for (restart, apart) in [("0", true), ("1", false)] {
+            let restarting = level(
+                r#"w:ilvl="1""#,
+                &format!(
+                    r#"<w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlRestart w:val="{restart}"/><w:lvlText w:val="%2)"/>"#
+                ),
+            );
+            assert_eq!(
+                differs(&nested, &format!("{decimal}{restarting}"), ""),
+                apart,
+                "{restart}"
+            );
+        }
         // A number element without its `w:val` is 0 to Word: a list instance
         // naming its definition with an unprefixed value takes definition 0.
         let definitions = |named: &str| {
