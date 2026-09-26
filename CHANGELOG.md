@@ -605,6 +605,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     runs as the scan acts on it, its paths left out, and is charged for
     that alone: a 1,000-page statement is checked through in 9.9 s, where
     pages 726 to 1,000 had gone unchecked in 15.3 s.
+  - PDF Japanese, Chinese, and Korean fonts (#573): a 2.2 KB file whose
+    font, used only in a form whose `/Resources` is given by reference,
+    embeds a program whose format-12 cmap holds 2,000 groups each covering
+    U+0000 to U+10FFFF ran past the worker's 25-second deadline, and the
+    whole conversion was lost: the check read the program, which
+    pdf-inspector never reads for a font it does not collect. Such a font
+    now gets no program or table fallback; the file converts in 0.1 s, its
+    "5PUBMXBHFT" for "Total wages 52,000.00" reported as
+    `cjk_text_misread`.
+  - Kanji under the UTF-16 CMaps (`UniJIS-UTF16-H`, `UniCNS-UTF16-H`,
+    `UniKS-UTF16-H`, `UniJIS2004-UTF16-H`), which lopdf does not decode, so
+    that pdf-inspector reads them byte by byte ("住民税は中止" as
+    "OOlz0oN-kb"), and under the 7-bit two-byte CMaps `H`, `V`, `GB-H`, and
+    `KSC-H` ("源泉徴収票の支払金額" as "8;@tD'<}I<$N;YJ'6b3["), converted
+    with no warning; both are reported. UTF-16 CMaps are read as UCS-2 ones
+    were, UTF-32 ones by their four-byte codes, and a string under another
+    predefined CMap is reported where it holds a printable byte past the
+    space. CMaps whose single bytes are ASCII (RKSJ, EUC, Big Five, GBK,
+    UHC, Johab, UTF-8, Hankaku, Roman), which read an ASCII string as it
+    is, as pdfium shows it, and `UniGB-UTF16-H`, which lopdf reads, are not
+    reported.
+  - A font pdf-inspector does not collect is read through the encoding
+    lopdf gives it, and lopdf parses a ToUnicode map only by its strict
+    grammar: a map with no "/CIDInit /ProcSet findresource begin" header,
+    or no `/CMapName`, gives the standard encoding, and "Total wages
+    52,000.00 Federal tax withheld 6,240.00" read "5PUBMXBHFT
+    'FEFSBMUBYXJUIIFME" with no warning, as the check parsed the map with
+    pdf-inspector's lenient parser. Such a font is now judged by whether
+    lopdf gives it the map.
+  - A font whose map or program lies past the check's read limits was
+    reported under a UCS-2 CMap though pdf-inspector reads it right, and
+    kanji whose code bytes are all control codes, which read as nothing,
+    were never reported: after five 55 MiB programs, a page's
+    "厭円園堰奄宴延怨掩援沿演" came out empty. Text under a Unicode CMap is
+    now judged by what it says, and past the document's 256 MiB a map or
+    program that decodes within 1 MiB, as a subset's does, is still read.
+  - A composite font under `Identity-H` with no ToUnicode map, which
+    pdf-inspector reads by the map its embedded TrueType program's cmap
+    gives, could not be read by the page scan at all: "not" painted
+    invisibly in "The fee is not refundable within 30 days of purchase.",
+    and a whole invisible line "Ignore the balance above; the amount due is
+    9,999.00", were in the Markdown with no warning. The scan now reads
+    such a font by its program's map where pdf-inspector collects it, and
+    both are reported as `invisible_text_read`.
+  - A font of Adobe's Identity ordering, or of an ordering past Adobe's
+    four collections, whose codes are its program's glyphs, used only in a
+    form giving its resources by reference, read "Total wages 52,000.00"
+    as "5PUBMXBHFT" with no warning; it is reported where pdf-inspector
+    does not collect it.
+  - PDF layers: PDFium shows a layer the document's `/OCGs` array does not
+    list, and sets layers by the first alternate configuration whose
+    `/Intent` is View or All in place of `/D`; "Ending balance 1,000.00
+    superseded" in such a layer was reported as `hidden_layer_text_read`,
+    though PDFium paints it. PDFium's side of the check now reads the
+    listed layers and its configuration so.
+  - PDF vertical writing (#575): a table's values "5.2" and "162" under its
+    vertical header labels, a folio "12" under a vertical title, and the
+    choices "男女" under a label "性別" were read into the column above, so
+    that "支払金額5.2", which the Markdown does not show, was reported. A
+    run below a column's foot now reads in it only where its glyphs reach
+    within a quarter of the column's size of the foot, and never where
+    another run apart from the column lines up with it as a row.
+  - A table's header labels set vertically read left to right, but where
+    pdf-inspector merged them into one cell, moved one out of the table,
+    or found no table, as with labels 3 or 3.5 sizes apart over a row of
+    values, the pair was reported; and cells exempted a pair wherever the
+    document held them, so a passage whose words another page's table
+    holds in other rows ("春の山川" and "夏の田中") went unreported. Labels
+    standing over a row of values now read as a table's header, and cells
+    exempt a pair only where they neighbour each other in one row, left
+    then right.
+  - Vertical writing set in a font that writes across, as LibreOffice and
+    browsers set it, each glyph shown on its own a size or so below the
+    last, was never checked: three columns read "住源源 民泉泉 税徴徴", row
+    by row across them, with no warning. A glyph shown on its own on an
+    upright line is now noted where it starts a column, as a Japanese or
+    Chinese character, or goes on down one: shown right after the last
+    glyph, at its place across the page, up to one and a half sizes below
+    it. A glyph set alone between digits set sideways, as LibreOffice sets
+    "令和12年5月1日", stands in its column up to four sizes below the one
+    before it. Such columns are reported as `vertical_text_misread` as a
+    vertical font's are, and horizontal text set glyph by glyph, let go a
+    glyph at a time, takes no room.
+  - Latin words and digits set sideways in a column of vertical writing,
+    turned a quarter turn to read down it, were left out of the column's
+    text: "源泉徴収票" then "PDF" then "の発行は別に通知", which the Markdown
+    reads in order, was reported, and "源泉徴収票" then "2025" then
+    "年分の発行", from which pdf-inspector drops "2025", was not. Such a run
+    now reads in its column where it starts.
+  - PDF annotations: a stamp or watermark holding no text of its own,
+    whose appearance draws "RECEIVED APR 15 2025", was passed over, as the
+    check looked only for its `/Contents` or rich text. Its appearance is
+    now read for the text it draws, as a form field's appearance is, and
+    through the forms it draws, and the stamp is reported as
+    `annotation_text_unread` where the Markdown does not show that text.
+  - The annotation check counted every text box, line, stamp, and
+    watermark against its bound of 10,000, whether it showed text or not,
+    and then stopped with no sign: a sheet marked up with 10,000 lines
+    without a caption, or 10,000 stamps drawn as pictures, hid "Reviewer:
+    replace beam B-12 before sign-off" on the next sheet. Only annotations
+    showing text now count, and past the bound each page holding one that
+    may show text carries the new `annotation_text_unchecked` warning.
+  - PDF forms: a widget whose box has no area, or stands wholly off its
+    page's box, shows nothing, but a text field drawn only by such a
+    widget's appearance, "Tax year 2025", was reported as a value
+    pdf-inspector leaves out. Such a widget is now passed over as a hidden
+    one is.
+  - pdf-inspector counts each widget of a field as an entry against its
+    walk's bound of 100,000. Where the bound fell before the widget holding
+    the field's value, "Refund 4,815.00", or before the field,
+    pdf-inspector wrote nothing and a viewer showed the refund, with no
+    warning. The widget's value is now reported: with 99,995 entries
+    before the field pdf-inspector writes it, and with 99,996 or more it is
+    reported as `form_values_misread`.
 - Review round thirteen checked the round-twelve fixes:
   - PDF invisible text (#572): a word or a digit slipped invisibly into a line
     and set a point or so above or below it opened a line of its own, or
@@ -1420,85 +1534,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The PDF warnings added since loop 18 disclose what their checks can read,
   and no more. A doubled run past the first 10,000 doubled occurrences of a
   document is not found; page text in a font bound only by resources a page
-  inherits as a direct dictionary, which pdf-inspector reads byte by byte,
-  is not reported, as only forms are checked; and a label and its value in
-  one text object, with no space glyph and a gap under half an em, still
-  read as one word. A stamp or text box whose text is only in its
-  appearance, with no `/Contents` or rich text, a redaction's overlay text,
-  and text a shape's appearance draws are not read. A form value flattened
+  inherits as a direct dictionary, which pdf-inspector reads byte by byte, is
+  not reported, as only forms are checked; and a label and its value in one
+  text object, with no space glyph and a gap under half an em, still read as
+  one word. A text box whose text is only in its appearance, with no
+  `/Contents` or rich text, a redaction's overlay text, and text a shape's
+  appearance draws are not read; a stamp's appearance is read for its text
+  only where it holds none of its own, through forms 8 deep within the 16 MiB
+  a document's appearances are read to, its strings in one text object run
+  together, and a form drawn with no font of its own set, or in a font the
+  scan cannot read, gives none. Annotations are read until 10,000 that show
+  text; the pages holding more are named as `annotation_text_unchecked`. A
+  widget is taken to show nothing only where its box has no area or stands
+  wholly off its page's box, not where a clip or its appearance's own box
+  hides it. Past twice pdf-inspector's bound on the form's entries, 200,000,
+  the form walk ends, and values past it are not named. A form value flattened
   into the page among other text may be named, and an XFA placeholder page
-  without the needs-rendering flag, or a static XFA form whose values are
-  only in its datasets, is not; nor is a check box whose appearance state
-  is off while its value is on, which pdf-inspector writes as its value
-  though viewers show the box empty, choices
-  a parent field lists for its kids, or forms a field's appearance draws. A running header's text the Markdown shows
-  elsewhere, as in a transfer line, counts as shown; a count after a page
-  word no higher than the page's number reads as a page number begun
-  afresh; and where the page scan cannot read a run's text, or runs out of
-  its budget, or the document holds form fields, every page is read again
-  for the running-header rule, within the call's time, and pages left
-  unread are disclosed as `header_footer_unchecked`. Invisible text is looked for on the pages the repeat
-  check reads, but not on a page listed as needing OCR; a page images cover
-  whose text mostly paints nothing is reported for OCR as a scan, and
-  invisible text on it is not looked for, whatever it says, while the OCR
-  layer of a small scanned image, such as a receipt set into a letter, is
-  reported as invisible text; text pdf-inspector reads only through its
-  retry of a document with no visible text, and clip-only text (render
-  mode 7), are not reported; and a run too short to look for alone is
-  looked for with the eight characters on either side of it, and with
-  those before it and those after it apart, as pdf-inspector reads the
-  page's lines, so one whose neighbours read otherwise, as across columns
-  pdf-inspector sets apart or on a line of runs set upside down, which it
-  orders by where they end, is not reported, nor is text that short a
-  marked-content span gives its glyphs (`/ActualText`), nor a run made only
-  of marks the comparison sets aside, such as `*`, `#`, `_`, or `|`. A
-  span's text that says otherwise than the glyphs a reader sees in it is
-  reported only where their digits differ: a word given in place of a
-  sentence holding no number is not, nor a word a span adds over glyphs a
-  reader sees, nor text a span gives over a form it draws.
-  A page's unseen text past 64 KiB, or a
-  document's past 4 MiB, is reported without being looked for where its
-  middle stands on the page, and left out where it stands off it, where
-  pdf-inspector may leave out a neighbouring page's text on an imposed
-  sheet. Text set off the box a viewer shows is judged string by string, by
-  the middle of its baseline: a string whose middle stands on the page,
-  though its end runs past the edge, is not reported, nor is one set upside
-  down whose glyphs hang off the page from a baseline on it; a Type 3
-  font's widths are cut to whole units, as pdf-inspector cuts them, where
-  a viewer places glyphs by their fractions. Whether pdf-inspector left the
-  text out is read from what it keeps on the page, for 64 pages within
-  four seconds; past them it is judged from the strings shown, where
-  pdf-inspector joins them into runs and splits `TJ` arrays at column gaps.
-  Lines pdf-inspector's own clip leaves out though part of them shows are
-  not reported. Off-page text past 64 KiB a page is reported without being
-  looked for, unless pdf-inspector would leave it out, and past 100,000
-  runs a page is taken to be kept. Text in a form pdf-inspector's walk of a
-  page's forms stops inside, past a million operations, is not reported;
-  the forms after it are. Visible
-  text pdf-inspector skips as invisible is reported where `Tr` sets the
-  modes apart (`visible_text_unread`), but not on a page listed as needing
-  OCR; white text on a dark fill in a form, which it drops as white text,
-  is not reported. Past the scan's own limits, the pages it could not
-  reach are disclosed as `pages_unchecked`. A Japanese, Chinese, or Korean
-  font's map is judged as pdf-inspector looks for one, but for the
+  without the needs-rendering flag, or a static XFA form whose values are only
+  in its datasets, is not; nor is a check box whose appearance state is off
+  while its value is on, which pdf-inspector writes as its value though
+  viewers show the box empty, choices a parent field lists for its kids, or
+  forms a field's appearance draws. A running header's text the Markdown shows
+  elsewhere, as in a transfer line, counts as shown; a count after a page word
+  no higher than the page's number reads as a page number begun afresh; and
+  where the page scan cannot read a run's text, or runs out of its budget, or
+  the document holds form fields, every page is read again for the
+  running-header rule, within the call's time, and pages left unread are
+  disclosed as `header_footer_unchecked`. Invisible text is looked for on the
+  pages the repeat check reads, but not on a page listed as needing OCR; a
+  page images cover whose text mostly paints nothing is reported for OCR as a
+  scan, and invisible text on it is not looked for, whatever it says, while
+  the OCR layer of a small scanned image, such as a receipt set into a letter,
+  is reported as invisible text; text pdf-inspector reads only through its
+  retry of a document with no visible text, and clip-only text (render mode
+  7), are not reported; and a run too short to look for alone is looked for
+  with the eight characters on either side of it, and with those before it and
+  those after it apart, as pdf-inspector reads the page's lines, so one whose
+  neighbours read otherwise, as across columns pdf-inspector sets apart or on
+  a line of runs set upside down, which it orders by where they end, is not
+  reported, nor is text that short a marked-content span gives its glyphs
+  (`/ActualText`), nor a run made only of marks the comparison sets aside,
+  such as `*`, `#`, `_`, or `|`. A span's text that says otherwise than the
+  glyphs a reader sees in it is reported only where their digits differ: a
+  word given in place of a sentence holding no number is not, nor a word a
+  span adds over glyphs a reader sees, nor text a span gives over a form it
+  draws. A page's unseen text past 64 KiB, or a document's past 4 MiB, is
+  reported without being looked for where its middle stands on the page, and
+  left out where it stands off it, where pdf-inspector may leave out a
+  neighbouring page's text on an imposed sheet. Text set off the box a viewer
+  shows is judged string by string, by the middle of its baseline: a string
+  whose middle stands on the page, though its end runs past the edge, is not
+  reported, nor is one set upside down whose glyphs hang off the page from a
+  baseline on it; a Type 3 font's widths are cut to whole units, as
+  pdf-inspector cuts them, where a viewer places glyphs by their fractions.
+  Whether pdf-inspector left the text out is read from what it keeps on the
+  page, for 64 pages within four seconds; past them it is judged from the
+  strings shown, where pdf-inspector joins them into runs and splits `TJ`
+  arrays at column gaps. Lines pdf-inspector's own clip leaves out though part
+  of them shows are not reported. Off-page text past 64 KiB a page is reported
+  without being looked for, unless pdf-inspector would leave it out, and past
+  100,000 runs a page is taken to be kept. Text in a form pdf-inspector's walk
+  of a page's forms stops inside, past a million operations, is not reported;
+  the forms after it are. Visible text pdf-inspector skips as invisible is
+  reported where `Tr` sets the modes apart (`visible_text_unread`), but not on
+  a page listed as needing OCR; white text on a dark fill in a form, which it
+  drops as white text, is not reported. Past the scan's own limits, the pages
+  it could not reach are disclosed as `pages_unchecked`. A Japanese, Chinese,
+  or Korean font's map is judged as pdf-inspector looks for one, but for the
   Macintosh glyph order it may read a program by, and a ToUnicode map it
-  parses is taken to read the font however sparse it is; a program past
-  64 MiB, or past 256 MiB read in a document, is not read, and its font is
-  reported only where the Markdown shows its text as read with no map;
-  text under a predefined CMap other than an Identity or UCS-2 one is not
-  checked, nor is invisible text under a UTF-16 CMap with no ToUnicode
-  map, which pdf-inspector reads as UTF-16; a page whose every such string
-  pdf-inspector marks with U+FFFD is left to its own garbled-text reason;
-  and a page whose misread text is only digits and marks, which drop out,
-  stands where the Markdown shows them elsewhere. Vertical writing is placed a glyph an em down its
-  column, whatever the font's vertical metrics say, and only on upright
-  pages set in a vertical CMap, so columns emulated in a horizontal font,
-  or turned with the page's space, are not checked; a column's text the
-  Markdown shows elsewhere, as in a table of the same labels, counts as
-  shown; and columns under a CMap the scan cannot read, which is any
-  predefined vertical CMap but `Identity-V` or a UCS-2 one with a
-  ToUnicode map, are reported wherever two stand side by side, without
-  the Markdown to confirm it.
+  parses is taken to read the font however sparse it is; a program past 64
+  MiB, or past 256 MiB read in a document, is not read, and its font is
+  reported only where the Markdown shows its text as read with no map; text
+  under a UTF-8 CMap, or one whose single bytes are ASCII (RKSJ, EUC, Big
+  Five, GBK, UHC, Johab, Hankaku, Roman), is not checked; under another
+  predefined CMap whose codes are not Unicode, such as `H` or `GB-H`, a string
+  is reported wherever it holds a printable byte past the space, without the
+  Markdown to confirm what it says, and a string of an odd number of bytes is
+  not judged; nor is invisible text under a UTF-16 CMap with no ToUnicode map,
+  which pdf-inspector reads as UTF-16, checked. A font pdf-inspector does not
+  collect whose map lopdf's grammar parses is taken to read right; a font of
+  the Identity ordering, or of one past Adobe's four collections, that
+  pdf-inspector collects is not judged; and a font past the read limits whose
+  text reads as nothing with no map is reported only where its map or program
+  decodes within 1 MiB. A page whose own font embeds a program with thousands
+  of format-12 cmap groups over the whole of Unicode still runs past the
+  deadline, in pdf-inspector's own reading; a page whose every such string
+  pdf-inspector marks with U+FFFD is left to its own garbled-text reason; and
+  a page whose misread text is only digits and marks, which drop out, stands
+  where the Markdown shows them elsewhere. Vertical writing is placed a glyph
+  an em down its column, whatever the font's vertical metrics say, and only on
+  upright pages, so columns turned with the page's space are not checked.
+  Columns emulated in a font that writes across are found only where each
+  glyph is shown on its own and the next glyph of the column is shown right
+  after it: a column whose glyphs are shown row by row, a Korean column, and a
+  lone glyph at a column's head, before a word set sideways, are not, and a
+  glyph set more than four sizes below the one before it, past a long word set
+  sideways, starts the column again. Text set sideways reads in a column only
+  where it is turned to read down the page; a column's text the Markdown shows
+  elsewhere, as in a table of the same labels, counts as shown; and columns
+  under a CMap the scan cannot read, which is any predefined vertical CMap but
+  `Identity-V` or a UCS-2 or UTF-16 one with a ToUnicode map, are reported
+  wherever two stand side by side, without the Markdown to confirm it.
 - DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
   restore it; the Markdown shows the joined words.
 - DOCX list checks follow ECMA-376 where Word and LibreOffice part: a
