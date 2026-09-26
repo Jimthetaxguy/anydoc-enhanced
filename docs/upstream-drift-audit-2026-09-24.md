@@ -169,7 +169,7 @@ document-controlled free text and are not copied into responses.
 
 ## AnyDoc open pull requests
 
-AnyDoc has no release after 0.2.4. It had 58 open pull requests on 2026-09-25.
+AnyDoc has no release after 0.2.4. It had 58 open pull requests on 2026-09-25, and 60 on 2026-09-26, the two new ones (#179, #180) read from their pages.
 Each was fetched from its `refs/pull/*/head` ref and compared with the pinned
 parser. The table below lists them by their titles; an earlier revision of
 this audit named some by their latest commit, and listed #160, closed on
@@ -177,6 +177,8 @@ this audit named some by their latest commit, and listed #160, closed on
 
 | PR | Title | Local disposition |
 |---|---|---|
+| #180 | fix(markdown): slug a heading line break as the space it renders | Link targets only: a heading holding a manual line break renders the break as a space, but the slug links to it use drops it, so a table of contents entry points at no heading. No text is lost; no local check. |
+| #179 | fix(docx): keep non-breaking hyphens | The pinned parser drops `w:noBreakHyphen`, joining the text on either side ("Form 1040‑SR" converts as "Form 1040SR"); the local DOCX preflight discloses it as omitted characters. The PR writes a hyphen. |
 | #177 | fix(docx): preserve symbol checkbox states | The pinned parser drops every `w:sym`. The local DOCX preflight refuses symbols, legacy form checkboxes, and drop-downs outside tracked deletions (`incomplete_conversion`). The PR renders four Wingdings / Wingdings 2 checkbox codes; after adoption the refusal can relax for exactly those. |
 | #176, #174 | fix(doc): preserve symbol checkbox states; omit deleted revision text | Legacy `.doc` only; that lane is disabled. |
 | #175 | fix(pdf): bump pdf-inspector to 1.20.0 so RTL text extracts in logical order | Superseded: this repository calls pdf-inspector 1.24.0 directly for PDFs. |
@@ -404,7 +406,8 @@ When AnyDoc publishes a release after 0.2.4:
 1. Add wildcard arms for the non-exhaustive `Format` (#154) that map to
    unrecognized or disabled.
 2. If #177 is included, allow the four rendered Wingdings checkbox codes. Keep
-   refusing every other `w:sym`, `w:checkBox`, and `w:ddList`.
+   refusing every other `w:sym`, `w:checkBox`, and `w:ddList`. If #179 is
+   included, stop disclosing `w:noBreakHyphen` as an omitted character.
 3. Keep the number-format refusal even if #148 lands. Upstream renders long
    codes as General, which is lossy.
 4. Re-run the hardening corpus and the golden comparison, and re-check the

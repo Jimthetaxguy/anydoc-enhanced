@@ -9,7 +9,7 @@ selected production revisions are recorded here.
 | Logical mirror | Repository | Local production reference | Latest release observed | Upstream `main` observed | License | Audit date |
 |---|---|---|---|---|---|---|
 | `firecrawl-pdf-inspector` | <https://github.com/firecrawl/pdf-inspector> | crates.io `1.25.0`, checksum `4c7bbb3b63dec43a1c849508e0da95833af6185649f121e41fc3cbd2d3b2e639`; PDF parsing runs in the bounded worker | `1.25.0`, released 2026-09-25 with no Git tag; the package matches `main` | `2dbd16b3ea4ea943af2802bd72e45dd264eacb9f` (the 1.25.0 release, #593); 113 open pull requests scanned | MIT | 2026-09-26 |
-| firecrawl-anydoc | https://github.com/firecrawl/anydoc | crates.io anydoc 0.2.4, checksum recorded in Cargo.lock; local worker enables DOCX, exact PPTX, XLSX, ODS, ODT, Linux-memory-gated ODP, and Linux-memory-gated strict EPUB | v0.2.4 at 42bf1c5ecdde9eb0d96d6bd75a9e6698cf93b14c (still the latest release) | 261fc257d17c3eab0f673be31c408fd9fdc2171a (README only after the tag); all 58 open pull requests reviewed | MIT | 2026-09-25 |
+| firecrawl-anydoc | https://github.com/firecrawl/anydoc | crates.io anydoc 0.2.4, checksum recorded in Cargo.lock; local worker enables DOCX, exact PPTX, XLSX, ODS, ODT, Linux-memory-gated ODP, and Linux-memory-gated strict EPUB | v0.2.4 at 42bf1c5ecdde9eb0d96d6bd75a9e6698cf93b14c (still the latest release) | 261fc257d17c3eab0f673be31c408fd9fdc2171a (README only after the tag); all 60 open pull requests reviewed (#179 and #180 on 2026-09-26) | MIT | 2026-09-26 |
 
 Local sibling mirror conventions:
 
