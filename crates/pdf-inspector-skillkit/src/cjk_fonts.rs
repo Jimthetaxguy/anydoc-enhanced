@@ -41,11 +41,16 @@ const ASCII_CIDS: std::ops::RangeInclusive<u16> = 1..=95;
 
 /// Bytes of maps and font programs read per document to tell whether
 /// pdf-inspector finds a map; past them, a font is not judged (see
-/// `Unmapped::judged`).
+/// `Unmapped::judged`), but where its map or program is small.
 const MAX_READ_BYTES: usize = 256 << 20;
 /// Bytes one map or program may decode to; past them, its font is not
 /// judged.
 const MAX_STREAM_BYTES: usize = 64 << 20;
+/// Bytes a map or program decodes to at most to be read past
+/// `MAX_READ_BYTES`, up to `MAX_SMALL_READ_BYTES` more in all, as a
+/// subset's program is, however large the programs read before it.
+const MAX_SMALL_STREAM_BYTES: usize = 1 << 20;
+const MAX_SMALL_READ_BYTES: usize = 64 << 20;
 /// Distinct CIDs of a font's widths pdf-inspector reads, at most.
 const MAX_WIDTH_CIDS: usize = 65_536;
 
@@ -63,10 +68,13 @@ pub(crate) struct Unmapped {
     /// cannot read; else as the byte it is, as for a predefined CMap lopdf
     /// names but cannot read.
     pub(crate) standard: bool,
-    /// Whether it is told to have no map; else it may have one, as its
-    /// program was past the bytes read (`MAX_STREAM_BYTES`,
-    /// `MAX_READ_BYTES`), and its text is looked for only as pdf-inspector
-    /// reads it with none.
+    /// Whether its text is judged by what it says: where it is told to
+    /// have no map, or where its codes are Unicode, whose reading the
+    /// Markdown shows if pdf-inspector finds a map after all. Else it may
+    /// have one, as its map or program was past the bytes read
+    /// (`MAX_STREAM_BYTES`, `MAX_READ_BYTES`), and its text is looked for
+    /// only as pdf-inspector reads it with none, which is never what a
+    /// collection's CIDs say.
     pub(crate) judged: bool,
 }
 
@@ -360,13 +368,18 @@ fn dictionary<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Dict
 }
 
 /// A stream's content as pdf-inspector reads it, decoded where it can be,
-/// counted against `read`; None past `MAX_READ_BYTES` in all, or where it
-/// decodes past `MAX_STREAM_BYTES`.
+/// counted against `read`; None where it decodes past `MAX_STREAM_BYTES`,
+/// or, past `MAX_READ_BYTES` read in all, past `MAX_SMALL_STREAM_BYTES`,
+/// and past the small streams' bytes, at all.
 fn content(stream: &Stream, read: &mut usize) -> Option<Vec<u8>> {
-    if *read >= MAX_READ_BYTES {
+    let limit = if *read < MAX_READ_BYTES {
+        MAX_STREAM_BYTES
+    } else if *read < MAX_READ_BYTES + MAX_SMALL_READ_BYTES {
+        MAX_SMALL_STREAM_BYTES
+    } else {
         return None;
-    }
-    let data = match stream.decompressed_content_with_limit(MAX_STREAM_BYTES) {
+    };
+    let data = match stream.decompressed_content_with_limit(limit) {
         Ok(data) if !data.is_empty() => data,
         Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => {
             return None;
@@ -532,12 +545,16 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
     };
     // lopdf gives an encoding only to a dictionary typed as a font.
     let standard = codes == Codes::Cids && font.has_type(b"Font");
+    // Text whose codes are Unicode says what it is, so its reading with no
+    // map, the same where it says ASCII, is never taken to show the font
+    // has none.
+    let unicode = matches!(codes, Codes::Utf16 | Codes::Utf32);
     let unmapped = |passthrough: bool, judged: bool| {
         Some(Unmapped {
             passthrough,
             codes,
             standard,
-            judged,
+            judged: judged || unicode,
         })
     };
     let bytes = unmapped(false, true);
@@ -911,6 +928,16 @@ mod tests {
         build: impl FnOnce(&mut Document) -> Dictionary,
         on_page: bool,
     ) -> (Option<Unmapped>, CjkFonts) {
+        judging_after(0, build, on_page)
+    }
+
+    /// How `font` is judged (see `judged_where`) once `read` bytes of maps
+    /// and programs have been read, with what was read to judge it.
+    fn judging_after(
+        read: usize,
+        build: impl FnOnce(&mut Document) -> Dictionary,
+        on_page: bool,
+    ) -> (Option<Unmapped>, CjkFonts) {
         let mut document = Document::with_version("1.7");
         let font = build(&mut document);
         let font = document.add_object(font);
@@ -948,7 +975,10 @@ mod tests {
         let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
         document.trailer.set("Root", catalog);
         let font = document.get_dictionary(font).unwrap();
-        let mut fonts = CjkFonts::default();
+        let mut fonts = CjkFonts {
+            read,
+            ..CjkFonts::default()
+        };
         (fonts.font(&document, font), fonts)
     }
 
@@ -1226,6 +1256,53 @@ mod tests {
                 ..BYTES.unwrap()
             })
         );
+    }
+
+    #[test]
+    fn small_programs_are_read_past_the_bytes_a_document_reads() {
+        // Past the bytes a document reads, a subset's program is still
+        // read: one with no map leaves the font's text read byte by byte,
+        // one with a map reads it; past the small streams' bytes, or past
+        // a small stream's, no program is read.
+        let small = |map: bool| {
+            move |document: &mut Document| {
+                let groups: &[(u32, u32, u32)] = if map { &[(0x20, 0x7E, 1)] } else { &[] };
+                let program = ("FontFile2", truetype(groups));
+                type0(
+                    cid_font(document, "Japan1", Some(program)),
+                    "Identity-H".into(),
+                )
+            }
+        };
+        let unjudged = Some(Unmapped {
+            judged: false,
+            ..BYTES.unwrap()
+        });
+        assert_eq!(judging_after(MAX_READ_BYTES, small(false), true).0, BYTES);
+        assert_eq!(judging_after(MAX_READ_BYTES, small(true), true).0, None);
+        let spent = MAX_READ_BYTES + MAX_SMALL_READ_BYTES;
+        assert_eq!(judging_after(spent, small(false), true).0, unjudged);
+        let large = |document: &mut Document| {
+            let mut program = truetype(&[]);
+            program.resize(MAX_SMALL_STREAM_BYTES + 1, 0);
+            type0(
+                cid_font(document, "Japan1", Some(("FontFile2", program))),
+                "Identity-H".into(),
+            )
+        };
+        assert_eq!(judging_after(0, large, true).0, BYTES);
+        assert_eq!(judging_after(MAX_READ_BYTES, large, true).0, unjudged);
+        // Unicode text whose map is past the bytes read is judged by what
+        // it says, which its reading with no map, where it is ASCII, is.
+        let ucs2 = |document: &mut Document| {
+            let mut map = Stream::new(dictionary! {}, vec![b' '; MAX_STREAM_BYTES + 1]);
+            map.compress().unwrap();
+            let map = document.add_object(map);
+            let mut font = type0(cid_font(document, "Japan1", None), "UniJIS-UCS2-H".into());
+            font.set("ToUnicode", map);
+            font
+        };
+        assert_eq!(judged(ucs2), bytes_as(Codes::Utf16));
     }
 
     #[test]
