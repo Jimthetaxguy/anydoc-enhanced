@@ -497,6 +497,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round fifteen checked the off-page check (loop 30) and the
+  round-fourteen fixes, against pdfium's rendering and pdf-inspector's own
+  reading:
+  - A form drawn once was kept as the scan acts on it, whatever it held, so
+    100 pages each drawing a form of 5,000 glyphs took the worker past its
+    memory limit, at 834 MB, with no Markdown. A form is now kept only when
+    it is drawn again, as a letterhead is, within 32 MiB of what it holds:
+    the same file converts at 89 MB in 2.8 s.
+  - Off-page and invisible runs of thousands of short strings made texts of
+    tens of kilobytes to look for, and the automaton looking for a hundred
+    or fewer was built as a DFA, whose size grows with their length: a 2 KB
+    line of 4,000 strings running off the page timed out. Texts are looked
+    for with an NFA, and the same line converts in 0.08 s.
+  - Whether content pdf-inspector reads nothing of shows text decoded the
+    forms it draws on the scan's own budget, so two 40 MiB forms on a dense
+    page left the whole document unchecked. It now reads within a bound of
+    its own, looks into forms however deep they are drawn, takes content
+    to show text where it draws more XObjects than it notes, passes over
+    text in render mode 3, which paints nothing, and reads a page past 64
+    MiB stream by stream: such a page with no text is no longer reported.
+  - An inline image's data holding `EI 3 Tr (` was read as operators, so
+    the scan took the `Tr` in it for the viewer's and missed a line a viewer
+    paints and pdf-inspector drops. The data is passed over by the length
+    its entries give, as pdfium and lopdf pass it over, and the mode a
+    viewer sets is found where lopdf reads each `Tr`: `3Tr`, one word to
+    pdfium and a mode of 3 to pdf-inspector, now reports its line as
+    `visible_text_unread`, as does text shown outside a text object, which
+    a viewer paints and pdf-inspector drops.
+  - `Tf` is read as pdfium reads it: a font named by a string, which it
+    finds all the same, is no longer reported as text before any font; a
+    `Tf` of one operand, which sets size 0, and text scaled to no width
+    (`0 Tz`), which paint nothing, are reported as invisible.
+  - An outer span left open after a span inside it ended lost the glyphs it
+    showed first, with no sign; and glyphs a reader does not see were
+    matched to a span's text exactly, so "NOT" painted invisibly under a
+    span saying "not" went unreported. Both are reported.
+  - Text off the page was placed with half an em a glyph for a font naming
+    a standard font without widths, which pdf-inspector and pdfium both
+    give the standard font's: a ReportLab paragraph's line in Times ending
+    in a bold word was reported off the page though every glyph shows, and
+    Courier or Helvetica capitals running past the edge were not. Fonts
+    that name a standard font now take its widths. Strings are placed by
+    the text matrix as a viewer keeps it, moved past each string in text
+    space, so a transformation or a form inside a text object, and `T*`
+    with no leading set, which a viewer leaves where it is, are placed
+    right; and text is judged against the box pdfium shows, which differs
+    from pdf-inspector's where a crop box has no area or lies off the
+    page.
+  - Whether pdf-inspector leaves out text set off a page was judged from
+    the strings shown, where it judges runs it has joined on a line and
+    split at column gaps: a neighbouring page's five lines written word by
+    word, and a slug of eleven words, were taken as left out though
+    pdf-inspector keeps them. Where it may have clipped a page, what it
+    keeps there is now read, and text is reported where it keeps a run off
+    its box or running past its side.
+  - Text in forms pdf-inspector's walk of a page's forms does not reach,
+    drawn more than five deep, past 10,000 forms drawn, or past a million
+    of their operations, is reported as `form_text_unread`.
 - Review round fourteen checked the round-thirteen fixes:
   - PDF invisible text (#572): round thirteen looked for a short run slipped
     into a line as the text before it and the text after it, apart; where
@@ -1396,20 +1454,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of marks the comparison sets aside, such as `*`, `#`, `_`, or `|`. A
   span's text that says otherwise than the glyphs a reader sees in it is
   reported only where their digits differ: a word given in place of a
-  sentence holding no number is not.
+  sentence holding no number is not, nor a word a span adds over glyphs a
+  reader sees, nor text a span gives over a form it draws.
   A page's unseen text past 64 KiB, or a
   document's past 4 MiB, is reported without being looked for where its
   middle stands on the page, and left out where it stands off it, where
   pdf-inspector may leave out a neighbouring page's text on an imposed
-  sheet. Text set off the page is judged run by run, as pdf-inspector
-  judges it, by the middle of its baseline: a run whose middle stands on
-  the page, though its end runs past the page's edge, is not reported, nor
-  is one whose middle its font's widths place otherwise than pdf-inspector
-  does, as for a standard font whose widths it supplies itself, where the
-  scan takes half an em a glyph, or a `TJ` array pdf-inspector splits at a
-  column gap, which is judged whole; off-page text past 64 KiB a page is
-  reported without being looked for, unless pdf-inspector would leave it
-  out, and past 100,000 runs a page is taken to be kept. Visible
+  sheet. Text set off the box a viewer shows is judged string by string, by
+  the middle of its baseline: a string whose middle stands on the page,
+  though its end runs past the edge, is not reported, nor is one set upside
+  down whose glyphs hang off the page from a baseline on it; a Type 3
+  font's widths are cut to whole units, as pdf-inspector cuts them, where
+  a viewer places glyphs by their fractions. Whether pdf-inspector left the
+  text out is read from what it keeps on the page, for 64 pages within
+  four seconds; past them it is judged from the strings shown, where
+  pdf-inspector joins them into runs and splits `TJ` arrays at column gaps.
+  Lines pdf-inspector's own clip leaves out though part of them shows are
+  not reported. Off-page text past 64 KiB a page is reported without being
+  looked for, unless pdf-inspector would leave it out, and past 100,000
+  runs a page is taken to be kept. Text in a form pdf-inspector's walk of a
+  page's forms stops inside, past a million operations, is not reported;
+  the forms after it are. Visible
   text pdf-inspector skips as invisible is reported where `Tr` sets the
   modes apart (`visible_text_unread`), but not on a page listed as needing
   OCR; white text on a dark fill in a form, which it drops as white text,

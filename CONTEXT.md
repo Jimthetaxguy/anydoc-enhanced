@@ -44,7 +44,8 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content as AnyDoc's walkers read it |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats as AnyDoc renders them |
 | `crates/pdf-inspector-skillkit/src/text_paints.rs` | PDF pages whose invisible OCR layer pdf-inspector 1.25.0 skips, text they paint twice, and text they set off the page that it reads |
-| `crates/pdf-inspector-skillkit/src/content_ops.rs` | Operators a PDF content stream holds, counted without decoding it, as pdf-inspector 1.25.0 counts them before reading a stream, and the render modes a viewer reads from it |
+| `crates/pdf-inspector-skillkit/src/content_ops.rs` | Operators a PDF content stream holds, counted without decoding it, as pdf-inspector 1.25.0 counts them before reading a stream; whether it shows text a viewer paints; and the render modes a viewer reads from it, found where lopdf reads each `Tr` |
+| `crates/pdf-inspector-skillkit/src/standard_fonts.rs` | The standard fonts' glyph widths, which a font naming one without widths takes in pdf-inspector and a viewer alike |
 | `crates/pdf-inspector-skillkit/src/annotations.rs` | Text PDF annotations show that pdf-inspector 1.25.0 never reads |
 | `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form values pdf-inspector 1.25.0 garbles or leaves out |
 | `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.25.0 drops as running headers that differ from the one it keeps, and the page scan's gate on reading pages again for them |
