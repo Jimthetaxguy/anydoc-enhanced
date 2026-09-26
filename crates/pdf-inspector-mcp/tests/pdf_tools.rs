@@ -2497,6 +2497,51 @@ fn layers_a_viewer_hides_on_opening_are_reported() {
     );
 }
 
+/// A statement page whose superseded balance sits in layer 6, which the
+/// default configuration turns off, with the optional content `properties`
+/// entries besides it.
+fn configured_layer_pdf(properties: &str) -> Vec<u8> {
+    pdf_file(&[
+        format!(
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties << /D << /OFF [6 0 R] >> {properties} >> >>"
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Checking account statement) Tj ET \
+              BT /F1 10 Tf 72 700 Td (Ending balance 2,000.00) Tj ET \
+              /OC /MC0 BDC BT /F1 10 Tf 72 680 Td (Ending balance 1,000.00 superseded) Tj ET EMC",
+        ),
+        b"<< /Type /OCG /Name (Superseded) >>".to_vec(),
+        b"<< /Type /OCG /Name (Other) >>".to_vec(),
+    ])
+}
+
+#[test]
+fn layers_pdfium_shows_are_not_reported() {
+    let results = convert_all(&[
+        configured_layer_pdf("/OCGs [6 0 R 7 0 R]"),
+        // PDFium shows a layer the document does not list, and sets layers
+        // by an alternate configuration meant for viewing in place of the
+        // default one; not by one with no intent.
+        configured_layer_pdf("/OCGs [7 0 R]"),
+        configured_layer_pdf("/OCGs [6 0 R 7 0 R] /Configs [<< /Name (Screen) /Intent /View >>]"),
+        configured_layer_pdf("/OCGs [6 0 R 7 0 R] /Configs [<< /Name (Other) >>]"),
+    ]);
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("1,000.00 superseded"), "{markdown}");
+    }
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results, "hidden_layer_text_read"),
+        [one.clone(), None, None, one]
+    );
+}
+
 /// A statement page with a form whose superseded balance is a text field on
 /// a widget in a layer that is off unless `shown`.
 fn layered_field_pdf(shown: bool) -> Vec<u8> {

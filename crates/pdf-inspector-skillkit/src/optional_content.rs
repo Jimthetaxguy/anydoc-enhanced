@@ -58,13 +58,49 @@ enum Key {
     Address(usize),
 }
 
-/// The document's layers, as its default configuration sets them.
-#[derive(Debug)]
-pub(crate) struct Layers {
+/// The states a configuration of the document's layers sets them to.
+#[derive(Debug, Default)]
+struct Configuration {
     /// Whether layers are off unless turned on.
     base_off: bool,
     on: HashSet<ObjectId>,
     off: HashSet<ObjectId>,
+}
+
+impl Configuration {
+    /// The configuration `dictionary` holds.
+    fn of(document: &Document, dictionary: &Dictionary) -> Self {
+        Configuration {
+            base_off: dictionary
+                .get(b"BaseState")
+                .ok()
+                .and_then(|state| state.as_name().ok())
+                .is_some_and(|state| state == b"OFF"),
+            on: references(document, dictionary.get(b"ON").ok()),
+            off: references(document, dictionary.get(b"OFF").ok()),
+        }
+    }
+
+    /// Whether it turns the layer `id` on.
+    fn sets_on(&self, id: ObjectId) -> bool {
+        if self.base_off {
+            self.on.contains(&id)
+        } else {
+            !self.off.contains(&id)
+        }
+    }
+}
+
+/// The document's layers, as its default configuration sets them.
+#[derive(Debug)]
+pub(crate) struct Layers {
+    /// The default configuration.
+    default: Configuration,
+    /// The configuration PDFium sets layers by, where it is not the default
+    /// one: the first of the alternate ones meant for viewing.
+    viewing: Option<Configuration>,
+    /// The layers the document lists; PDFium shows any other.
+    listed: HashSet<ObjectId>,
     /// The categories a viewer sets each layer's state from on opening the
     /// document (see `automatic`); `None` where they were too many to read.
     automatic: Option<HashMap<ObjectId, u8>>,
@@ -118,43 +154,30 @@ impl Layers {
             .ok()
             .and_then(|default| resolve(document, default))
             .and_then(|default| default.as_dict().ok());
-        let Some(default) = default else {
-            return Some(Layers::set(
-                false,
-                HashSet::new(),
-                HashSet::new(),
-                Some(HashMap::new()),
-            ));
+        let viewing = array(document, properties.get(b"Configs").ok())
+            .iter()
+            .filter_map(|configuration| {
+                resolve(document, configuration)
+                    .and_then(|configuration| configuration.as_dict().ok())
+            })
+            .find(|configuration| for_viewing(document, configuration))
+            .map(|configuration| Configuration::of(document, configuration));
+        let listed = references(document, properties.get(b"OCGs").ok());
+        let (default, automatic) = match default {
+            Some(default) => (
+                Configuration::of(document, default),
+                automatic(document, default.get(b"AS").ok()),
+            ),
+            None => (Configuration::default(), Some(HashMap::new())),
         };
-        Some(Layers::set(
-            default
-                .get(b"BaseState")
-                .ok()
-                .and_then(|state| state.as_name().ok())
-                .is_some_and(|state| state == b"OFF"),
-            references(document, default.get(b"ON").ok()),
-            references(document, default.get(b"OFF").ok()),
-            automatic(document, default.get(b"AS").ok()),
-        ))
-    }
-
-    /// Layers set as `base_off` says, with those `on` turned on and those
-    /// `off` turned off, and set on opening from the `automatic` categories
-    /// of their usage, no verdict reached yet.
-    fn set(
-        base_off: bool,
-        on: HashSet<ObjectId>,
-        off: HashSet<ObjectId>,
-        automatic: Option<HashMap<ObjectId, u8>>,
-    ) -> Self {
-        Layers {
-            base_off,
-            on,
-            off,
+        Some(Layers {
+            default,
+            viewing,
+            listed,
             automatic,
             shows: RefCell::new(HashMap::new()),
             terms: Cell::new(MAX_TERMS),
-        }
+        })
     }
 
     /// Take a layer or a term to read from the document's bound; `None`
@@ -201,16 +224,16 @@ impl Layers {
     /// dictionaries for viewing name for it (see `opened`). PDFium and
     /// pdf.js read no usage application dictionaries: PDFium sets a layer
     /// as its usage recommends for viewing, where it does, whatever the
-    /// configuration says, and pdf.js hides a layer that either turns off.
-    /// Readers differ where the usage recommends a state for viewing and
-    /// nothing applies it, or recommends showing a layer turned off; the
+    /// configuration says, and else shows a layer the document does not
+    /// list, and sets any other by the first alternate configuration meant
+    /// for viewing, where there is one, in place of the default one; pdf.js
+    /// hides a layer that either the default configuration or its usage
+    /// turns off. Readers differ where the usage recommends a state for
+    /// viewing and nothing applies it, or recommends showing a layer turned
+    /// off, and where PDFium's configuration is not the default one; the
     /// layer is taken to be hidden only where all of them hide it.
     fn hidden(&self, document: &Document, id: ObjectId, layer: Option<&Dictionary>) -> bool {
-        let set_on = if self.base_off {
-            self.on.contains(&id)
-        } else {
-            !self.off.contains(&id)
-        };
+        let set_on = self.default.sets_on(id);
         let usage = layer
             .and_then(|layer| layer.get(b"Usage").ok())
             .and_then(|usage| resolve(document, usage))
@@ -222,8 +245,12 @@ impl Layers {
             },
             None => None,
         };
-        let viewing = recommended(document, usage, b"View", b"ViewState");
-        opened == Some(false) && !viewing.unwrap_or(set_on)
+        let shown_by_pdfium =
+            recommended(document, usage, b"View", b"ViewState").unwrap_or_else(|| {
+                !self.listed.contains(&id)
+                    || self.viewing.as_ref().unwrap_or(&self.default).sets_on(id)
+            });
+        opened == Some(false) && !shown_by_pdfium
     }
 
     /// Whether a visibility expression shows its content, read `depth`
@@ -511,6 +538,27 @@ fn opened(
     }
 }
 
+/// Whether PDFium takes an alternate configuration to be meant for viewing:
+/// its `/Intent` is `View` or `All`, alone or among others, as a name or a
+/// string; a configuration with no intent is not.
+fn for_viewing(document: &Document, configuration: &Dictionary) -> bool {
+    let viewing = |intent: &Object| match resolve(document, intent) {
+        Some(Object::Name(intent) | Object::String(intent, _)) => {
+            intent == b"View" || intent == b"All"
+        }
+        _ => false,
+    };
+    match configuration
+        .get(b"Intent")
+        .ok()
+        .and_then(|intent| resolve(document, intent))
+    {
+        Some(Object::Array(intents)) => intents.iter().any(viewing),
+        Some(intent) => viewing(intent),
+        None => false,
+    }
+}
+
 /// The state `usage`, a layer's usage dictionary, recommends in `category`
 /// by its `entry`: on unless the entry is `/OFF`; `None` where it has none.
 fn recommended(
@@ -587,6 +635,58 @@ mod tests {
         let catalog = plain.add_object(dictionary! { "Type" => "Catalog" });
         plain.trailer.set("Root", catalog);
         assert!(Layers::new(&plain).is_none());
+    }
+
+    #[test]
+    fn layers_pdfium_shows_are_not_hidden() {
+        // A layer the default configuration turns off, the document listing
+        // `listed` layers, with `configurations` besides the default one.
+        let layer_in = |listed: bool, configurations: Vec<Object>| {
+            let mut document = Document::with_version("1.7");
+            let layer = document.add_object(dictionary! { "Type" => "OCG" });
+            let other = document.add_object(dictionary! { "Type" => "OCG" });
+            let mut ocgs: Vec<Object> = vec![other.into()];
+            if listed {
+                ocgs.push(layer.into());
+            }
+            let mut properties = dictionary! {
+                "OCGs" => ocgs,
+                "D" => dictionary! { "OFF" => vec![layer.into()] },
+            };
+            if !configurations.is_empty() {
+                properties.set("Configs", configurations);
+            }
+            let catalog = document.add_object(dictionary! {
+                "Type" => "Catalog", "OCProperties" => properties,
+            });
+            document.trailer.set("Root", catalog);
+            let layers = Layers::new(&document).expect("layers");
+            layers.hides(&document, &layer.into())
+        };
+        assert!(layer_in(true, Vec::new()));
+        // PDFium shows a layer the document does not list.
+        assert!(!layer_in(false, Vec::new()));
+        // It sets layers by the first alternate configuration meant for
+        // viewing, which here turns the layer on; not by one with no intent,
+        // or one meant for design, which it passes over.
+        let meant = |intent: Object| dictionary! { "Name" => Object::string_literal("Screen"), "Intent" => intent };
+        assert!(!layer_in(true, vec![meant("View".into()).into()]));
+        assert!(!layer_in(
+            true,
+            vec![
+                meant("Design".into()).into(),
+                meant(vec!["Design".into(), "All".into()].into()).into(),
+            ]
+        ));
+        assert!(!layer_in(
+            true,
+            vec![meant(Object::string_literal("View")).into()]
+        ));
+        assert!(layer_in(
+            true,
+            vec![dictionary! { "Name" => Object::string_literal("Other") }.into()]
+        ));
+        assert!(layer_in(true, vec![meant("Design".into()).into()]));
     }
 
     /// A document whose default configuration turns `off` off, among
