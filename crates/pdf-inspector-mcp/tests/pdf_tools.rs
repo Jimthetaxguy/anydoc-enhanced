@@ -2226,6 +2226,134 @@ fn form_values_in_layers_a_reader_hides_are_reported() {
     assert_eq!(warned_pages(&results, "form_values_misread"), [None, None]);
 }
 
+/// A statement page with `boxes`, its media box and any crop box, written
+/// in its page tree node when `inherited`: a heading and eight lines in
+/// Helvetica, then `content`.
+fn offpage_pdf(boxes: &str, inherited: bool, content: &str) -> Vec<u8> {
+    let (node, page) = if inherited { (boxes, "") } else { ("", boxes) };
+    let lines = (0..8).fold(String::new(), |lines, line| {
+        let y = 700 - 20 * line;
+        lines + &format!("BT /F1 10 Tf 72 {y} Td (Statement line {line} of the account) Tj ET\n")
+    });
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {node} >>").into_bytes(),
+        format!("<< /Type /Page /Parent 2 0 R {page} /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>")
+            .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream(
+            "",
+            format!("BT /F1 12 Tf 72 740 Td (Statement of account) Tj ET\n{lines}{content}")
+                .as_bytes(),
+        ),
+    ])
+}
+
+#[test]
+fn text_set_off_the_page_that_pdf_inspector_reads_is_reported() {
+    // Twelve lines of a copy or a neighbouring page set at `x`, from `y`
+    // down.
+    let copy = |x: u32, y: u32, text: &str| {
+        (0..12).fold(String::new(), |lines, line| {
+            let y = y - 20 * line;
+            lines + &format!("BT /F1 10 Tf {x} {y} Td ({text} {line} reads on) Tj ET\n")
+        })
+    };
+    let results = convert_all(&[
+        // One sentence set left of the page, which no viewer shows.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            "BT /F1 10 Tf -400 500 Td (Refund due to the taxpayer 12,400.00) Tj ET\n",
+        ),
+        // A crop keeping the left half of a form: a line running past it,
+        // and the copy beside it, which pdf-inspector keeps with that line.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792] /CropBox [0 0 306 792]",
+            false,
+            &format!(
+                "BT /F1 10 Tf 200 520 Td (Federal income tax withheld) Tj (7,512.00 as corrected) Tj ET\n{}",
+                copy(330, 480, "Copy C for employee records line")
+            ),
+        ),
+        // A sheet of two pages imposed side by side, cropped to the left
+        // one: the right one's heading and paragraphs, which pdf-inspector
+        // leaves out, though the heading reads as this page's.
+        offpage_pdf(
+            "/MediaBox [0 0 1224 792] /CropBox [0 0 612 792]",
+            false,
+            &format!(
+                "BT /F1 12 Tf 684 740 Td (Statement of account) Tj ET\n{}",
+                copy(684, 700, "Neighbouring page paragraph line")
+            ),
+        ),
+        // A sentence left of the page painted invisibly, reported as that.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            "3 Tr BT /F1 10 Tf -400 500 Td (Refund due to the taxpayer 12,400.00) Tj ET 0 Tr\n",
+        ),
+        // A page naming no box: a viewer shows US Letter, and pdf-inspector
+        // leaves nothing out, a neighbouring page's paragraphs and all.
+        offpage_pdf("", false, &copy(684, 700, "Neighbouring page paragraph line")),
+        // A crop box on the page tree node, and a page number running past
+        // it, but by less than half its width and the tolerance: on the
+        // page, as pdf-inspector judges it.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792] /CropBox [0 0 306 792]",
+            true,
+            "BT /F1 10 Tf 283 40 Td (Page 1 of 3) Tj ET\n",
+        ),
+        // A line shown after a run painted invisibly, which pdf-inspector
+        // skips, but which moves the pen past the page's edge.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            "BT /F1 10 Tf 420 400 Td 3 Tr (XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX) Tj 0 Tr (Refund due to the taxpayer 12,400.00) Tj ET\n",
+        ),
+        // A line the current transformation moves below the page.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            "q 1 0 0 1 0 -300 cm BT /F1 10 Tf 72 200 Td (Refund due to the taxpayer 12,400.00) Tj ET Q\n",
+        ),
+    ]);
+    let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
+    assert!(markdown(0).contains("12,400.00"), "{}", markdown(0));
+    assert!(
+        markdown(1).contains("7,512.00 as corrected"),
+        "{}",
+        markdown(1)
+    );
+    assert!(
+        !markdown(2).contains("Neighbouring page"),
+        "{}",
+        markdown(2)
+    );
+    assert!(markdown(4).contains("Neighbouring page"), "{}", markdown(4));
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results, "offpage_text_read"),
+        [
+            one.clone(),
+            one.clone(),
+            None,
+            None,
+            one.clone(),
+            None,
+            one.clone(),
+            one.clone()
+        ],
+        "{results:#?}"
+    );
+    assert_eq!(
+        warned_pages(&results, "invisible_text_read"),
+        [None, None, None, one, None, None, None, None],
+        "{results:#?}"
+    );
+}
+
 /// A statement page showing `content` after its heading and balance, in
 /// Helvetica as `/F1` (object 4), with a layer (object 6) off by default, and
 /// `objects` as objects 7 on. Its resources hold `/F1`, the layer as `/MC0`,

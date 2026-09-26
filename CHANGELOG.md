@@ -274,6 +274,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Markdown shows carries the new `hidden_layer_text_read` warning; the
   Markdown is not changed. An annotation a hidden layer holds is no longer
   read as text the page shows.
+- Text set off the page, which no viewer shows and pdf-inspector 1.25.0
+  reads, is reported. A viewer shows what a page's crop box keeps of its
+  media box; text set outside it, such as a printer's slug below the crop,
+  the copy of a form beside the one a crop keeps, the rest of a line
+  running past the page's edge, or a line placed far off the page, is never
+  shown. pdf-inspector leaves such text out only where it reads as a
+  neighbouring page's on an imposed sheet: ten runs or more whose middles
+  stand more than 6 points off the box, half their characters or more in
+  runs of four or more, none going on from a line on the page, off a box
+  72 points or more a side. Otherwise it keeps it, so a slug's "Job total
+  85000.00" converted beside a statement's figures, and "Refund due to the
+  taxpayer 12,400.00" set left of the page beside the balances a reader
+  sees, with no sign. The page scan now places each run as pdf-inspector
+  does, by the widths of its glyphs from where the string before it ended,
+  leaves out what pdf-inspector would, and a page whose off-page text the
+  Markdown shows carries the new `offpage_text_read` warning; the Markdown
+  is not changed. Off-page text painted invisibly, or in a layer a reader
+  hides, is reported by those warnings instead. The page's visible box is
+  now found as pdf-inspector finds it: a crop box wholly off the media box
+  gives way to it, where such a page had gone unchecked, and a malformed
+  box to the next one up the page tree.
 - Files a PDF embeds, which pdf-inspector 1.24.0 never reads, are reported.
   A portfolio bundles documents, such as a year's tax forms, as embedded
   files behind a cover page, and converted as that cover alone; attachments
@@ -1223,8 +1244,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document's past 4 MiB, is reported without being looked for where its
   middle stands on the page, and left out where it stands off it, where
   pdf-inspector may leave out a neighbouring page's text on an imposed
-  sheet; text set off the page, which no viewer shows and pdf-inspector
-  reads where it is not a neighbouring page's, is not reported. Visible
+  sheet. Text set off the page is judged run by run, as pdf-inspector
+  judges it, by the middle of its baseline: a run whose middle stands on
+  the page, though its end runs past the page's edge, is not reported, nor
+  is one whose middle its font's widths place otherwise than pdf-inspector
+  does, as for a standard font whose widths it supplies itself, where the
+  scan takes half an em a glyph, or a `TJ` array pdf-inspector splits at a
+  column gap, which is judged whole; off-page text past 64 KiB a page is
+  reported without being looked for, unless pdf-inspector would leave it
+  out, and past 100,000 runs a page is taken to be kept. Visible
   text pdf-inspector skips as invisible is reported where `Tr` sets the
   modes apart (`visible_text_unread`), but not on a page listed as needing
   OCR; white text on a dark fill in a form, which it drops as white text,

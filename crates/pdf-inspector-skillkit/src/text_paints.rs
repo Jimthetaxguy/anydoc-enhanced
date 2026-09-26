@@ -674,6 +674,24 @@ fn written(text: &str) -> String {
     written
 }
 
+/// A string as pdf-inspector reads it, as far as the scan can tell: the
+/// bytes themselves where it finds no font, as it reads a font it finds no
+/// map for (see `cjk_fonts`), else as the font reads them, a space standing
+/// in for a code the scan cannot read; and as pdf-inspector writes it (see
+/// `written`).
+fn read_text(glyph_fonts: &mut GlyphFonts, state: State, bytes: &[u8]) -> Option<String> {
+    let text = if state.raw {
+        Some(read_without_font(bytes))
+    } else if let Some(font) = state.cjk {
+        crate::cjk_fonts::read_as(font, bytes)
+    } else {
+        state
+            .glyph_font
+            .and_then(|font| glyph_fonts.text_or(font, bytes, ' '))
+    };
+    text.map(|text| written(&text))
+}
+
 /// What one page's content shows.
 #[derive(Default)]
 struct PageText {
@@ -718,6 +736,13 @@ struct PageText {
     /// reads as shown, when the page is read for repeats. Each string noted
     /// here, and in `hidden_text`, carries the edge run it is read in.
     invisible_text: Option<Noted>,
+    /// Text set off the page's box that pdf-inspector reads, when the page
+    /// is read for repeats, what a reader would not see on it anyway aside:
+    /// text in a layer it hides, or painted invisibly. And what
+    /// pdf-inspector reads of the page, to tell whether it leaves that text
+    /// out.
+    offpage_text: Option<Noted>,
+    offpage: OffPage,
     /// Text shown in a font pdf-inspector reads without its collection's
     /// map, as the font says it (see `cjk_fonts`), and whether any of it
     /// reads otherwise with no sign, when the page is read for repeats;
@@ -964,6 +989,108 @@ impl Noted {
             overflowed: self.overflowed,
             on_page,
         }
+    }
+}
+
+/// What pdf-inspector reads of a page, for whether it leaves out the text
+/// set off the page's box (see `OffPage::clipped`), when the page is read
+/// for repeats: where each run it reads starts and ends, and whether it
+/// stands off the box, up to `MAX_RUNS_PER_PAGE` runs, and whether runs
+/// past them were left out; the runs off the box, their characters, and
+/// those of runs of `MIN_WORDY_CHARS` or more; and where the pen stands
+/// after the string shown last, where one shown next without the text
+/// matrix being set starts.
+#[derive(Default)]
+struct OffPage {
+    runs: Vec<ReadRun>,
+    lost: bool,
+    off: usize,
+    characters: usize,
+    wordy: usize,
+    pen: Option<[f64; 2]>,
+}
+
+/// Where a run pdf-inspector reads starts and ends on its baseline, and
+/// whether its middle stands off the page's box.
+struct ReadRun {
+    start: [f32; 2],
+    end: [f32; 2],
+    off: bool,
+}
+
+impl OffPage {
+    fn keep(&mut self, run: ReadRun) {
+        if self.runs.len() < MAX_RUNS_PER_PAGE {
+            self.runs.push(run);
+        } else {
+            self.lost = true;
+        }
+    }
+
+    /// Count a run of `characters` read off the page's box.
+    fn count(&mut self, characters: usize) {
+        self.off += 1;
+        self.characters += characters;
+        if characters >= MIN_WORDY_CHARS {
+            self.wordy += characters;
+        }
+    }
+
+    /// Whether pdf-inspector leaves out the text off the page's box, the
+    /// page turned as `turn` turns a point (see `repeated_lines::page_turn`):
+    /// where it found a box, `MIN_CLIPPED_SIDE` or more a side, and the text
+    /// off it reads as a neighbouring page's, in `MIN_CLIPPED_RUNS` runs or
+    /// more, half its characters or more in runs of `MIN_WORDY_CHARS`, none
+    /// of them starting where a run on the page ends on its line (see
+    /// `STRADDLE_ALONG`), as the rest of a line running off the page does.
+    /// Where runs were left out, that cannot be told, and it is taken not
+    /// to.
+    fn clipped(&self, page_box: [f64; 4], declared: bool, turn: fn([f32; 2]) -> [f32; 2]) -> bool {
+        if !declared
+            || self.lost
+            || page_box[2] - page_box[0] < MIN_CLIPPED_SIDE
+            || page_box[3] - page_box[1] < MIN_CLIPPED_SIDE
+            || self.off < MIN_CLIPPED_RUNS
+            || self.wordy * 2 < self.characters.max(1)
+        {
+            return false;
+        }
+        // A run as pdf-inspector places it on the page turned: its left,
+        // its baseline, and its right.
+        let placed = |run: &ReadRun| {
+            let (start, end) = (turn(run.start), turn(run.end));
+            (
+                start[0].min(end[0]),
+                start[1].min(end[1]),
+                start[0].max(end[0]),
+            )
+        };
+        // The ends of the runs on the page, filed by where they stand.
+        let square = |x: f32, y: f32| {
+            (
+                (x / STRADDLE_ALONG).floor() as i64,
+                (y / STRADDLE_ACROSS).floor() as i64,
+            )
+        };
+        let mut ends: HashMap<(i64, i64), Vec<[f32; 2]>> = HashMap::new();
+        for run in self.runs.iter().filter(|run| !run.off) {
+            let (_, y, right) = placed(run);
+            ends.entry(square(right, y)).or_default().push([right, y]);
+        }
+        !self.runs.iter().filter(|run| run.off).any(|run| {
+            let (left, y, _) = placed(run);
+            let (column, row) = square(left, y);
+            (column.saturating_sub(1)..=column.saturating_add(1)).any(|column| {
+                (row.saturating_sub(1)..=row.saturating_add(1)).any(|row| {
+                    ends.get(&(column, row)).is_some_and(|ends| {
+                        ends.iter().any(|&[right, baseline]| {
+                            (left - right).abs() <= STRADDLE_ALONG
+                                && (y - baseline).abs() <= STRADDLE_ACROSS
+                        })
+                    })
+                })
+            })
+        })
     }
 }
 
@@ -1220,20 +1347,153 @@ impl PageText {
             noted.interrupt();
             return;
         }
-        let text = if state.raw {
-            Some(read_without_font(bytes))
-        } else if let Some(font) = state.cjk {
-            crate::cjk_fonts::read_as(font, bytes)
-        } else {
-            state
-                .glyph_font
-                .and_then(|font| self.glyph_fonts.text_or(font, bytes, ' '))
-        };
-        let Some(text) = text.map(|text| written(&text)) else {
+        let Some(text) = read_text(&mut self.glyph_fonts, state, bytes) else {
             return;
         };
         let on_page = centred_on_page(state, text_matrix, page_box, text.chars().count());
         noted.note(&text, placed, Start::of(state, text_matrix), edge, on_page);
+    }
+
+    /// How far a string moves the pen, in text space units before
+    /// horizontal scaling: by the widths of its glyphs where the scan reads
+    /// its font and pdf-inspector finds it, else half an em a code, as
+    /// pdf-inspector takes a font without widths; with the spacing after
+    /// each code, and a `TJ` array's offsets.
+    fn advance(&mut self, state: State, text: Option<&Object>) -> f64 {
+        let font = state.glyph_font.filter(|_| !state.raw);
+        let two_byte = font.is_some_and(|font| self.glyph_fonts.two_byte(font));
+        let elements = match text {
+            Some(Object::Array(elements)) => elements.as_slice(),
+            Some(text) => std::slice::from_ref(text),
+            None => &[],
+        };
+        let mut advance = 0.0;
+        for element in elements {
+            match element {
+                Object::String(bytes, _) => {
+                    for code in bytes.chunks(if two_byte { 2 } else { 1 }) {
+                        let code = match code {
+                            [high, low] => u16::from_be_bytes([*high, *low]),
+                            [byte] => u16::from(*byte),
+                            _ => continue,
+                        };
+                        let width = font
+                            .and_then(|font| self.glyph_fonts.width(font, code))
+                            .unwrap_or(0.5);
+                        let word = if code == 32 && !two_byte {
+                            state.word_spacing
+                        } else {
+                            0.0
+                        };
+                        advance += width * state.size + state.char_spacing + word;
+                    }
+                }
+                Object::Integer(offset) => advance -= *offset as f64 / 1000.0 * state.size,
+                Object::Real(offset) => advance -= f64::from(*offset) / 1000.0 * state.size,
+                _ => {}
+            }
+        }
+        advance
+    }
+
+    /// Where a string shown in a text object starts and ends on its
+    /// baseline, when the page is read for the text off its box: from where
+    /// the text matrix says where it was just set, else from where the pen
+    /// stands after the string before, which this one moves it past.
+    fn place(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        text: Option<&Object>,
+        placed: bool,
+    ) -> Option<[[f64; 2]; 2]> {
+        self.offpage_text.as_ref()?;
+        let matrix = multiply(text_matrix, state.ctm);
+        let origin = match self.offpage.pen.filter(|_| !placed) {
+            Some(pen) => pen,
+            None => [matrix[4], matrix[5]],
+        };
+        let advance = self.advance(state, text);
+        let along = [
+            advance * matrix[0] * state.horizontal_scale,
+            advance * matrix[1] * state.horizontal_scale,
+        ];
+        let pen = [origin[0] + along[0], origin[1] + along[1]];
+        self.offpage.pen = pen.iter().all(|value| value.is_finite()).then_some(pen);
+        let start = [
+            origin[0] + matrix[2] * state.rise,
+            origin[1] + matrix[3] * state.rise,
+        ];
+        let end = [start[0] + along[0], start[1] + along[1]];
+        start
+            .iter()
+            .chain(&end)
+            .all(|value| value.is_finite() && value.abs() < f64::from(f32::MAX))
+            .then_some([start, end])
+    }
+
+    /// Note a string pdf-inspector reads that stands where `placed` says
+    /// (see `place`), for the text set off the page's box (see `OffPage`):
+    /// whether its middle stands within `PAGE_BOX_TOLERANCE` of the box, as
+    /// pdf-inspector judges a run, and off it, its text as pdf-inspector
+    /// reads it (see `Noted::note`); but where the span it is shown in gives
+    /// text read in its place, as `given` says, and where a reader would not
+    /// see it on the page either, as `unseen` says, which other checks
+    /// report. Text on the page ends the run noted last.
+    #[allow(clippy::too_many_arguments)]
+    fn note_offpage(
+        &mut self,
+        state: State,
+        text_matrix: [f64; 6],
+        bytes: &[u8],
+        placed: bool,
+        at: Option<[[f64; 2]; 2]>,
+        edge: Option<usize>,
+        given: bool,
+        unseen: bool,
+        page_box: [f64; 4],
+    ) {
+        let Some([start, end]) = at.filter(|_| !given && self.offpage_text.is_some()) else {
+            return;
+        };
+        let middle = [0.5 * (start[0] + end[0]), 0.5 * (start[1] + end[1])];
+        let off = !((page_box[0] - PAGE_BOX_TOLERANCE..=page_box[2] + PAGE_BOX_TOLERANCE)
+            .contains(&middle[0])
+            && (page_box[1] - PAGE_BOX_TOLERANCE..=page_box[3] + PAGE_BOX_TOLERANCE)
+                .contains(&middle[1]));
+        let run = |off| ReadRun {
+            start: start.map(|value| value as f32),
+            end: end.map(|value| value as f32),
+            off,
+        };
+        if !off {
+            // pdf-inspector makes no run of white space.
+            if bytes.iter().any(|&byte| byte != b' ') {
+                self.offpage.keep(run(false));
+            }
+            if let Some(noted) = self.offpage_text.as_mut() {
+                noted.interrupt();
+            }
+            return;
+        }
+        let read = read_text(&mut self.glyph_fonts, state, bytes);
+        let characters = match &read {
+            Some(text) => text.trim().chars().count(),
+            None => bytes.iter().filter(|&&byte| byte != b' ').count(),
+        };
+        if characters > 0 {
+            self.offpage.count(characters);
+            self.offpage.keep(run(true));
+        }
+        let Some(noted) = self.offpage_text.as_mut() else {
+            return;
+        };
+        match read.filter(|_| !unseen) {
+            // Text left out for want of room marks the page, as what
+            // pdf-inspector keeps of it cannot be looked for.
+            Some(text) => noted.note(&text, placed, Start::of(state, text_matrix), edge, true),
+            None => noted.interrupt(),
+        }
     }
 
     /// Note the text a span of the page's gives its glyphs, which
@@ -1258,6 +1518,20 @@ impl PageText {
             };
             if given.shown && unseen {
                 noted.note(&text, true, None, None, given.on_page);
+            } else {
+                noted.interrupt();
+            }
+        }
+        // pdf-inspector writes the text where the span's first glyph is, as
+        // a run of its own: off the page where that glyph starts off it.
+        if let Some(noted) = self.offpage_text.as_mut() {
+            if given.shown && !given.on_page {
+                self.offpage.count(text.trim().chars().count());
+                if given.hidden || given.invisible {
+                    noted.interrupt();
+                } else {
+                    noted.note(&text, true, None, None, true);
+                }
             } else {
                 noted.interrupt();
             }
@@ -1564,6 +1838,11 @@ pub(crate) struct Findings {
     /// reads as shown (upstream issue #572), by page, on the pages read for
     /// repeats but a scan's with its text layer.
     pub(crate) invisible_texts: Vec<(u32, PageTexts)>,
+    /// Text set off the page's visible box, which no viewer shows, that
+    /// pdf-inspector reads where it does not take it for a neighbouring
+    /// page's (see `OffPage::clipped`), by page, on the pages read for
+    /// repeats but a scan's with its text layer.
+    pub(crate) offpage_texts: Vec<(u32, PageTexts)>,
     /// The pages, among those read for repeats, whose text in a font
     /// pdf-inspector finds no map for (upstream issue #573) reads otherwise
     /// with no sign; and that text as it says it and as pdf-inspector reads
@@ -1739,6 +2018,13 @@ pub(crate) fn scan_document(
                 if !invisible.is_empty() {
                     found.invisible_texts.push((number, invisible));
                 }
+                let mut offpage = page.offpage_text;
+                if !fits(offpage.bytes()) {
+                    offpage.leave_out();
+                }
+                if !offpage.is_empty() {
+                    found.offpage_texts.push((number, offpage));
+                }
                 if page.cjk_misread {
                     found.cjk_pages.push(number);
                 }
@@ -1876,6 +2162,8 @@ struct PageFindings {
     /// Text a viewer never paints that pdf-inspector reads, on a page that
     /// is not a scan with its text layer.
     invisible_text: PageTexts,
+    /// Text set off the page's box that pdf-inspector reads, on such a page.
+    offpage_text: PageTexts,
     /// Text in fonts pdf-inspector finds no map for, and whether any reads
     /// otherwise with no sign.
     cjk_text: CjkTexts,
@@ -1892,9 +2180,7 @@ fn scan_page(
     budgets: Budgets<'_>,
     layers: Option<&std::rc::Rc<Layers>>,
 ) -> Result<PageFindings, Exhausted> {
-    let Some(page_box) = page_box(document, page_id) else {
-        return Ok(PageFindings::default());
-    };
+    let (page_box, declared) = page_box(document, page_id);
     let scopes = page_resources(document, page_id);
     let check_twice = checks.twice;
     // A scan is an image XObject; for the layer check, a page that binds
@@ -1941,6 +2227,7 @@ fn scan_page(
         layers: layers.cloned(),
         hidden_text: (check_twice && layers.is_some()).then(Noted::default),
         invisible_text: check_twice.then(Noted::default),
+        offpage_text: check_twice.then(Noted::default),
         cjk_text: check_twice.then(Noted::default),
         cjk_read: check_twice.then(Noted::default),
         cjk_misread: false,
@@ -2007,6 +2294,16 @@ fn scan_page(
         .filter(|_| !hidden_layer)
         .map(|noted| noted.looked_for(&runs))
         .unwrap_or_default();
+    // Text off the page's box, but where pdf-inspector takes it for a
+    // neighbouring page's and leaves it out; on a scan with its text layer,
+    // reported for OCR, it is not looked for either.
+    let turn = crate::repeated_lines::page_turn(&runs);
+    let offpage_text = page
+        .offpage_text
+        .take()
+        .filter(|_| !hidden_layer && !page.offpage.clipped(page_box, declared, turn))
+        .map(|noted| noted.looked_for(&runs))
+        .unwrap_or_default();
     let vertical_readings = page
         .vertical
         .take()
@@ -2026,6 +2323,7 @@ fn scan_page(
         edges,
         hidden_text,
         invisible_text,
+        offpage_text,
         cjk_text: CjkTexts {
             says: page
                 .cjk_text
@@ -2398,6 +2696,13 @@ fn execute<'a>(
                 }
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
+                // Where the string stands, whether pdf-inspector reads it or
+                // not: either way it moves the pen.
+                let at = if in_text {
+                    page.place(state, text_matrix, text, placed)
+                } else {
+                    None
+                };
                 let hidden = state.hidden || marked.hidden > 0;
                 // A string shown in a span of the page's giving its glyphs'
                 // text, which pdf-inspector reads in place of the glyphs,
@@ -2440,6 +2745,17 @@ fn execute<'a>(
                             page_box,
                         );
                     }
+                    page.note_offpage(
+                        state,
+                        text_matrix,
+                        &bytes,
+                        placed,
+                        at,
+                        edge,
+                        given,
+                        hidden || state.render_mode == 3,
+                        page_box,
+                    );
                     page.note_unmapped(&bytes, placed, state.cjk);
                     if state.vertical {
                         page.note_vertical(state, text_matrix, &bytes, placed, page_box, edge);
@@ -2802,6 +3118,19 @@ fn multiply(first: [f64; 6], then: [f64; 6]) -> [f64; 6] {
 /// Points past the page box that text pdf-inspector takes for the page's
 /// may start.
 const PAGE_BOX_TOLERANCE: f64 = 6.0;
+/// Runs off the page pdf-inspector leaves out at least, where they read as
+/// a neighbouring page's text, as the rest of an imposed sheet does, and
+/// the characters a run holds at least to count as words for that (see
+/// `OffPage::clipped`).
+const MIN_CLIPPED_RUNS: usize = 10;
+const MIN_WORDY_CHARS: usize = 4;
+/// The least side, in points, of a page box pdf-inspector leaves text off.
+const MIN_CLIPPED_SIDE: f64 = 72.0;
+/// How near, in points, a run off the page starts to where a run on it
+/// ends, along their line and across it, to go on with it, as the rest of
+/// a line running off the page does.
+const STRADDLE_ALONG: f32 = 10.0;
+const STRADDLE_ACROSS: f32 = 2.0;
 
 /// Whether a string shown under `text_matrix` starts on the page, within
 /// `PAGE_BOX_TOLERANCE` of its box. One whose start is unknown is taken to.
@@ -3058,53 +3387,68 @@ fn binds_image(
     false
 }
 
-/// The page's visible box in default user space: the crop box within the
-/// media box, as `[left, bottom, right, top]`.
-fn page_box(document: &Document, page_id: ObjectId) -> Option<[f64; 4]> {
-    let media = inherited(document, page_id, b"MediaBox")
-        .and_then(|value| rectangle(document, value))
-        .unwrap_or([0.0, 0.0, 612.0, 792.0]);
-    let visible = match inherited(document, page_id, b"CropBox")
-        .and_then(|value| rectangle(document, value))
-    {
-        Some(crop) => [
-            media[0].max(crop[0]),
-            media[1].max(crop[1]),
-            media[2].min(crop[2]),
-            media[3].min(crop[3]),
-        ],
-        None => media,
+/// US Letter, the box a viewer shows a page naming none on.
+const LETTER: [f64; 4] = [0.0, 0.0, 612.0, 792.0];
+
+/// The page's visible box in default user space, as `[left, bottom, right,
+/// top]`, as pdf-inspector takes it (`visible_page_box`): the crop box
+/// within the media box, or the media box where the two do not overlap, a
+/// crop box alone within US Letter, each the first well-formed one found up
+/// the page tree; and whether one was found. A page with none a viewer
+/// shows as US Letter, and pdf-inspector keeps all its text (see
+/// `OffPage::clipped`).
+fn page_box(document: &Document, page_id: ObjectId) -> ([f64; 4], bool) {
+    let within = |one: [f64; 4], other: [f64; 4]| {
+        let both = [
+            one[0].max(other[0]),
+            one[1].max(other[1]),
+            one[2].min(other[2]),
+            one[3].min(other[3]),
+        ];
+        (both[2] > both[0] && both[3] > both[1]).then_some(both)
     };
-    (visible[2] > visible[0] && visible[3] > visible[1]).then_some(visible)
+    match (
+        found_box(document, page_id, b"MediaBox"),
+        found_box(document, page_id, b"CropBox"),
+    ) {
+        (Some(media), Some(crop)) => (within(media, crop).unwrap_or(media), true),
+        (Some(media), None) => (media, true),
+        (None, Some(crop)) => (within(LETTER, crop).unwrap_or(LETTER), true),
+        (None, None) => (LETTER, false),
+    }
 }
 
-fn inherited<'a>(document: &'a Document, page_id: ObjectId, key: &[u8]) -> Option<&'a Object> {
+/// The box `key` names on the page, or else on the nearest node above it
+/// in the page tree naming a well-formed one: an array whose first four
+/// numbers span some area.
+fn found_box(document: &Document, page_id: ObjectId, key: &[u8]) -> Option<[f64; 4]> {
     let mut node = document.get_dictionary(page_id).ok()?;
     for _ in 0..MAX_PAGE_TREE_DEPTH {
-        if let Ok(value) = node.get(key) {
-            return Some(value);
+        let values = node.get(key).ok().and_then(|value| array(document, value));
+        let numbers: Vec<f64> = values
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|value| number(document, value))
+            .take(4)
+            .collect();
+        if let [left, bottom, right, top] = numbers[..] {
+            let corners = [
+                left.min(right),
+                bottom.min(top),
+                left.max(right),
+                bottom.max(top),
+            ];
+            if corners.iter().all(|value| value.is_finite())
+                && corners[2] > corners[0]
+                && corners[3] > corners[1]
+            {
+                return Some(corners);
+            }
         }
         let parent = node.get(b"Parent").ok()?.as_reference().ok()?;
         node = document.get_dictionary(parent).ok()?;
     }
     None
-}
-
-fn rectangle(document: &Document, value: &Object) -> Option<[f64; 4]> {
-    let values = array(document, value)?;
-    if values.len() != 4 {
-        return None;
-    }
-    let mut corners = [0.0; 4];
-    for (slot, value) in corners.iter_mut().zip(values) {
-        *slot = number(document, value)?;
-    }
-    Some([
-        corners[0].min(corners[2]),
-        corners[1].min(corners[3]),
-        corners[0].max(corners[2]),
-        corners[1].max(corners[3]),
-    ])
 }
 
 #[cfg(test)]
@@ -4069,5 +4413,121 @@ pub(crate) mod tests {
         assert!(budget.take_bytes(1).is_err());
         budget.operations = MAX_OPERATIONS;
         assert!(budget.take_operations(1).is_err());
+    }
+
+    #[test]
+    fn page_boxes_are_found_as_pdf_inspector_finds_them() {
+        let boxed = |page: Dictionary, node: Dictionary| {
+            let mut document = Document::with_version("1.5");
+            let pages = document.new_object_id();
+            let mut page = page;
+            page.set("Type", "Page");
+            page.set("Parent", pages);
+            let page = document.add_object(page);
+            let mut node = node;
+            node.set("Type", "Pages");
+            node.set("Kids", vec![page.into()]);
+            node.set("Count", 1);
+            document.objects.insert(pages, Object::Dictionary(node));
+            page_box(&document, page)
+        };
+        let corners = |values: [i64; 4]| Object::Array(values.map(Object::from).to_vec());
+        let one = |key: &str, values: [i64; 4]| {
+            let mut dictionary = Dictionary::new();
+            dictionary.set(key, corners(values));
+            dictionary
+        };
+        let mut cropped = one("MediaBox", [0, 0, 612, 792]);
+        cropped.set("CropBox", corners([36, 36, 576, 756]));
+        assert_eq!(
+            boxed(cropped.clone(), Dictionary::new()),
+            ([36.0, 36.0, 576.0, 756.0], true)
+        );
+        // A crop box wholly off the media box gives way to it.
+        cropped.set("CropBox", corners([700, 0, 900, 792]));
+        assert_eq!(
+            boxed(cropped, Dictionary::new()),
+            ([0.0, 0.0, 612.0, 792.0], true)
+        );
+        // A box spanning no area gives way to one up the page tree, whose
+        // corners may come in any order, and numbers past four do not count.
+        let mut node = Dictionary::new();
+        node.set(
+            "MediaBox",
+            Object::Array(vec![612.into(), 792.into(), 0.into(), 0.into(), 5.into()]),
+        );
+        assert_eq!(
+            boxed(one("MediaBox", [0, 0, 0, 792]), node),
+            ([0.0, 0.0, 612.0, 792.0], true)
+        );
+        // A crop box alone stands within US Letter.
+        assert_eq!(
+            boxed(one("CropBox", [0, 0, 1000, 396]), Dictionary::new()),
+            ([0.0, 0.0, 612.0, 396.0], true)
+        );
+        // A page naming no box shows as US Letter, keeping all its text.
+        assert_eq!(boxed(Dictionary::new(), Dictionary::new()), (LETTER, false));
+    }
+
+    #[test]
+    fn text_off_the_page_is_left_out_as_pdf_inspector_leaves_it_out() {
+        const PAGE: [f64; 4] = [0.0, 0.0, 612.0, 792.0];
+        let upright: fn([f32; 2]) -> [f32; 2] = |at| at;
+        // Lines on the page, and as many of a page imposed beside it, of
+        // `characters` each, with a line running off the page when `onto`.
+        let imposed = |lines: usize, characters: usize, onto: bool| {
+            let mut page = OffPage::default();
+            for line in 0..lines {
+                let y = 700.0 - 20.0 * line as f32;
+                page.keep(ReadRun {
+                    start: [72.0, y],
+                    end: [300.0, y],
+                    off: false,
+                });
+                page.keep(ReadRun {
+                    start: [684.0, y],
+                    end: [900.0, y],
+                    off: true,
+                });
+                page.count(characters);
+            }
+            if onto {
+                page.keep(ReadRun {
+                    start: [308.0, 700.0],
+                    end: [660.0, 700.0],
+                    off: true,
+                });
+                page.count(characters);
+            }
+            page
+        };
+        assert!(imposed(10, 40, false).clipped(PAGE, true, upright));
+        // Not where no box was found, nor off a box too small to leave text
+        // off, nor where fewer runs, or mostly short ones, stand off it.
+        assert!(!imposed(10, 40, false).clipped(PAGE, false, upright));
+        assert!(!imposed(10, 40, false).clipped([0.0, 0.0, 612.0, 60.0], true, upright));
+        assert!(!imposed(9, 40, false).clipped(PAGE, true, upright));
+        assert!(!imposed(10, 3, false).clipped(PAGE, true, upright));
+        // Nor where a line running off the page goes on with one on it.
+        assert!(!imposed(10, 40, true).clipped(PAGE, true, upright));
+        // On a page turned for its lines reading up it, a line running off
+        // its top goes on with the one below it along that line.
+        let mut turned = OffPage::default();
+        for line in 0..10 {
+            let x = 100.0 + 20.0 * line as f32;
+            turned.keep(ReadRun {
+                start: [x, 600.0],
+                end: [x, 700.0],
+                off: false,
+            });
+            turned.keep(ReadRun {
+                start: [x, 700.0],
+                end: [x, 900.0],
+                off: true,
+            });
+            turned.count(40);
+        }
+        assert!(turned.clipped(PAGE, true, upright));
+        assert!(!turned.clipped(PAGE, true, |[x, y]| [y, -x]));
     }
 }

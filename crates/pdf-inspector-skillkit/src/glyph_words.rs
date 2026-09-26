@@ -388,6 +388,14 @@ impl GlyphFonts {
         self.decoders[font].glyph(code)
     }
 
+    /// A code's width in em, when `font` gives its widths.
+    pub(crate) fn width(&self, font: usize, code: u16) -> Option<f64> {
+        self.decoders[font]
+            .widths
+            .as_ref()
+            .map(|widths| widths.of(code))
+    }
+
     /// What a string shown in `font` reads as, when every glyph of it can
     /// be read.
     pub(crate) fn text(&mut self, font: usize, bytes: &[u8]) -> Option<String> {

@@ -43,7 +43,7 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters as a reader and as AnyDoc see them |
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content as AnyDoc's walkers read it |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats as AnyDoc renders them |
-| `crates/pdf-inspector-skillkit/src/text_paints.rs` | PDF pages whose invisible OCR layer pdf-inspector 1.25.0 skips, and text they paint twice |
+| `crates/pdf-inspector-skillkit/src/text_paints.rs` | PDF pages whose invisible OCR layer pdf-inspector 1.25.0 skips, text they paint twice, and text they set off the page that it reads |
 | `crates/pdf-inspector-skillkit/src/content_ops.rs` | Operators a PDF content stream holds, counted without decoding it, as pdf-inspector 1.25.0 counts them before reading a stream |
 | `crates/pdf-inspector-skillkit/src/annotations.rs` | Text PDF annotations show that pdf-inspector 1.25.0 never reads |
 | `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form values pdf-inspector 1.25.0 garbles or leaves out |

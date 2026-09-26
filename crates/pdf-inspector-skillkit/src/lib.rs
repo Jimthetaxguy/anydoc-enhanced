@@ -113,6 +113,8 @@ pub const PDF_WARNING_EMBEDDED_FILES_UNREAD: &str = "embedded_files_unread";
 pub const PDF_WARNING_HIDDEN_LAYER_TEXT_READ: &str = "hidden_layer_text_read";
 /// The Markdown holds text the page paints invisibly (upstream #572).
 pub const PDF_WARNING_INVISIBLE_TEXT_READ: &str = "invisible_text_read";
+/// The Markdown holds text set outside the page's visible area.
+pub const PDF_WARNING_OFFPAGE_TEXT_READ: &str = "offpage_text_read";
 /// Text in a Japanese or Chinese font without a map of its characters reads
 /// otherwise, or not at all, with no sign (upstream #573).
 pub const PDF_WARNING_CJK_TEXT_MISREAD: &str = "cjk_text_misread";
@@ -825,6 +827,24 @@ impl PdfInfo {
         }
     }
 
+    /// Report the pages whose text set off the page's visible box, which
+    /// pdf-inspector reads where it does not take it for a neighbouring
+    /// page's (see `text_paints::OffPage`), the Markdown shows.
+    fn check_offpage_text(
+        &mut self,
+        texts: &[(u32, text_paints::PageTexts)],
+        only: Option<&HashSet<u32>>,
+    ) {
+        let pages = self.shown_pages(texts, only);
+        if !pages.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_OFFPAGE_TEXT_READ,
+                "On these pages the Markdown holds text set outside the page's visible area, which no viewer shows, such as text a crop was meant to hide or the rest of a line running off the page: pdf-inspector 1.25.0 leaves such text out only where ten runs or more of it read as a neighbouring page's paragraphs; such text is not what a reader sees, and may say what the page does not.",
+                pages,
+            ));
+        }
+    }
+
     /// Report the pages whose text in a font pdf-inspector finds no map for
     /// (see `cjk_fonts`) reads otherwise with no sign, and mark the
     /// document's encoding. A page stands only where the Markdown shows none
@@ -1131,6 +1151,8 @@ impl PdfInfo {
         self.check_hidden_layers(&hidden, only);
         let invisible = std::mem::take(&mut found.invisible_texts);
         self.check_invisible_text(&invisible, only);
+        let offpage = std::mem::take(&mut found.offpage_texts);
+        self.check_offpage_text(&offpage, only);
         let cjk = std::mem::take(&mut found.cjk_texts);
         self.check_cjk_text(&found.cjk_pages, &cjk, only);
         let vertical = std::mem::take(&mut found.vertical_readings);
@@ -1143,7 +1165,7 @@ impl PdfInfo {
             if !pages.is_empty() {
                 self.warnings.push(PdfWarning::new(
                     PDF_WARNING_PAGES_UNCHECKED,
-                    "The checks of what a page paints stopped before these pages, as the document's content ran past the bounds they read within: text painted twice or invisibly, word gaps, and Japanese or Chinese text pdf-inspector 1.25.0 misreads are not reported on them; read them another way where they matter.",
+                    "The checks of what a page paints stopped before these pages, as the document's content ran past the bounds they read within: text painted twice, invisibly, or off the page, word gaps, and Japanese or Chinese text pdf-inspector 1.25.0 misreads are not reported on them; read them another way where they matter.",
                     pages,
                 ));
             }

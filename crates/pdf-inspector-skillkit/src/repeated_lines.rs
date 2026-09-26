@@ -754,7 +754,7 @@ fn lines_of(runs: &[EdgeRun]) -> Vec<Vec<usize>> {
 /// thirds or more of the runs set within 20 degrees of an axis are set
 /// along the page's height, the way more of them read (see
 /// `correct_rotated_page`, which counts shows where this counts runs).
-fn page_turn(runs: &[EdgeRun]) -> fn([f32; 2]) -> [f32; 2] {
+pub(crate) fn page_turn(runs: &[EdgeRun]) -> fn([f32; 2]) -> [f32; 2] {
     const TAN_20_DEG: f32 = 0.364;
     let (mut across, mut up, mut down) = (0usize, 0usize, 0usize);
     for run in runs {
