@@ -161,6 +161,78 @@ const MAX_CALL_FOR_REPEATS: std::time::Duration = std::time::Duration::from_secs
 /// What reading a page again for its lines costs, at most, as a share of
 /// what converting it did, before the first part read says.
 const REPEAT_READ_SHARE: f64 = 0.4;
+/// Pages read again, at most, to tell whether pdf-inspector left out the
+/// text set off them, and how long reading them may take: past them, the
+/// page scan's reading stands.
+const MAX_CLIP_PAGES: usize = 64;
+const MAX_CLIP_READING: std::time::Duration = std::time::Duration::from_secs(4);
+const MAX_CALL_FOR_CLIPS: std::time::Duration = std::time::Duration::from_secs(12);
+/// How far, in points, a run may stand past pdf-inspector's box for it to
+/// take the run as on the page.
+const CLIP_TOLERANCE: f32 = 6.0;
+
+/// Of `pages`, each with the box pdf-inspector clips it to, the first
+/// `MAX_CLIP_PAGES`, read again a part at a time within `MAX_CLIP_READING`,
+/// and while the call begun at `called` is not past `MAX_CALL_FOR_CLIPS`,
+/// whether pdf-inspector keeps text off that box, as it reads each page: a
+/// run with its middle or its baseline off the box, as it judges a run, or
+/// running past the box's side, as a line running past a crop is one run
+/// with its middle on the page. The box stands where it places the page's
+/// text, its corner the origin, turned with the page where it reads the
+/// text turned. A page it clips keeps none.
+fn offpage_kept(
+    buffer: &[u8],
+    pages: &[(u32, [f64; 4])],
+    called: std::time::Instant,
+) -> HashMap<u32, bool> {
+    let started = std::time::Instant::now();
+    let mut kept = HashMap::new();
+    for part in pages[..pages.len().min(MAX_CLIP_PAGES)].chunks(16) {
+        if started.elapsed() > MAX_CLIP_READING || called.elapsed() > MAX_CALL_FOR_CLIPS {
+            break;
+        }
+        let wanted: HashSet<u32> = part.iter().map(|(page, _)| *page).collect();
+        let read = std::panic::catch_unwind(|| {
+            pdf_inspector::extract_text_with_positions_and_rotations_mem_in_frame(
+                buffer,
+                Some(&wanted),
+                pdf_inspector::PositionFrame::Sheet,
+            )
+        });
+        let Ok(Ok((items, turns))) = read else {
+            break;
+        };
+        for &(page, page_box) in part {
+            let (width, height) = (
+                (page_box[2] - page_box[0]) as f32,
+                (page_box[3] - page_box[1]) as f32,
+            );
+            let [left, bottom, right, top] = match turns.get(&page) {
+                Some(pdf_inspector::PageRotation::Ccw) => [0.0, -width, height, 0.0],
+                Some(pdf_inspector::PageRotation::Cw) => [-height, 0.0, 0.0, width],
+                _ => [0.0, 0.0, width, height],
+            };
+            let (left, right) = (left - CLIP_TOLERANCE, right + CLIP_TOLERANCE);
+            let (bottom, top) = (bottom - CLIP_TOLERANCE, top + CLIP_TOLERANCE);
+            let off = items.iter().any(|item| {
+                let (start, end) = (
+                    item.x.min(item.x + item.width),
+                    item.x.max(item.x + item.width),
+                );
+                let middle = item.x + item.width / 2.0;
+                item.page == page
+                    && matches!(item.item_type, pdf_inspector::types::ItemType::Text)
+                    && !item.text.trim().is_empty()
+                    && (!(left..=right).contains(&middle)
+                        || !(bottom..=top).contains(&item.y)
+                        || start < left
+                        || end > right)
+            });
+            kept.insert(page, off);
+        }
+    }
+    kept
+}
 
 impl PdfWarning {
     fn new(code: &str, message: &str, pages: Vec<u32>) -> Self {
@@ -352,8 +424,9 @@ impl PdfInfo {
         buffer: &[u8],
         only: Option<&HashSet<u32>>,
         mode: &ProcessMode,
+        started: std::time::Instant,
     ) -> Option<Vec<(u32, Vec<repeated_lines::EdgeRun>)>> {
-        let mut found = self.scan_text_paints(buffer, only, mode);
+        let mut found = self.scan_text_paints(buffer, only, mode, started);
         let edges = found.edges.take();
         let tables = self
             .markdown
@@ -860,15 +933,42 @@ impl PdfInfo {
         }
     }
 
-    /// Report the pages whose text set off the page's visible box, which
-    /// pdf-inspector reads where it does not take it for a neighbouring
-    /// page's (see `text_paints::OffPage`), the Markdown shows.
+    /// Report the pages whose text set off the box a viewer shows, which
+    /// pdf-inspector reads, the Markdown shows: text within the box it clips
+    /// to, where its own box differs, and text off it on a page it does not
+    /// clip. Whether it clipped a page is read from the text it reads there
+    /// (see `offpage_kept`); past what can be read again, as the page scan
+    /// takes it (see `text_paints::Clip`).
     fn check_offpage_text(
         &mut self,
+        buffer: &[u8],
         texts: &[(u32, text_paints::PageTexts)],
         only: Option<&HashSet<u32>>,
+        started: std::time::Instant,
     ) {
-        let pages = self.shown_pages(texts, only);
+        let shown = self.shown_pages(texts, only);
+        let clips: HashMap<u32, text_paints::Clip> = texts
+            .iter()
+            .filter_map(|(page, texts)| Some((*page, texts.clip?)))
+            .collect();
+        // The pages pdf-inspector may have clipped, with the box it clips to.
+        let uncertain: Vec<(u32, [f64; 4])> = shown
+            .iter()
+            .filter_map(|page| {
+                let clip = clips.get(page).filter(|clip| !clip.kept)?;
+                Some((*page, clip.page_box?))
+            })
+            .collect();
+        let kept = offpage_kept(buffer, &uncertain, started);
+        let pages: Vec<u32> = shown
+            .into_iter()
+            .filter(|page| match clips.get(page) {
+                Some(clip) if !clip.kept && clip.page_box.is_some() => {
+                    kept.get(page).copied().unwrap_or(!clip.clipped)
+                }
+                _ => true,
+            })
+            .collect();
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_OFFPAGE_TEXT_READ,
@@ -1140,6 +1240,7 @@ impl PdfInfo {
         buffer: &[u8],
         only: Option<&HashSet<u32>>,
         mode: &ProcessMode,
+        started: std::time::Instant,
     ) -> text_paints::Findings {
         let layer_skip: HashSet<u32> = self
             .ocr_reasons_by_page
@@ -1185,7 +1286,7 @@ impl PdfInfo {
         let invisible = std::mem::take(&mut found.invisible_texts);
         self.check_invisible_text(&invisible, only);
         let offpage = std::mem::take(&mut found.offpage_texts);
-        self.check_offpage_text(&offpage, only);
+        self.check_offpage_text(buffer, &offpage, only, started);
         let cjk = std::mem::take(&mut found.cjk_texts);
         self.check_cjk_text(&found.cjk_pages, &cjk, only);
         let vertical = std::mem::take(&mut found.vertical_readings);
@@ -1330,6 +1431,7 @@ mod markdown_tables;
 mod optional_content;
 pub mod pdf_worker;
 mod repeated_lines;
+mod standard_fonts;
 mod text_paints;
 mod vertical_text;
 mod word_gaps;
@@ -1503,7 +1605,7 @@ pub fn process_bytes_with_options(
     let strips = options.markdown.strip_headers_footers;
     let result = pdf_inspector::process_pdf_mem_with_options(buffer, options)?;
     let mut info = PdfInfo::from_result(result, &mode);
-    let edges = info.check_pages(buffer, pages.as_ref(), &mode);
+    let edges = info.check_pages(buffer, pages.as_ref(), &mode, started);
     info.check_repeated_lines(
         buffer,
         pages.as_ref(),

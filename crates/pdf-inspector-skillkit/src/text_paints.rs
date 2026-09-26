@@ -45,6 +45,7 @@
 //! is reported when it shows text in a form pdf-inspector does not reach,
 //! or text read byte by byte that its font reads otherwise.
 
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -69,6 +70,12 @@ const MAX_REPEAT_CONTENT_BYTES: usize = 64 << 20;
 const MAX_REPEAT_OPERATIONS: usize = 4_000_000;
 /// Form XObjects executing inside one another.
 const MAX_FORM_DEPTH: usize = 12;
+/// How deep in other forms pdf-inspector 1.25.0 draws a form, how many
+/// forms it draws on a page, and how many of their operations it walks, at
+/// most: past them it reads nothing more of the page's forms.
+const MAX_READ_FORM_DEPTH: usize = 5;
+const MAX_READ_FORM_INVOCATIONS: usize = 10_000;
+const MAX_READ_FORM_OPERATIONS: usize = 1_000_000;
 /// Graphics states saved (`q`) and not yet restored, per content stream.
 const MAX_SAVED_STATES: usize = 256;
 /// Bytes an object stream may decode to while the document loads, as
@@ -96,8 +103,14 @@ const MAX_REPEATS_PER_PAGE: usize = 16;
 /// look for it where the span's text puts it.
 const MAX_UNSEEN_IN_SPAN: usize = 256;
 const GIVEN_CONTEXT_CHARS: usize = 8;
-/// Operations of forms kept to be drawn again, across a document, at most.
-const MAX_KEPT_OPERATIONS: usize = 1_000_000;
+/// Bytes of the operations of forms kept to be drawn again, across a
+/// document, at most, as far as `KeptForm::bytes` tells: each takes several
+/// hundred.
+const MAX_KEPT_BYTES: usize = 32 << 20;
+/// Bytes the forms drawn by content pdf-inspector reads nothing of, or the
+/// streams of a page it reads none of, decode to that are read to tell
+/// whether they show text, at most (see `census_shows_text`).
+const MAX_CENSUS_BYTES: usize = 256 << 20;
 /// Placed run starts kept per document, for the table check.
 const MAX_PLACED_RUNS: usize = 400_000;
 /// How near a run must start again to repeat one, as a share of its size:
@@ -168,7 +181,9 @@ struct State {
     /// The render mode as pdf-inspector reads text by it: it takes each
     /// text object to start in mode 0.
     read_mode: i64,
-    /// Whether `Tf` has set a font; text shown before shows nothing.
+    /// Whether `Tf` has set a font; text shown before shows nothing. A
+    /// viewer sets one whatever the operands, its default where it finds
+    /// none named.
     font: bool,
     /// Whether pdf-inspector reads the text here at all: not in a form it
     /// does not find where the page or form drawing it names it (see
@@ -187,7 +202,10 @@ struct State {
     /// The font, when its glyph codes can be read and the page is checked
     /// for words shown glyph by glyph.
     glyph_font: Option<usize>,
+    /// The font size as pdf-inspector reads it, from `Tf`'s second operand,
+    /// and as a viewer does, from its last, 0 where that is no number.
     size: f64,
+    viewer_size: f64,
     char_spacing: f64,
     word_spacing: f64,
     /// Horizontal scaling, as a share.
@@ -209,6 +227,12 @@ struct State {
 }
 
 impl State {
+    /// Whether a viewer paints nothing of text shown here: in render mode
+    /// 3, at size 0, or scaled to no width.
+    fn paints_nothing(&self) -> bool {
+        self.render_mode == 3 || self.viewer_size == 0.0 || self.horizontal_scale == 0.0
+    }
+
     const START: State = State {
         ctm: IDENTITY,
         render_mode: 0,
@@ -220,6 +244,7 @@ impl State {
         gaps: None,
         glyph_font: None,
         size: 0.0,
+        viewer_size: 0.0,
         char_spacing: 0.0,
         word_spacing: 0.0,
         horizontal_scale: 1.0,
@@ -761,6 +786,8 @@ struct PageText {
     /// out.
     offpage_text: Option<Noted>,
     offpage: OffPage,
+    /// The box a viewer shows of the page (see `viewer_box`).
+    shown_box: [f64; 4],
     /// Text shown in a font pdf-inspector reads without its collection's
     /// map, as the font says it (see `cjk_fonts`), and whether any of it
     /// reads otherwise with no sign, when the page is read for repeats;
@@ -772,7 +799,7 @@ struct PageText {
     cjk_fonts: crate::cjk_fonts::CjkFonts,
     /// Forms found to show no text and paint no image or shading, so far in
     /// the document: they bear on no check, and are read once.
-    inert_forms: HashSet<ObjectId>,
+    inert_forms: HashMap<ObjectId, usize>,
     /// Whether pdf-inspector reads nothing of content the page shows text
     /// in, or may: its own, or a form's, past `MAX_READ_OPERATORS` or
     /// `MAX_READ_BYTES` (see `content_ops`). And the forms found past them
@@ -785,6 +812,8 @@ struct PageText {
     actual_text_differs: bool,
     /// Forms kept to be drawn again (see `KeptForms`).
     kept_forms: KeptForms,
+    /// pdf-inspector's walk of the page's forms (see `FormWalk`).
+    form_walk: FormWalk,
     /// Strings shown in fonts that write vertically, when the page is read
     /// for repeats, and the bytes of their text kept.
     vertical: Option<Vec<crate::vertical_text::VerticalRun>>,
@@ -877,6 +906,22 @@ pub(crate) struct PageTexts {
     pub(crate) overflowed: bool,
     /// Whether any of the texts starts on the page.
     on_page: bool,
+    /// For text set off the page's box, how pdf-inspector's clip bears on
+    /// it.
+    pub(crate) clip: Option<Clip>,
+}
+
+/// How pdf-inspector's clip bears on the text set off a page's box that a
+/// viewer shows (see `viewer_box`): the box pdf-inspector clips to, where
+/// the page declares one (see `page_box`), and whether the scan takes the
+/// text off it for a neighbouring page's, which pdf-inspector leaves out
+/// (see `OffPage::clipped`); and whether some of that text stands within
+/// pdf-inspector's box, which it keeps whatever it clips.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Clip {
+    pub(crate) page_box: Option<[f64; 4]>,
+    pub(crate) clipped: bool,
+    pub(crate) kept: bool,
 }
 
 impl PageTexts {
@@ -1018,6 +1063,7 @@ impl Noted {
             texts,
             overflowed: self.overflowed,
             on_page,
+            clip: None,
         }
     }
 }
@@ -1027,9 +1073,7 @@ impl Noted {
 /// for repeats: where each run it reads starts and ends, and whether it
 /// stands off the box, up to `MAX_RUNS_PER_PAGE` runs, and whether runs
 /// past them were left out; the runs off the box, their characters, and
-/// those of runs of `MIN_WORDY_CHARS` or more; and where the pen stands
-/// after the string shown last, where one shown next without the text
-/// matrix being set starts.
+/// those of runs of `MIN_WORDY_CHARS` or more.
 #[derive(Default)]
 struct OffPage {
     runs: Vec<ReadRun>,
@@ -1037,7 +1081,9 @@ struct OffPage {
     off: usize,
     characters: usize,
     wordy: usize,
-    pen: Option<[f64; 2]>,
+    /// Whether text off the box a viewer shows was noted that stands within
+    /// pdf-inspector's.
+    kept: bool,
 }
 
 /// Where a run pdf-inspector reads starts and ends on its baseline, and
@@ -1426,40 +1472,12 @@ impl PageText {
         advance
     }
 
-    /// Where a string shown in a text object starts and ends on its
-    /// baseline, when the page is read for the text off its box: from where
-    /// the text matrix says where it was just set, else from where the pen
-    /// stands after the string before, which this one moves it past.
-    fn place(
-        &mut self,
-        state: State,
-        text_matrix: [f64; 6],
-        text: Option<&Object>,
-        placed: bool,
-    ) -> Option<[[f64; 2]; 2]> {
+    /// How far along a string shown in a text object moves the text
+    /// matrix, in text space, when the page is read for the text off its
+    /// box (see `placement`).
+    fn along(&mut self, state: State, text: Option<&Object>) -> Option<f64> {
         self.offpage_text.as_ref()?;
-        let matrix = multiply(text_matrix, state.ctm);
-        let origin = match self.offpage.pen.filter(|_| !placed) {
-            Some(pen) => pen,
-            None => [matrix[4], matrix[5]],
-        };
-        let advance = self.advance(state, text);
-        let along = [
-            advance * matrix[0] * state.horizontal_scale,
-            advance * matrix[1] * state.horizontal_scale,
-        ];
-        let pen = [origin[0] + along[0], origin[1] + along[1]];
-        self.offpage.pen = pen.iter().all(|value| value.is_finite()).then_some(pen);
-        let start = [
-            origin[0] + matrix[2] * state.rise,
-            origin[1] + matrix[3] * state.rise,
-        ];
-        let end = [start[0] + along[0], start[1] + along[1]];
-        start
-            .iter()
-            .chain(&end)
-            .all(|value| value.is_finite() && value.abs() < f64::from(f32::MAX))
-            .then_some([start, end])
+        Some(self.advance(state, text) * state.horizontal_scale)
     }
 
     /// Note a string pdf-inspector reads that stands where `placed` says
@@ -1477,29 +1495,36 @@ impl PageText {
         text_matrix: [f64; 6],
         bytes: &[u8],
         placed: bool,
-        at: Option<[[f64; 2]; 2]>,
+        [at, read_at]: [Option<[[f64; 2]; 2]>; 2],
         edge: Option<usize>,
         given: bool,
         unseen: bool,
         page_box: [f64; 4],
     ) {
-        let Some([start, end]) = at.filter(|_| !given && self.offpage_text.is_some()) else {
+        let (Some([start, end]), Some(read)) = (at, read_at) else {
             return;
         };
-        let middle = [0.5 * (start[0] + end[0]), 0.5 * (start[1] + end[1])];
-        let off = !((page_box[0] - PAGE_BOX_TOLERANCE..=page_box[2] + PAGE_BOX_TOLERANCE)
-            .contains(&middle[0])
-            && (page_box[1] - PAGE_BOX_TOLERANCE..=page_box[3] + PAGE_BOX_TOLERANCE)
-                .contains(&middle[1]));
-        let run = |off| ReadRun {
-            start: start.map(|value| value as f32),
-            end: end.map(|value| value as f32),
-            off,
-        };
-        if !off {
+        if given || self.offpage_text.is_none() {
+            return;
+        }
+        let middle =
+            |[start, end]: [[f64; 2]; 2]| [0.5 * (start[0] + end[0]), 0.5 * (start[1] + end[1])];
+        // Off the box a viewer shows, where it places the string, and off
+        // pdf-inspector's, which it clips to, where it places it.
+        let shown = self.shown_box;
+        let off = !(shown[2] > shown[0]
+            && shown[3] > shown[1]
+            && within_box(middle([start, end]), shown));
+        let off_read = !within_box(middle(read), page_box);
+        let [start, end] = read;
+        if !off && !off_read {
             // pdf-inspector makes no run of white space.
             if bytes.iter().any(|&byte| byte != b' ') {
-                self.offpage.keep(run(false));
+                self.offpage.keep(ReadRun {
+                    start: start.map(|value| value as f32),
+                    end: end.map(|value| value as f32),
+                    off: false,
+                });
             }
             if let Some(noted) = self.offpage_text.as_mut() {
                 noted.interrupt();
@@ -1511,10 +1536,23 @@ impl PageText {
             Some(text) => text.trim().chars().count(),
             None => bytes.iter().filter(|&&byte| byte != b' ').count(),
         };
-        if characters > 0 {
+        if off_read && characters > 0 {
             self.offpage.count(characters);
-            self.offpage.keep(run(true));
         }
+        if off_read && characters > 0 || !off_read && bytes.iter().any(|&byte| byte != b' ') {
+            self.offpage.keep(ReadRun {
+                start: start.map(|value| value as f32),
+                end: end.map(|value| value as f32),
+                off: off_read,
+            });
+        }
+        if !off {
+            if let Some(noted) = self.offpage_text.as_mut() {
+                noted.interrupt();
+            }
+            return;
+        }
+        self.offpage.kept |= characters > 0 && !off_read && !unseen;
         let Some(noted) = self.offpage_text.as_mut() else {
             return;
         };
@@ -1575,8 +1613,13 @@ impl PageText {
         // characters around it in the span's text.
         if let (true, Some(seen)) = (given.shown, given.seen.as_deref()) {
             let actual: Vec<char> = crate::repeated_lines::bare(&text).chars().collect();
-            let bare: String = actual.iter().collect();
+            // Compared as words are told apart, whatever their case, and
+            // quotes, apostrophes, and dashes of whichever shape; the text
+            // looked for is the span's as it stands.
+            let bare: String = actual.iter().copied().map(fold).collect();
+            let seen: String = seen.chars().map(fold).collect();
             for (glyphs, invisible, hidden) in &given.unseen {
+                let glyphs: String = glyphs.chars().map(fold).collect();
                 if bare.matches(glyphs.as_str()).count() <= seen.matches(glyphs.as_str()).count() {
                     continue;
                 }
@@ -2009,7 +2052,7 @@ pub(crate) fn scan_document(
     let mut gap_fonts = GapFonts::default();
     let mut glyph_fonts = GlyphFonts::default();
     let mut cjk_fonts = crate::cjk_fonts::CjkFonts::default();
-    let mut inert_forms = HashSet::new();
+    let mut inert_forms = HashMap::new();
     let mut dense_forms = HashMap::new();
     let mut kept_forms = KeptForms::default();
     let mut found = Findings::default();
@@ -2198,6 +2241,7 @@ pub(crate) fn scan_document(
                         texts: vec![value.text.clone()],
                         overflowed: false,
                         on_page: true,
+                        clip: None,
                     };
                     (page, texts)
                 }));
@@ -2216,7 +2260,7 @@ struct Budgets<'a> {
     gap_fonts: &'a mut GapFonts,
     glyph_fonts: &'a mut GlyphFonts,
     cjk_fonts: &'a mut crate::cjk_fonts::CjkFonts,
-    inert_forms: &'a mut HashSet<ObjectId>,
+    inert_forms: &'a mut HashMap<ObjectId, usize>,
     dense_forms: &'a mut HashMap<ObjectId, bool>,
     kept_forms: &'a mut KeptForms,
 }
@@ -2281,6 +2325,7 @@ fn scan_page(
     layers: Option<&std::rc::Rc<Layers>>,
 ) -> Result<PageFindings, Exhausted> {
     let (page_box, declared) = page_box(document, page_id);
+    let shown_box = viewer_box(document, page_id);
     let scopes = page_resources(document, page_id);
     let check_twice = checks.twice;
     // A scan is an image XObject; for the layer check, a page that binds
@@ -2315,8 +2360,15 @@ fn scan_page(
     let Ok(content) =
         document.get_page_content_with_limit(page_id, crate::content_ops::MAX_READ_BYTES)
     else {
+        // What the page shows is missing from the Markdown where it shows
+        // text.
+        let resources = Resources {
+            form: None,
+            own: true,
+            page: &scopes,
+        };
         return Ok(PageFindings {
-            content_unread: true,
+            content_unread: page_shows_text(document, page_id, resources),
             ..PageFindings::default()
         });
     };
@@ -2342,6 +2394,7 @@ fn scan_page(
         glyph_words: check_twice.then(GlyphWords::default),
         glyph_fonts: std::mem::take(glyph_fonts),
         forms: check_forms,
+        shown_box,
         ..PageText::default()
     };
     page.save();
@@ -2399,15 +2452,22 @@ fn scan_page(
         .filter(|_| !hidden_layer)
         .map(|noted| noted.looked_for(&runs))
         .unwrap_or_default();
-    // Text off the page's box, but where pdf-inspector takes it for a
-    // neighbouring page's and leaves it out; on a scan with its text layer,
-    // reported for OCR, it is not looked for either.
+    // Text off the box a viewer shows, with how pdf-inspector's clip bears
+    // on it; on a scan with its text layer, reported for OCR, it is not
+    // looked for.
     let turn = crate::repeated_lines::page_turn(&runs);
     let offpage_text = page
         .offpage_text
         .take()
-        .filter(|_| !hidden_layer && !page.offpage.clipped(page_box, declared, turn))
-        .map(|noted| noted.looked_for(&runs))
+        .filter(|_| !hidden_layer)
+        .map(|noted| PageTexts {
+            clip: Some(Clip {
+                page_box: declared.then_some(page_box),
+                clipped: page.offpage.clipped(page_box, declared, turn),
+                kept: page.offpage.kept,
+            }),
+            ..noted.looked_for(&runs)
+        })
         .unwrap_or_default();
     let vertical_readings = page
         .vertical
@@ -2493,7 +2553,7 @@ fn execute<'a>(
     if operators > crate::content_ops::MAX_READ_OPERATORS {
         // What it shows is missing from the Markdown: text of its own, or
         // of a form it draws.
-        let shows = shows_text(document, content, resources, budget)?;
+        let shows = shows_text(document, content, resources);
         if let Some(&form) = forms.last() {
             page.dense_forms.insert(form, shows);
         }
@@ -2504,6 +2564,9 @@ fn execute<'a>(
     let Ok(decoded) = Content::decode(content) else {
         return Ok(());
     };
+    if !forms.is_empty() && start.reached {
+        page.form_walk.operations += operators;
+    }
     // A form that shows no text and paints no image or shading, as a
     // letterhead's drawn logo, bears on no check: it is read once, and
     // passed over wherever it is drawn again.
@@ -2515,23 +2578,25 @@ fn execute<'a>(
             )
         });
         if !paints {
-            page.inert_forms.insert(form);
+            page.inert_forms.insert(form, operators);
             return Ok(());
         }
     }
-    // The modes a viewer sets at each `Tr`, as it reads the stream (see
-    // `content_ops::viewer_modes`), where it reads as many as lopdf does.
+    // The modes a viewer sets at each `Tr` lopdf decodes, as it reads the
+    // stream (see `content_ops::viewer_modes_read`), where they are found.
     let tr_count = decoded
         .operations
         .iter()
         .filter(|operation| operation.operator == "Tr")
         .count();
-    let viewer_modes = (tr_count > 0)
-        .then(|| crate::content_ops::viewer_modes(content))
-        .filter(|modes| modes.len() == tr_count);
-    // A form is kept as the scan acts on it, to be drawn again at the cost
-    // of that alone, as a letterhead with a line of text is on every page.
-    if let Some(&form) = forms.last() {
+    let viewer_modes = crate::content_ops::viewer_modes_read(content, tr_count);
+    // A form drawn again is kept as the scan acts on it, to be drawn after
+    // at the cost of that alone, as a letterhead with a line of text is on
+    // every page.
+    if let Some(&form) = forms
+        .last()
+        .filter(|&&form| page.kept_forms.drawn_again(form))
+    {
         let operations: Vec<Operation> = decoded
             .operations
             .into_iter()
@@ -2539,6 +2604,7 @@ fn execute<'a>(
             .collect();
         let kept = std::rc::Rc::new(KeptForm {
             operations,
+            total: operators,
             viewer_modes,
         });
         page.kept_forms.keep(form, &kept);
@@ -2591,6 +2657,12 @@ fn run<'a>(
     let mut text_matrix = IDENTITY;
     let mut line_matrix = IDENTITY;
     let mut placed = false;
+    // The text and line matrices as a viewer keeps them, to place strings
+    // by: moved to the next line by the leading set, none where none is,
+    // and moved along past each string shown, in text space, so that a
+    // string is placed however the transformation changes before it.
+    let mut viewer_text = IDENTITY;
+    let mut viewer_line = IDENTITY;
     // Whether a text object is open, the only place pdf-inspector reads
     // text, and a string there waiting on the next run.
     let mut in_text = false;
@@ -2616,6 +2688,8 @@ fn run<'a>(
             line_matrix = multiply([1.0, 0.0, 0.0, 1.0, 0.0, -leading], line_matrix);
             text_matrix = line_matrix;
             placed = true;
+            viewer_line = multiply([1.0, 0.0, 0.0, 1.0, 0.0, -state.leading], viewer_line);
+            viewer_text = viewer_line;
         }
         if matches!(operator, "T*" | "'" | "\"" | "Td" | "TD" | "Tm" | "BT") {
             travelled = Some(0.0);
@@ -2749,43 +2823,52 @@ fn run<'a>(
                 }
             }
             "Tf" => {
-                if let [name, size] = operands.as_slice() {
-                    state.font = name.as_name().is_ok();
-                    let found = name
-                        .as_name()
-                        .ok()
-                        .and_then(|name| resources.find(document, b"Font", name))
-                        .and_then(|(font, read)| Some((dictionary(document, font)?, read)));
-                    let resolved = found.map(|(font, _)| font);
-                    // pdf-inspector reads text by the fonts it finds (see
-                    // `Resources`), and byte by byte where it finds none.
-                    let read = found.is_some_and(|(_, read)| read);
-                    // Word gaps are checked with the repeats, on the pages
-                    // read for them, in text pdf-inspector reads.
-                    let judged = read && state.reached;
-                    state.gaps = resolved
-                        .filter(|_| page.runs.is_some() && judged)
-                        .and_then(|font| page.gap_fonts.font(document, font));
-                    state.glyph_font = resolved
-                        .filter(|_| page.glyph_words.is_some() && judged)
-                        .and_then(|font| page.glyph_fonts.font(document, font));
-                    state.raw = !read;
-                    state.cjk = resolved
-                        .filter(|_| judged && page.cjk_text.is_some())
-                        .and_then(|font| page.cjk_fonts.font(document, font));
-                    state.vertical = judged
-                        && page.vertical.is_some()
-                        && resolved.is_some_and(crate::vertical_text::writes_vertically);
-                    state.decoded = resolved.filter(|_| page.forms).and_then(|font| {
-                        let two_bytes = font
-                            .get(b"Subtype")
-                            .and_then(Object::as_name)
-                            .is_ok_and(|subtype| subtype == b"Type0");
-                        match page.glyph_fonts.font(document, font) {
-                            Some(font) => Some(Decoded::Glyphs { font, two_bytes }),
-                            None => two_bytes.then_some(Decoded::TwoBytes),
-                        }
-                    });
+                // A viewer sets a font whatever the operands, its default
+                // where it finds none named, at the size the last gives, 0
+                // where it is no number, which paints nothing; pdf-inspector
+                // takes the font from the first, where it is a name, and the
+                // size from the second, where there are two or more.
+                state.font = true;
+                state.viewer_size = operands
+                    .last()
+                    .and_then(|size| number(document, size))
+                    .unwrap_or(0.0);
+                if let [name, size, ..] = operands.as_slice() {
+                    if let Ok(name) = name.as_name() {
+                        let found = resources
+                            .find(document, b"Font", name)
+                            .and_then(|(font, read)| Some((dictionary(document, font)?, read)));
+                        let resolved = found.map(|(font, _)| font);
+                        // pdf-inspector reads text by the fonts it finds (see
+                        // `Resources`), and byte by byte where it finds none.
+                        let read = found.is_some_and(|(_, read)| read);
+                        // Word gaps are checked with the repeats, on the pages
+                        // read for them, in text pdf-inspector reads.
+                        let judged = read && state.reached;
+                        state.gaps = resolved
+                            .filter(|_| page.runs.is_some() && judged)
+                            .and_then(|font| page.gap_fonts.font(document, font));
+                        state.glyph_font = resolved
+                            .filter(|_| page.glyph_words.is_some() && judged)
+                            .and_then(|font| page.glyph_fonts.font(document, font));
+                        state.raw = !read;
+                        state.cjk = resolved
+                            .filter(|_| judged && page.cjk_text.is_some())
+                            .and_then(|font| page.cjk_fonts.font(document, font));
+                        state.vertical = judged
+                            && page.vertical.is_some()
+                            && resolved.is_some_and(crate::vertical_text::writes_vertically);
+                        state.decoded = resolved.filter(|_| page.forms).and_then(|font| {
+                            let two_bytes = font
+                                .get(b"Subtype")
+                                .and_then(Object::as_name)
+                                .is_ok_and(|subtype| subtype == b"Type0");
+                            match page.glyph_fonts.font(document, font) {
+                                Some(font) => Some(Decoded::Glyphs { font, two_bytes }),
+                                None => two_bytes.then_some(Decoded::TwoBytes),
+                            }
+                        });
+                    }
                     if let Some(size) = number(document, size) {
                         state.size = size;
                     }
@@ -2824,6 +2907,8 @@ fn run<'a>(
                 }
                 text_matrix = IDENTITY;
                 line_matrix = IDENTITY;
+                viewer_text = IDENTITY;
+                viewer_line = IDENTITY;
                 placed = true;
                 in_text = true;
                 pending = None;
@@ -2846,6 +2931,8 @@ fn run<'a>(
                 if let Some(matrix) = matrix(document, operands) {
                     text_matrix = matrix;
                     line_matrix = matrix;
+                    viewer_text = matrix;
+                    viewer_line = matrix;
                     placed = true;
                 }
             }
@@ -2857,6 +2944,8 @@ fn run<'a>(
                         }
                         line_matrix = multiply([1.0, 0.0, 0.0, 1.0, x, y], line_matrix);
                         text_matrix = line_matrix;
+                        viewer_line = multiply([1.0, 0.0, 0.0, 1.0, x, y], viewer_line);
+                        viewer_text = viewer_line;
                         placed = true;
                     }
                 }
@@ -2882,11 +2971,22 @@ fn run<'a>(
                 let bytes = shown_bytes(text);
                 page.show(state, &bytes);
                 // Where the string stands, whether pdf-inspector reads it or
-                // not: either way it moves the pen.
-                let at = if in_text {
-                    page.place(state, text_matrix, text, placed)
-                } else {
-                    None
+                // not: either way it moves the text matrix along. And where
+                // pdf-inspector places it: where the text matrix was just
+                // set, which it moves to a new line by a leading of its own
+                // where none is set.
+                let (at, read_at) = match in_text.then(|| page.along(state, text)).flatten() {
+                    Some(along) => {
+                        let at = placement(state, viewer_text, along);
+                        let read_at = if placed {
+                            placement(state, text_matrix, along)
+                        } else {
+                            at
+                        };
+                        viewer_text = multiply([1.0, 0.0, 0.0, 1.0, along, 0.0], viewer_text);
+                        (at, read_at)
+                    }
+                    None => (None, None),
                 };
                 let hidden = state.hidden || marked.hidden > 0;
                 // A string shown in a span of the page's giving its glyphs'
@@ -2895,8 +2995,9 @@ fn run<'a>(
                 let given = in_text
                     && state.font
                     && forms.is_empty()
-                    && marked.show(&bytes, state.render_mode == 3, hidden, || {
-                        starts_on_page(state, text_matrix, page_box)
+                    && marked.show(&bytes, state.paints_nothing(), hidden, || match at {
+                        Some([start, _]) => within_box(start, page_box),
+                        None => starts_on_page(state, text_matrix, page_box),
                     });
                 // What pdf-inspector reads: text it reaches, in a font, in a
                 // text object, but in mode 3 as it takes the mode, and, in a
@@ -2909,7 +3010,7 @@ fn run<'a>(
                 if given {
                     let glyphs = said_text(&mut page.glyph_fonts, state, &bytes)
                         .map(|glyphs| crate::repeated_lines::bare(&glyphs));
-                    marked.record(glyphs, state.render_mode == 3, hidden);
+                    marked.record(glyphs, state.paints_nothing(), hidden);
                 }
                 if in_text && state.font && state.reached && state.read_mode != 3 && !white {
                     let edge = page.note_edge(state, text_matrix, &bytes, placed);
@@ -2924,9 +3025,11 @@ fn run<'a>(
                             false,
                             page_box,
                         );
-                        // Mode 3 paints nothing; pdf-inspector reads it where
-                        // it takes the text object to start in mode 0 (#572).
-                        let invisible = state.render_mode == 3;
+                        // Mode 3 paints nothing, nor does text of size 0 or
+                        // scaled to no width; pdf-inspector reads it, mode 3
+                        // where it takes the text object to start in mode 0
+                        // (#572).
+                        let invisible = state.paints_nothing();
                         page.note_unseen(
                             state,
                             text_matrix,
@@ -2943,10 +3046,10 @@ fn run<'a>(
                         text_matrix,
                         &bytes,
                         placed,
-                        at,
+                        [at, read_at],
                         edge,
                         given,
-                        hidden || state.render_mode == 3,
+                        hidden || state.paints_nothing(),
                         page_box,
                     );
                     // Glyphs a span's text stands in for are not read, so
@@ -2965,13 +3068,14 @@ fn run<'a>(
                     page.note_unseen(raw, text_matrix, &bytes, placed, None, true, true, page_box);
                 }
                 // Text a viewer paints that pdf-inspector skips, as `Tr`'s
-                // first operand says mode 3 where its last says another, and
-                // white text aside, which a white page hides.
-                if in_text
+                // first operand says mode 3 where its last says another, or
+                // shows outside a text object, which it reads nothing of,
+                // and white text aside, which a white page hides.
+                if (!in_text || state.read_mode == 3)
                     && state.font
                     && state.reached
-                    && state.read_mode == 3
-                    && !matches!(state.render_mode, 3 | 7)
+                    && !state.paints_nothing()
+                    && state.render_mode != 7
                     && !hidden
                     && !given
                     && !(state.white && matches!(state.render_mode, 0 | 2 | 4 | 6))
@@ -3061,10 +3165,18 @@ fn run<'a>(
                 match stream.dict.get(b"Subtype").and_then(Object::as_name) {
                     Ok(b"Image") => page.draw_image(state.ctm, page_box),
                     Ok(b"Form") => {
-                        if forms.len() >= MAX_FORM_DEPTH
-                            || forms.contains(&id)
-                            || page.inert_forms.contains(&id)
-                        {
+                        // Whether pdf-inspector draws the form, within its
+                        // walk of the page's forms: one passed over here for
+                        // bearing on no check it walks all the same, and one
+                        // holding more than it reads it does not walk.
+                        let walked = state.reached && read && page.form_walk.admits(forms.len());
+                        if let Some(&operators) = page.inert_forms.get(&id) {
+                            if walked {
+                                page.form_walk.operations += operators;
+                            }
+                            continue;
+                        }
+                        if forms.len() >= MAX_FORM_DEPTH || forms.contains(&id) {
                             continue;
                         }
                         if let Some(&shows) = page.dense_forms.get(&id) {
@@ -3137,7 +3249,7 @@ fn run<'a>(
                                 .is_some_and(|layers| layers.hide(document, &stream.dict));
                         let inner = State {
                             ctm: multiply(form_matrix, state.ctm),
-                            reached: state.reached && read,
+                            reached: walked,
                             hidden,
                             raw: true,
                             gaps: None,
@@ -3156,6 +3268,9 @@ fn run<'a>(
                                 Some(kept) => budget
                                     .take_operations(kept.operations.len())
                                     .and_then(|()| {
+                                        if walked {
+                                            page.form_walk.operations += kept.total;
+                                        }
                                         run(
                                             document,
                                             &kept.operations,
@@ -3197,19 +3312,83 @@ fn run<'a>(
     Ok(())
 }
 
-/// A form's operations the page scan acts on (see `acted_on`), and the
-/// modes a viewer sets at each `Tr` among them, where they are known.
+/// How far pdf-inspector has walked a page's forms: the forms it drew, and
+/// their operations.
+#[derive(Default)]
+struct FormWalk {
+    invocations: usize,
+    operations: usize,
+}
+
+impl FormWalk {
+    /// Whether pdf-inspector draws a form `depth` forms deep, as it counts
+    /// it drawn: not past `MAX_READ_FORM_DEPTH`, and not once it has drawn
+    /// `MAX_READ_FORM_INVOCATIONS` or walked `MAX_READ_FORM_OPERATIONS`.
+    fn admits(&mut self, depth: usize) -> bool {
+        let admitted = depth <= MAX_READ_FORM_DEPTH
+            && self.invocations < MAX_READ_FORM_INVOCATIONS
+            && self.operations < MAX_READ_FORM_OPERATIONS;
+        self.invocations += usize::from(admitted);
+        admitted
+    }
+}
+
+/// A form's operations the page scan acts on (see `acted_on`), how many it
+/// holds in all, and the modes a viewer sets at each `Tr` among them, where
+/// they are known.
 struct KeptForm {
     operations: Vec<Operation>,
+    total: usize,
     viewer_modes: Option<Vec<Option<i64>>>,
 }
 
-/// Forms kept to be drawn again, so far in the document, and the
-/// operations they hold, up to `MAX_KEPT_OPERATIONS`.
+impl KeptForm {
+    /// Roughly the bytes the form holds: each operation's, and its
+    /// operands', strings, names, and arrays among them.
+    fn bytes(&self) -> usize {
+        let mut bytes = self
+            .viewer_modes
+            .as_ref()
+            .map_or(0, |modes| modes.len() * std::mem::size_of::<Option<i64>>());
+        let mut objects: Vec<&Object> = Vec::new();
+        for operation in &self.operations {
+            bytes += std::mem::size_of::<Operation>() + operation.operator.len();
+            objects.extend(&operation.operands);
+            while let Some(object) = objects.pop() {
+                bytes += std::mem::size_of::<Object>();
+                match object {
+                    Object::Name(held) | Object::String(held, _) => bytes += held.len(),
+                    Object::Array(items) => objects.extend(items),
+                    Object::Dictionary(entries) => {
+                        for (key, value) in entries.iter() {
+                            bytes += key.len();
+                            objects.push(value);
+                        }
+                    }
+                    Object::Stream(stream) => {
+                        bytes += stream.content.len();
+                        for (key, value) in stream.dict.iter() {
+                            bytes += key.len();
+                            objects.push(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        bytes
+    }
+}
+
+/// Forms kept to be drawn again, so far in the document, and the bytes
+/// they hold, up to `MAX_KEPT_BYTES`; and the forms drawn once, which are
+/// kept where they are drawn again, as a letterhead is on every page: a
+/// form drawn once, as a page's own content often is, is never kept.
 #[derive(Default)]
 struct KeptForms {
     forms: HashMap<ObjectId, std::rc::Rc<KeptForm>>,
-    operations: usize,
+    bytes: usize,
+    drawn: HashSet<ObjectId>,
 }
 
 impl KeptForms {
@@ -3217,10 +3396,15 @@ impl KeptForms {
         self.forms.get(&form).cloned()
     }
 
+    /// Whether `form` was drawn before, as it is noted to be now.
+    fn drawn_again(&mut self, form: ObjectId) -> bool {
+        !self.drawn.insert(form)
+    }
+
     fn keep(&mut self, form: ObjectId, kept: &std::rc::Rc<KeptForm>) {
-        let operations = self.operations + kept.operations.len();
-        if operations <= MAX_KEPT_OPERATIONS {
-            self.operations = operations;
+        let bytes = self.bytes.saturating_add(kept.bytes());
+        if bytes <= MAX_KEPT_BYTES {
+            self.bytes = bytes;
             self.forms.insert(form, std::rc::Rc::clone(kept));
         }
     }
@@ -3264,21 +3448,78 @@ fn acted_on(operator: &str) -> bool {
     )
 }
 
-/// Whether content pdf-inspector reads nothing of shows text, as far as
-/// `content_ops::census` tells without decoding it: text of its own, or of a
-/// form it draws, looked into once, within `MAX_READ_BYTES`.
-fn shows_text(
+/// Whether content pdf-inspector reads nothing of shows text a viewer
+/// paints, as far as `content_ops::census` tells without decoding it: text
+/// of its own, or of the forms it draws, however deep (see
+/// `census_shows_text`).
+fn shows_text(document: &Document, content: &[u8], resources: Resources<'_, '_>) -> bool {
+    let mut left = MAX_CENSUS_BYTES;
+    census_shows_text(
+        document,
+        content,
+        resources,
+        0,
+        &mut left,
+        &mut HashSet::new(),
+    )
+}
+
+/// Whether a page's content, which pdf-inspector reads none of past
+/// `MAX_READ_BYTES`, shows text a viewer paints: its streams read one at a
+/// time, as `shows_text` reads content.
+fn page_shows_text(document: &Document, page_id: ObjectId, resources: Resources<'_, '_>) -> bool {
+    let mut left = MAX_CENSUS_BYTES;
+    let mut seen = HashSet::new();
+    document.get_page_contents(page_id).into_iter().any(|id| {
+        let Ok(stream) = document.get_object(id).and_then(Object::as_stream) else {
+            return false;
+        };
+        match census_bytes(stream, &mut left) {
+            Some(Cow::Borrowed(bytes)) => {
+                census_shows_text(document, bytes, resources, 0, &mut left, &mut seen)
+            }
+            Some(Cow::Owned(bytes)) => {
+                census_shows_text(document, &bytes, resources, 0, &mut left, &mut seen)
+            }
+            None => true,
+        }
+    })
+}
+
+/// A stream's content for the census, decoded, or as it stands where it
+/// does not decode, as lopdf reads it, charged to `left`: `None` past it.
+fn census_bytes<'s>(stream: &'s Stream, left: &mut usize) -> Option<Cow<'s, [u8]>> {
+    let bytes = match stream.decompressed_content_with_limit(*left) {
+        Ok(bytes) => Cow::Owned(bytes),
+        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => {
+            return None;
+        }
+        Err(_) => Cow::Borrowed(stream.content.as_slice()),
+    };
+    *left = left.checked_sub(bytes.len())?;
+    Some(bytes)
+}
+
+/// Whether `content`, drawn `depth` forms deep, shows text a viewer paints
+/// (see `content_ops::census`), or a form it draws does, each form read
+/// once (`seen`) with the resources it draws with: taken to where the
+/// census names more XObjects than it keeps, where forms run deeper than
+/// `MAX_FORM_DEPTH`, or where they decode past what is `left` of
+/// `MAX_CENSUS_BYTES`, which cannot be told.
+fn census_shows_text(
     document: &Document,
     content: &[u8],
     resources: Resources<'_, '_>,
-    budget: &mut Budget,
-) -> Result<bool, Exhausted> {
+    depth: usize,
+    left: &mut usize,
+    seen: &mut HashSet<ObjectId>,
+) -> bool {
     let census = crate::content_ops::census(content);
-    if census.shows_text {
-        return Ok(true);
+    if census.shows_text || census.more_drawn {
+        return true;
     }
     for name in &census.drawn {
-        let Some((_, stream, _)) = xobject(document, resources, name) else {
+        let Some((id, stream, _)) = xobject(document, resources, name) else {
             continue;
         };
         let form = stream
@@ -3286,22 +3527,36 @@ fn shows_text(
             .get(b"Subtype")
             .and_then(Object::as_name)
             .is_ok_and(|subtype| subtype == b"Form");
-        let Some(bytes) = form
-            .then(|| {
-                stream
-                    .decompressed_content_with_limit(crate::content_ops::MAX_READ_BYTES)
-                    .ok()
-            })
-            .flatten()
-        else {
+        if !form || !seen.insert(id) {
             continue;
+        }
+        if depth + 1 >= MAX_FORM_DEPTH {
+            return true;
+        }
+        let Some(bytes) = census_bytes(stream, left) else {
+            return true;
         };
-        budget.take_bytes(bytes.len())?;
-        if crate::content_ops::census(&bytes).shows_text {
-            return Ok(true);
+        let form_resources = match stream
+            .dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|resources| dictionary(document, resources))
+        {
+            Some(own) => Resources {
+                form: Some(own),
+                own: true,
+                page: resources.page,
+            },
+            None => Resources {
+                own: false,
+                ..resources
+            },
+        };
+        if census_shows_text(document, &bytes, form_resources, depth + 1, left, seen) {
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 /// A page's content with each comment, from a `%` outside a string to the
@@ -3391,6 +3646,9 @@ struct Given<'c> {
     /// Whether anything was painted in it: an image, a form, a shading, or
     /// a path.
     drawn: bool,
+    /// Whether a string a reader sees was shown in it, spans inside it
+    /// giving text of their own aside, at any time since it began.
+    showed: bool,
 }
 
 impl<'c> Marked<'c> {
@@ -3419,6 +3677,7 @@ impl<'c> Marked<'c> {
                 seen: Some(String::new()),
                 unseen: Vec::new(),
                 drawn: false,
+                showed: false,
             });
         }
     }
@@ -3454,12 +3713,11 @@ impl<'c> Marked<'c> {
     }
 
     /// Whether a span giving text is still open having shown glyphs a
-    /// reader sees: pdf-inspector, reading its text where it ends, reads
-    /// neither that text nor any glyph shown since it began.
+    /// reader sees, before a span inside it gave text of its own or after:
+    /// pdf-inspector, reading its text where it ends, reads neither that
+    /// text nor any glyph shown since it began.
     fn left_open(&self) -> bool {
-        self.given
-            .iter()
-            .any(|given| given.shown && !(given.invisible || given.hidden))
+        self.given.iter().any(|given| given.showed)
     }
 
     /// Close the last span open; the text it gives, if any.
@@ -3495,8 +3753,30 @@ impl<'c> Marked<'c> {
             given.shown = true;
             given.invisible &= invisible;
             given.hidden &= hidden;
+            given.showed |= !(invisible || hidden);
         }
         true
+    }
+}
+
+/// A character as words are told apart by it, one for one: in lower case
+/// where that is one character, and a quote, an apostrophe, or a dash of
+/// any shape as the plain one, those Windows-1252 puts among the control
+/// characters Latin-1 reads its bytes as among them, as a span's text read
+/// byte by byte has them.
+fn fold(character: char) -> char {
+    match character {
+        '\u{2018}' | '\u{2019}' | '\u{201B}' | '\u{2032}' | '`' | '\u{00B4}' | '\u{0091}'
+        | '\u{0092}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201F}' | '\u{2033}' | '\u{0093}' | '\u{0094}' => '"',
+        '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{0096}' | '\u{0097}' => '-',
+        _ => {
+            let mut lower = character.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(lower), None) => lower,
+                _ => character,
+            }
+        }
     }
 }
 
@@ -3556,6 +3836,29 @@ const STRADDLE_ACROSS: f32 = 2.0;
 
 /// Whether a string shown under `text_matrix` starts on the page, within
 /// `PAGE_BOX_TOLERANCE` of its box. One whose start is unknown is taken to.
+/// Where a string moving the text matrix `along` (see `PageText::along`),
+/// shown with the text matrix `matrix`, starts and ends on its baseline,
+/// where that can be told.
+fn placement(state: State, matrix: [f64; 6], along: f64) -> Option<[[f64; 2]; 2]> {
+    let matrix = multiply(matrix, state.ctm);
+    let start = [
+        matrix[4] + matrix[2] * state.rise,
+        matrix[5] + matrix[3] * state.rise,
+    ];
+    let end = [start[0] + along * matrix[0], start[1] + along * matrix[1]];
+    start
+        .iter()
+        .chain(&end)
+        .all(|value| value.is_finite() && value.abs() < f64::from(f32::MAX))
+        .then_some([start, end])
+}
+
+/// Whether a point stands within `PAGE_BOX_TOLERANCE` of the page's box.
+fn within_box(at: [f64; 2], page_box: [f64; 4]) -> bool {
+    (page_box[0] - PAGE_BOX_TOLERANCE..=page_box[2] + PAGE_BOX_TOLERANCE).contains(&at[0])
+        && (page_box[1] - PAGE_BOX_TOLERANCE..=page_box[3] + PAGE_BOX_TOLERANCE).contains(&at[1])
+}
+
 fn starts_on_page(state: State, text_matrix: [f64; 6], page_box: [f64; 4]) -> bool {
     centred_on_page(state, text_matrix, page_box, 0)
 }
@@ -3837,6 +4140,54 @@ fn page_box(document: &Document, page_id: ObjectId) -> ([f64; 4], bool) {
         (Some(media), None) => (media, true),
         (None, Some(crop)) => (within(LETTER, crop).unwrap_or(LETTER), true),
         (None, None) => (LETTER, false),
+    }
+}
+
+/// The box a viewer shows of a page, as `[left, bottom, right, top]`, as
+/// pdfium finds it: the crop box named nearest up the page tree, cut to the
+/// media box named nearest, or US Letter where that has no area; the media
+/// box where the crop box has none; and none, with no area, where the two do
+/// not meet. A box named by anything but an array of four has no area.
+fn viewer_box(document: &Document, page_id: ObjectId) -> [f64; 4] {
+    let named = |key: &[u8]| -> Option<[f64; 4]> {
+        let mut node = document.get_dictionary(page_id).ok()?;
+        for _ in 0..MAX_PAGE_TREE_DEPTH {
+            if let Ok(value) = node.get(key) {
+                let values = array(document, value).unwrap_or_default();
+                let [left, bottom, right, top] = values else {
+                    return Some([0.0; 4]);
+                };
+                let [left, bottom, right, top] =
+                    [left, bottom, right, top].map(|value| number(document, value).unwrap_or(0.0));
+                return Some([
+                    left.min(right),
+                    bottom.min(top),
+                    left.max(right),
+                    bottom.max(top),
+                ]);
+            }
+            let parent = node.get(b"Parent").ok()?.as_reference().ok()?;
+            node = document.get_dictionary(parent).ok()?;
+        }
+        None
+    };
+    let area = |corners: &[f64; 4]| corners[2] > corners[0] && corners[3] > corners[1];
+    let media = named(b"MediaBox").filter(area).unwrap_or(LETTER);
+    match named(b"CropBox").filter(area) {
+        Some(crop) => {
+            let both = [
+                crop[0].max(media[0]),
+                crop[1].max(media[1]),
+                crop[2].min(media[2]),
+                crop[3].min(media[3]),
+            ];
+            if area(&both) {
+                both
+            } else {
+                [0.0; 4]
+            }
+        }
+        None => media,
     }
 }
 

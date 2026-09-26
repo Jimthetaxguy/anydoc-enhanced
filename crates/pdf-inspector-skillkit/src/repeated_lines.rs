@@ -644,6 +644,24 @@ const MAX_PATTERN_BYTES: usize = 1 << 20;
 /// shown, as in a Markdown repeating one text over and over.
 const MAX_MATCHES: usize = 20_000_000;
 
+/// An automaton finding `patterns`, built as an NFA whatever their number:
+/// a DFA, which the builder picks for a hundred patterns or fewer, takes
+/// time and memory in their length times the bytes they hold, and texts of
+/// tens of kilobytes are looked for.
+fn automaton(patterns: &[&str]) -> Option<aho_corasick::AhoCorasick> {
+    [
+        aho_corasick::AhoCorasickKind::ContiguousNFA,
+        aho_corasick::AhoCorasickKind::NoncontiguousNFA,
+    ]
+    .into_iter()
+    .find_map(|kind| {
+        aho_corasick::AhoCorasick::builder()
+            .kind(Some(kind))
+            .build(patterns)
+            .ok()
+    })
+}
+
 /// The texts of `patterns`, bare, that the Markdown shows, each where it
 /// does not run on into a number: a text starting with a digit found after
 /// none, and one ending with a digit found before none, but where white
@@ -670,7 +688,7 @@ pub(crate) fn found_in<'a>(patterns: &[&'a str], markdown: &str) -> HashSet<&'a 
             .max(1);
         let (part, next) = rest.split_at(take);
         rest = next;
-        let Ok(automaton) = aho_corasick::AhoCorasick::new(part) else {
+        let Some(automaton) = automaton(part) else {
             continue;
         };
         for shown in automaton.find_overlapping_iter(&haystack) {

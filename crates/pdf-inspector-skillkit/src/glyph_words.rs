@@ -291,8 +291,11 @@ struct Decoder {
     /// How a code the map and names leave reads.
     unnamed: Unnamed,
     /// Its glyphs' widths, when it gives them and its glyphs advance along
-    /// the baseline.
+    /// the baseline; and, for a simple font naming a standard font and giving
+    /// none, each code's width as a viewer and pdf-inspector take it (see
+    /// `standard_widths`), which places its strings.
     widths: Option<Widths>,
+    standard: Option<Box<[f64]>>,
     /// What the codes read so far read as, code by code or not.
     read: HashMap<(u16, bool), Option<String>>,
     /// The codes shown so far: what each reads as for a word, and its width.
@@ -388,12 +391,15 @@ impl GlyphFonts {
         self.decoders[font].glyph(code)
     }
 
-    /// A code's width in em, when `font` gives its widths.
+    /// A code's width in em, when `font` gives its widths, or names a
+    /// standard font whose widths it takes (see `standard_widths`).
     pub(crate) fn width(&self, font: usize, code: u16) -> Option<f64> {
-        self.decoders[font]
-            .widths
-            .as_ref()
-            .map(|widths| widths.of(code))
+        let decoder = &self.decoders[font];
+        match (&decoder.widths, &decoder.standard) {
+            (Some(widths), _) => Some(widths.of(code)),
+            (None, Some(standard)) => standard.get(usize::from(code)).copied(),
+            (None, None) => None,
+        }
     }
 
     /// What a string shown in `font` reads as, when every glyph of it can
@@ -507,12 +513,16 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
         (true, true) => composite_widths(document, font, steps),
         (true, false) => None,
     };
+    let standard = (widths.is_none() && !two_byte)
+        .then(|| standard_widths(document, font, &names))
+        .flatten();
     Some(Decoder {
         two_byte,
         cmap,
         names,
         unnamed,
         widths,
+        standard,
         read: HashMap::new(),
         glyphs: HashMap::new(),
     })
@@ -805,6 +815,55 @@ fn differences(document: &Document, font: &Dictionary, steps: &mut usize) -> Has
         }
     }
     names
+}
+
+/// The width in em of each code of a simple font naming a standard font
+/// (see `standard_fonts`) without widths of its own, as a viewer and
+/// pdf-inspector take it: the width of the glyph for the character its
+/// differences name, else the character the encoding it names, or its
+/// encoding's base, gives it, else the character Windows-1252 reads it as,
+/// its letters' together for a ligature named by them; half an em where
+/// the font has no such glyph, as pdf-inspector takes one.
+fn standard_widths(
+    document: &Document,
+    font: &Dictionary,
+    names: &HashMap<u8, String>,
+) -> Option<Box<[f64]>> {
+    let subtype = font.get(b"Subtype").ok()?.as_name().ok()?;
+    if !matches!(subtype, b"Type1" | b"TrueType" | b"MMType1") {
+        return None;
+    }
+    let standard = crate::standard_fonts::widths(font.get(b"BaseFont").ok()?.as_name().ok()?)?;
+    let base = match font
+        .get(b"Encoding")
+        .ok()
+        .and_then(|encoding| resolved(document, encoding))
+    {
+        Some(Object::Name(name)) => predefined(name),
+        Some(Object::Dictionary(encoding)) => encoding
+            .get(b"BaseEncoding")
+            .ok()
+            .and_then(|base| resolved(document, base))
+            .and_then(|base| base.as_name().ok())
+            .and_then(predefined),
+        _ => None,
+    };
+    let width = |text: &str| -> f64 {
+        text.chars()
+            .map(|character| standard.width(character).unwrap_or(0.5))
+            .sum()
+    };
+    Some(
+        (0..=u8::MAX)
+            .map(|code| match names.get(&code) {
+                Some(name) => glyph_name_to_string(name).map_or(0.5, |text| width(&text)),
+                None => base
+                    .and_then(|base| base[usize::from(code)])
+                    .or_else(|| (code >= 0x20).then(|| crate::text_paints::windows_1252(code)))
+                    .map_or(0.5, |character| width(&character.to_string())),
+            })
+            .collect(),
+    )
 }
 
 /// A width, or a reference to one, whole as pdf-inspector reads it.

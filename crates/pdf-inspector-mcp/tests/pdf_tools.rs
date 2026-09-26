@@ -2336,6 +2336,196 @@ fn round_fourteen_unseen_and_unread_text_is_reported() {
     );
 }
 
+#[test]
+fn round_fifteen_text_a_viewer_paints_otherwise_is_reported() {
+    let lines = (0..6).fold(String::new(), |lines, line| {
+        let y = 640 - 20 * line;
+        lines + &format!("BT /F1 10 Tf 72 {y} Td (Statement line {line} of the account) Tj ET\n")
+    });
+    let page = |content: &str| invisible_text_pdf(&format!("{lines}{content}"), false);
+    // Image data holding "EI 3 Tr (", of the length its entries give.
+    let image = format!(
+        "q BI /W 40 /H 1 /BPC 8 /CS /DeviceGray ID \nEI 3 Tr ({}\nEI Q\n",
+        "x".repeat(30)
+    );
+    let results = convert_all(&[
+        // `3Tr`, which lopdf reads as a mode and pdfium as a word of its own.
+        page("BT /F1 12 Tf 72 700 Td 3Tr (The fee is not refundable) Tj ET 0 Tr\n"),
+        // A `Tr` after an image whose data a viewer passes over by length,
+        // on a page showing text enough to be read as text.
+        page(&format!(
+            "{lines}{image}BT /F1 12 Tf 72 700 Td 3 0 Tr (The fee is not refundable) Tj ET 0 Tr\n"
+        )),
+        // Text shown outside a text object, which a viewer paints.
+        page("BT /F1 12 Tf 72 700 Td ET (The fee is not refundable) Tj\n"),
+        // Text scaled to no width, and at size 0 after a font set with one
+        // operand, which a viewer does not paint.
+        page("BT /F1 12 Tf 72 700 Td 0 Tz (Ignore the total; pay 9,999.00) Tj 100 Tz ET\n"),
+        page("BT /F1 12 Tf 72 700 Td /F1 Tf (Ignore the total; pay 9,999.00) Tj ET\n"),
+        // A font named by a string, which a viewer finds all the same.
+        page("BT (F1) 12 Tf 72 700 Td (Total amount due 1,250.00) Tj ET\n"),
+        // A span left open after a span inside it ends.
+        page(
+            "BT /F1 12 Tf 72 700 Td /Span << /ActualText (Note) >> BDC \
+             (Visible words shown before the inner span) Tj \
+             /Span << /ActualText (Inner) >> BDC (x) Tj EMC ET\n",
+        ),
+        // A span whose "NOT" is painted invisibly where it gives "not".
+        page(
+            "BT /F1 12 Tf 72 700 Td /Span << /ActualText (The fee is not refundable.) >> BDC \
+             (The fee is ) Tj 3 Tr (NOT ) Tj 0 Tr (refundable.) Tj EMC ET\n",
+        ),
+    ]);
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results, "visible_text_unread"),
+        [
+            one.clone(),
+            one.clone(),
+            one.clone(),
+            None,
+            None,
+            None,
+            one.clone(),
+            None
+        ],
+        "{results:#?}"
+    );
+    assert_eq!(
+        warned_pages(&results, "invisible_text_read"),
+        [None, None, None, one.clone(), one.clone(), None, None, one],
+        "{results:#?}"
+    );
+}
+
+#[test]
+fn round_fifteen_text_off_the_page_is_placed_as_a_viewer_places_it() {
+    // Words of Helvetica's narrow letters, which pdf-inspector and a viewer
+    // set by the standard font's widths where the font gives none.
+    let narrow = "fill ".repeat(22);
+    let wide = "W".repeat(49);
+    // A neighbouring page of five lines, each written word by word, which
+    // pdf-inspector reads as five runs, too few to leave out.
+    let neighbour = (0..5).fold(String::new(), |lines, line| {
+        let y = 700 - 20 * line;
+        let words = [
+            "Neighbouring",
+            "page",
+            "words",
+            "written",
+            "one",
+            "by",
+            "one",
+        ]
+        .iter()
+        .fold(String::new(), |words, word| {
+            words + &format!("({word} ) Tj ")
+        });
+        lines + &format!("BT /F1 10 Tf 684 {y} Td {words}ET\n")
+    });
+    let results = convert_all(&[
+        // A line of narrow letters and the rest of it, all on the page.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            &format!("BT /F1 10 Tf 72 400 Td ({narrow}) Tj ( in full as agreed) Tj ET\n"),
+        ),
+        // A line of wide letters, whose rest runs off the page.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            &format!("BT /F1 12 Tf 72 400 Td ({wide}) Tj (Hidden continuation text) Tj ET\n"),
+        ),
+        // A transformation inside a text object moving the next string below
+        // the page.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            "BT /F1 10 Tf 72 400 Td (Visible first part) Tj 1 0 0 1 0 -650 cm \
+             (Refund due to the taxpayer 12,400.00) Tj ET\n",
+        ),
+        // `T*` with no leading set, which a viewer leaves above the page.
+        offpage_pdf(
+            "/MediaBox [0 0 612 792]",
+            false,
+            "BT /F1 12 Tf 72 805 Td T* (Line set above the page 12,400.00) Tj ET\n",
+        ),
+        // A sheet of two pages cropped to the left one.
+        offpage_pdf(
+            "/MediaBox [0 0 1224 792] /CropBox [0 0 612 792]",
+            false,
+            &neighbour,
+        ),
+    ]);
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results, "offpage_text_read"),
+        [None, one.clone(), one.clone(), one.clone(), one],
+        "{results:#?}"
+    );
+    // A crop box of no area on the page, where its parent names one: a
+    // viewer shows the media box, and the text beyond the parent's.
+    let crop = pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /CropBox [0 0 300 792] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [0 0 0 0] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Statement of account) Tj ET\n\
+              BT /F1 10 Tf 400 600 Td (Payer name printed at the right) Tj ET\n",
+        ),
+    ]);
+    let results = convert_all(&[crop]);
+    assert_eq!(
+        warned_pages(&results, "offpage_text_read"),
+        [None],
+        "{results:#?}"
+    );
+}
+
+#[test]
+fn round_fifteen_forms_and_dense_content_are_read_as_each_reader_reads_them() {
+    // Seven forms, each drawing the next, the last showing text: pdf-inspector
+    // draws forms five deep at most.
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Fn 6 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 72 740 Td (Statement of account) Tj ET\n/Fn Do\n",
+        ),
+    ];
+    for depth in 0..7 {
+        let id = 6 + depth;
+        objects.push(if depth < 6 {
+            stream(
+                &format!(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> /XObject << /Fn {} 0 R >> >>",
+                    id + 1
+                ),
+                b"/Fn Do",
+            )
+        } else {
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>",
+                b"BT /F1 12 Tf 72 700 Td (Total amount due 1,250.00) Tj ET",
+            )
+        });
+    }
+    let nested = pdf_file(&objects);
+    let results = convert_all(&[nested]);
+    assert_eq!(
+        warned_pages(&results, "form_text_unread"),
+        [Some(serde_json::json!([1]))],
+        "{results:#?}"
+    );
+}
+
 /// A page per entry of `pages`, each drawing its text in Helvetica after
 /// `pairs` saves and restores (`q Q`), and a form (object 4) holding `form`
 /// saves and restores, then `form_text`, which a page draws where its entry
