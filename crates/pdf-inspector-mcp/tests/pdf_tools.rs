@@ -2024,6 +2024,12 @@ fn truetype_program(groups: &[(u32, u32, u32)]) -> Vec<u8> {
 /// `Identity-H` with the ToUnicode map `map` and the embedded TrueType
 /// program `program`.
 fn cjk_form_pdf(map: &[u8], program: &[u8]) -> Vec<u8> {
+    cjk_form_pdf_in("Japan1", Some(map), program)
+}
+
+/// A statement page as `cjk_form_pdf` makes, in a CID font of Adobe's
+/// `ordering`, with the ToUnicode map `map`, if any.
+fn cjk_form_pdf_in(ordering: &str, map: Option<&[u8]>, program: &[u8]) -> Vec<u8> {
     let cids = |text: &str| -> String {
         text.bytes()
             .map(|byte| format!("{:04X}", byte - 0x1F))
@@ -2040,14 +2046,19 @@ fn cjk_form_pdf(map: &[u8], program: &[u8]) -> Vec<u8> {
             )
         })
         .collect();
+    let to_unicode = if map.is_some() {
+        " /ToUnicode 7 0 R"
+    } else {
+        ""
+    };
     pdf_file(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F2 5 0 R >> /XObject << /Fm1 9 0 R >> >> /Contents 10 0 R >>".to_vec(),
-        b"<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>".to_vec(),
+        format!("<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /Identity-H /DescendantFonts [6 0 R]{to_unicode} >>").into_bytes(),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
-        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> /FontDescriptor 8 0 R /DW 1000 /CIDToGIDMap /Identity >>".to_vec(),
-        stream("", map),
+        format!("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering ({ordering}) /Supplement 6 >> /FontDescriptor 8 0 R /DW 1000 /CIDToGIDMap /Identity >>").into_bytes(),
+        stream("", map.unwrap_or_default()),
         b"<< /Type /FontDescriptor /FontName /KozMinPr6N-Regular /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 /FontFile2 11 0 R >>".to_vec(),
         stream(
             "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources 12 0 R",
@@ -2134,6 +2145,49 @@ fn cjk_maps_lopdf_cannot_parse_are_reported_where_pdf_inspector_reads_by_lopdf()
     let markdown = results[2]["markdown"].as_str().unwrap_or_default();
     assert!(markdown.contains("Total wages 52,000.00"), "{}", results[2]);
     assert_eq!(reported(&results[2]), None, "{}", results[2]);
+}
+
+#[test]
+fn identity_fonts_pdf_inspector_does_not_collect_are_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    // A font in Adobe's Identity ordering, whose codes are its program's
+    // glyphs, in a form giving its resources by reference: pdf-inspector
+    // reads it byte by byte with no map, or with a map lopdf's grammar
+    // rejects, "5PUBMXBHFT" for "Total wages"; with one lopdf parses, it
+    // reads it right.
+    let program = truetype_program(&[(0x20, 0x7E, 1)]);
+    let bare = b"begincmap\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+        1 beginbfrange\n<0001> <005F> <0020>\nendbfrange\nendcmap\n";
+    let whole = b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+        /CMapName /Adobe-Identity-UCS def\n1 begincodespacerange\n<0000> <FFFF>\n\
+        endcodespacerange\n1 beginbfrange\n<0001> <005F> <0020>\nendbfrange\nendcmap\n\
+        CMapName currentdict /CMap defineresource pop\nend\nend\n";
+    let documents = [
+        cjk_form_pdf_in("Identity", None, &program),
+        cjk_form_pdf_in("Identity", Some(bare), &program),
+        cjk_form_pdf_in("Identity", Some(whole), &program),
+    ];
+    let mut calls = Vec::new();
+    for (index, pdf) in documents.iter().enumerate() {
+        let path = temporary.path().join(format!("identity-{index}.pdf"));
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    // When a release reads such fonts right, these expectations go.
+    for result in &results[..2] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("5PUBMXBHFT"), "{result}");
+    }
+    assert_eq!(
+        warned_pages(&results, "cjk_text_misread"),
+        [
+            Some(serde_json::json!([1])),
+            Some(serde_json::json!([1])),
+            None
+        ]
+    );
 }
 
 /// A page of Japanese `columns` set under `encoding` in a CID font with a

@@ -122,8 +122,9 @@ pub const PDF_WARNING_HIDDEN_LAYER_TEXT_READ: &str = "hidden_layer_text_read";
 pub const PDF_WARNING_INVISIBLE_TEXT_READ: &str = "invisible_text_read";
 /// The Markdown holds text set outside the page's visible area.
 pub const PDF_WARNING_OFFPAGE_TEXT_READ: &str = "offpage_text_read";
-/// Text in a Japanese or Chinese font without a map of its characters reads
-/// otherwise, or not at all, with no sign (upstream #573).
+/// Text in a composite font, as Japanese or Chinese is set in, that
+/// pdf-inspector reads without a map of its characters reads otherwise, or
+/// not at all, with no sign (upstream #573).
 pub const PDF_WARNING_CJK_TEXT_MISREAD: &str = "cjk_text_misread";
 /// Characters a text in such a font needs, bare, to tell whether the
 /// Markdown shows it.
@@ -1069,7 +1070,7 @@ impl PdfInfo {
         self.has_encoding_issues = true;
         self.warnings.push(PdfWarning::new(
             PDF_WARNING_CJK_TEXT_MISREAD,
-            "On these pages text set in a Japanese, Chinese, or Korean font that carries no map of its characters reads as other characters, and its digits and punctuation may drop out, with no sign: pdf-inspector 1.25.0 finds no map for such a font where it cannot parse the Adobe Japan1, GB1, or CNS1 map or looks for none (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
+            "On these pages text set in a composite font, as Japanese, Chinese, and Korean text is, reads as other characters, and its digits and punctuation may drop out, with no sign: pdf-inspector 1.25.0 finds no map of such a font's characters where it cannot parse the Adobe Japan1, GB1, or CNS1 map or the font's own, or looks for none, as for a font only a form giving its resources by reference uses (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
             reported,
         ));
     }
