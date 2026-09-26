@@ -9,10 +9,11 @@
 //! their page with text of their own: text boxes, captioned lines, and
 //! stamps and watermarks whose appearance draws text. It gives the text
 //! each holds, the plain text of its rich text, from which a viewer draws
-//! it, or its `/Contents`, with its page; the Markdown decides. Notes shown
-//! only in a popup, markup that comments on the page's own text, and
-//! annotations hidden or set off their page are not what the page shows,
-//! and are not read.
+//! it, or its `/Contents`, or, for a stamp or watermark holding neither,
+//! the text its appearance draws, with its page; the Markdown decides.
+//! Notes shown only in a popup, markup that comments on the page's own
+//! text, and annotations hidden or set off their page are not what the
+//! page shows, and are not read.
 //!
 //! An appearance is read within bounds: each stream once, however many
 //! annotations share it, to `MAX_APPEARANCE_BYTES` decoded, and a
@@ -22,7 +23,8 @@
 //! nothing, or 7, which only clips, is not drawn. Past the bounds, a stamp
 //! is taken to draw no text; a stream whose verdict the bounds cut short is
 //! read again where it is reached another way, as a form nearer a stamp
-//! than it was to the first.
+//! than it was to the first. The text a stamp's appearance draws is read
+//! within what the bounds leave, to the same depth.
 
 use std::collections::{HashMap, HashSet};
 
@@ -407,6 +409,8 @@ struct Appearances<'a> {
     drawn: HashMap<(ObjectId, bool), Option<bool>>,
     /// Decoded bytes left to read.
     budget: usize,
+    /// How each font of the text read reads its codes.
+    glyphs: crate::glyph_words::GlyphFonts,
 }
 
 /// Whether a stream draws text, and whether that was read whole: not cut
@@ -439,30 +443,172 @@ impl<'a> Appearances<'a> {
             document,
             drawn: HashMap::new(),
             budget: MAX_APPEARANCE_TOTAL,
+            glyphs: crate::glyph_words::GlyphFonts::default(),
         }
     }
 
-    /// Whether an annotation's normal appearance draws text.
-    fn draws_text(&mut self, annotation: &Dictionary) -> bool {
+    /// An annotation's normal appearance: a stream, or one of the streams
+    /// it gives by appearance state, as the annotation's state names.
+    fn normal(&self, annotation: &'a Dictionary) -> Option<&'a Object> {
         let document = self.document;
-        let Some(normal) = annotation
+        let normal = annotation
             .get(b"AP")
             .ok()
             .and_then(|appearance| dictionary(document, appearance))
-            .and_then(|appearance| appearance.get(b"N").ok())
-        else {
-            return false;
-        };
-        // The normal appearance is a stream, or streams by appearance state.
-        let stream = match resolve(document, normal) {
+            .and_then(|appearance| appearance.get(b"N").ok())?;
+        match resolve(document, normal) {
             Some(Object::Dictionary(states)) => annotation
                 .get(b"AS")
                 .ok()
                 .and_then(|state| state.as_name().ok())
                 .and_then(|state| states.get(state).ok()),
             _ => Some(normal),
+        }
+    }
+
+    /// Whether an annotation's normal appearance draws text.
+    fn draws_text(&mut self, annotation: &'a Dictionary) -> bool {
+        self.normal(annotation)
+            .is_some_and(|stream| self.object(stream, 0, false).drawn)
+    }
+
+    /// The text an annotation's normal appearance draws, as a viewer shows
+    /// it: each string shown in a render mode that paints, as its font
+    /// reads it, itself or through the forms it draws, a space between
+    /// text objects; `None` where it draws none with a letter or digit.
+    fn text(&mut self, annotation: &'a Dictionary) -> Option<String> {
+        let stream = self.normal(annotation)?;
+        let mut texts = Vec::new();
+        self.read_text(stream, 0, false, &mut Vec::new(), &mut texts);
+        let text = texts.join(" ");
+        let text = text.trim();
+        text.chars()
+            .any(char::is_alphanumeric)
+            .then(|| text.to_string())
+    }
+
+    /// Read into `texts` what a stream, given as it is referred to and
+    /// drawn `invisible` or not (see `shows_text`), draws: each text
+    /// object's strings, then those of each form it draws, to
+    /// `MAX_FORM_DEPTH` deep, but for a form among `reading`, the forms
+    /// being read, which draws itself.
+    fn read_text(
+        &mut self,
+        object: &'a Object,
+        depth: usize,
+        invisible: bool,
+        reading: &mut Vec<ObjectId>,
+        texts: &mut Vec<String>,
+    ) {
+        let document = self.document;
+        let (id, stream) = match object {
+            Object::Reference(id) => match document.get_object(*id) {
+                Ok(Object::Stream(stream)) if !reading.contains(id) => (Some(*id), stream),
+                _ => return,
+            },
+            Object::Stream(stream) => (None, stream),
+            _ => return,
         };
-        stream.is_some_and(|stream| self.object(stream, 0, false).drawn)
+        let limit = self.budget.min(MAX_APPEARANCE_BYTES);
+        let content = stream.get_plain_content_with_limit(limit);
+        self.budget -= match &content {
+            Ok(content) => content.len().min(limit),
+            Err(_) => stream.content.len().min(limit),
+        };
+        let Some(operations) = content
+            .ok()
+            .and_then(|content| lopdf::content::Content::decode(&content).ok())
+            .map(|content| content.operations)
+        else {
+            return;
+        };
+        let resources = |kind: &[u8]| {
+            stream
+                .dict
+                .get(b"Resources")
+                .ok()
+                .and_then(|resources| dictionary(document, resources))
+                .and_then(|resources| resources.get(kind).ok())
+                .and_then(|named| dictionary(document, named))
+        };
+        let (fonts, xobjects) = (resources(b"Font"), resources(b"XObject"));
+        // The font and whether the render mode paints nothing, which `q`
+        // saves and `Q` restores, and the text of the text object open.
+        let (mut font, mut invisible) = (None, invisible);
+        let mut saved = Vec::new();
+        let mut text = String::new();
+        for operation in &operations {
+            let operands = &operation.operands;
+            match operation.operator.as_str() {
+                "q" => saved.push((font, invisible)),
+                "Q" => (font, invisible) = saved.pop().unwrap_or((font, invisible)),
+                "Tf" => {
+                    font = operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| fonts?.get(name).ok())
+                        .and_then(|font| dictionary(document, font))
+                        .and_then(|font| self.glyphs.font(document, font));
+                }
+                // A viewer takes a mode it knows, cut to a whole number.
+                "Tr" => {
+                    if let Some(mode) = operands
+                        .last()
+                        .and_then(|mode| mode.as_float().ok())
+                        .map(|mode| mode as i64)
+                        .filter(|mode| (0..=7).contains(mode))
+                    {
+                        invisible = matches!(mode, 3 | 7);
+                    }
+                }
+                "Tj" | "'" | "\"" | "TJ" => {
+                    let shown = if operation.operator == "TJ" {
+                        operands.first()
+                    } else {
+                        operands.last()
+                    };
+                    let strings: Vec<&[u8]> = match shown {
+                        Some(Object::Array(parts)) => {
+                            parts.iter().filter_map(|part| part.as_str().ok()).collect()
+                        }
+                        Some(part) => part.as_str().ok().into_iter().collect(),
+                        None => Vec::new(),
+                    };
+                    for bytes in strings {
+                        let read = font
+                            .filter(|_| !invisible)
+                            .and_then(|font| self.glyphs.text_or(font, bytes, ' '));
+                        text.extend(read);
+                    }
+                }
+                "ET" if !text.trim().is_empty() => texts.push(std::mem::take(&mut text)),
+                "Do" if depth < MAX_FORM_DEPTH => {
+                    let Some(form) = operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| xobjects?.get(name).ok())
+                        .filter(|form| {
+                            resolve(document, form)
+                                .and_then(|form| form.as_stream().ok())
+                                .and_then(|form| form.dict.get(b"Subtype").ok())
+                                .and_then(|subtype| subtype.as_name().ok())
+                                == Some(b"Form")
+                        })
+                    else {
+                        continue;
+                    };
+                    reading.extend(id);
+                    self.read_text(form, depth + 1, invisible, reading, texts);
+                    if id.is_some() {
+                        reading.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !text.trim().is_empty() {
+            texts.push(text);
+        }
     }
 
     /// Whether a stream, given as it is referred to and drawn `invisible`
@@ -716,6 +862,13 @@ pub(crate) fn unread(
                         .and_then(|contents| text(document, contents))
                         .filter(|contents| !contents.trim().is_empty())
                 });
+            // A stamp or watermark with no text of its own shows the text
+            // its appearance draws.
+            let contents = contents.or_else(|| {
+                matches!(subtype, b"Stamp" | b"Watermark")
+                    .then(|| appearances.text(annotation))
+                    .flatten()
+            });
             if let Some(contents) = contents {
                 texts.push(AnnotationText {
                     page: number,
@@ -892,6 +1045,60 @@ mod tests {
                 "Over the edge"
             ]
         );
+    }
+
+    #[test]
+    fn stamps_with_no_text_of_their_own_are_found_as_their_appearance_draws_it() {
+        let found = document(|document| {
+            let font = document.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1",
+                "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
+            });
+            let form = |document: &mut Document, content: &[u8], resources: Dictionary| {
+                document.add_object(Stream::new(
+                    dictionary! { "Subtype" => "Form", "Resources" => resources },
+                    content.to_vec(),
+                ))
+            };
+            let fonts = || dictionary! { "Font" => dictionary! { "Helv" => font } };
+            let received = form(
+                document,
+                b"2 w 2 2 216 36 re S BT /Helv 16 Tf 10 14 Td [(RECEIVED APR ) -20 (15 2025)] TJ ET",
+                fonts(),
+            );
+            // Acrobat draws a stamp's text in a form its appearance draws;
+            // text in a mode that paints nothing is not drawn.
+            let inner = form(
+                document,
+                b"BT /Helv 12 Tf (PAID) Tj ET BT 3 Tr /Helv 12 Tf (DRAFT) Tj ET",
+                fonts(),
+            );
+            let outer = form(
+                document,
+                b"q /FRM Do Q",
+                dictionary! { "XObject" => dictionary! { "FRM" => inner } },
+            );
+            // Text in a font the appearance does not give reads as nothing.
+            let unread = form(document, b"BT /F9 12 Tf (VOID) Tj ET", Dictionary::new());
+            let stamp = |subtype: &str, appearance: ObjectId| {
+                dictionary! {
+                    "Subtype" => Object::Name(subtype.as_bytes().to_vec()),
+                    "AP" => dictionary! { "N" => appearance },
+                }
+            };
+            vec![
+                stamp("Stamp", received),
+                stamp("Watermark", outer),
+                stamp("Stamp", unread),
+                // A text box shows only the text it holds.
+                stamp("FreeText", received),
+            ]
+        });
+        let texts: Vec<String> = unread(&found, None, None)
+            .into_iter()
+            .map(|annotation| annotation.text)
+            .collect();
+        assert_eq!(texts, ["RECEIVED APR 15 2025", "PAID"]);
     }
 
     #[test]

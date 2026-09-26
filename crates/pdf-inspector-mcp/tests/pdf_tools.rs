@@ -3848,6 +3848,53 @@ fn annotation_text_pdf_inspector_never_reads_is_reported() {
     assert_eq!(reported(&results[1]), None, "{}", results[1]);
 }
 
+/// An invoice page with an annotation of `subtype` holding no text of its
+/// own, whose appearance draws "RECEIVED APR 15 2025"; `flattened` also sets
+/// that text in the page's own content.
+fn received_stamp_pdf(subtype: &str, flattened: bool) -> Vec<u8> {
+    let mut content = String::from("BT /F1 14 Tf 72 740 Td (Invoice 2025-0415) Tj ET");
+    if flattened {
+        content.push_str(" BT /F1 16 Tf 310 664 Td (RECEIVED APR 15 2025) Tj ET");
+    }
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", content.as_bytes()),
+        format!("<< /Type /Annot /Subtype /{subtype} /Rect [300 650 520 690] /F 4 /AP << /N 7 0 R >> >>").into_bytes(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 220 40] /Resources << /Font << /Helv 4 0 R >> >>",
+            b"1 0 0 RG 2 w 2 2 216 36 re S BT /Helv 16 Tf 1 0 0 rg 10 14 Td (RECEIVED APR 15 2025) Tj ET",
+        ),
+    ])
+}
+
+#[test]
+fn stamps_with_no_text_of_their_own_are_reported_as_their_appearance_draws() {
+    let results = convert_all(&[
+        // A reader shows what the appearance draws; pdf-inspector 1.25.0
+        // reads no stamp or watermark.
+        received_stamp_pdf("Stamp", false),
+        received_stamp_pdf("Watermark", false),
+        // Text the page's own content also sets is in the Markdown.
+        received_stamp_pdf("Stamp", true),
+    ]);
+    // When a release reads stamps, these expectations go.
+    for result in &results[..2] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(!markdown.contains("RECEIVED"), "{result}");
+    }
+    assert_eq!(
+        warned_pages(&results, "annotation_text_unread"),
+        [
+            Some(serde_json::json!([1])),
+            Some(serde_json::json!([1])),
+            None
+        ]
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn stamps_are_read_through_their_forms_within_bounds() {
