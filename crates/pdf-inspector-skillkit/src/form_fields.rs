@@ -604,10 +604,14 @@ impl<'a> Walk<'a> {
         let Some(page) = self.page(id, dictionary) else {
             return;
         };
-        // Past pdf-inspector's bounds, a field that is its own widget, whose
-        // value pdf-inspector would have written, is not in the Markdown.
+        // Past pdf-inspector's bounds, a field that is its own widget, or a
+        // widget holding a value of its own, whose value pdf-inspector would
+        // have written, is not in the Markdown: its walk may end among a
+        // field's widgets, each an entry it counts, as well as between
+        // fields.
         if self.past {
-            if dictionary.has(b"T") || depth == 0 {
+            let holds_own = own.is_some_and(|own| self.value(kind, own).is_some());
+            if dictionary.has(b"T") || depth == 0 || holds_own {
                 self.left_out(kind, &name_meant, value, dictionary, vec![page]);
             }
             return;
@@ -1389,6 +1393,61 @@ mod tests {
             assert_eq!(
                 values(&document, None).misread,
                 expected.into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn values_of_widgets_past_the_bounds_of_pdf_inspectors_walk_are_found() {
+        // A field whose third widget holds its value: pdf-inspector counts
+        // each widget as an entry, and where its bounds fall among them, or
+        // before the field, never writes the value, though a viewer shows it.
+        let lost = |entries: usize| {
+            let mut document = form(|document, page| {
+                let field = document.new_object_id();
+                let widgets: Vec<ObjectId> = (0..3)
+                    .map(|index| {
+                        let mut widget = dictionary! {
+                            "Subtype" => "Widget", "Parent" => field, "P" => page,
+                        };
+                        if index == 2 {
+                            widget.set("V", Object::string_literal("Refund 4,815.00"));
+                        }
+                        document.add_object(widget)
+                    })
+                    .collect();
+                document.objects.insert(
+                    field,
+                    Object::Dictionary(dictionary! {
+                        "FT" => "Tx", "T" => Object::string_literal("refund_amount"),
+                        "Kids" => widgets.iter().map(|&id| id.into()).collect::<Vec<Object>>(),
+                    }),
+                );
+                (vec![field], widgets)
+            });
+            let catalog = document
+                .trailer
+                .get(b"Root")
+                .and_then(Object::as_reference)
+                .expect("a catalog");
+            document
+                .get_dictionary_mut(catalog)
+                .and_then(|catalog| catalog.get_mut(b"AcroForm"))
+                .and_then(Object::as_dict_mut)
+                .and_then(|form| form.get_mut(b"Fields"))
+                .and_then(Object::as_array_mut)
+                .expect("fields")
+                .splice(0..0, std::iter::repeat_n(Object::Null, entries));
+            values(&document, None).misread
+        };
+        assert!(lost(MAX_FIELD_NODES - 5).is_empty());
+        for entries in [MAX_FIELD_NODES - 4, MAX_FIELD_NODES - 1] {
+            assert_eq!(
+                lost(entries),
+                [FormValue {
+                    text: "Refund 4,815.00".to_string(),
+                    pages: vec![1]
+                }]
             );
         }
     }

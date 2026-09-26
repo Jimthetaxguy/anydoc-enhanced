@@ -3746,6 +3746,62 @@ fn form_values_past_the_bounds_of_pdf_inspectors_walk_are_reported() {
     );
 }
 
+/// A one-page form whose `/Fields` lists `entries` entries that are no
+/// fields before its one field, a refund, whose third widget holds its
+/// value.
+fn padded_widgets_form_pdf(entries: usize) -> Vec<u8> {
+    let mut fields = "null ".repeat(entries);
+    fields.push_str("6 0 R");
+    let widget = |index: usize, value: &str| {
+        let y = 600 - 30 * index;
+        format!(
+            "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [72 {y} 272 {}] /P 3 0 R{value} >>",
+            y + 20
+        )
+        .into_bytes()
+    };
+    pdf_file(&[
+        format!("<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [{fields}] >> >>").into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [7 0 R 8 0 R 9 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", b"BT /F1 12 Tf 72 700 Td (Amended return summary) Tj ET"),
+        b"<< /FT /Tx /T (refund_amount) /Kids [7 0 R 8 0 R 9 0 R] >>".to_vec(),
+        widget(0, ""),
+        widget(1, ""),
+        widget(2, " /V (Refund 4,815.00)"),
+    ])
+}
+
+#[test]
+fn form_values_past_the_bounds_among_a_fields_widgets_are_reported() {
+    // pdf-inspector 1.25.0 counts each widget of a field as an entry against
+    // its bound of 100,000; where the bound falls before the widget holding
+    // the value, or before the field, it never writes the value.
+    let results = convert_all(&[
+        padded_widgets_form_pdf(99_995),
+        padded_widgets_form_pdf(99_996),
+        padded_widgets_form_pdf(99_999),
+    ]);
+    let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
+    assert!(
+        markdown(0).contains("refund_amount: Refund 4,815.00"),
+        "{}",
+        markdown(0)
+    );
+    for index in 1..3 {
+        assert!(!markdown(index).contains("Refund"), "{}", markdown(index));
+    }
+    assert_eq!(
+        warned_pages(&results, "form_values_misread"),
+        [
+            None,
+            Some(serde_json::json!([1])),
+            Some(serde_json::json!([1]))
+        ]
+    );
+}
+
 /// A statement page a reviewer marked up: a text box typed onto it and a
 /// stamp drawn in text, both annotations; `flattened` also sets their text
 /// in the page's own content.
