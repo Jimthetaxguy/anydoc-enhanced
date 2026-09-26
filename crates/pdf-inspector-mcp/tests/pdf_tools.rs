@@ -2091,6 +2091,51 @@ fn cjk_fonts_pdf_inspector_does_not_collect_are_judged_without_their_programs() 
     assert_eq!(reported, Some(serde_json::json!([1])), "{result}");
 }
 
+#[test]
+fn cjk_maps_lopdf_cannot_parse_are_reported_where_pdf_inspector_reads_by_lopdf() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    // In a font only a form giving its resources by reference names,
+    // pdf-inspector reads the ToUnicode map as lopdf parses it, whatever
+    // the program says; lopdf's grammar rejects a map with no header or no
+    // `/CMapName` entry, and pdf-inspector falls to the standard encoding,
+    // "5PUBMXBHFT". A map lopdf parses reads right.
+    let program = truetype_program(&[(0x20, 0x7E, 1)]);
+    let mappings = "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+        1 beginbfrange\n<0001> <005F> <0020>\nendbfrange\nendcmap\n";
+    let header = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n";
+    let footer = "CMapName currentdict /CMap defineresource pop\nend\nend\n";
+    let maps = [
+        format!("begincmap\n/CMapName /Adobe-Identity-UCS def\n{mappings}"),
+        format!("{header}{mappings}{footer}"),
+        format!("{header}/CMapName /Adobe-Identity-UCS def\n{mappings}{footer}"),
+    ];
+    let mut calls = Vec::new();
+    for (index, map) in maps.iter().enumerate() {
+        let path = temporary.path().join(format!("cjk-map-{index}.pdf"));
+        std::fs::write(&path, cjk_form_pdf(map.as_bytes(), &program)).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "cjk_text_misread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // When a release reads such maps, these expectations go.
+    for result in &results[..2] {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("5PUBMXBHFT"), "{result}");
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+    }
+    let markdown = results[2]["markdown"].as_str().unwrap_or_default();
+    assert!(markdown.contains("Total wages 52,000.00"), "{}", results[2]);
+    assert_eq!(reported(&results[2]), None, "{}", results[2]);
+}
+
 /// A page of Japanese `columns` set under `encoding` in a CID font with a
 /// ToUnicode map; with `Identity-V`, in columns read right to left from the
 /// top, 18 pt apart, each glyph placed on its own when `glyph_by_glyph`;

@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use lopdf::{Dictionary, Document, Encoding, Object, ObjectId, Stream};
 use pdf_inspector::tounicode::{build_cmap_from_truetype, ToUnicodeCMap};
 
 /// Adobe's collections for Japanese, Simplified and Traditional Chinese,
@@ -481,13 +481,15 @@ pub(crate) fn utf16_cmap(encoding: &[u8]) -> bool {
 
 /// How pdf-inspector 1.25.0 reads `font`, when it is a composite font of
 /// Adobe's Japanese, Chinese, or Korean collections that it finds no map
-/// for, as it looks for one: a `/ToUnicode` stream it parses; one it cannot
+/// for, as it looks for one: where it collects the font (see
+/// `collected_keys`), a `/ToUnicode` stream it parses, and one it cannot
 /// parse, under an Identity CMap, the descendant's program or the Korean
-/// table, where it collects the font (see `collected_keys`); with no
-/// `/ToUnicode` at all, under an Identity CMap named in place, the same,
-/// and last its widths, taken for Unicode, looked up by the program or by
-/// a descendant given by reference, where the descendant has a font
-/// descriptor and a font it collects is filed under that key.
+/// table; where it does not, the `/ToUnicode` stream lopdf parses; with no
+/// `/ToUnicode` at all, under an Identity CMap named in place, the
+/// program or the table, and last its widths, taken for Unicode, looked up
+/// by the program or by a descendant given by reference, where the
+/// descendant has a font descriptor and a font it collects is filed under
+/// that key.
 fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Option<Unmapped> {
     fn name(object: &Object) -> Option<&[u8]> {
         object.as_name().ok()
@@ -528,11 +530,13 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
         Some(Named::Bytes(codes)) => codes,
         Some(Named::Read | Named::Unknown) => return None,
     };
+    // lopdf gives an encoding only to a dictionary typed as a font.
+    let standard = codes == Codes::Cids && font.has_type(b"Font");
     let unmapped = |passthrough: bool, judged: bool| {
         Some(Unmapped {
             passthrough,
             codes,
-            standard: codes == Codes::Cids,
+            standard,
             judged,
         })
     };
@@ -549,13 +553,23 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
             else {
                 return bytes;
             };
+            // A font it does not collect it reads by the encoding lopdf
+            // gives it: the map where lopdf's strict grammar parses it, else
+            // the standard encoding. No program or table stands in, as it
+            // builds those as it files a map, and never reads the program.
+            if !fonts.collected(document, id.0) {
+                return match font.get_font_encoding_with_limit(document, MAX_STREAM_BYTES) {
+                    Ok(Encoding::UnicodeMapEncoding(_)) => None,
+                    Err(lopdf::Error::Decompress(
+                        lopdf::DecompressError::MemoryLimitExceeded { .. },
+                    )) => unmapped(false, false),
+                    _ => bytes,
+                };
+            }
             // A map it cannot parse, or that is empty, leaves it the
             // program's or the table, under an Identity CMap named in place
-            // or by reference, where it collects the font: it builds that
-            // fallback as it files the map, and for a font it does not
-            // collect never reads the program.
-            let fallback = fonts.collected(document, id.0)
-                && identity(encoding.and_then(|encoding| resolved(document, encoding)));
+            // or by reference.
+            let fallback = identity(encoding.and_then(|encoding| resolved(document, encoding)));
             let Some(map) = content(stream, &mut fonts.read) else {
                 // A map past the bytes read may parse; else, the Korean
                 // table reads the font.
@@ -1126,6 +1140,54 @@ mod tests {
         };
         assert_eq!(judged_where(korean, true), None);
         assert_eq!(judged_where(korean, false), BYTES);
+    }
+
+    /// A Japan1 font under `Identity-H` whose ToUnicode map is `map`.
+    fn with_map(map: &'static [u8]) -> impl Fn(&mut Document) -> Dictionary {
+        move |document: &mut Document| {
+            let map = document.add_object(Stream::new(dictionary! {}, map.to_vec()));
+            let mut font = type0(cid_font(document, "Japan1", None), "Identity-H".into());
+            font.set("ToUnicode", map);
+            font
+        }
+    }
+
+    #[test]
+    fn maps_of_fonts_pdf_inspector_does_not_collect_are_read_as_lopdf_reads_them() {
+        // Maps with no `/CIDInit /ProcSet findresource begin` header, or
+        // no entry such as `/CMapName`, which pdf-inspector's own parser
+        // reads where it collects the font, and lopdf's grammar, which
+        // reads the fonts it does not, rejects.
+        let bare = b"begincmap 1 begincodespacerange <0000> <FFFF> endcodespacerange \
+            1 beginbfrange <0001> <005F> <0020> endbfrange endcmap";
+        let nameless = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            1 begincodespacerange <0000> <FFFF> endcodespacerange \
+            1 beginbfrange <0001> <005F> <0020> endbfrange endcmap \
+            CMapName currentdict /CMap defineresource pop end end";
+        for map in [&bare[..], &nameless[..]] {
+            assert_eq!(judged_where(with_map(map), true), None);
+            assert_eq!(judged_where(with_map(map), false), BYTES);
+        }
+        let whole = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            /CMapName /Adobe-Identity-UCS def \
+            1 begincodespacerange <0000> <FFFF> endcodespacerange \
+            1 beginbfrange <0001> <005F> <0020> endbfrange endcmap \
+            CMapName currentdict /CMap defineresource pop end end";
+        assert_eq!(judged_where(with_map(whole), false), None);
+        // A font not typed as a font lopdf gives no encoding, and its bytes
+        // read as they are.
+        let untyped = |document: &mut Document| {
+            let mut font = with_map(bare)(document);
+            font.remove(b"Type");
+            font
+        };
+        assert_eq!(
+            judged_where(untyped, false),
+            Some(Unmapped {
+                standard: false,
+                ..BYTES.unwrap()
+            })
+        );
     }
 
     #[test]
