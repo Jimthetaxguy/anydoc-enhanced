@@ -2726,8 +2726,8 @@ struct DocxParagraphMark {
     /// The list instance (`w:numId`), level (`w:ilvl`), and paragraph style
     /// (`w:pStyle`) numbering it, as Word reads them: every mark it shows,
     /// in the branches of compatibility content it takes, later values
-    /// winning, numbers read with white space collapsed. A list instance of
-    /// 0 removes a style's numbering.
+    /// winning, each from its `w:val` alone, numbers read as LibreOffice
+    /// reads integers. A list instance of 0 removes a style's numbering.
     list: Option<u64>,
     level: Option<usize>,
     style: Option<String>,
@@ -4131,45 +4131,45 @@ fn scan_docx_mark(
     if !word && !anydoc {
         return Ok(());
     }
+    // Word, as LibreOffice shows it, reads the WordprocessingML `w:val`
+    // alone, a number as it reads integers (`1x` is 1, and an element
+    // without the value 0); AnyDoc reads `w:val`, else an unprefixed `val`,
+    // a number as it stands.
+    let within = |style: &String| style.len() <= MAX_STYLE_ID_BYTES;
     match node.local.as_slice() {
         b"pStyle" => {
-            let style = word_attribute(resolver, event, b"val")
-                .filter(|style| style.len() <= MAX_STYLE_ID_BYTES);
             if anydoc {
-                mark.anydoc_style = style.clone();
+                mark.anydoc_style = anydoc_attribute(resolver, event, b"val").filter(within);
             }
-            if word && style.is_some() {
-                mark.style = style;
+            if let Some(style) = word_attribute(resolver, event, b"val")
+                .filter(within)
+                .filter(|_| word)
+            {
+                mark.style = Some(style);
             }
         }
-        // Word reads a number with white space around it collapsed, AnyDoc
-        // as it stands.
         b"numId" => {
             let values = xml_attribute_values(event, b"val");
             mark.numbered |= values.iter().any(|value| value.trim() != "0");
-            let value = word_attribute(resolver, event, b"val");
             if anydoc {
-                mark.anydoc_list = value.as_deref().and_then(|value| value.parse().ok());
+                mark.anydoc_list =
+                    anydoc_attribute(resolver, event, b"val").and_then(|value| value.parse().ok());
             }
-            if let Some(list) = value
-                .as_deref()
-                .and_then(|value| value.trim().parse().ok())
-                .filter(|_| word)
-            {
-                mark.list = Some(list);
+            if word {
+                let list = word_attribute(resolver, event, b"val").unwrap_or_default();
+                mark.list = Some(word_list_id(&list));
             }
         }
         b"ilvl" => {
-            let value = word_attribute(resolver, event, b"val");
             if anydoc {
-                mark.anydoc_level = value.as_deref().and_then(|value| value.parse().ok());
+                mark.anydoc_level =
+                    anydoc_attribute(resolver, event, b"val").and_then(|value| value.parse().ok());
             }
-            if let Some(level) = value
-                .as_deref()
-                .and_then(|value| value.trim().parse().ok())
-                .filter(|_| word)
-            {
-                mark.level = Some(level);
+            if word {
+                let value = word_attribute(resolver, event, b"val").unwrap_or_default();
+                if let Some(level) = word_paragraph_level(&value) {
+                    mark.level = Some(level);
+                }
             }
         }
         b"del" | b"moveFrom" => mark.deleted = true,
@@ -4363,7 +4363,17 @@ struct DocxLevel {
     /// numbers: `None` when absent, and then Word shows no number.
     text: Option<DocxLevelText>,
     /// Legal numbering (`w:isLgl`): every level's number shows in decimal.
-    legal: Option<bool>,
+    legal: Option<DocxLegal>,
+}
+
+/// Legal numbering (`w:isLgl`) as a level gives it. Word turns it off for
+/// an element whose value says so, and LibreOffice applies it whatever the
+/// value, so for Word such an element leaves it uncertain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocxLegal {
+    On,
+    Off,
+    Uncertain,
 }
 
 /// A level's number text (`w:lvlText`).
@@ -4396,7 +4406,7 @@ impl DocxLevel {
     }
 
     fn legal(&self) -> bool {
-        self.legal == Some(true)
+        self.legal == Some(DocxLegal::On)
     }
 
     /// This level laid over `base`: each property it gives replaces the
@@ -4724,14 +4734,37 @@ fn docx_number_text(text: &str) -> Vec<DocxTextPiece> {
 
 impl DocxShape {
     /// The label Word shows for a paragraph numbered `value` at `level`,
-    /// with `counters` holding the shallower levels' numbers. Legal
-    /// numbering (`w:isLgl`) shows the levels in decimal, but a format
-    /// beyond decimal, Roman numerals, and letters stays unknown at the
-    /// paragraph's own level, as it does at a shallower level without legal
-    /// numbering; past `z` Word doubles the letter (`aa`, `bb`) where AnyDoc
-    /// counts on (`aa`, `ab`). A level whose text is longer than the replay
-    /// reads is unknown.
+    /// with `counters` holding the shallower levels' numbers. Where whether
+    /// the level's numbering is legal is uncertain, a label that depends on
+    /// it is unknown.
     fn word_label(&self, level: usize, value: u64, counters: &DocxCounters) -> DocxLabel {
+        match self.levels[level].legal {
+            Some(DocxLegal::Uncertain) => {
+                let legal = self.word_label_as(level, value, counters, true);
+                if legal == self.word_label_as(level, value, counters, false) {
+                    legal
+                } else {
+                    DocxLabel::Unknown
+                }
+            }
+            legal => self.word_label_as(level, value, counters, legal == Some(DocxLegal::On)),
+        }
+    }
+
+    /// The label Word shows (see [`DocxShape::word_label`]), its numbering
+    /// legal or not. Legal numbering (`w:isLgl`) shows the levels in
+    /// decimal, but a format beyond decimal, Roman numerals, and letters
+    /// stays unknown at the paragraph's own level, as it does at a
+    /// shallower level without legal numbering; past `z` Word doubles the
+    /// letter (`aa`, `bb`) where AnyDoc counts on (`aa`, `ab`). A level
+    /// whose text is longer than the replay reads is unknown.
+    fn word_label_as(
+        &self,
+        level: usize,
+        value: u64,
+        counters: &DocxCounters,
+        legal: bool,
+    ) -> DocxLabel {
         match self.markers[level] {
             DocxMarker::Nothing => return self.word_literal(level),
             DocxMarker::Bullet => return DocxLabel::Bullet,
@@ -4756,9 +4789,9 @@ impl DocxShape {
                 DocxTextPiece::Number(shown) => shown,
             };
             let count = match DocxCount::shown_by_word(&self.levels[shown]) {
-                Some(_) if own.legal() => DocxCount::Decimal,
+                Some(_) if legal => DocxCount::Decimal,
                 Some(count) => count,
-                None if own.legal() && shown < level => DocxCount::Decimal,
+                None if legal && shown < level => DocxCount::Decimal,
                 None => return DocxLabel::Unknown,
             };
             let number = if shown == level {
@@ -5497,7 +5530,8 @@ struct DocxKeptStyle {
 /// Read paragraph styles' numbering from a styles part, as Word and as
 /// AnyDoc read it, streamed under AnyDoc's depth and node bounds: the
 /// WordprocessingML `w:style` children of the part's first `w:styles`, each
-/// found by its exact id, and each attribute as AnyDoc picks it.
+/// found by its exact id, each attribute as the side picks it (see
+/// [`word_attribute`] and [`anydoc_attribute`]).
 fn docx_style_numbering(
     reader: impl std::io::BufRead,
     numbering: &mut DocxStyleNumbering,
@@ -5557,6 +5591,7 @@ fn docx_style_numbering(
             word: in_word,
         };
         let attribute = |name: &[u8]| word_attribute(reader.resolver(), &event, name);
+        let anydoc_value = |name: &[u8]| anydoc_attribute(reader.resolver(), &event, name);
         // A WordprocessingML element at `path` below the root, every element
         // along it WordprocessingML's too.
         let under = |path: &[&[u8]]| {
@@ -5581,16 +5616,21 @@ fn docx_style_numbering(
             let default = paragraph && attribute(b"default").is_some_and(|value| xml_true(&value));
             if let Some(id) = &id {
                 docx_word_style(numbering, id, paragraph, default)?;
-                // A later definition of the id replaces this one for AnyDoc.
+            }
+            // A later definition of the id replaces this one for AnyDoc.
+            if let Some(id) = anydoc_value(b"styleId").filter(|id| id.len() <= MAX_STYLE_ID_BYTES) {
+                if numbering.anydoc_styles.len() >= MAX_DOCX_STYLES
+                    && !numbering.anydoc_styles.contains_key(&id)
+                {
+                    return Err(DocumentError::ResourceLimit);
+                }
                 if start {
                     kept = Some(DocxKeptStyle {
-                        id: id.clone(),
+                        id,
                         ..DocxKeptStyle::default()
                     });
                 } else {
-                    numbering
-                        .anydoc_styles
-                        .insert(id.clone(), DocxStyleList::default());
+                    numbering.anydoc_styles.insert(id, DocxStyleList::default());
                 }
             }
             if start {
@@ -5610,7 +5650,7 @@ fn docx_style_numbering(
                     b"basedOn" if under(&[b"style"]) => {
                         kept.bases += 1;
                         if kept.bases == 1 {
-                            kept.style.based_on = attribute(b"val");
+                            kept.style.based_on = anydoc_value(b"val");
                         }
                     }
                     b"pPr" if under(&[b"style"]) => kept.marks += 1,
@@ -5624,7 +5664,8 @@ fn docx_style_numbering(
                     {
                         kept.lists += 1;
                         if kept.lists == 1 {
-                            kept.style.list = attribute(b"val").and_then(|list| list.parse().ok());
+                            kept.style.list =
+                                anydoc_value(b"val").and_then(|list| list.parse().ok());
                         }
                     }
                     _ => {}
@@ -5652,8 +5693,8 @@ fn docx_style_numbering(
                     }
                 }
             }
-            // Word merges every value, reading numbers with white space
-            // collapsed.
+            // Word merges every value, reading numbers as LibreOffice reads
+            // integers, an element without its value as 0.
             if let Some(key) = open.as_ref().and_then(|style| style.key.as_ref()) {
                 match local {
                     b"basedOn" if under(&[b"style"]) => {
@@ -5662,16 +5703,13 @@ fn docx_style_numbering(
                         }
                     }
                     b"numId" if under(&[b"style", b"pPr", b"numPr"]) => {
-                        if let Some(list) =
-                            attribute(b"val").and_then(|list| list.trim().parse().ok())
-                        {
-                            numbering.styles.entry(key.clone()).or_default().list = Some(list);
-                        }
+                        let list = attribute(b"val").unwrap_or_default();
+                        numbering.styles.entry(key.clone()).or_default().list =
+                            Some(word_list_id(&list));
                     }
                     b"ilvl" if under(&[b"style", b"pPr", b"numPr"]) => {
-                        if let Some(level) =
-                            attribute(b"val").and_then(|level| level.trim().parse::<usize>().ok())
-                        {
+                        let level = attribute(b"val").unwrap_or_default();
+                        if let Some(level) = word_paragraph_level(&level) {
                             numbering.styles.entry(key.clone()).or_default().level = Some(level);
                         }
                     }
@@ -5720,15 +5758,40 @@ fn docx_word_style(
 
 /// The attribute AnyDoc 0.2.4 reads for `attr(ns::W, name)`: the first in
 /// WordprocessingML's namespace, Transitional or Strict, else the first
-/// without a prefix. Word reads the same attribute, and each side then reads
-/// its value as it reads numbers and names.
-fn word_attribute(
+/// without a prefix.
+fn anydoc_attribute(
     resolver: &quick_xml::name::NamespaceResolver,
     event: &quick_xml::events::BytesStart<'_>,
     wanted: &[u8],
 ) -> Option<String> {
     let (qualified, unprefixed) = word_attribute_forms(resolver, event, wanted);
     qualified.or(unprefixed)
+}
+
+/// The attribute Word, as LibreOffice shows it, reads: the first in
+/// WordprocessingML's namespace, Transitional or Strict, alone. An
+/// unprefixed `val` sets nothing.
+fn word_attribute(
+    resolver: &quick_xml::name::NamespaceResolver,
+    event: &quick_xml::events::BytesStart<'_>,
+    wanted: &[u8],
+) -> Option<String> {
+    word_attribute_forms(resolver, event, wanted).0
+}
+
+/// An attribute as the side reads it: Word's (see [`word_attribute`]) or
+/// AnyDoc's (see [`anydoc_attribute`]).
+fn side_attribute(
+    word: bool,
+    resolver: &quick_xml::name::NamespaceResolver,
+    event: &quick_xml::events::BytesStart<'_>,
+    wanted: &[u8],
+) -> Option<String> {
+    if word {
+        word_attribute(resolver, event, wanted)
+    } else {
+        anydoc_attribute(resolver, event, wanted)
+    }
 }
 
 /// An attribute's first value in WordprocessingML's namespace, Transitional
@@ -5858,6 +5921,41 @@ fn word_integer(value: &str) -> i64 {
     }
 }
 
+/// An unsigned integer as LibreOffice reads one (`OUString::toUInt32`): as
+/// [`word_integer`] reads one, but that a minus sign, or a value past
+/// `u32`'s range, reads as 0.
+fn word_unsigned(value: &str) -> u32 {
+    let rest = value.trim_start_matches(|character: char| character != '\0' && character <= ' ');
+    if rest.starts_with('-') {
+        return 0;
+    }
+    let digits = rest.strip_prefix('+').unwrap_or(rest);
+    let mut number = 0u64;
+    for digit in digits.bytes().take_while(u8::is_ascii_digit) {
+        number = number * 10 + u64::from(digit - b'0');
+        if number > u64::from(u32::MAX) {
+            return 0;
+        }
+    }
+    number as u32
+}
+
+/// A list instance's id (`w:numId`) as Word, as LibreOffice shows it, reads
+/// it, on a paragraph, a style, or a list instance alike: as an integer (see
+/// [`word_integer`]), a negative one kept as its two's complement, so ids
+/// match as the integers do.
+fn word_list_id(value: &str) -> u64 {
+    word_integer(value) as u64
+}
+
+/// A paragraph's or paragraph style's list level (`w:numPr/w:ilvl`) as
+/// Word, as LibreOffice shows it, reads it: as an integer, a negative one
+/// ignored, leaving the level the paragraph had. A level past the ninth is
+/// kept, for the replay to show uncertainly.
+fn word_paragraph_level(value: &str) -> Option<usize> {
+    usize::try_from(word_integer(value)).ok()
+}
+
 /// The number formats ECMA-376 defines (`ST_NumberFormat`). Word, as
 /// LibreOffice shows it, reads no other: `<w:numFmt w:val=" upperRoman"/>`
 /// leaves the level's format as it was.
@@ -5927,37 +6025,38 @@ const WORD_NUMBER_FORMATS: [&str; 63] = [
     "custom",
 ];
 
-/// A `w:start` or `w:startOverride` value as Word reads it (see
-/// [`word_integer`]), a negative one as 0. An element without a value
-/// reads as 0.
+/// A `w:start` or `w:startOverride` value as Word, as LibreOffice shows
+/// it, reads it: as an integer (see [`word_integer`]), a negative one as 0,
+/// and then kept in 16 bits, as LibreOffice keeps a level's start, so a
+/// start of 70000 numbers from 4464. An element without a value reads as
+/// 0.
 fn word_start_value(value: Option<&str>) -> u64 {
-    word_integer(value.unwrap_or_default()).max(0) as u64
+    (word_integer(value.unwrap_or_default()).max(0) as u64) & u64::from(u16::MAX)
 }
 
 /// The level a `w:lvl` or `w:lvlOverride` names as Word, as LibreOffice
-/// shows it, reads it: its WordprocessingML `w:ilvl` read as an integer,
-/// `Some(None)` for a level past the ninth, which numbers nothing. `None`
-/// where it names none: Word then reads the element into its current
-/// level, the last one named in the definition or list instance, and drops
-/// it where none has been.
+/// shows it, reads it: its WordprocessingML `w:ilvl` read as an unsigned
+/// integer (see [`word_unsigned`]; `-1` is level 0) and kept in 16 bits
+/// (65536 is level 0), `Some(None)` for a level past the ninth, which
+/// numbers nothing. `None` where it names none: Word then reads the element
+/// into its current level, the last one named in the definition or list
+/// instance, and drops it where none has been.
 fn word_level_index(
     resolver: &quick_xml::name::NamespaceResolver,
     event: &quick_xml::events::BytesStart<'_>,
 ) -> Option<Option<usize>> {
-    let (qualified, _) = word_attribute_forms(resolver, event, b"ilvl");
-    Some(
-        usize::try_from(word_integer(&qualified?))
-            .ok()
-            .filter(|&index| index < DOCX_LIST_LEVELS),
-    )
+    let index = usize::from(word_unsigned(&word_attribute(resolver, event, b"ilvl")?) as u16);
+    Some((index < DOCX_LIST_LEVELS).then_some(index))
 }
 
 /// Read a numbering part's list definitions as Word or AnyDoc reads them,
 /// streamed under AnyDoc's depth and node bounds: the WordprocessingML
 /// `w:abstractNum` and `w:num` children of the first `w:numbering`, each
-/// attribute as AnyDoc picks it. Of two definitions or list instances with
-/// one id, AnyDoc keeps the last, read afresh, and Word, as LibreOffice
-/// shows it, the first.
+/// attribute as the side picks it (see [`side_attribute`]). Of two
+/// definitions or list instances with one id, AnyDoc keeps the last, read
+/// afresh, and Word, as LibreOffice shows it, the first. A level named
+/// again in a definition or list instance is, for Word, read on over what
+/// it holds, as LibreOffice merges it; for AnyDoc, read afresh.
 fn docx_numbering_definitions(
     reader: impl std::io::BufRead,
     word: bool,
@@ -5976,21 +6075,20 @@ fn docx_numbering_definitions(
     let mut list: Option<DocxOpenList> = None;
     let mut override_level: Option<DocxOpenOverride> = None;
     let mut open_level: Option<DocxOpenLevel> = None;
-    // A number as the side reads it: Word reads an XML Schema integer,
-    // collapsing white space around it, and AnyDoc parses the text as it
-    // stands, so a number written with white space is only Word's.
-    let number = |text: String| {
+    // A list instance's id as the side reads it: Word as LibreOffice reads
+    // integers, and AnyDoc the text as it stands.
+    let list_id = |text: String| {
         if word {
-            text.trim().to_string()
+            Some(word_list_id(&text))
         } else {
-            text
+            text.parse().ok()
         }
     };
     // A definition id as the side matches it: AnyDoc its text, Word the
     // integer it reads.
     let definition_id = |id: String| {
         if word {
-            id.trim().parse::<i64>().ok().map(|id| id.to_string())
+            Some(word_integer(&id).to_string())
         } else {
             Some(id)
         }
@@ -6040,7 +6138,7 @@ fn docx_numbering_definitions(
             local: xml_local_name(event.name().as_ref()).to_vec(),
             word: in_word,
         };
-        let attribute = |name: &[u8]| word_attribute(reader.resolver(), &event, name);
+        let attribute = |name: &[u8]| side_attribute(word, reader.resolver(), &event, name);
         // A WordprocessingML element whose parent is the named one.
         let parent_is = |name: &[u8]| {
             node.word
@@ -6070,7 +6168,7 @@ fn docx_numbering_definitions(
                         });
                 }
                 b"num" => {
-                    let id = attribute(b"numId").and_then(|id| number(id).parse().ok());
+                    let id = attribute(b"numId").and_then(list_id);
                     list = Some(DocxOpenList {
                         // Word keeps a list instance's first reading.
                         id: id.filter(|id| !word || !numbering.lists.contains_key(id)),
@@ -6084,21 +6182,17 @@ fn docx_numbering_definitions(
         } else if parent_is(b"abstractNum") && stack.len() == 2 {
             if let Some(open) = definition.as_mut() {
                 match local {
-                    // Word starts afresh the level an element names, and
-                    // reads one naming none into its current level. AnyDoc
-                    // takes the level named, else the first.
+                    // Word reads a level on over what the definition holds
+                    // of it: the level an element names, else its current
+                    // level. AnyDoc takes the level named, else the first,
+                    // afresh.
                     b"lvl" if word => {
-                        let (index, base) = match word_level_index(reader.resolver(), &event) {
-                            Some(named) => {
-                                open.current = named;
-                                (named, None)
-                            }
-                            None => (
-                                open.current,
-                                open.current
-                                    .and_then(|current| open.definition.levels[current].clone()),
-                            ),
-                        };
+                        if let Some(named) = word_level_index(reader.resolver(), &event) {
+                            open.current = named;
+                        }
+                        let index = open.current;
+                        let base =
+                            index.and_then(|current| open.definition.levels[current].clone());
                         open_level = index.map(|index| DocxOpenLevel {
                             index,
                             depth: stack.len(),
@@ -6139,9 +6233,12 @@ fn docx_numbering_definitions(
             if let Some(open) = list.as_mut() {
                 match local {
                     b"abstractNumId" => {
-                        // AnyDoc reads the first; Word the last.
+                        // AnyDoc reads the first; Word the last, 0 where it
+                        // gives no value.
                         if word || !open.definition_read {
-                            open.list.definition = attribute(b"val").and_then(definition_id);
+                            open.list.definition = attribute(b"val")
+                                .or_else(|| word.then(String::new))
+                                .and_then(definition_id);
                         }
                         open.definition_read = true;
                     }
@@ -6182,18 +6279,11 @@ fn docx_numbering_definitions(
                         }
                     }
                     b"lvl" => {
-                        let (index, base) = match word_level_index(reader.resolver(), &event) {
-                            Some(named) => {
-                                instance.current = named;
-                                (named, None)
-                            }
-                            None => (
-                                instance.current,
-                                instance
-                                    .current
-                                    .and_then(|current| instance.list.levels[current].clone()),
-                            ),
-                        };
+                        if let Some(named) = word_level_index(reader.resolver(), &event) {
+                            instance.current = named;
+                        }
+                        let index = instance.current;
+                        let base = index.and_then(|current| instance.list.levels[current].clone());
                         open_level = index.map(|index| DocxOpenLevel {
                             index,
                             depth: stack.len(),
@@ -6227,7 +6317,7 @@ fn docx_numbering_definitions(
             }
         } else if parent_is(b"lvl") {
             if let Some(open) = open_level.as_mut() {
-                docx_level_property(open, local, word, |name| attribute(name), &event);
+                docx_level_property(open, local, word, |name| attribute(name));
             }
         }
         if start {
@@ -6254,7 +6344,9 @@ fn docx_numbering_definitions(
 /// as it reads integers, an element without a value as 0; a format
 /// (`w:numFmt`), number text (`w:lvlText`), or style (`w:pStyle`) only from
 /// an element that gives one, a format only one ECMA-376 defines, so
-/// `<w:numFmt/>` leaves the format before it.
+/// `<w:numFmt/>` leaves the format before it; and legal numbering
+/// (`w:isLgl`) as on, or, where the element's value turns it off, as
+/// uncertain (see [`DocxLegal`]).
 /// LibreOffice does not apply `w:lvlRestart` at all; Word's, which ECMA-376
 /// defines, is read as its other numbers are.
 fn docx_level_property(
@@ -6262,7 +6354,6 @@ fn docx_level_property(
     local: &[u8],
     word: bool,
     attribute: impl Fn(&[u8]) -> Option<String>,
-    event: &quick_xml::events::BytesStart<'_>,
 ) {
     let property: &'static [u8] = match local {
         b"numFmt" => b"numFmt",
@@ -6290,7 +6381,13 @@ fn docx_level_property(
             }
             b"pStyle" => level.style = value.map(Rc::from).or(level.style.take()),
             b"lvlText" => level.text = value.map(DocxLevelText::of).or(level.text.take()),
-            b"isLgl" => level.legal = Some(!xml_toggle_off(event)),
+            b"isLgl" => {
+                level.legal = Some(if value.as_deref().is_some_and(xml_false) {
+                    DocxLegal::Uncertain
+                } else {
+                    DocxLegal::On
+                });
+            }
             _ => {}
         }
         return;
@@ -6306,10 +6403,13 @@ fn docx_level_property(
         b"pStyle" => level.style = value.map(Rc::from),
         b"lvlText" => level.text = Some(DocxLevelText::of(value.unwrap_or_default())),
         b"isLgl" => {
-            level.legal = Some(!matches!(
-                value.as_deref(),
-                Some("0" | "false" | "off" | "none")
-            ));
+            level.legal = Some(
+                if matches!(value.as_deref(), Some("0" | "false" | "off" | "none")) {
+                    DocxLegal::Off
+                } else {
+                    DocxLegal::On
+                },
+            );
         }
         _ => {}
     }
@@ -15259,6 +15359,182 @@ mod tests {
     }
 
     #[test]
+    fn docx_numbering_is_read_as_libreoffice_stores_it() {
+        let item = |ilvl: &str, list: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{list}"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>"#
+            )
+        };
+        let flat = item("0", "1").repeat(3);
+        let nested = [
+            item("0", "1"),
+            item("1", "1"),
+            item("0", "1"),
+            item("1", "1"),
+            item("1", "1"),
+        ]
+        .concat();
+        let differs = |body: &str, levels: &str, instance: &str| {
+            let document = word_part("document", body);
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{levels}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/>{instance}</w:num></w:numbering>"#
+            );
+            docx_preflight(&[
+                ("word/document.xml", &document),
+                ("word/numbering.xml", numbering.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        let level = |ilvl: &str, inner: &str| format!(r#"<w:lvl {ilvl}>{inner}</w:lvl>"#);
+        let decimal = level(
+            r#"w:ilvl="0""#,
+            r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+        );
+        let letters = level(
+            r#"w:ilvl="1""#,
+            r#"<w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/>"#,
+        );
+        let roman = r#"<w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/>"#;
+        assert!(!differs(&flat, &decimal, ""));
+        // Word reads a level's properties from `w:val` alone: an unprefixed
+        // start, format, number text, or start override sets nothing there,
+        // though AnyDoc reads it.
+        for inner in [
+            r#"<w:start val="7"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+            r#"<w:start w:val="1"/><w:numFmt val="upperRoman"/><w:lvlText w:val="%1."/>"#,
+            r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText val="Art %1:"/>"#,
+        ] {
+            assert!(
+                differs(&flat, &level(r#"w:ilvl="0""#, inner), ""),
+                "{inner}"
+            );
+        }
+        assert!(differs(
+            &flat,
+            &decimal,
+            r#"<w:lvlOverride w:ilvl="0"><w:startOverride val="5"/></w:lvlOverride>"#
+        ));
+        // A paragraph's level written "1x" is level 1 to Word.
+        assert!(differs(
+            &[item("0", "1"), item("1x", "1"), item("1x", "1")].concat(),
+            &format!("{decimal}{letters}"),
+            ""
+        ));
+        // LibreOffice keeps a start in 16 bits: 65536 numbers from 0, 70000
+        // from 4464; AnyDoc numbers from the start as written.
+        for start in ["65536", "70000", "2147483646"] {
+            let wide = level(
+                r#"w:ilvl="0""#,
+                &format!(
+                    r#"<w:start w:val="{start}"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#
+                ),
+            );
+            assert!(differs(&flat, &wide, ""), "{start}");
+        }
+        let narrow = level(
+            r#"w:ilvl="0""#,
+            r#"<w:start w:val="65535"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+        );
+        assert!(!differs(&flat, &narrow, ""));
+        assert!(differs(
+            &nested,
+            &format!("{decimal}{letters}"),
+            r#"<w:lvlOverride w:ilvl="0"><w:startOverride w:val="70000"/></w:lvlOverride>"#
+        ));
+        // It reads a level's index as an unsigned integer kept in 16 bits:
+        // -1 names level 0, as it does to AnyDoc, which reads a level it
+        // cannot parse as the first; 65536 names level 0, and 65537 level
+        // 1, which AnyDoc drops; and a level past the ninth numbers
+        // nothing on either side.
+        for (ilvl, apart) in [
+            ("-1", false),
+            ("65536", true),
+            ("65537", true),
+            ("9", false),
+        ] {
+            let levels = format!(
+                "{decimal}{letters}{}",
+                level(&format!(r#"w:ilvl="{ilvl}""#), roman)
+            );
+            assert_eq!(differs(&nested, &levels, ""), apart, "{ilvl}");
+        }
+        // An override of level -1 is one of level 0, as it is to AnyDoc.
+        assert!(!differs(
+            &nested,
+            &format!("{decimal}{letters}"),
+            r#"<w:lvlOverride w:ilvl="-1"><w:startOverride w:val="5"/></w:lvlOverride>"#
+        ));
+        // A level named twice is read on over what it holds, as LibreOffice
+        // merges it, where AnyDoc reads the last afresh: the first's legal
+        // numbering stays.
+        let legal_twice = format!(
+            "{}{}{}",
+            level(
+                r#"w:ilvl="0""#,
+                r#"<w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/>"#
+            ),
+            level(
+                r#"w:ilvl="1""#,
+                r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/><w:isLgl/>"#
+            ),
+            level(
+                r#"w:ilvl="1""#,
+                r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/>"#
+            )
+        );
+        assert!(differs(&nested, &legal_twice, ""));
+        let overridden_twice = format!(
+            r#"<w:lvlOverride w:ilvl="0">{}</w:lvlOverride><w:lvlOverride w:ilvl="0">{}</w:lvlOverride>"#,
+            level(
+                r#"w:ilvl="0""#,
+                r#"<w:start w:val="5"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:isLgl/>"#
+            ),
+            level(r#"w:ilvl="0""#, roman)
+        );
+        assert!(differs(
+            &nested,
+            &format!("{decimal}{letters}"),
+            &overridden_twice
+        ));
+        // A number element without its `w:val` is 0 to Word: a list instance
+        // naming its definition with an unprefixed value takes definition 0.
+        let definitions = |named: &str| {
+            let numbering = format!(
+                r#"<w:numbering {WORD_NS}><w:abstractNum w:abstractNumId="0">{decimal}</w:abstractNum><w:abstractNum w:abstractNumId="5">{}</w:abstractNum><w:num w:numId="1"><w:abstractNumId val="{named}"/></w:num></w:numbering>"#,
+                level(r#"w:ilvl="0""#, roman)
+            );
+            docx_preflight(&[
+                ("word/document.xml", &word_part("document", &flat)),
+                ("word/numbering.xml", numbering.as_bytes()),
+            ])
+            .list_numbering_differs
+        };
+        assert!(!definitions("0"));
+        assert!(definitions("5"));
+        // Legal numbering an element's value turns off, which Word honors
+        // and LibreOffice does not, is uncertain where it changes a label,
+        // and only there.
+        for value in ["0", "false", "off"] {
+            let composite = format!(
+                "{}{}",
+                level(
+                    r#"w:ilvl="0""#,
+                    r#"<w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/>"#
+                ),
+                level(
+                    r#"w:ilvl="1""#,
+                    &format!(
+                        r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/><w:isLgl w:val="{value}"/>"#
+                    )
+                )
+            );
+            assert!(differs(&nested, &composite, ""), "{value}");
+            let all_decimal = composite.replace("upperRoman", "decimal");
+            assert!(!differs(&nested, &all_decimal, ""), "{value}");
+        }
+    }
+
+    #[test]
     fn docx_numbering_is_read_as_each_side_reads_it() {
         const IGNORABLE: &str = r#"xmlns:x="urn:x" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x""#;
         let items = |numbering: &str| {
@@ -15291,19 +15567,26 @@ mod tests {
             definition(r#"w:abstractNumId="0""#, &decimal)
         );
         assert!(!differs(&direct, &one));
-        // A paragraph's list and level are read from WordprocessingML's
-        // attribute, else the unprefixed one, never another vocabulary's:
-        // Word reads " 1" and AnyDoc cannot.
+        // A paragraph's list and level are read, by Word, from
+        // WordprocessingML's attribute alone, as LibreOffice reads integers,
+        // and by AnyDoc from it, else from the unprefixed one, as it stands;
+        // never from another vocabulary's. Word reads " 1", "1x", and
+        // "1.0" as 1, which AnyDoc cannot read, and AnyDoc reads an
+        // unprefixed value, which Word does not.
         for numbering in [
             r#"<w:ilvl w:val="0"/><w:numId w:val=" 1" x:val="1"/>"#,
             r#"<w:ilvl w:val="0"/><w:numId x:val="1" w:val=" 1"/>"#,
-            r#"<w:ilvl w:val="0"/><w:numId val=" 1"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId w:val="1x"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId w:val="1.0"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId val="1"/>"#,
+            r#"<w:ilvl val="0"/><w:numId val="1"/>"#,
         ] {
             assert!(differs(&items(numbering), &one), "{numbering}");
         }
         for numbering in [
             r#"<w:ilvl w:val="0"/><w:numId x:val=" 1" w:val="1"/>"#,
-            r#"<w:ilvl w:val="0"/><w:numId val="1"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId val=" 1"/>"#,
+            r#"<w:ilvl w:val="0"/><w:numId w:val="1" val="2"/>"#,
         ] {
             assert!(!differs(&items(numbering), &one), "{numbering}");
         }
