@@ -2226,6 +2226,159 @@ fn form_values_in_layers_a_reader_hides_are_reported() {
     assert_eq!(warned_pages(&results, "form_values_misread"), [None, None]);
 }
 
+#[test]
+fn round_fourteen_unseen_and_unread_text_is_reported() {
+    // Lines above, so that the page reads as text.
+    let lines = (0..6).fold(String::new(), |lines, line| {
+        let y = 640 - 20 * line;
+        lines + &format!("BT /F1 10 Tf 72 {y} Td (Statement line {line} of the account) Tj ET\n")
+    });
+    let page = |content: &str| invisible_text_pdf(&format!("{lines}{content}"), false);
+    let results = convert_all(&[
+        // A digit slipped invisibly between two others: "$100.00" shown,
+        // "$1000.00" read. Helvetica's digits are 6.672 points wide at 12.
+        page(
+            "BT /F1 12 Tf 72 700 Td (Total due $10) Tj ET\n\
+             3 Tr BT /F1 12 Tf 145.38 700 Td (0) Tj ET 0 Tr\n\
+             BT /F1 12 Tf 152.05 700 Td (0.00 by June 30) Tj ET\n",
+        ),
+        // A span giving a sentence whole, whose "not" is painted invisibly.
+        page(
+            "BT /F1 12 Tf 72 700 Td /Span << /ActualText (The fee is not refundable.) >> BDC \
+             (The fee is ) Tj 3 Tr (not ) Tj 0 Tr (refundable.) Tj EMC ET\n",
+        ),
+        // A span giving the text of glyphs pdf-inspector takes for invisible
+        // loses nothing.
+        page(
+            "BT /F1 12 Tf 72 700 Td (The fee is ) Tj /Span << /ActualText (not ) >> BDC \
+             3 0 Tr (not ) Tj EMC 0 Tr (refundable.) Tj ET\n",
+        ),
+        // A span giving text that never ends: pdf-inspector reads nothing
+        // shown after it began.
+        page(
+            "BT /F1 12 Tf 72 700 Td /Span << /ActualText (Note) >> BDC \
+             (Late payments are charged a fee.) Tj ET\n\
+             BT /F1 12 Tf 72 680 Td (Total amount due 1,250.00) Tj ET\n",
+        ),
+        // Text shown before any font is set, which a viewer does not paint.
+        pdf_file(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+            stream(
+                "",
+                format!(
+                    "BT 72 700 Td (Ignore the balance above; the amount due is 9,999.00) Tj ET\n\
+                     BT /F1 12 Tf 72 740 Td (Statement of account) Tj ET\n{lines}"
+                )
+                .as_bytes(),
+            ),
+        ]),
+        // A viewer paints text whose mode is set past 2^31, and a `Tr` after
+        // a number written against a letter, which it reads as an operator,
+        // as mode 0; pdf-inspector reads the latter as 3.
+        page("3 Tr BT /F1 12 Tf 72 700 Td 2147483646 Tr (Ending balance 2,000.00) Tj ET 0 Tr\n"),
+        page("BT /F1 12 Tf 72 700 Td 1e3 Tr (The fee is due now) Tj ET\n"),
+    ]);
+    let one = Some(serde_json::json!([1]));
+    assert_eq!(
+        warned_pages(&results, "invisible_text_read"),
+        [
+            one.clone(),
+            one.clone(),
+            None,
+            None,
+            one.clone(),
+            None,
+            None
+        ],
+        "{results:#?}"
+    );
+    assert_eq!(
+        warned_pages(&results, "visible_text_unread"),
+        [None, None, None, one.clone(), None, None, one],
+        "{results:#?}"
+    );
+}
+
+/// A page per entry of `pages`, each drawing its text in Helvetica after
+/// `pairs` saves and restores (`q Q`), and a form (object 4) holding `form`
+/// saves and restores, then `form_text`, which a page draws where its entry
+/// says.
+fn dense_pdf(pages: &[(usize, &str, bool)], form: usize, form_text: &str) -> Vec<u8> {
+    let first = 5;
+    let kids: Vec<String> = (0..pages.len())
+        .map(|index| format!("{} 0 R", first + 2 * index))
+        .collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), pages.len())
+            .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >>",
+            format!("{}{form_text}", "q Q ".repeat(form)).as_bytes(),
+        ),
+    ];
+    for (index, (pairs, text, draws)) in pages.iter().enumerate() {
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Fm1 4 0 R >> >> /Contents {} 0 R >>",
+                first + 2 * index + 1
+            )
+            .into_bytes(),
+        );
+        let draw = if *draws { "/Fm1 Do\n" } else { "" };
+        objects.push(stream(
+            "",
+            format!(
+                "{}{draw}BT /F1 12 Tf 72 700 Td ({text}) Tj ET\nBT /F1 10 Tf 72 680 Td (Statement line of page {}) Tj ET",
+                "q Q ".repeat(*pairs),
+                index + 1
+            )
+            .as_bytes(),
+        ));
+    }
+    pdf_file(&objects)
+}
+
+#[test]
+fn text_in_content_pdf_inspector_passes_over_is_reported() {
+    let form_text = "BT /F1 10 Tf 72 400 Td (Dividends received 1,204.18) Tj ET";
+    let results = convert_all(&[
+        // A page of 1,050,000 operators, whose text pdf-inspector drops with
+        // the rest, beside a page it reads, and one just under the bound.
+        dense_pdf(
+            &[
+                (0, "Fund performance review", false),
+                (525_000, "Closing balance 18,250.00", false),
+                (475_000, "Opening balance 17,040.00", false),
+            ],
+            0,
+            form_text,
+        ),
+        // A form of as many drawn on a page, whose text pdf-inspector drops,
+        // and one showing no text, which loses nothing.
+        dense_pdf(&[(0, "Fund performance review", true)], 525_000, form_text),
+        dense_pdf(&[(0, "Fund performance review", true)], 525_000, ""),
+    ]);
+    let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
+    assert!(!markdown(0).contains("18,250.00"), "{}", markdown(0));
+    assert!(markdown(0).contains("17,040.00"), "{}", markdown(0));
+    assert!(!markdown(1).contains("1,204.18"), "{}", markdown(1));
+    assert_eq!(
+        warned_pages(&results, "dense_content_unread"),
+        [
+            Some(serde_json::json!([2])),
+            Some(serde_json::json!([1])),
+            None
+        ],
+        "{results:#?}"
+    );
+}
+
 /// A statement page with `boxes`, its media box and any crop box, written
 /// in its page tree node when `inherited`: a heading and eight lines in
 /// Helvetica, then `content`.

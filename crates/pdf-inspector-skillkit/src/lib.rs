@@ -79,10 +79,14 @@ pub const PDF_WARNING_WORD_GAPS_MISREAD: &str = "word_gaps_misread";
 /// Pages showing text through a form that pdf-inspector 1.25.0 does not
 /// reach or reads without its font (open upstream #312).
 pub const PDF_WARNING_FORM_TEXT_UNREAD: &str = "form_text_unread";
-/// Text a viewer paints that pdf-inspector 1.25.0 skips, taking its render
+/// Text a viewer paints that pdf-inspector 1.25.0 skips: taking its render
 /// mode for invisible from the first operand of `Tr` where a viewer takes
-/// another from the last.
+/// another from the last, or reading nothing past the start of a span
+/// giving its glyphs' text that never ends.
 pub const PDF_WARNING_VISIBLE_TEXT_UNREAD: &str = "visible_text_unread";
+/// Content pdf-inspector 1.25.0 reads nothing of, past a million operators
+/// or 64 MiB, where it shows text or may.
+pub const PDF_WARNING_DENSE_CONTENT_UNREAD: &str = "dense_content_unread";
 
 /// Pages painting text twice whose text is read again to confirm the
 /// repeat in the Markdown.
@@ -457,8 +461,21 @@ impl PdfInfo {
         if !visible_unread.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_VISIBLE_TEXT_UNREAD,
-                "On these pages text a viewer shows is missing from the Markdown: the page sets its render mode with more than one number, or with one that is none, and pdf-inspector 1.25.0 takes the first for invisible where a viewer paints the text by the last, so \"The fee is not refundable\" reads \"The fee is refundable\"; read these pages another way, such as by OCR.",
+                "On these pages text a viewer shows is missing from the Markdown, as pdf-inspector 1.25.0 skips it: where the page sets its render mode with more than one number, or with one that is none, it takes the first for invisible where a viewer paints the text by the last, so \"The fee is not refundable\" reads \"The fee is refundable\"; and where a marked-content span giving its glyphs' text never ends, it reads neither that text nor any glyph shown since; read these pages another way, such as by OCR.",
                 visible_unread,
+            ));
+        }
+        let content_unread: Vec<u32> = found
+            .content_unread
+            .iter()
+            .copied()
+            .filter(|page| only.is_none_or(|only| only.contains(page)))
+            .collect();
+        if !content_unread.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_DENSE_CONTENT_UNREAD,
+                "On these pages text is missing from the Markdown: the page's content, or a form it draws, holds more than a million operators or 64 MiB, as a detailed chart or map may, and pdf-inspector 1.25.0 reads nothing of such content, the text it shows included; read these pages another way, such as by OCR.",
+                content_unread,
             ));
         }
         let painted_twice =

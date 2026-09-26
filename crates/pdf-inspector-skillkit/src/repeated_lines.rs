@@ -927,7 +927,13 @@ fn read_in_order(
                 return Vec::new();
             };
             if !beside {
-                return vec![span];
+                // With a character on either side as well, so that a span
+                // joined to digits on both sides, as a run slipped into a
+                // number is, is found where it stands.
+                let wider = (from > 0 && to < text.len())
+                    .then(|| read(from - 1..to + 1))
+                    .flatten();
+                return [Some(span), wider].into_iter().flatten().collect();
             }
             let before = text[..from]
                 .iter()
@@ -940,12 +946,21 @@ fn read_in_order(
                 .take(CONTEXT_CHARS)
                 .take_while(|character| character.is_some())
                 .count();
+            // Whole, where there is text on both sides, as a digit slipped
+            // between two others is found only whole; and each side apart,
+            // where the other reads otherwise.
+            let (before, after) = (
+                (before >= MIN_CONTEXT_CHARS).then_some(before),
+                (after >= MIN_CONTEXT_CHARS).then_some(after),
+            );
             [
-                (before >= MIN_CONTEXT_CHARS).then(|| read(from - before..to)),
-                (after >= MIN_CONTEXT_CHARS).then(|| read(from..to + after)),
+                before
+                    .zip(after)
+                    .and_then(|(before, after)| read(from - before..to + after)),
+                before.and_then(|before| read(from - before..to)),
+                after.and_then(|after| read(from..to + after)),
             ]
             .into_iter()
-            .flatten()
             .flatten()
             .collect()
         })
@@ -1909,5 +1924,30 @@ mod tests {
             up(480.0, 127.0, "refundable within"),
         ];
         assert!(holds(&runs, 2, &["Thefeeisnot", "notrefundab"]));
+        // A digit slipped between two others is read whole with the text
+        // on either side, which alone the Markdown shows as it stands: each
+        // side runs on into a number.
+        let runs = [
+            line_run(72.0, 640.0, Some("Total due $10")),
+            line_run(150.0, 640.0, Some("0")),
+            line_run(150.0, 640.0, Some("0.00 by June")),
+        ];
+        assert_eq!(
+            line_contexts(&runs, &[(1, 1, true)])[0],
+            ["aldue$1000.00byJu", "aldue$100", "00.00byJu"]
+        );
+        let found = found_in(
+            &["aldue$1000.00byJu", "aldue$100", "00.00byJu"],
+            "Total due $1000.00 by June",
+        );
+        assert_eq!(found, HashSet::from(["aldue$1000.00byJu"]));
+        // A longer run is read with a character on either side as well.
+        let runs = [
+            line_run(72.0, 640.0, Some("Total due $1")),
+            line_run(150.0, 640.0, Some("0,000,00")),
+            line_run(190.0, 640.0, Some("0.00")),
+        ];
+        let read = line_contexts(&runs, &[(1, 1, false)]);
+        assert_eq!(read[0], ["0,000,00", "10,000,000"]);
     }
 }

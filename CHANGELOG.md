@@ -497,6 +497,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round fourteen checked the round-thirteen fixes:
+  - PDF invisible text (#572): round thirteen looked for a short run slipped
+    into a line as the text before it and the text after it, apart; where
+    both ran into digits, as a "0" slipped invisibly between "$10" and
+    "0.00", neither was taken as found, and "$100.00" shown as "$1000.00"
+    went unreported, where it had been reported before. The run is now also
+    looked for whole with the text on either side, and a longer one with a
+    character on either side, so "$1.00" shown as "$10,000,000.00" is
+    reported too.
+  - A page, or a form it draws, of more than a million operators or 64 MiB
+    of content, pdf-inspector 1.25.0 reads nothing of: a chart page of
+    1,050,000 operators converted without "Closing balance 18,250.00", with
+    no sign. A page whose such content shows text, or draws a form that
+    does, now carries the new `dense_content_unread` warning. The scan reads
+    a page's content as pdf-inspector does, its streams together up to 64
+    MiB and a stream that does not decode as it stands, where it had passed
+    over any one stream past 32 MiB with no sign: text painted invisibly in
+    a 34 MB stream is reported.
+  - An inline image written without white space before its data or after
+    `EI`, as `IDx EI`, ended the count of a stream's operators, so a 16 KB
+    file of 2 million path operators again aborted the conversion at 844
+    MB. The count now finds the image's end as pdf-inspector finds it, and
+    goes on where it finds none: 0.25 s within 34 MB.
+  - A marked-content span giving its glyphs' text (`/ActualText`) was
+    looked for only where every glyph in it was unseen: a sentence given
+    whole whose "not" is painted invisibly converted as "The fee is not
+    refundable" with no sign; the span's text is now looked for where it
+    holds what its unseen glyphs say. A span giving text that never ends,
+    after which pdf-inspector reads no glyph, is reported as
+    `visible_text_unread`; glyphs a span's text stands in for are no longer
+    reported as visible text skipped, under `3 0 Tr`, nor as Japanese text
+    read without its map.
+  - Text shown before any font is set, which a viewer does not paint and
+    pdf-inspector reads byte by byte, is reported as invisible.
+  - Render modes are read as pdfium reads them: an operand as a float cut
+    to a whole number, one at or past 2^31 as mode 0, and a number written
+    against a letter, as `1e3 Tr`, as an operator of its own, which leaves
+    `Tr` without one. Text so set, which a viewer paints, is no longer
+    reported as invisible; and where pdf-inspector reads `1e3 Tr` as mode 3
+    and drops the text, it is reported as `visible_text_unread`.
+  - A form drawn again, as a letterhead with a line of text on every page,
+    runs as the scan acts on it, its paths left out, and is charged for
+    that alone: a 1,000-page statement is checked through in 9.9 s, where
+    pages 726 to 1,000 had gone unchecked in 15.3 s.
 - Review round thirteen checked the round-twelve fixes:
   - PDF invisible text (#572): a word or a digit slipped invisibly into a line
     and set a point or so above or below it opened a line of its own, or
@@ -1338,12 +1382,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported as invisible text; text pdf-inspector reads only through its
   retry of a document with no visible text, and clip-only text (render
   mode 7), are not reported; and a run too short to look for alone is
-  looked for with the eight characters before it, and apart with the eight
-  after it, as pdf-inspector reads the page's lines, so one whose
-  neighbours read otherwise, as across columns pdf-inspector sets apart or
-  on a line of runs set upside down, which it orders by where they end, is
-  not reported, nor is text that short a marked-content span gives its
-  glyphs (`/ActualText`). A page's unseen text past 64 KiB, or a
+  looked for with the eight characters on either side of it, and with
+  those before it and those after it apart, as pdf-inspector reads the
+  page's lines, so one whose neighbours read otherwise, as across columns
+  pdf-inspector sets apart or on a line of runs set upside down, which it
+  orders by where they end, is not reported, nor is text that short a
+  marked-content span gives its glyphs (`/ActualText`), nor a run made only
+  of marks the comparison sets aside, such as `*`, `#`, `_`, or `|`. A
+  span's text that says otherwise than the glyphs a reader sees in it, as
+  "$1000.00" given over glyphs painting "$100.00", or a word given in place
+  of a sentence, is not reported: pdf-inspector writes the span's text.
+  A page's unseen text past 64 KiB, or a
   document's past 4 MiB, is reported without being looked for where its
   middle stands on the page, and left out where it stands off it, where
   pdf-inspector may leave out a neighbouring page's text on an imposed
