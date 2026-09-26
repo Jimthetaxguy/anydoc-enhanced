@@ -1591,6 +1591,87 @@ fn docx_notes_from_another_part_than_words_are_refused() {
         "{markdown}"
     );
     assert!(!markdown.contains("OTHER-NOTE"), "{markdown}");
+    // Parts that write the note Word shows alike convert, though Word's part
+    // defines it again after, which Word does not show.
+    let restated = temporary.path().join("restated.docx");
+    let stale = note("SHOWN-NOTE pays 100 USD").replace(
+        "</w:footnotes>",
+        r#"<w:footnote w:id="1"><w:p><w:r><w:t>STALE-NOTE</w:t></w:r></w:p></w:footnote></w:footnotes>"#,
+    );
+    let entries = docx_parts(
+        body,
+        &[
+            footnotes("rId8", "footnotes.xml"),
+            footnotes("rId0", "other.xml"),
+        ]
+        .concat(),
+        &[
+            ("word/footnotes.xml", stale),
+            ("word/other.xml", note("SHOWN-NOTE pays 100 USD")),
+        ],
+    );
+    let entries: Vec<(&str, String)> = entries
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.clone()))
+        .collect();
+    write_package(&restated, &entries);
+    let restated = run_document_tool(
+        restated.to_string_lossy().into_owned(),
+        "docx-notes-parts-test",
+    );
+    assert_eq!(restated["completeness"], "complete", "{restated}");
+    let markdown = restated["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("SHOWN-NOTE pays 100 USD"), "{markdown}");
+    assert!(!markdown.contains("STALE-NOTE"), "{markdown}");
+}
+
+#[test]
+fn docx_notes_are_read_as_word_and_anydoc_read_them() {
+    let temporary = tempfile::tempdir().expect("temporary DOCX directory");
+    let body =
+        r#"<w:p><w:r><w:t>NOTE-CLAUSE</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+    let convert = |name: &str, notes: &str| {
+        let path = temporary.path().join(name);
+        let footnotes = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:footnotes {WORD_NAMESPACE} xmlns:x="urn:x">{notes}</w:footnotes>"#
+        );
+        let entries = docx_parts(
+            body,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#,
+            &[("word/footnotes.xml", footnotes)],
+        );
+        let entries: Vec<(&str, String)> = entries
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.clone()))
+            .collect();
+        write_package(&path, &entries);
+        run_document_tool(
+            path.to_string_lossy().into_owned(),
+            "docx-notes-readings-test",
+        )
+    };
+    // AnyDoc skips a note an unprefixed type makes a separator, which Word,
+    // reading `w:type` alone, shows at its reference.
+    let skipped = convert(
+        "skipped.docx",
+        r#"<w:footnote type="separator" w:id="1"><w:p><w:r><w:t>SHOWN-NOTE</w:t></w:r></w:p></w:footnote>"#,
+    );
+    assert_eq!(skipped["code"], "incomplete_conversion", "{skipped}");
+    // A type in another vocabulary is read by neither side: a note no
+    // reference names converts after the text, disclosed.
+    let rider = convert(
+        "rider.docx",
+        r#"<w:footnote w:id="1"><w:p><w:r><w:t>SHOWN-NOTE</w:t></w:r></w:p></w:footnote><w:footnote x:type="separator" w:id="2"><w:p><w:r><w:t>RIDER-NOTE</w:t></w:r></w:p></w:footnote>"#,
+    );
+    assert_eq!(rider["completeness"], "complete", "{rider}");
+    assert!(
+        rider["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "hidden_content_preserved"),
+        "{rider}"
+    );
 }
 
 #[test]
