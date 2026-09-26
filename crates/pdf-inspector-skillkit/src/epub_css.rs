@@ -3731,14 +3731,15 @@ fn parse_complex(tokens: &[Token], nesting: usize, context: SelectorContext) -> 
             flush(&mut current, &mut items);
             match items.last_mut() {
                 Some(SelectorItem::Compound(_)) => items.push(SelectorItem::Combinator(combinator)),
-                Some(SelectorItem::Combinator(previous)) => {
-                    if combinator != Combinator::Descendant {
-                        *previous = combinator;
-                    }
+                Some(SelectorItem::Combinator(previous))
+                    if combinator != Combinator::Descendant =>
+                {
+                    *previous = combinator;
                 }
-                // A leading combinator (a relative selector) constrains
+                // Whitespace beside another combinator leaves it be, and a
+                // leading combinator (a relative selector) constrains
                 // nothing this model reads.
-                None => {}
+                Some(SelectorItem::Combinator(_)) | None => {}
             }
             index += 1;
             continue;

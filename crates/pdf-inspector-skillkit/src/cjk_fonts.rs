@@ -701,8 +701,10 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
 fn codes(bytes: &[u8]) -> Option<Vec<u16>> {
     bytes.len().is_multiple_of(2).then(|| {
         bytes
-            .chunks_exact(2)
-            .map(|code| u16::from_be_bytes([code[0], code[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&code| u16::from_be_bytes(code))
             .collect()
     })
 }
@@ -812,10 +814,10 @@ pub(crate) fn says(font: Unmapped, bytes: &[u8]) -> Option<String> {
         Codes::Utf16 => Some(as_utf16(&codes)),
         Codes::Utf32 => bytes.len().is_multiple_of(4).then(|| {
             bytes
-                .chunks_exact(4)
-                .filter_map(|code| {
-                    char::from_u32(u32::from_be_bytes([code[0], code[1], code[2], code[3]]))
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter_map(|&code| char::from_u32(u32::from_be_bytes(code)))
                 .filter(|character| !character.is_control())
                 .collect()
         }),
