@@ -36,14 +36,14 @@ Revert the dependency and lockfile changes, then rerun the locked verification g
 
 ## Full dependency license audit
 
-Generated with `cargo license --json` (cargo-license 0.7.0) on 2026-09-24. The
-206-package workspace graph (204 external packages plus 2 workspace packages)
+Generated with `cargo license --json` (cargo-license 0.7.0) on 2026-09-26. The
+208-package workspace graph (206 external packages plus 2 workspace packages)
 resolves to:
 
 | License set | Crate count | Notes |
 |---|---:|---|
-| `Apache-2.0 OR MIT` | 137 | Bulk of the Rust ecosystem |
-| `MIT` | 33 | Includes `anydoc`, `lopdf`, and `pdf-inspector` |
+| `Apache-2.0 OR MIT` | 138 | Bulk of the Rust ecosystem |
+| `MIT` | 34 | Includes `anydoc`, `lopdf`, `pdf-inspector`, and `pulldown-cmark` |
 | `Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT` | 14 | wasm/wit toolchain crates |
 | `MIT OR Unlicense` | 6 | Permissive dual-license choice |
 | `Apache-2.0 OR MIT OR Zlib` | 3 | Permissive multi-license choice |

@@ -10716,14 +10716,17 @@ fn sanitize_markdown(markdown: &str) -> (String, bool) {
 /// Remove HTML tags, except what is text or a line break. AnyDoc escapes a
 /// literal `<` (`\<Client name>` is a `<` and words, as a Markdown renderer
 /// reads it); a tag may still start after an escaped `<`, so the search
-/// resumes just past it. Code spans and fenced code blocks show `<` as
-/// written, so nothing in them is a tag. AnyDoc's own `<br>` separates the
+/// resumes just past it. Code spans and code blocks show `<` as written,
+/// so nothing in them is a tag. AnyDoc's own `<br>` separates the
 /// lines of a table cell; without it, "52,000" over "1,250" would read as
 /// one number.
 /// The longest anchor id the sanitizer keeps.
 const MAX_ANCHOR_ID_BYTES: usize = 64;
 
 fn strip_html_tags(text: &str, html: &Regex) -> String {
+    if !html.is_match(text) {
+        return text.to_string();
+    }
     let code = markdown_code_ranges(text);
     let in_code = |position: usize| {
         code.binary_search_by(|&(start, end)| {
@@ -10779,95 +10782,45 @@ fn strip_html_tags(text: &str, html: &Regex) -> String {
     output
 }
 
-/// The byte ranges of fenced code blocks and code spans, in order and not
-/// overlapping, as CommonMark pairs backtick strings. Fences may sit in a
-/// list item or block quote.
+/// The byte ranges of code blocks and code spans, in order and not
+/// overlapping, where CommonMark shows code and GFM's tables do too. A
+/// fence indented four spaces past its container is indented code, and a
+/// fence ends with the block quote or list item it sits in; in a GFM table
+/// a pipe splits a cell before backticks pair (`| `a | <b>` |` holds no
+/// code), so only what both readings show as code counts.
 fn markdown_code_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    // Fenced blocks, line by line: (marker, length) of the open fence.
-    let mut fence: Option<(u8, usize, usize)> = None;
-    let mut prose: Vec<(usize, usize)> = Vec::new();
-    let mut prose_start = 0;
-    let mut line_start = 0;
-    for line in text.split_inclusive('\n') {
-        let line_end = line_start + line.len();
-        let body = line.trim_start_matches([' ', '>']);
-        let marker = body
-            .bytes()
-            .next()
-            .filter(|byte| matches!(byte, b'`' | b'~'));
-        let run = marker.map_or(0, |marker| {
-            body.bytes().take_while(|&b| b == marker).count()
-        });
-        match (fence, marker) {
-            (None, Some(marker)) if run >= 3 && !(marker == b'`' && body[run..].contains('`')) => {
-                prose.push((prose_start, line_start));
-                fence = Some((marker, run, line_start));
-            }
-            (Some((open, length, start)), Some(marker))
-                if marker == open && run >= length && body[run..].trim().is_empty() =>
-            {
-                ranges.push((start, line_end));
-                fence = None;
-                prose_start = line_end;
-            }
-            _ => {}
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let code = |options| {
+        let mut ranges: Vec<(usize, usize)> = Parser::new_ext(text, options)
+            .into_offset_iter()
+            .filter(|(event, _)| matches!(event, Event::Code(_) | Event::Start(Tag::CodeBlock(_))))
+            .map(|(_, range)| (range.start, range.end))
+            .collect();
+        ranges.sort_unstable();
+        ranges
+    };
+    let commonmark = code(Options::empty());
+    // With no pipe there is no table, and both readings agree.
+    if !text.contains('|') {
+        return commonmark;
+    }
+    let tables = code(Options::ENABLE_TABLES);
+    let mut both = Vec::new();
+    let (mut a, mut b) = (0, 0);
+    while let (Some(&(a_start, a_end)), Some(&(b_start, b_end))) =
+        (commonmark.get(a), tables.get(b))
+    {
+        let (start, end) = (a_start.max(b_start), a_end.min(b_end));
+        if start < end {
+            both.push((start, end));
         }
-        line_start = line_end;
-    }
-    match fence {
-        Some((_, _, start)) => ranges.push((start, text.len())),
-        None => prose.push((prose_start, text.len())),
-    }
-    // Code spans in the prose between fences: a backtick string not escaped
-    // opens one, closed by the next string of the same length before a
-    // blank line.
-    for (start, end) in prose {
-        let bytes = &text.as_bytes()[start..end];
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] != b'`' {
-                index += 1;
-                continue;
-            }
-            let run = bytes[index..].iter().take_while(|&&b| b == b'`').count();
-            let escapes = bytes[..index]
-                .iter()
-                .rev()
-                .take_while(|&&b| b == b'\\')
-                .count();
-            if escapes % 2 == 1 {
-                index += 1;
-                continue;
-            }
-            let mut search = index + run;
-            let mut closed = None;
-            while search < bytes.len() {
-                if bytes[search..].starts_with(b"\n\n") {
-                    break;
-                }
-                if bytes[search] == b'`' {
-                    let length = bytes[search..].iter().take_while(|&&b| b == b'`').count();
-                    if length == run {
-                        closed = Some(search + length);
-                        break;
-                    }
-                    search += length;
-                } else {
-                    search += 1;
-                }
-            }
-            match closed {
-                Some(close) => {
-                    ranges.push((start + index, start + close));
-                    index = close;
-                }
-                None => index += run,
-            }
+        if a_end <= b_end {
+            a += 1;
+        } else {
+            b += 1;
         }
     }
-    ranges.sort_unstable();
-    ranges
+    both
 }
 
 fn redact_destinations_and_paths(markdown: &str) -> String {
@@ -11350,6 +11303,52 @@ mod tests {
         // An unclosed fence runs to the end.
         let unclosed = "text\n```\n<b>code</b>";
         assert_eq!(sanitize_markdown(unclosed), (unclosed.to_string(), false));
+    }
+
+    #[test]
+    fn sanitizer_reads_code_where_commonmark_does() {
+        // Code blocks in block quotes and list items, a fence on a list
+        // item's first line, and indented code show what is written.
+        for input in [
+            "> ```\n> <b>kept</b>\n> ```\n",
+            "1. ```\n   <b>kept</b>\n   ```\n",
+            "- a\n  - b\n\n    ```\n    <b>kept</b>\n    ```\n",
+            "Example:\n\n    <b>kept</b>\n",
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (input.to_string(), false),
+                "{input}"
+            );
+        }
+        // A fence indented four spaces is a code line, and the tag after it
+        // is HTML; a fence ends with the block quote or list item it sits
+        // in; a GFM table's pipe splits a span before its backticks pair; a
+        // list item ends a paragraph and any span in it; and a fence in an
+        // HTML block is HTML. Tags there are removed.
+        for (input, output) in [
+            (
+                "Intro\n\n    ```\n<img src=x onerror=alert(1)>\n    ```\n",
+                "Intro\n\n    ```\n\n    ```\n",
+            ),
+            ("> ```\n<img src=x>\n```\n", "> ```\n\n```\n"),
+            (
+                "- item\n  ```\n<img src=x>\n  ```\n",
+                "- item\n  ```\n\n  ```\n",
+            ),
+            (
+                "| x | y |\n|---|---|\n| `a | <img src=x>` |\n",
+                "| x | y |\n|---|---|\n| `a | ` |\n",
+            ),
+            ("`a\n- <img src=x>`\n", "`a\n- `\n"),
+            ("<div>\n```\n<img src=x>\n```\n</div>\n", "\n```\n\n```\n\n"),
+        ] {
+            assert_eq!(
+                sanitize_markdown(input),
+                (output.to_string(), true),
+                "{input}"
+            );
+        }
     }
 
     #[test]

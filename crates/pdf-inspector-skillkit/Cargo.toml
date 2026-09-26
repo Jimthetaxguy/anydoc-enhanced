@@ -28,3 +28,5 @@ zip = { workspace = true }
 tempfile = { workspace = true }
 libc = { workspace = true }
 log = "0.4"
+# Finds the code a Markdown renderer shows, which the sanitizer leaves as written.
+pulldown-cmark = { version = "0.13.4", default-features = false }
