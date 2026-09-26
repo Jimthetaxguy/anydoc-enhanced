@@ -1516,6 +1516,47 @@ fn chromium_display(words: &[String]) -> bool {
     outer <= 1 && item <= 1 && (item == 0 || matches!(inner, None | Some("flow" | "flow-root")))
 }
 
+/// Whether Chromium drops a style rule for its selector list: a selector
+/// in it names a pseudo-class or pseudo-element Chromium does not know,
+/// outside the lists of `:is()` and `:where()`, which forgive what they
+/// cannot read. A selector list is read whole, so one such selector drops
+/// the rule, and the rules nested in it.
+fn chromium_rejects(tokens: &[Token]) -> bool {
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] != Token::Colon {
+            index += 1;
+            continue;
+        }
+        let element = tokens.get(index + 1) == Some(&Token::Colon);
+        let at = index + if element { 2 } else { 1 };
+        let (name, function) = match tokens.get(at) {
+            Some(Token::Ident(name)) => (name.to_ascii_lowercase(), false),
+            Some(Token::Function(name)) => (name.to_ascii_lowercase(), true),
+            _ => return true,
+        };
+        let known = if element {
+            name.starts_with("-webkit-")
+                || CHROMIUM_PSEUDO_ELEMENTS
+                    .split(' ')
+                    .any(|known| known == name)
+        } else {
+            CHROMIUM_PSEUDO_CLASSES
+                .split(' ')
+                .any(|known| known == name)
+        };
+        if !known {
+            return true;
+        }
+        index = if function && matches!(name.as_str(), "is" | "where") {
+            skip_component(tokens, at)
+        } else {
+            at + 1
+        };
+    }
+    false
+}
+
 /// Whether Chromium parses the selector in `selector()`: one complex
 /// selector whose pseudo-classes and pseudo-elements it knows. One with
 /// another engine's prefix (`-moz-`, `-ms-`, `-o-`) it rejects; one this
@@ -5153,6 +5194,9 @@ impl<'a> RuleSelectors<'a> {
 
     fn list(&self) -> &[ComplexSelector] {
         self.list.get_or_init(|| {
+            if chromium_rejects(self.prelude) {
+                return Vec::new();
+            }
             let context = SelectorContext {
                 nest: self.parent.as_ref(),
                 namespaces: &self.namespaces,
@@ -12516,6 +12560,33 @@ mod tests {
         // Text every reader hides for certain, AnyDoc may drop.
         assert!(!drops_shown(
             &[".x { display: none } p .x { display: none }"],
+            refund
+        ));
+    }
+
+    #[test]
+    fn a_selector_chromium_cannot_read_drops_its_whole_list() {
+        let refund =
+            r#"<div class="a"><p>Refund due <span class="x">1,250.00</span> by April.</p></div>"#;
+        // A pseudo-class or pseudo-element Chromium does not know drops the
+        // rule it stands in, read whole, and the rules nested in it: here
+        // the hide AnyDoc takes from the list's other selector.
+        for sheet in [
+            ".x, :bogus { display: none }",
+            "::-moz-selection, .x { display: none }",
+        ] {
+            assert!(drops_shown(&[sheet], refund), "{sheet}");
+        }
+        for sheet in [
+            ".x { display: none } .a { .x, :bogus { display: inline } }",
+            ".x { display: none } .x:not(:bogus) { display: inline }",
+            ".x::-webkit-bogus, .x { display: none }",
+        ] {
+            assert!(!drops_shown(&[sheet], refund), "{sheet}");
+        }
+        // `:is()` and `:where()` forgive what they cannot read.
+        assert!(converts_hidden(
+            &[":is(.x, :bogus) { display: none }"],
             refund
         ));
     }
