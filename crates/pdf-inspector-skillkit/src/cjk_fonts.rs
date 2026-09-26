@@ -15,9 +15,14 @@
 //! as control codes, and nothing marks it. Where
 //! the font's widths are given mostly past code 0x41, it takes the codes
 //! for Unicode, as Chromium's fonts' are, and reads every one as the
-//! character of its value: "一壱溢" as "ҰұҲ". A font under a predefined
-//! `Uni*-UCS2` CMap with no `/ToUnicode` map is read the same way, but
-//! Chinese under `UniGB-UCS2-H`, which lopdf reads as UTF-16.
+//! character of its value: "一壱溢" as "ҰұҲ". A font under any other
+//! predefined CMap with no map is read byte by byte too, as lopdf names the
+//! CMap but cannot decode it: kanji under `UniJIS-UCS2-H` or
+//! `UniJIS-UTF16-H` as the bytes of their UTF-16 codes ("住民税" as "OOlz"),
+//! and under `H` or `GB-H` as the bytes of their two-byte codes; but
+//! Chinese under `UniGB-UCS2-H` and `UniGB-UTF16-H`, which lopdf reads as
+//! UTF-16, and ASCII under a CMap whose single bytes are ASCII, as the RKSJ
+//! and EUC ones', read as they say.
 
 use std::collections::{HashMap, HashSet};
 
@@ -51,14 +56,102 @@ pub(crate) struct Unmapped {
     /// character of its value; else a string with a byte past 0x7F reads
     /// as U+FFFD, and any other as its bytes.
     pub(crate) passthrough: bool,
-    /// Whether the codes are UCS-2, under a predefined `Uni*-UCS2` CMap,
-    /// not the collection's CIDs.
-    pub(crate) ucs2: bool,
+    /// What the codes are, as far as they tell what a string says.
+    pub(crate) codes: Codes,
+    /// Whether it reads a byte by the standard encoding, which lopdf gives
+    /// a font under an Identity CMap it has no map for, or an encoding it
+    /// cannot read; else as the byte it is, as for a predefined CMap lopdf
+    /// names but cannot read.
+    pub(crate) standard: bool,
     /// Whether it is told to have no map; else it may have one, as its
     /// program was past the bytes read (`MAX_STREAM_BYTES`,
     /// `MAX_READ_BYTES`), and its text is looked for only as pdf-inspector
     /// reads it with none.
     pub(crate) judged: bool,
+}
+
+/// What a font's codes are, as far as they tell what a string says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Codes {
+    /// The CIDs of its collection, two bytes each.
+    Cids,
+    /// Unicode, as a predefined `Uni*-UCS2` or `Uni*-UTF16` CMap writes
+    /// it: UTF-16, two bytes a character, or four.
+    Utf16,
+    /// Unicode as a `Uni*-UTF32` CMap writes it, four bytes a character.
+    Utf32,
+    /// Another predefined CMap's, which the check does not read: two bytes
+    /// each from 0x21 to 0x7E, as `H` or `GB-H` has them, or single bytes
+    /// for kana or symbols.
+    Other,
+}
+
+/// How pdf-inspector reads a font under a CMap it names, in place or by
+/// reference, when it finds no map for the font, by the CMap's name.
+enum Named {
+    /// `Identity-H` or `Identity-V`: codes are CIDs.
+    Identity,
+    /// As the text says, or marked: lopdf reads `UniGB-UCS2-H` and
+    /// `UniGB-UTF16-H` as UTF-16, and a CMap whose single bytes 0x00 to
+    /// 0x7F are ASCII (the RKSJ, EUC, Big Five, GBK, UHC, Johab, and UTF-8
+    /// ones, `Hankaku`, and `Roman`) reads an ASCII string as it is, while
+    /// pdf-inspector marks any string with a byte past 0x7F.
+    Read,
+    /// Byte by byte, whatever its codes are.
+    Bytes(Codes),
+    /// A name no predefined CMap has, which a viewer cannot read either.
+    Unknown,
+}
+
+/// How pdf-inspector reads a font under the CMap `name` with no map for it
+/// (see `Named`). lopdf gives any other predefined CMap an encoding it
+/// cannot decode, so pdf-inspector reads its strings byte by byte.
+fn named_cmap(name: &[u8]) -> Named {
+    /// The predefined CMaps whose codes are two bytes each from 0x21 to
+    /// 0x7E, and those whose single bytes name kana or symbols.
+    const OTHER: [&[u8]; 23] = [
+        b"H",
+        b"V",
+        b"78-H",
+        b"78-V",
+        b"Add-H",
+        b"Add-V",
+        b"Ext-H",
+        b"Ext-V",
+        b"NWP-H",
+        b"NWP-V",
+        b"GB-H",
+        b"GB-V",
+        b"GBT-H",
+        b"GBT-V",
+        b"CNS1-H",
+        b"CNS1-V",
+        b"CNS2-H",
+        b"CNS2-V",
+        b"KSC-H",
+        b"KSC-V",
+        b"Hiragana",
+        b"Katakana",
+        b"WP-Symbol",
+    ];
+    let has = |part: &[u8]| name.windows(part.len()).any(|window| window == part);
+    let unicode = name.starts_with(b"Uni") && (name.ends_with(b"-H") || name.ends_with(b"-V"));
+    match name {
+        b"Identity-H" | b"Identity-V" => Named::Identity,
+        b"UniGB-UCS2-H" | b"UniGB-UTF16-H" => Named::Read,
+        _ if utf16_cmap(name) => Named::Bytes(Codes::Utf16),
+        _ if unicode && has(b"-UTF32-") => Named::Bytes(Codes::Utf32),
+        _ if unicode && has(b"-UTF8-") => Named::Read,
+        _ if OTHER.contains(&name) => Named::Bytes(Codes::Other),
+        _ if ["RKSJ", "EUC", "B5", "GBK", "UHC", "Johab"]
+            .iter()
+            .any(|family| has(family.as_bytes()))
+            || matches!(name, b"Hankaku" | b"Roman") =>
+        {
+            Named::Read
+        }
+        _ => Named::Unknown,
+    }
 }
 
 /// Fonts judged so far, by the address of their dictionary; the programs
@@ -376,10 +469,13 @@ fn widths_look_like_unicode(descendant: &Dictionary) -> bool {
 }
 
 /// Whether `encoding` names one of Adobe's predefined CMaps whose codes are
-/// UCS-2, two bytes each, such as `UniJIS-UCS2-H` or `UniGB-UCS2-V`.
-pub(crate) fn ucs2_cmap(encoding: &[u8]) -> bool {
+/// Unicode as UTF-16, two bytes each but for a character past the Basic
+/// Multilingual Plane: UCS-2, as `UniJIS-UCS2-H` or `UniGB-UCS2-V` has
+/// them, or UTF-16, as `UniJIS-UTF16-H` has them.
+pub(crate) fn utf16_cmap(encoding: &[u8]) -> bool {
+    let has = |part: &[u8]| encoding.windows(part.len()).any(|window| window == part);
     encoding.starts_with(b"Uni")
-        && encoding.windows(6).any(|part| part == b"-UCS2-")
+        && (has(b"-UCS2-") || has(b"-UTF16-"))
         && (encoding.ends_with(b"-H") || encoding.ends_with(b"-V"))
 }
 
@@ -420,16 +516,23 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
     }
     let tabled = in_place && ordering == TABLED_COLLECTION;
     let encoding = font.get(b"Encoding").ok();
-    let named = encoding.and_then(name);
-    let ucs2 = named.is_some_and(ucs2_cmap);
-    // lopdf reads Chinese under this one as UTF-16.
-    if matches!(named, Some(b"UniGB-UCS2-H")) {
-        return None;
-    }
+    // A CMap named in place or by reference, which lopdf follows; an
+    // encoding given as a stream of its own lopdf cannot read, and gives
+    // the standard encoding.
+    let codes = match encoding
+        .and_then(|encoding| resolved(document, encoding))
+        .and_then(name)
+        .map(named_cmap)
+    {
+        Some(Named::Identity) | None => Codes::Cids,
+        Some(Named::Bytes(codes)) => codes,
+        Some(Named::Read | Named::Unknown) => return None,
+    };
     let unmapped = |passthrough: bool, judged: bool| {
         Some(Unmapped {
             passthrough,
-            ucs2,
+            codes,
+            standard: codes == Codes::Cids,
             judged,
         })
     };
@@ -483,13 +586,10 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
         Ok(_) => return bytes,
         Err(_) => {}
     }
-    match encoding {
-        Some(Object::Name(_)) if identity(encoding) => {}
-        Some(Object::Name(_)) if ucs2 => return bytes,
-        // Another predefined CMap.
-        Some(Object::Name(_)) => return None,
-        // An encoding given by reference or as a stream of its own.
-        _ => return bytes,
+    // Another predefined CMap, whose codes it reads byte by byte, or an
+    // encoding given by reference or as a stream of its own.
+    if !identity(encoding) {
+        return bytes;
     }
     // No map is looked up for a descendant with no font descriptor, nor
     // found for a font no page or form it collects fonts from names.
@@ -578,9 +678,11 @@ fn score(text: &str) -> i32 {
 /// control codes it drops, where it reads it with no sign: none for a string
 /// with an odd byte, or, in a font whose codes it does not take for
 /// Unicode, one with a byte past 0x7F, which it marks with U+FFFD. A string
-/// of null-heavy codes it reads as UTF-16 where that scores as text; any
-/// other byte by byte, under the standard encoding, which gives control
-/// codes and 0x7F no character, or, for UCS-2, as Latin-1.
+/// of null-heavy codes it reads as UTF-16 where that scores as text, each
+/// control code counting against it; any other byte by byte: by the
+/// standard encoding, which gives control codes and 0x7F no character and
+/// 0x27 and 0x60 curly quotes, where `font.standard` says so, else as the
+/// bytes are.
 pub(crate) fn read_as(font: Unmapped, bytes: &[u8]) -> Option<String> {
     let codes = codes(bytes)?;
     if font.passthrough {
@@ -589,54 +691,75 @@ pub(crate) fn read_as(font: Unmapped, bytes: &[u8]) -> Option<String> {
     if bytes.iter().any(|&byte| byte > 0x7F) {
         return None;
     }
-    let utf16 = as_utf16(&codes);
     let nulls = bytes.iter().filter(|&&byte| byte == 0).count();
-    if bytes.len() >= 4 && nulls * 4 > bytes.len() && score(&utf16) > 0 {
-        return Some(utf16);
+    if bytes.len() >= 4 && nulls * 4 > bytes.len() {
+        let utf16 = String::from_utf16_lossy(&codes);
+        if score(&utf16) > 0 {
+            return Some(
+                utf16
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect(),
+            );
+        }
     }
     Some(
         bytes
             .iter()
             .filter(|&&byte| (0x20..0x7F).contains(&byte))
             .map(|&byte| match byte {
-                0x27 if !font.ucs2 => '\u{2019}',
-                0x60 if !font.ucs2 => '\u{2018}',
+                0x27 if font.standard => '\u{2019}',
+                0x60 if font.standard => '\u{2018}',
                 byte => char::from(byte),
             })
             .collect(),
     )
 }
 
-/// What a string shown in `font` says, as far as can be told: under a
-/// UCS-2 CMap, its codes as UTF-16; in a collection, its codes the
+/// What a string shown in `font` says, as far as can be told: codes that
+/// are Unicode as the characters they are; in a collection, its codes the
 /// collection gives letters, digits, or the marks amounts and dates are
-/// written with, and a space for any other code. None for an odd byte.
+/// written with, and a space for any other code. None for an odd byte, for
+/// UTF-32 codes that are not four bytes each, and for another predefined
+/// CMap's codes.
 pub(crate) fn says(font: Unmapped, bytes: &[u8]) -> Option<String> {
     let codes = codes(bytes)?;
-    if font.ucs2 {
-        return Some(as_utf16(&codes));
+    match font.codes {
+        Codes::Utf16 => Some(as_utf16(&codes)),
+        Codes::Utf32 => bytes.len().is_multiple_of(4).then(|| {
+            bytes
+                .chunks_exact(4)
+                .filter_map(|code| {
+                    char::from_u32(u32::from_be_bytes([code[0], code[1], code[2], code[3]]))
+                })
+                .filter(|character| !character.is_control())
+                .collect()
+        }),
+        Codes::Other => None,
+        Codes::Cids => Some(
+            codes
+                .iter()
+                .map(|&cid| {
+                    ASCII_CIDS
+                        .contains(&cid)
+                        .then(|| char::from(cid as u8 + 0x1F))
+                        .filter(|character| {
+                            character.is_ascii_alphanumeric() || ",.-/:()".contains(*character)
+                        })
+                        .unwrap_or(' ')
+                })
+                .collect(),
+        ),
     }
-    Some(
-        codes
-            .iter()
-            .map(|&cid| {
-                ASCII_CIDS
-                    .contains(&cid)
-                    .then(|| char::from(cid as u8 + 0x1F))
-                    .filter(|character| {
-                        character.is_ascii_alphanumeric() || ",.-/:()".contains(*character)
-                    })
-                    .unwrap_or(' ')
-            })
-            .collect(),
-    )
 }
 
 /// Whether pdf-inspector reads a string shown in `font` otherwise than it
 /// says with no sign: taking its codes for Unicode, a code past the space;
 /// else a string with no byte past 0x7F, which in a collection it reads
-/// otherwise wherever a code is past the space, and under UCS-2 wherever
-/// it does not read it as UTF-16.
+/// otherwise wherever a code is past the space, where the codes are
+/// Unicode wherever it does not read them as the characters they are, and
+/// under another predefined CMap wherever a byte is printable and past the
+/// space.
 pub(crate) fn misread(font: Unmapped, bytes: &[u8]) -> bool {
     let Some(codes) = codes(bytes) else {
         return false;
@@ -647,10 +770,11 @@ pub(crate) fn misread(font: Unmapped, bytes: &[u8]) -> bool {
     if bytes.iter().any(|&byte| byte > 0x7F) {
         return false;
     }
-    if font.ucs2 {
-        return read_as(font, bytes) != Some(as_utf16(&codes));
+    match font.codes {
+        Codes::Cids => codes.iter().any(|&code| code > 1),
+        Codes::Utf16 | Codes::Utf32 => read_as(font, bytes) != says(font, bytes),
+        Codes::Other => bytes.iter().any(|byte| (0x21..0x7F).contains(byte)),
     }
-    codes.iter().any(|&code| code > 1)
 }
 
 #[cfg(test)]
@@ -820,9 +944,21 @@ mod tests {
 
     const BYTES: Option<Unmapped> = Some(Unmapped {
         passthrough: false,
-        ucs2: false,
+        codes: Codes::Cids,
+        standard: true,
         judged: true,
     });
+
+    /// A font whose `codes` pdf-inspector reads byte by byte as they are,
+    /// under a predefined CMap lopdf cannot read.
+    fn bytes_as(codes: Codes) -> Option<Unmapped> {
+        Some(Unmapped {
+            passthrough: false,
+            codes,
+            standard: false,
+            judged: true,
+        })
+    }
 
     #[test]
     fn fonts_pdf_inspector_finds_no_map_for_are_unmapped() {
@@ -868,17 +1004,30 @@ mod tests {
             font
         });
         assert_eq!(font, BYTES);
-        // UCS-2 codes with no map.
-        let font =
-            judged(|document| type0(cid_font(document, "Japan1", None), "UniJIS-UCS2-H".into()));
-        assert_eq!(
-            font,
-            Some(Unmapped {
-                passthrough: false,
-                ucs2: true,
-                judged: true,
-            })
-        );
+        // Codes of a predefined CMap lopdf cannot read, with no map: UCS-2
+        // and UTF-16, UTF-32, and two bytes from 0x21 to 0x7E.
+        for (ordering, encoding, codes) in [
+            ("Japan1", "UniJIS-UCS2-H", Codes::Utf16),
+            ("Japan1", "UniJIS-UTF16-H", Codes::Utf16),
+            ("Japan1", "UniJIS2004-UTF16-V", Codes::Utf16),
+            ("CNS1", "UniCNS-UTF16-H", Codes::Utf16),
+            ("Korea1", "UniKS-UTF16-H", Codes::Utf16),
+            ("GB1", "UniGB-UTF16-V", Codes::Utf16),
+            ("Japan1", "UniJIS-UTF32-H", Codes::Utf32),
+            ("Japan1", "H", Codes::Other),
+            ("Japan1", "V", Codes::Other),
+            ("GB1", "GB-H", Codes::Other),
+            ("Korea1", "KSC-H", Codes::Other),
+            ("Japan1", "Hiragana", Codes::Other),
+        ] {
+            let font = judged(|document| {
+                type0(
+                    cid_font(document, ordering, None),
+                    Object::Name(encoding.into()),
+                )
+            });
+            assert_eq!(font, bytes_as(codes), "{encoding}");
+        }
         // Widths given mostly past 0x41 take the codes for Unicode.
         let font = judged(|document| {
             let descendants = cid_font(document, "Japan1", None);
@@ -904,8 +1053,7 @@ mod tests {
             font,
             Some(Unmapped {
                 passthrough: true,
-                ucs2: false,
-                judged: true,
+                ..BYTES.unwrap()
             })
         );
     }
@@ -1012,9 +1160,8 @@ mod tests {
         assert_eq!(
             font,
             Some(Unmapped {
-                passthrough: false,
-                ucs2: false,
                 judged: false,
+                ..BYTES.unwrap()
             })
         );
     }
@@ -1037,13 +1184,31 @@ mod tests {
             font
         });
         assert_eq!(font, None);
-        // Another predefined CMap, and Chinese under the one lopdf reads.
-        for encoding in ["90ms-RKSJ-H", "UniGB-UCS2-H"] {
+        // Chinese under the CMaps lopdf reads as UTF-16; CMaps whose single
+        // bytes are ASCII, which read an ASCII string as it is and have
+        // pdf-inspector mark any other; and a CMap no viewer knows either.
+        for encoding in [
+            "UniGB-UCS2-H",
+            "UniGB-UTF16-H",
+            "90ms-RKSJ-H",
+            "EUC-V",
+            "GBK-EUC-H",
+            "ETen-B5-H",
+            "KSCms-UHC-H",
+            "KSC-Johab-H",
+            "UniJIS-UTF8-H",
+            "Roman",
+            "Private-H",
+        ] {
             let font = judged(|document| {
-                type0(
+                // A map it cannot parse changes nothing.
+                let map = document.add_object(Stream::new(dictionary! {}, b"garbage".to_vec()));
+                let mut font = type0(
                     cid_font(document, "Japan1", None),
                     Object::Name(encoding.into()),
-                )
+                );
+                font.set("ToUnicode", map);
+                font
             });
             assert_eq!(font, None, "{encoding}");
         }
@@ -1084,47 +1249,74 @@ mod tests {
             read_as(font, &[0x31, 0x7F, 0x7F, 0x41]).as_deref(),
             Some("1A")
         );
+        // A null-heavy string reads as UTF-16 only where that scores as
+        // text with its control codes counted, as CID 1, the space, is
+        // one: "Tot" and a kanji read byte by byte.
+        let mixed = [0x00, 0x35, 0x00, 0x50, 0x00, 0x55, 0x00, 0x01, 0x04, 0x65];
+        assert_eq!(read_as(font, &mixed).as_deref(), Some("5PUe"));
         // Codes taken for Unicode read as the characters of their values.
         let passthrough = Unmapped {
             passthrough: true,
-            ucs2: false,
-            judged: true,
+            ..font
         };
         assert_eq!(
             read_as(passthrough, &[0x04, 0xB0, 0x04, 0xB1]).as_deref(),
             Some("Ұұ")
         );
         assert!(misread(passthrough, &[0x04, 0xB0]));
-        // UCS-2 ASCII reads right as UTF-16; kanji byte by byte.
-        let ucs2 = Unmapped {
-            passthrough: false,
-            ucs2: true,
-            judged: true,
-        };
-        assert!(!misread(ucs2, &[0x00, 0x41, 0x00, 0x42]));
+        // UCS-2 and UTF-16 ASCII reads right as UTF-16; kanji byte by byte,
+        // its quotes straight.
+        let utf16 = bytes_as(Codes::Utf16).unwrap();
+        assert!(!misread(utf16, &[0x00, 0x41, 0x00, 0x42]));
         assert_eq!(
-            says(ucs2, &[0x4F, 0x4F, 0x6C, 0x11]).as_deref(),
+            says(utf16, &[0x4F, 0x4F, 0x6C, 0x11]).as_deref(),
             Some("住民")
         );
         assert_eq!(
-            read_as(ucs2, &[0x4F, 0x4F, 0x6C, 0x11]).as_deref(),
+            read_as(utf16, &[0x4F, 0x4F, 0x6C, 0x11]).as_deref(),
             Some("OOl")
         );
-        assert!(misread(ucs2, &[0x4F, 0x4F, 0x6C, 0x11]));
+        assert!(misread(utf16, &[0x4F, 0x4F, 0x6C, 0x11]));
+        assert_eq!(read_as(utf16, &[0x30, 0x27]).as_deref(), Some("0'"));
+        // UTF-32 ASCII reads right byte by byte, its null bytes dropped;
+        // kanji do not.
+        let utf32 = bytes_as(Codes::Utf32).unwrap();
+        let ascii = [0, 0, 0, 0x41, 0, 0, 0, 0x42];
+        assert_eq!(says(utf32, &ascii).as_deref(), Some("AB"));
+        assert!(!misread(utf32, &ascii));
+        let kanji = [0, 0, 0x4F, 0x4F, 0, 0, 0x6C, 0x11];
+        assert_eq!(says(utf32, &kanji).as_deref(), Some("住民"));
+        assert!(misread(utf32, &kanji));
+        // The two-byte codes of `H` read as ASCII: "住民" as "=;L1", which
+        // says nothing the check can tell.
+        let jis = bytes_as(Codes::Other).unwrap();
+        let codes = [0x3D, 0x3B, 0x4C, 0x31];
+        assert_eq!(read_as(jis, &codes).as_deref(), Some("=;L1"));
+        assert_eq!(says(jis, &codes), None);
+        assert!(misread(jis, &codes));
+        assert!(!misread(jis, &[0x20, 0x20]));
     }
 
     #[test]
-    fn ucs2_cmaps_are_told_by_name() {
+    fn utf16_cmaps_are_told_by_name() {
         for name in [
             "UniJIS-UCS2-H",
             "UniJIS-UCS2-HW-V",
             "UniGB-UCS2-V",
             "UniKS-UCS2-H",
+            "UniJIS-UTF16-H",
+            "UniJIS2004-UTF16-V",
         ] {
-            assert!(ucs2_cmap(name.as_bytes()), "{name}");
+            assert!(utf16_cmap(name.as_bytes()), "{name}");
         }
-        for name in ["Identity-H", "UniJIS-UTF16-H", "90ms-RKSJ-V", "UniJIS-UCS2"] {
-            assert!(!ucs2_cmap(name.as_bytes()), "{name}");
+        for name in [
+            "Identity-H",
+            "UniJIS-UTF32-H",
+            "UniJIS-UTF8-H",
+            "90ms-RKSJ-V",
+            "UniJIS-UCS2",
+        ] {
+            assert!(!utf16_cmap(name.as_bytes()), "{name}");
         }
     }
 }

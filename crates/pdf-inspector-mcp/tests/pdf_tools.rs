@@ -1878,6 +1878,89 @@ fn cjk_fonts_pdf_inspector_finds_no_map_for_are_reported() {
     assert_eq!(reported(&results[4]), None, "{}", results[4]);
 }
 
+#[test]
+fn cjk_text_under_predefined_cmaps_lopdf_cannot_read_is_reported() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    let utf16 = |text: &str| -> String {
+        text.encode_utf16()
+            .map(|unit| format!("{unit:04X}"))
+            .collect()
+    };
+    let latin = utf16("Total wages 52,000.00");
+    // "住民税は中止" as UTF-16, no byte of it past 0x7F, which pdf-inspector
+    // would mark.
+    let kanji = utf16("住民税は中止");
+    // "源泉徴収票の支払金額" in the two-byte codes of JIS X 0208.
+    let jis = "383B407444273C7D493C244E3B594A273662335B".to_owned();
+    let ascii: String = "Total wages 52,000.00"
+        .bytes()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    // Lines enough for each page to read as text.
+    let body: String = (0..12)
+        .map(|line| {
+            format!(
+                "BT /F2 10 Tf 72 {} Td (Line {line} of the notice body text for the period.) Tj ET\n",
+                480 - 14 * line
+            )
+        })
+        .collect();
+    let page = |ordering: &str, encoding: &str, codes: &[String]| {
+        cjk_page_pdf(
+            ordering,
+            &format!("/Encoding /{encoding}"),
+            "",
+            codes,
+            &body,
+            false,
+        )
+    };
+    let pages = [
+        // Kanji under UTF-16 CMaps lopdf names but cannot read, read byte
+        // by byte ("OOlz0oN-kb"), and under `H`, read as ASCII.
+        page("Japan1", "UniJIS-UTF16-H", &[latin.clone(), kanji.clone()]),
+        page("CNS1", "UniCNS-UTF16-H", std::slice::from_ref(&kanji)),
+        page("Japan1", "H", &[jis]),
+        // ASCII under a UTF-16 CMap, which pdf-inspector reads as UTF-16;
+        // kanji under the one lopdf reads; and ASCII under a CMap whose
+        // single bytes are ASCII.
+        page("Japan1", "UniJIS-UTF16-H", &[latin]),
+        page("GB1", "UniGB-UTF16-H", &[kanji]),
+        page("Japan1", "90ms-RKSJ-H", &[ascii]),
+    ];
+    let mut calls = Vec::new();
+    for (index, pdf) in pages.iter().enumerate() {
+        let path = temporary.path().join(format!("cjk-cmap-{index}.pdf"));
+        std::fs::write(&path, pdf).expect("write PDF");
+        let path = path.to_str().expect("UTF-8 path").to_string();
+        calls.push(("pdf_to_markdown", serde_json::json!({ "path": path })));
+    }
+    let results = call_tools(&calls, None);
+    let reported = |result: &serde_json::Value| -> Option<serde_json::Value> {
+        result["warnings"].as_array().and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "cjk_text_misread")
+                .map(|warning| warning["pages"].clone())
+        })
+    };
+    // When a release reads these CMaps, these expectations go.
+    assert!(
+        results[0]["markdown"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("OOlz0oN-kb")),
+        "{}",
+        results[0]
+    );
+    for result in &results[..3] {
+        assert_eq!(reported(result), Some(serde_json::json!([1])), "{result}");
+        assert_eq!(result["has_encoding_issues"], true, "{result}");
+    }
+    for result in &results[3..] {
+        assert_eq!(reported(result), None, "{result}");
+    }
+}
+
 /// A TrueType program of 96 glyphs whose `cmap` is one format-12 subtable
 /// of `groups`, each the code points from its first to its last, mapped to
 /// glyphs from its third on.

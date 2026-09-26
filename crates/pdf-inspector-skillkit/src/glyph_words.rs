@@ -471,13 +471,13 @@ impl GlyphFonts {
 fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Decoder> {
     let subtype = font.get(b"Subtype").ok()?.as_name().ok()?;
     // Whether its codes are two bytes, and whether they are the glyphs'
-    // CIDs, which its widths are given by: a UCS-2 CMap's are not, and
-    // its codes are read through its ToUnicode map alone.
+    // CIDs, which its widths are given by: a UCS-2 or UTF-16 CMap's are
+    // not, and its codes are read through its ToUnicode map alone.
     let (two_byte, by_cid) = match subtype {
         b"Type0" => match font.get(b"Encoding").ok()?.as_name().ok()? {
             b"Identity-H" => (true, true),
             b"Identity-V" => (true, false),
-            name if crate::cjk_fonts::ucs2_cmap(name) => (true, false),
+            name if crate::cjk_fonts::utf16_cmap(name) => (true, false),
             _ => return None,
         },
         b"Type1" | b"TrueType" | b"MMType1" | b"Type3" => (false, false),
