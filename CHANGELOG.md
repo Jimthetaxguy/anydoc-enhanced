@@ -497,6 +497,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- The pull request's automated review (Codex) raised three findings. The
+  archive entry count was already fixed in round fifteen (below); the
+  other two:
+  - `batch_classify` started a task for every path before the first
+    classification ran, and held the runtime, so its timeout could not
+    fire, until all were started: 300,000 short paths took the server to
+    578 MiB. It now keeps no more classifications in flight than the
+    worker runs at once, four, and the same request peaks at 304 MiB,
+    what its answer itself takes.
+  - The Markdown sanitizer found code by a scan of its own, which took for
+    code a fence indented four spaces, a fence past the end of the block
+    quote or list item it sat in, a span a GFM table's pipe splits or a
+    list item cuts short, and a fence inside an HTML block; a tag there,
+    which a renderer shows as HTML, was kept. Code is now found by parsing
+    the Markdown as CommonMark does (`pulldown-cmark` 0.13), and as GFM's
+    tables do where it holds a pipe, and only what both show as code,
+    indented code blocks included, is left as written. The slowest input
+    found parses in 1.9 s at the 8 MiB Markdown bound; runs of backticks
+    had taken the scan 8 s.
 - Review round fifteen also checked the EPUB, DOCX, and document-worker
   fixes of rounds ten and fourteen, against Chromium and LibreOffice:
   - EPUB: pseudo-class and pseudo-element names are read in the forms
