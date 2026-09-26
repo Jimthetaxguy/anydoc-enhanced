@@ -5350,6 +5350,11 @@ fn push_style_rule(
 /// [`Cascade::references`]).
 type Named = (Precedence, Applies, Option<Rc<str>>);
 
+/// The SVG resources an element paints with for certain, by property: its
+/// fill, its stroke, its clip path, its mask, and its start, middle, and
+/// end markers.
+type Painted = [Option<Rc<str>>; 7];
+
 /// The resource a painting property names for some reader for certain: that
 /// of the declaration that wins the cascade where the declarations naming
 /// one apply on some reader, and those naming none may apply on all, unless
@@ -6409,18 +6414,19 @@ impl Cascade {
     }
 
     /// The ids of the SVG resources the element at the top of the tree
-    /// paints with: a pattern as its fill or stroke, a clip path, a mask,
-    /// or its markers. For each painting property, the declaration that
-    /// certainly wins the cascade among its presentation attributes, the
-    /// rules that set the property, and its inline style names the one it
-    /// uses; where a declaration that may apply above it says otherwise,
-    /// it names none for certain.
+    /// paints with, by property (see [`Painted`]): a pattern as its fill or
+    /// stroke, a clip path, a mask, or its markers. For each painting
+    /// property, the declaration that certainly wins the cascade among its
+    /// presentation attributes, the rules that set the property, and its
+    /// inline style names the one it uses; where a declaration that may
+    /// apply above it says otherwise, it names none for certain. `None`
+    /// where no declaration may apply, which leaves an inherited one.
     fn references(
         &self,
         tree: &Tree,
         ancestors: &AncestorKeys,
         work: &mut u64,
-    ) -> Result<Vec<(u8, Rc<str>)>, DocumentError> {
+    ) -> Result<[Option<Option<Rc<str>>>; 7], DocumentError> {
         let element = tree.stack.last().expect("an element to style");
         // The fill, the stroke, the clip path, the mask, and the start,
         // middle, and end markers, which `marker` sets together.
@@ -6517,10 +6523,9 @@ impl Cascade {
                 add(&painting, precedence, certainty);
             }
         }
-        Ok((0u8..)
-            .zip(&slots)
-            .filter_map(|(at, slot)| Some((at, names_surely(slot)?)))
-            .collect())
+        Ok(std::array::from_fn(|slot| {
+            (!slots[slot].is_empty()).then(|| names_surely(&slots[slot]))
+        }))
     }
 
     pub(super) fn rule_count(&self) -> usize {
@@ -7724,6 +7729,10 @@ struct Open {
     /// The font size an SVG element's attributes or inline style set, on it
     /// or on an element around it inside the image.
     svg_font: Option<f64>,
+    /// For an SVG element, the resources its painting properties name,
+    /// which a fill, a stroke, and markers pass to its children (see
+    /// [`Painted`]).
+    painting: Painted,
     /// For an SVG `text` or `tspan` that sets `dx`, `dy`, `x`, or `y`
     /// lists, how each moves its glyphs, where it or an element around it
     /// moves one apart (see [`svg_glyph_shifts`]), and how many of them
@@ -9868,9 +9877,40 @@ pub(super) fn chapter_text(
                     || parent.fallback
                     || parent.transparent
             });
+        // The resources an SVG element's painting properties name, by
+        // property (see [`Cascade::references`]): its own, or for a fill, a
+        // stroke, and markers, which inherit, its parent's where it sets
+        // none.
+        let painting: Painted = if svg_element {
+            let own = if reader.paints_resources()
+                || PAINTING_PROPERTIES
+                    .iter()
+                    .chain(&["style"])
+                    .any(|name| element.values(name).next().is_some())
+            {
+                let tree = Tree {
+                    stack: &elements,
+                    earlier: &earlier,
+                };
+                reader.references(&tree, &ancestors, work)?
+            } else {
+                Default::default()
+            };
+            let inherited = open.last().map(|parent| &parent.painting);
+            std::array::from_fn(|slot| match &own[slot] {
+                Some(named) => named.clone(),
+                None if !matches!(slot, 2 | 3) => inherited.and_then(|parent| parent[slot].clone()),
+                None => None,
+            })
+        } else {
+            Default::default()
+        };
         // What an SVG element refers to: the element a `use` element draws
-        // (by `href`, before `xlink:href`), and the resources its painting
-        // properties name.
+        // (by `href`, before `xlink:href`), and the resources it paints with.
+        // A shape, text, or `use` paints a fill, except a line, which has no
+        // inside, or where its opacity is zero, and a stroke, except where
+        // its width is zero; a path, line, polyline, polygon, or `use`
+        // takes markers; and any element a clip path or mask.
         let references: Vec<(bool, Rc<str>)> = if svg_element {
             let mut references: Vec<(bool, Rc<str>)> = Vec::new();
             if element.local == "use" {
@@ -9882,45 +9922,45 @@ pub(super) fn chapter_text(
                     references.push((false, Rc::from(id)));
                 }
             }
-            let may_paint = reader.paints_resources()
-                || PAINTING_PROPERTIES
+            let zero = |name: &str| {
+                let [inline] = inline_numbers(element, [name]);
+                inline
+                    .as_deref()
+                    .or(element.first(name))
+                    .and_then(svg_number)
+                    == Some(0.0)
+            };
+            let local = element.local.as_str();
+            let shape = matches!(
+                local,
+                "rect"
+                    | "circle"
+                    | "ellipse"
+                    | "line"
+                    | "polyline"
+                    | "polygon"
+                    | "path"
+                    | "text"
+                    | "tspan"
+                    | "textPath"
+                    | "use"
+            );
+            let markable = matches!(local, "path" | "line" | "polyline" | "polygon" | "use");
+            references.extend(
+                painting
                     .iter()
-                    .chain(&["style"])
-                    .any(|name| element.values(name).next().is_some());
-            if may_paint {
-                let tree = Tree {
-                    stack: &elements,
-                    earlier: &earlier,
-                };
-                // A fill shows nothing on a line, which has no inside, or
-                // where its opacity is zero, as a stroke of no width does;
-                // markers stand only on paths, lines, polylines, and
-                // polygons, and on what may hold or draw them.
-                let zero = |name: &str| {
-                    let [inline] = inline_numbers(element, [name]);
-                    inline
-                        .as_deref()
-                        .or(element.first(name))
-                        .and_then(svg_number)
-                        == Some(0.0)
-                };
-                let markable = matches!(
-                    element.local.as_str(),
-                    "path" | "line" | "polyline" | "polygon" | "use" | "svg" | "g" | "a" | "switch"
-                );
-                references.extend(
-                    reader
-                        .references(&tree, &ancestors, work)?
-                        .into_iter()
-                        .filter(|(slot, _)| match slot {
-                            0 => element.local != "line" && !zero("fill-opacity"),
-                            1 => !zero("stroke-width"),
-                            4.. => markable,
-                            _ => true,
-                        })
-                        .map(|(_, id)| (true, id)),
-                );
-            }
+                    .enumerate()
+                    .filter(|(slot, _)| match slot {
+                        0 => shape && local != "line" && !zero("fill-opacity"),
+                        1 => shape && !zero("stroke-width"),
+                        2 | 3 => true,
+                        _ => markable,
+                    })
+                    .filter_map(|(_, target)| target.clone())
+                    .map(|target| (true, target)),
+            );
+            references.sort_unstable();
+            references.dedup();
             references
         } else {
             Vec::new()
@@ -10098,6 +10138,7 @@ pub(super) fn chapter_text(
                 svg_text,
                 switch_taken,
                 svg_font,
+                painting,
                 glyph_shifts,
                 shifts_taken: 0,
                 items: Tri::No,
@@ -10151,6 +10192,7 @@ pub(super) fn chapter_text(
                     svg_text,
                     switch_taken,
                     svg_font,
+                    painting,
                     glyph_shifts,
                     shifts_taken: 0,
                     items,
@@ -10811,6 +10853,14 @@ mod tests {
                 r##"<svg {svg}><defs><text id="t">SECRET</text></defs><use href="#t" transform="translate(10) scale(0)"/></svg>"##
             ),
             format!(r##"<svg {svg}><text><textPath href="#none">SECRET</textPath></text></svg>"##),
+            // A group passes its fill and markers to what it holds, which
+            // paints them only where it takes them and sets none of its own.
+            format!(
+                r##"<svg {svg}><marker id="k"><text>SECRET</text></marker><g marker-start="url(#k)"><rect width="100" height="50"/></g></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p" width="400" height="60"><text>SECRET</text></pattern><g fill="url(#p)"><rect width="400" height="60" fill="red"/></g></svg>"##
+            ),
         ] {
             assert!(converts_hidden(&[], &body), "{body}");
         }
@@ -10827,6 +10877,14 @@ mod tests {
             ),
             format!(
                 r##"<svg {svg}><marker id="k"><text>Shown</text></marker><path d="M10 60 L200 60" marker-start="url(#k)"/></svg>"##
+            ),
+            // What a group passes on paints where what it holds is shown,
+            // though the group is hidden.
+            format!(
+                r##"<svg {svg}><pattern id="p" width="400" height="60"><text>Shown</text></pattern><g fill="url(#p)"><rect width="400" height="60"/></g></svg>"##
+            ),
+            format!(
+                r##"<svg {svg}><pattern id="p" width="400" height="60"><text>Shown</text></pattern><g visibility="hidden" fill="url(#p)"><rect visibility="visible" width="400" height="60"/></g></svg>"##
             ),
             format!(
                 r##"<svg {svg}><clipPath id="c"><text>Shown</text></clipPath><rect clip-path="url('#c')"/></svg>"##
