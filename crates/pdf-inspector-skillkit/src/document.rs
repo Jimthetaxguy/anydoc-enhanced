@@ -6771,8 +6771,8 @@ fn anydoc_typed_part(
 
 /// The part Word reads for a typed relationship of a main part, as
 /// LibreOffice shows it: the target of the first internal relationship of
-/// that type in the rels part, and none without one. Word has no
-/// conventional name to fall back on.
+/// that type in the rels part, as written (see [`word_resolve`]), and none
+/// without one. Word has no conventional name to fall back on.
 fn word_typed_part(
     relationships: &[PackageRelationship],
     main: &str,
@@ -6781,7 +6781,143 @@ fn word_typed_part(
     relationships
         .iter()
         .find(|relationship| relationship.internal && relationship.kind == kind)
-        .and_then(|relationship| anydoc_resolve(main, &relationship.target))
+        .map(|relationship| word_resolve(main, &relationship.target))
+}
+
+/// Resolve a package reference as Word, as LibreOffice shows it, opens the
+/// part it names: from the base part's directory, `..` clamped at the root,
+/// each segment as written, a query or fragment kept. An empty reference
+/// names the base part, as for AnyDoc.
+fn word_resolve(base_part: &str, reference: &str) -> String {
+    if reference.is_empty() {
+        return base_part.to_string();
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    if !reference.starts_with('/') {
+        if let Some((directory, _)) = base_part.rsplit_once('/') {
+            segments.extend(directory.split('/').filter(|segment| !segment.is_empty()));
+        }
+    }
+    for segment in reference.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    segments.join("/")
+}
+
+/// Whether Word and AnyDoc open different parts for a relationship's
+/// target: Word the part it names as written, and AnyDoc the part it names
+/// once its query and fragment are dropped and each segment percent-decoded
+/// (`anydoc_resolve`), as `foot%6Eotes.xml` names `footnotes.xml` to AnyDoc
+/// alone. Where the package holds neither part, both read nothing.
+fn target_parts_differ(archive: &ZipArchive<Cursor<&[u8]>>, base_part: &str, target: &str) -> bool {
+    let word = word_resolve(base_part, target);
+    let anydoc = anydoc_resolve(base_part, target);
+    anydoc.as_deref() != Some(word.as_str())
+        && std::iter::once(word.as_str())
+            .chain(anydoc.as_deref())
+            .any(|part| archive.index_for_name(part).is_some())
+}
+
+/// Whether a relationships part is written as OPC defines it, which is how
+/// Word and AnyDoc read it alike: a `Relationships` root in the package
+/// relationships namespace, holding nothing but `Relationship` elements in
+/// it, each with a unique, non-empty `Id`, a `Type`, and a `Target`, and no
+/// attribute but those and `TargetMode` (`Internal` or `External`), all
+/// unprefixed. LibreOffice, and System.IO.Packaging, refuse any other
+/// element or attribute; LibreOffice reads the unprefixed attributes, by
+/// element names as written, while AnyDoc reads the first attribute of each
+/// local name, in any namespace, of a `Relationship` in the namespace at
+/// any depth. Written otherwise, one part could name one target to Word and
+/// another to AnyDoc (`x:Target="other.xml" Target="footnotes.xml"`).
+fn opc_relationships(bytes: &[u8]) -> bool {
+    let mut reader = quick_xml::NsReader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut depth = 0usize;
+    let mut roots = 0usize;
+    let mut ids: HashSet<Vec<u8>> = HashSet::new();
+    loop {
+        let Ok((namespace, event)) = reader.read_resolved_event_into(&mut buffer) else {
+            return false;
+        };
+        let in_namespace = matches!(
+            namespace,
+            quick_xml::name::ResolveResult::Bound(namespace)
+                if namespace.as_ref() == PACKAGE_RELATIONSHIPS_NAMESPACE
+        );
+        let (element, opens) = match event {
+            quick_xml::events::Event::Start(element) => (element, true),
+            quick_xml::events::Event::Empty(element) => (element, false),
+            quick_xml::events::Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                buffer.clear();
+                continue;
+            }
+            quick_xml::events::Event::Eof => return roots == 1,
+            _ => {
+                buffer.clear();
+                continue;
+            }
+        };
+        let name = element.name();
+        let written = match depth {
+            0 => {
+                roots += 1;
+                roots == 1 && in_namespace && name.as_ref() == b"Relationships"
+            }
+            1 => {
+                in_namespace
+                    && name.as_ref() == b"Relationship"
+                    && opc_relationship_attributes(&element, &mut ids)
+            }
+            _ => false,
+        };
+        if !written {
+            return false;
+        }
+        if opens {
+            depth += 1;
+        }
+        buffer.clear();
+    }
+}
+
+/// Whether a `Relationship` element carries the attributes OPC defines, and
+/// no other (see [`opc_relationships`]), its `Id` not among `ids`, which it
+/// joins.
+fn opc_relationship_attributes(
+    element: &quick_xml::events::BytesStart<'_>,
+    ids: &mut HashSet<Vec<u8>>,
+) -> bool {
+    let mut id = None;
+    let mut kind = false;
+    let mut target = false;
+    for attribute in element.attributes() {
+        let Ok(attribute) = attribute else {
+            return false;
+        };
+        let key = attribute.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            continue;
+        }
+        let Ok(value) = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) else {
+            return false;
+        };
+        match key {
+            b"Id" if !value.is_empty() => id = Some(value.as_bytes().to_vec()),
+            b"Type" if !value.is_empty() => kind = true,
+            b"Target" if !value.is_empty() => target = true,
+            b"TargetMode" if matches!(value.as_ref(), "Internal" | "External") => {}
+            _ => return false,
+        }
+    }
+    kind && target && id.is_some_and(|id| ids.insert(id))
 }
 
 /// Resolve a package reference exactly as AnyDoc 0.2.4 does
@@ -6912,6 +7048,10 @@ struct OoxmlLayout {
     list_parts: DocxListParts,
     /// The DOCX footnotes and endnotes parts each side reads.
     note_parts: DocxNoteParts,
+    /// A relationship naming a part both sides read, of those the checks
+    /// follow, opens one part to Word and another to AnyDoc (see
+    /// [`target_parts_differ`]).
+    targets_differ: bool,
 }
 
 /// The styles and numbering parts Word and AnyDoc each read for a Word
@@ -6968,21 +7108,37 @@ fn ooxml_layout(
         DocumentKind::Xlsx => "xl/workbook.xml",
         _ => return Ok(OoxmlLayout::default()),
     };
-    // Every check reads the conventional main part, while AnyDoc converts the
-    // part the officeDocument relationship names (lowest id first). A package
-    // with such a relationship naming any other part is refused rather than
-    // converted from a part the checks never saw.
-    let declared: Vec<OoxmlRelationship> = read_relationships(archive, "_rels/.rels")?
-        .into_iter()
-        .filter(|relationship| relationship.kind.ends_with("/officeDocument"))
-        .collect();
-    if !declared
+    // The package's relationships, and a Word or Excel main part's, name the
+    // parts both sides read; each must be written as OPC defines it, so that
+    // they name the same parts to both.
+    let package_rels = read_optional_xml_part(archive, "_rels/.rels")?;
+    let rels = read_optional_xml_part(archive, &ooxml_rels_part(main))?;
+    let main_rels = rels.as_ref().filter(|_| kind != DocumentKind::Pptx);
+    if package_rels
         .iter()
-        .all(|relationship| anydoc_resolve("", &relationship.target).as_deref() == Some(main))
+        .chain(main_rels)
+        .any(|bytes| !opc_relationships(bytes))
     {
         return Err(DocumentError::Malformed);
     }
-    let rels = read_optional_xml_part(archive, &ooxml_rels_part(main))?;
+    // Every check reads the conventional main part, while AnyDoc converts the
+    // part the officeDocument relationship names (lowest id first), and Word
+    // the part it names as written. A package with such a relationship
+    // naming any other part to either is refused rather than converted from
+    // a part the checks never saw.
+    let declared: Vec<OoxmlRelationship> = match &package_rels {
+        Some(bytes) => ooxml_relationships(bytes)?,
+        None => Vec::new(),
+    }
+    .into_iter()
+    .filter(|relationship| relationship.kind.ends_with("/officeDocument"))
+    .collect();
+    if !declared.iter().all(|relationship| {
+        anydoc_resolve("", &relationship.target).as_deref() == Some(main)
+            && word_resolve("", &relationship.target) == main
+    }) {
+        return Err(DocumentError::Malformed);
+    }
     let relationships = match &rels {
         Some(bytes) => ooxml_relationships(bytes)?,
         None => Vec::new(),
@@ -6993,6 +7149,20 @@ fn ooxml_layout(
             .filter(|relationship| relationship.kind.ends_with(suffix))
             .filter_map(|relationship| anydoc_resolve(main, &relationship.target))
             .collect()
+    };
+    // The internal relationships of these types, or these ids, whose parts
+    // Word and AnyDoc must both open.
+    let differ = |archive: &ZipArchive<Cursor<&[u8]>>, suffixes: &[&str], ids: &HashSet<String>| {
+        relationships
+            .iter()
+            .filter(|relationship| {
+                !relationship.external
+                    && (ids.contains(&relationship.id)
+                        || suffixes
+                            .iter()
+                            .any(|suffix| relationship.kind.ends_with(suffix)))
+            })
+            .any(|relationship| target_parts_differ(archive, main, &relationship.target))
     };
     let mut layout = OoxmlLayout::default();
     match kind {
@@ -7008,6 +7178,11 @@ fn ooxml_layout(
                 .numbering_parts
                 .insert("word/numbering.xml".to_string());
             layout.numbering_parts.extend(typed("/numbering"));
+            layout.targets_differ = differ(
+                archive,
+                &["/styles", "/numbering", "/footnotes", "/endnotes"],
+                &HashSet::new(),
+            );
             let read = match &rels {
                 Some(bytes) => package_relationships(bytes)?,
                 None => Vec::new(),
@@ -7045,15 +7220,17 @@ fn ooxml_layout(
             layout.styles_parts.extend(typed("/styles"));
             // AnyDoc loads each `<sheet r:id>` through the workbook
             // relationships whatever their type.
-            if let Some(workbook) = read_optional_xml_part(archive, main)? {
-                let ids = xlsx_sheet_relationship_ids(&workbook);
-                layout.worksheet_parts.extend(
-                    relationships
-                        .iter()
-                        .filter(|relationship| ids.contains(&relationship.id))
-                        .filter_map(|relationship| anydoc_resolve(main, &relationship.target)),
-                );
-            }
+            let ids = match read_optional_xml_part(archive, main)? {
+                Some(workbook) => xlsx_sheet_relationship_ids(&workbook),
+                None => HashSet::new(),
+            };
+            layout.worksheet_parts.extend(
+                relationships
+                    .iter()
+                    .filter(|relationship| ids.contains(&relationship.id))
+                    .filter_map(|relationship| anydoc_resolve(main, &relationship.target)),
+            );
+            layout.targets_differ = differ(archive, &["/sharedStrings", "/styles"], &ids);
         }
         _ => {}
     }
@@ -8774,6 +8951,8 @@ fn preflight_package(
     // XLSX cells by style and value class, checked once the styles are read.
     let mut format_uses: HashSet<(u32, xlsx_numfmt::CellClass)> = HashSet::new();
     let mut result = PackagePreflight::default();
+    // A part Word would read in place of the one AnyDoc converts.
+    result.unsupported_content |= layout.targets_differ;
     let mut ppt_presentation = None;
     let mut ppt_presentation_rels = None;
     let mut ppt_slide_parts = HashSet::new();
@@ -11219,11 +11398,13 @@ mod tests {
 
     #[test]
     fn preflight_surfaces_external_relationship_presence_without_fetching() {
-        let rels = br#"<Relationship TargetMode="External" Target="https://example.invalid"/>"#;
+        let rels = format!(
+            r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rId9" Type="{REL_NS}/hyperlink" TargetMode="External" Target="https://example.invalid"/></Relationships>"#
+        );
         let bytes = zip_entries(&[
             ("[Content_Types].xml", DOCX_TYPES),
             ("word/document.xml", DOCX_XML),
-            ("_rels/.rels", rels),
+            ("_rels/.rels", rels.as_bytes()),
         ]);
         let result = preflight_package(&bytes, DocumentKind::Docx, DocumentVariant::Docx).unwrap();
         assert!(result.external_relationships);
@@ -11399,7 +11580,7 @@ mod tests {
                 r#"<workbook xmlns:r="{REL_NS}"><sheets><sheet name="Data" sheetId="1" {workbook_sheet} r:id="rId1"/></sheets></workbook>"#
             );
             let rels = format!(
-                r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+                r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
             );
             let sheet =
                 format!("<worksheet {SML_NS}><sheetData>{worksheet}</sheetData></worksheet>");
@@ -12459,7 +12640,7 @@ mod tests {
     #[test]
     fn docx_story_parts_follow_relationships_and_fail_closed() {
         let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
-        let notes_rels = br#"<Relationships><Relationship Id="rId7" Type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target = "notes/fn.xml"/></Relationships>"#;
+        let notes_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId7" Type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target = "notes/fn.xml"/></Relationships>"#;
         let symbol = word_part(
             "footnotes",
             r#"<w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p>"#,
@@ -12540,7 +12721,7 @@ mod tests {
     #[test]
     fn xlsx_parts_follow_relationships_with_spaced_attributes() {
         let oversized = styles_with_code(&"0".repeat(MAX_NUMBER_FORMAT_BYTES + 1));
-        let rels = br#"<Relationships><Relationship Id="rId9" Type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target = "design/s.xml"/></Relationships>"#;
+        let rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target = "design/s.xml"/></Relationships>"#;
         let bytes = xlsx_with_styles("xl/design/s.xml", &oversized, Some(rels));
         assert!(matches!(
             preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
@@ -12555,7 +12736,7 @@ mod tests {
                 r#"<workbook xmlns:r="{REL_NS}" xmlns:x="urn:decoy"><sheets><sheet name="Data" sheetId="1" {sheet_attributes}/></sheets></workbook>"#
             );
             let rels = format!(
-                r#"<Relationships><Relationship Id="rDecoy" Type="{REL_NS}/worksheet" Target="decoy.xml"/><Relationship Id="rId1" Type="{REL_NS}/{relationship_type}" Target="data/s1.xml"/></Relationships>"#
+                r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rDecoy" Type="{REL_NS}/worksheet" Target="decoy.xml"/><Relationship Id="rId1" Type="{REL_NS}/{relationship_type}" Target="data/s1.xml"/></Relationships>"#
             );
             let bytes = zip_entries(&[
                 ("[Content_Types].xml", XLSX_TYPES),
@@ -12630,13 +12811,12 @@ mod tests {
         let rels = |inner: String| {
             format!(r#"<Relationships xmlns="{PACKAGE_RELS_NS}">{inner}</Relationships>"#)
         };
-        // Spellings AnyDoc resolves to the conventional part are accepted.
+        // Spellings Word and AnyDoc both resolve to the conventional part
+        // are accepted.
         for target in [
             "word/document.xml",
             "../word/document.xml",
             "word/./document.xml",
-            "word/%64ocument.xml",
-            "word/document.xml?v=1#top",
         ] {
             assert!(
                 with_root(&rels(relationship("rId1", target))).is_ok(),
@@ -12654,8 +12834,16 @@ mod tests {
                 "{first} {second}"
             );
         }
-        // Encoded structure and traversal out of the conventional part fail.
-        for target in ["word%2Fdocument.xml", "word/main.xml", "../main.xml"] {
+        // Encoded structure and traversal out of the conventional part fail,
+        // as do spellings AnyDoc alone resolves to it: Word opens the part a
+        // target names as written, query and all.
+        for target in [
+            "word%2Fdocument.xml",
+            "word/main.xml",
+            "../main.xml",
+            "word/%64ocument.xml",
+            "word/document.xml?v=1#top",
+        ] {
             assert!(
                 matches!(
                     with_root(&rels(relationship("rId1", target))),
@@ -12664,11 +12852,25 @@ mod tests {
                 "{target}"
             );
         }
-        // AnyDoc does not match end-tag prefixes; neither does the guard.
-        let mismatched = format!(
-            r#"<pr:Relationships xmlns:pr="{PACKAGE_RELS_NS}"><pr:Relationship Id="rId1" Type="{REL_NS}/officeDocument" Target="word/document.xml"/></x:Relationships>"#
+        // Relationships written otherwise than OPC defines them, which Word
+        // and AnyDoc can read apart, are refused: prefixed elements, which
+        // LibreOffice does not read, an end tag that does not match, and a
+        // relationship nested in another element.
+        let prefixed = format!(
+            r#"<pr:Relationships xmlns:pr="{PACKAGE_RELS_NS}"><pr:Relationship Id="rId1" Type="{REL_NS}/officeDocument" Target="word/document.xml"/></pr:Relationships>"#
         );
-        assert!(with_root(&mismatched).is_ok());
+        let mismatched = rels(relationship("rId1", "word/document.xml"))
+            .replace("</Relationships>", "</x:Relationships>");
+        let nested = rels(format!(
+            "<x:wrap xmlns:x=\"urn:x\">{}</x:wrap>",
+            relationship("rId1", "word/document.xml")
+        ));
+        for written in [prefixed, mismatched, nested] {
+            assert!(
+                matches!(with_root(&written), Err(DocumentError::Malformed)),
+                "{written}"
+            );
+        }
     }
 
     #[test]
@@ -14034,7 +14236,7 @@ mod tests {
             r#"<workbook {SML_NS} xmlns:r="{REL_NS}"><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets></workbook>"#
         );
         let workbook_rels = format!(
-            r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+            r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
         );
         let hidden = drawing("VISIBILITY:HIDDEN");
         let result = preflight_package(
@@ -14068,7 +14270,7 @@ mod tests {
             r#"<workbook {SML_NS} xmlns:r="{REL_NS}"><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets></workbook>"#
         );
         let workbook_rels = format!(
-            r#"<Relationships><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{REL_NS}/styles" Target="styles.xml"/></Relationships>"#
+            r#"<Relationships xmlns="{PACKAGE_RELS_NS}"><Relationship Id="rId1" Type="{REL_NS}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{REL_NS}/styles" Target="styles.xml"/></Relationships>"#
         );
         let styles = format!(r#"<styleSheet {SML_NS}>{styles}</styleSheet>"#);
         let mut entries: Vec<(&str, &[u8])> = vec![
@@ -14737,20 +14939,216 @@ mod tests {
             "footnotes",
             r#"<w:p><w:r><w:sym w:char="F0FE"/></w:r></w:p>"#,
         );
-        for (target, part) in [
-            ("notes/fn.xml?v=1", "word/notes/fn.xml"),
-            ("f%6E.xml", "word/fn.xml"),
-            ("../../word/fn2.xml", "word/fn2.xml"),
-            ("/extra/notes.xml#part", "extra/notes.xml"),
-        ] {
+        let clean = word_part("footnotes", r#"<w:p><w:r><w:t>Note</w:t></w:r></w:p>"#);
+        let preflight = |target: &str, part: &str, notes: &[u8]| {
             let rels = footnotes_rels(target);
-            let preflight = docx_preflight(&[
+            docx_preflight(&[
                 ("word/document.xml", &body),
                 ("word/_rels/document.xml.rels", &rels),
-                (part, &symbol),
-            ]);
-            assert!(preflight.unsupported_content, "{target}");
+                (part, notes),
+            ])
+        };
+        // Traversal resolves alike for Word and AnyDoc, and the part it
+        // names is checked.
+        assert!(preflight("../../word/fn2.xml", "word/fn2.xml", &symbol).unsupported_content);
+        assert!(!preflight("../../word/fn2.xml", "word/fn2.xml", &clean).unsupported_content);
+        // A query, a fragment, or a percent-encoded name names one part to
+        // AnyDoc, which drops the query and fragment and decodes the name,
+        // and another to Word, which opens the name as written: refused,
+        // whichever of the two the package holds.
+        for (target, decoded, written) in [
+            (
+                "notes/fn.xml?v=1",
+                "word/notes/fn.xml",
+                "word/notes/fn.xml?v=1",
+            ),
+            ("f%6E.xml", "word/fn.xml", "word/f%6E.xml"),
+            (
+                "/extra/notes.xml#part",
+                "extra/notes.xml",
+                "extra/notes.xml#part",
+            ),
+        ] {
+            assert!(
+                preflight(target, decoded, &clean).unsupported_content,
+                "{target}"
+            );
+            assert!(
+                preflight(target, written, &clean).unsupported_content,
+                "{target}"
+            );
         }
+        // Where the package holds neither, both read nothing.
+        assert!(!preflight("f%6E.xml", "word/other.xml", &clean).unsupported_content);
+    }
+
+    #[test]
+    fn ooxml_relationships_name_the_same_parts_to_word_and_anydoc() {
+        let body = word_part("document", "<w:p><w:r><w:t>Body</w:t></w:r></w:p>");
+        let relationship = |attributes: &str| format!("<Relationship {attributes}/>");
+        let rels = |inner: &str| {
+            format!(
+                r#"<Relationships xmlns="{PACKAGE_RELS_NS}" xmlns:x="urn:x">{inner}</Relationships>"#
+            )
+        };
+        let docx = |root: &str, main: &str| {
+            let mut entries: Vec<(&str, &[u8])> = vec![
+                ("word/document.xml", &body),
+                ("word/other.xml", &body),
+                ("word/footnotes.xml", &body),
+                ("word/numbering.xml", &body),
+            ];
+            if !root.is_empty() {
+                entries.push(("_rels/.rels", root.as_bytes()));
+            }
+            if !main.is_empty() {
+                entries.push(("word/_rels/document.xml.rels", main.as_bytes()));
+            }
+            docx_result(&entries)
+        };
+        let office = |target: &str| {
+            relationship(&format!(
+                r#"Id="rId1" Type="{REL_NS}/officeDocument" Target="{target}""#
+            ))
+        };
+        let typed = |id: &str, kind: &str, target: &str| {
+            relationship(&format!(
+                r#"Id="{id}" Type="{REL_NS}/{kind}" Target="{target}""#
+            ))
+        };
+        assert!(docx(&rels(&office("word/document.xml")), "").is_ok());
+        // Declarations are not attributes, and a target mode OPC names is
+        // allowed.
+        let external = relationship(&format!(
+            r#"xmlns:y="urn:y" Id="rId9" Type="{REL_NS}/hyperlink" TargetMode="External" Target="https://example.invalid""#
+        ));
+        assert!(docx("", &rels(&external)).is_ok());
+        // An attribute OPC does not define, in another vocabulary or none,
+        // is refused: LibreOffice reads the unprefixed `Target` or `Type`
+        // where AnyDoc reads the first of either name.
+        for written in [
+            relationship(&format!(
+                r#"Id="rId1" Type="{REL_NS}/officeDocument" x:Target="word/document.xml" Target="word/other.xml""#
+            )),
+            relationship(&format!(
+                r#"Id="rId1" x:Type="{REL_NS}/officeDocument" Type="{REL_NS}/customXml" Target="word/other.xml""#
+            )),
+            relationship(&format!(
+                r#"Id="rId1" Type="{REL_NS}/officeDocument" Target="word/document.xml" Note="kept""#
+            )),
+        ] {
+            assert!(
+                matches!(docx(&rels(&written), ""), Err(DocumentError::Malformed)),
+                "{written}"
+            );
+        }
+        for written in [
+            typed("rId8", "footnotes", "footnotes.xml")
+                .replace("Target=", r#"x:Target="other.xml" Target="#),
+            typed("rId8", "numbering", "numbering.xml")
+                .replace("Target=", r#"x:Target="other.xml" Target="#),
+            // Ids repeated, empty, or missing, and a target mode in another
+            // spelling.
+            typed("rId8", "footnotes", "footnotes.xml") + &typed("rId8", "styles", "styles.xml"),
+            typed("", "footnotes", "footnotes.xml"),
+            relationship(&format!(
+                r#"Type="{REL_NS}/footnotes" Target="footnotes.xml""#
+            )),
+            typed("rId8", "footnotes", "footnotes.xml")
+                .replace("/>", r#" TargetMode="internal"/>"#),
+        ] {
+            assert!(
+                matches!(docx("", &rels(&written)), Err(DocumentError::Malformed)),
+                "{written}"
+            );
+        }
+        // A relationships part without the namespace, which AnyDoc does not
+        // read and LibreOffice does, is refused too.
+        let bare = format!(
+            r#"<Relationships>{}</Relationships>"#,
+            typed("rId8", "footnotes", "other.xml")
+        );
+        assert!(matches!(docx("", &bare), Err(DocumentError::Malformed)));
+        // A percent-encoded target: AnyDoc decodes it, Word does not.
+        let encoded_main = rels(&office("word/docum%65nt.xml"));
+        assert!(matches!(
+            docx(&encoded_main, ""),
+            Err(DocumentError::Malformed)
+        ));
+        let encoded_numbering = rels(&typed("rId8", "numbering", "numb%65ring.xml"));
+        assert!(
+            docx("", &encoded_numbering)
+                .expect("DOCX preflight")
+                .unsupported_content
+        );
+        // Workbooks: sheets, shared strings, and styles alike.
+        let workbook = format!(
+            r#"<workbook xmlns:r="{REL_NS}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        );
+        let sheet = format!(
+            r#"<worksheet {SML_NS}><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+        );
+        let xlsx = |root: Option<String>, workbook_rels: String| {
+            let mut entries: Vec<(&str, Vec<u8>)> = vec![
+                ("[Content_Types].xml", XLSX_TYPES.to_vec()),
+                ("xl/workbook.xml", workbook.clone().into_bytes()),
+                ("xl/_rels/workbook.xml.rels", workbook_rels.into_bytes()),
+                ("xl/worksheets/sheet1.xml", sheet.clone().into_bytes()),
+                ("xl/worksheets/sheet%31.xml", sheet.clone().into_bytes()),
+                ("xl/sharedStrings.xml", b"<sst/>".to_vec()),
+                ("xl/wb2.xml", workbook.clone().into_bytes()),
+            ];
+            if let Some(root) = root {
+                entries.push(("_rels/.rels", root.into_bytes()));
+            }
+            let entries: Vec<(&str, &[u8])> = entries
+                .iter()
+                .map(|(name, bytes)| (*name, bytes.as_slice()))
+                .collect();
+            preflight_package(
+                &zip_entries(&entries),
+                DocumentKind::Xlsx,
+                DocumentVariant::Xlsx,
+            )
+        };
+        let sheet_rel = |target: &str| typed("rId1", "worksheet", target);
+        let control =
+            xlsx(None, rels(&sheet_rel("worksheets/sheet1.xml"))).expect("XLSX preflight");
+        assert!(!control.unsupported_content);
+        let moved_sheet = xlsx(
+            None,
+            rels(
+                &sheet_rel("worksheets/sheet1.xml")
+                    .replace("Target=", r#"x:Target="worksheets/sheet2.xml" Target="#),
+            ),
+        );
+        assert!(matches!(moved_sheet, Err(DocumentError::Malformed)));
+        let strings = sheet_rel("worksheets/sheet1.xml")
+            + &typed("rId2", "sharedStrings", "sharedStrings.xml")
+                .replace("Target=", r#"x:Target="sst2.xml" Target="#);
+        assert!(matches!(
+            xlsx(None, rels(&strings)),
+            Err(DocumentError::Malformed)
+        ));
+        let encoded_sheet =
+            xlsx(None, rels(&sheet_rel("worksheets/sheet%31.xml"))).expect("XLSX preflight");
+        assert!(encoded_sheet.unsupported_content);
+        let encoded_strings = sheet_rel("worksheets/sheet1.xml")
+            + &typed("rId2", "sharedStrings", "sh%61redStrings.xml");
+        assert!(
+            xlsx(None, rels(&encoded_strings))
+                .expect("XLSX preflight")
+                .unsupported_content
+        );
+        let moved_main = rels(
+            &office("xl/workbook.xml")
+                .replace("Target=", r#"x:Target="xl/workbook.xml" Target="#)
+                .replace("Target=\"xl/workbook.xml\"/", "Target=\"xl/wb2.xml\"/"),
+        );
+        assert!(matches!(
+            xlsx(Some(moved_main), rels(&sheet_rel("worksheets/sheet1.xml"))),
+            Err(DocumentError::Malformed)
+        ));
     }
 
     #[test]
@@ -16001,7 +16399,7 @@ mod tests {
         ));
 
         // Renaming the styles part behind its relationship does not evade it.
-        let rels = br#"<Relationships><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="design/theme-styles.xml"/></Relationships>"#;
+        let rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="design/theme-styles.xml"/></Relationships>"#;
         let bytes = xlsx_with_styles("xl/design/theme-styles.xml", &oversized, Some(rels));
         assert!(matches!(
             preflight_package(&bytes, DocumentKind::Xlsx, DocumentVariant::Xlsx),
