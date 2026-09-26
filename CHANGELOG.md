@@ -795,6 +795,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     otherwise than AnyDoc and now report `list_numbering_differs`.
     `classify_document` answers as before on all of them, and round nine's
     performance reproducers keep their verdicts and costs.
+- Review round ten also checked round nine's EPUB fixes:
+  - EPUB: sizing a margin, padding, or gap from a custom property walked
+    every ancestor for each declaration, parsing its inline style again
+    and trying every rule that sets the property, none of it counted as
+    work. Small books whose elements carry long inline styles or nest
+    deep took 8.8 s or ran past the 15-second deadline, and Bootstrap 5
+    books of 60 and 100 chapters were refused as a resource limit. An
+    element's inline style is now parsed once and counted, what a custom
+    property says is kept at each element it was looked up at, the rules
+    setting one are indexed as other rules are, and a `var()` length is
+    resolved only where it is read. The small books take 0.03-0.08 s and
+    at most 37 MiB, and the Bootstrap books convert in 1.8 s and 2.9 s at
+    93 and 143 MiB, against 1.4 s and 2.4 s before round nine, when
+    `var()` was not read.
+  - EPUB: round nine read a media query testing any feature, `@supports`
+    on anything but `display`, `@container`, `@scope`, and `&` nested
+    eight deep as rules that may apply, and a show that may apply never
+    beat a hide: `.x { display: none }` shown again under `@media
+    (min-width: 0)` converted complete though AnyDoc drops what Chromium
+    shows, and the same text converted was refused. Media queries are now
+    tried on the screens of the readers the check follows, 320 to 1280
+    CSS pixels wide, either way up, at 1 to 3 device pixels to the CSS
+    pixel: `(min-width: 0)` holds on all of them, `(max-width: 1px)` and
+    `print` on none, `(min-width: 768px)` on some, and a query Chromium
+    rejects, such as `screen screen`, on none. `@supports` reads the
+    properties Chromium 141 supports and `selector()`, `@scope` rules
+    match inside their root, `@container` rules apply only under an
+    element that may be a size container, `&` stands for its rule however
+    deep, and a `<link>` or `<style>` element's media and an `@import`'s
+    conditions cap its sheet.
+  - EPUB: a hide that might apply excused AnyDoc's drop, while a show had
+    to apply for certain. Text some readers show is now shown: AnyDoc may
+    convert it, and loses it where it drops it, so a paragraph only
+    narrow screens show (Bootstrap's `d-md-none`), which AnyDoc drops, is
+    refused, and one only wide screens show (`d-none d-md-inline`), which
+    it converts, is not. Text that a rule the check cannot settle may
+    show or hide, as with `:has()`, `:lang()`, or a value set through
+    `var()`, counts both ways: as hidden where AnyDoc converts it and as
+    shown where it drops it. A namespaced attribute selector reads its
+    `@namespace` prefix, so `span[epub|type~="pagebreak"]` hides page
+    numbers for certain.
+  - EPUB: `display: revert` and `revert-layer` were read as values a
+    reader ignores, so the hide they undo still won. `revert` now takes
+    what the user agent's rules give and `revert-layer` what the layers
+    below give, the `hidden` attribute standing below every author layer,
+    as Chromium reads it. A layer is declared only where the `@media` and
+    `@supports` conditions around it hold, and one that some screens
+    declare in another place is in doubt.
+  - EPUB: stylesheets Chromium never applies were applied: an alternate
+    stylesheet, a `<link>` or `<style>` whose type is not CSS, and a
+    disabled link. AnyDoc applies them and drops the text they hide,
+    which Chromium shows; the reader now leaves them out, and of titled
+    sheets takes only the preferred set, so the drop is refused.
+  - EPUB: `@import url(base.css) layer(base)`, and a bare `layer`, were
+    read as unlayered, so the imported sheet's more specific hide beat
+    the importing sheet's show; the imported sheet now stands in the
+    layer its import names. An `@import` after a style rule, which
+    Chromium ignores, is no longer applied, so text it would hide, which
+    Chromium shows and AnyDoc converts, is no longer refused.
+  - EPUB: a dash bullet was refused where its box, not white space or a
+    margin, sets it apart from a list item's text: an inline block wider
+    than the dash, a box `position: relative` moves away, or a `::before`
+    or `::after` box the item lays out as a flex item with a gap or as a
+    grid item. Each now stands for AnyDoc's list marker; a dash touching
+    the text is still a minus.
+  - EPUB: a box that takes room between two numbers without being seen,
+    such as a space with `visibility: hidden`, a dash with `opacity: 0`,
+    or an empty inline block with a width, now keeps "12" and "50" apart
+    as a space does, so AnyDoc's "1250" is refused. So do the quote marks
+    a reader sets around `<q>`: "In 2023<q>15 cases</q>" shows
+    "2023“15", which AnyDoc runs together.
+  - EPUB: flex items a reader sets apart by their size ran together. An
+    item that grows (`flex: 1`, `flex-grow`), has a width, minimum width,
+    or basis, or takes an auto margin now stands apart from the next, so
+    "Units shipped" run into "Returns filed" is refused; an inline flex
+    box, as wide as its items, sets none apart.
+  - EPUB: `content: var(--tw-content)`, as Tailwind v4 writes
+    `before:content-['−']`, was read as unknown, so a minus Chromium
+    shows before an amount, which AnyDoc drops, passed. A `::before` or
+    `::after` box now shows what the custom property its own rules set
+    says.
+  - EPUB: SVG `dy`, `x`, and `y` lists, and `dx` lengths in em,
+    millimetres, or percent, are now read glyph by glyph, as `dx` lists
+    in pixels were, so `dy="0 0 60 0"` on "1250" is two numbers.
+  - EPUB: text in an SVG resource counted as painted where Chromium
+    paints nothing: a marker on a rectangle, a pattern tile sized zero, a
+    `use` scaled to nothing, a pattern fill at zero opacity or on a line,
+    a stroke of zero width, and a `textPath` naming no path. Each now
+    draws nothing, so AnyDoc converting the text is refused. A symbol in
+    a sprite sheet hidden with `display: none` paints where a `use` draws
+    it, and a group's fill, stroke, and markers pass to the shapes it
+    holds, so a visible rectangle in a hidden group paints its pattern.
+  - EPUB: a style rule whose selector list holds a pseudo-class or
+    pseudo-element Chromium cannot read is dropped whole, with the rules
+    nested in it, as Chromium drops it: `.note, .note:bogus { display:
+    none }` no longer hides text Chromium shows. `:is()` and `:where()`
+    still forgive what they cannot read.
+  - Against Chromium's layout, 60 of the review's 104 EPUB fixtures are
+    now refused and 14 refused in error convert, each as Chromium paints
+    it on some screen from 320 to 1280 px wide, the dashes as bullets. Of
+    4,768 EPUBs in the regression sweep four newly refuse, and 13 of the
+    269 fixture-kit EPUBs, each confirmed in Chromium; none newly
+    converts. The earlier reproducers take what they took.
 - Review round nine checked loops 17 to 19, the round-eight fixes, and the
   document worker:
   - PDF words split in glyph-by-glyph text (#531): Chrome's Skia keeps a
@@ -1310,22 +1413,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `content`, `position`, and `white-space` of `::before` and `::after`
   boxes. A floated or positioned box keeps the line before it and ends the
   line after it, unless it holds a drop cap: one or two characters, or
-  three going on in lower case, and no digits. A rule the walk cannot
-  settle, with `:has()` or `:lang()`, or reaching a sibling let go past
-  the first 32 and the latest 96, counts only where digits meet: "Balance
-  due" and "1,250.00" run together under such a rule are not refused. Alt
-  text meeting other text counts the same way. Generated counters refuse a
-  book even where they match AnyDoc's own list numbers. A style sheet's own
-  media or layer, given where it is linked (`<link media>`, `<style
-  media>`, `@import ... layer()`), is read as always applying; SVG `x` and
-  `y` lists are not read; and whether free space in a flex row, a `grow`
-  or an `auto` margin, sets its items apart is not decided, as that needs
-  the text's widths.
+  three going on in lower case, and no digits.
+  A layout rule the walk cannot settle, with `:has()` or `:lang()`, under a
+  media query that holds on some screens only, or reaching a sibling let go
+  past the first 32 and the latest 96, counts only where digits meet:
+  "Balance due" and "1,250.00" run together under such a rule are not
+  refused. Alt text meeting other text counts the same way. Generated
+  counters refuse a book even where they match AnyDoc's own list numbers.
+  Text widths are not measured: a flex item that grows, has a width, or
+  takes an auto margin stands apart from the next, even where it sets its
+  text at the end of its line against it, and a dash bullet's box sets it
+  apart whatever its width. SVG glyphs are taken as 0.6 em wide, so digits
+  kerned glyph by glyph with `x` lists may read apart where Chromium sets
+  them touching, and `textLength`, which spreads a label's glyphs, is not
+  read.
 - ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
   converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
 - EPUB `noscript` content is treated as shown, as readers without scripting
   show it, and MathML as converted whole. Books using the Kindle stylesheet
   pair are refused rather than converted without their `.kf8-only` text.
+- EPUB readers are taken to be Chromium 141 on screens 320 to 1280 CSS
+  pixels wide, as tall, either way up, at 1 to 3 device pixels to the CSS
+  pixel. Text any of them shows counts as shown, and a media query none of
+  them meets, such as `(min-width: 1400px)`, never applies. A cascade layer
+  first declared under a query some of them meet, and declared again
+  after, is placed where its rules win the most, so text they may show or
+  hide counts both ways.
+- EPUB SVG: a clip path or mask an HTML element names with `clip-path` or
+  `mask`, and a pattern that takes its tile from another through `href`,
+  are not read as drawn, so their text, which Chromium paints and AnyDoc
+  converts, is refused. `fill-opacity` and `stroke-width` are read from an
+  element's own attributes and style only, not from style rules or its
+  ancestors.
+- EPUB: `content: var()` is read where the `::before` or `::after` box's
+  own rules set the custom property; one it inherits is not known. The
+  `quotes` property is not read, so a `<q>` whose marks `quotes: none`
+  takes away still keeps digits apart. A dash a flex column sets on a line
+  of its own is still read as a minus.
 - EPUB page numbers hidden through attribute or descendant selectors, such as
   Project Gutenberg's `.x-ebookmaker .pagenum`, refuse the book, because
   AnyDoc converts them.
