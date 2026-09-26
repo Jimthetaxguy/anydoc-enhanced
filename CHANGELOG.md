@@ -497,6 +497,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round fifteen also checked the EPUB, DOCX, and document-worker
+  fixes of rounds ten and fourteen, against Chromium and LibreOffice:
+  - EPUB: pseudo-class and pseudo-element names are read in the forms
+    Chromium 141 parses, so a rule naming `::scroll-marker-group` hides what
+    Chromium hides, and a name the lists do not hold puts the rule in doubt;
+    only rules Chromium keeps end the imports it reads; media conditions are
+    read together on the screens they tell apart; and media lists are read
+    once per list, within the work bound.
+  - DOCX notes are read as Word and AnyDoc each read them, the note AnyDoc
+    renders compared at each reference; relationships naming one part to
+    Word and another to AnyDoc, by prefixed attributes or targets whose
+    percent-decoding changes them, are refused.
+  - DOCX list numbering reads its attributes and numbers as LibreOffice
+    reads and keeps them, and a label Word and LibreOffice restart apart
+    (`w:lvlRestart`) is disclosed as uncertain.
+  - An archive's entries are counted from its end records, not from every
+    signature in its data; and `classify_document` reports as enabled only
+    what `document_to_markdown` converts.
+  - Open from this round: EPUB grid layout and the remaining EPUB findings,
+    and DOCX start values and levels past 16 bits, repeated level
+    elements, and `w:isLgl` read as LibreOffice reads them.
 - Review round fifteen checked the off-page check (loop 30) and the
   round-fourteen fixes, against pdfium's rendering and pdf-inspector's own
   reading:
