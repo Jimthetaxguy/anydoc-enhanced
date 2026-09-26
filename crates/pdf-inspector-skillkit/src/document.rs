@@ -9671,7 +9671,9 @@ fn classify_package(bytes: &[u8], path: &Path, oversized: bool) -> DocumentClass
 
 /// The classification of `size_bytes` of input found to be of this kind
 /// and variant: the kind's capabilities, and whether its route converts
-/// the variant.
+/// the variant, which must be one of the kind's own: a presentation whose
+/// content types declare a Word document is not converted (see
+/// [`document_route`]).
 fn classification_of(
     kind: Option<DocumentKind>,
     variant: Option<DocumentVariant>,
@@ -9691,7 +9693,8 @@ fn classification_of(
                     | DocumentVariant::Epub
                     | DocumentVariant::Csv
             )
-        );
+        )
+        && variant.and_then(kind_for_variant) == kind;
     DocumentClassification {
         kind,
         variant,
@@ -11441,6 +11444,65 @@ mod tests {
         assert_eq!(contract.supported_variants, vec![DocumentVariant::Pptx]);
         assert_eq!(contract.hidden_content_policy, "reject");
         assert_eq!(contract.external_content_policy, "reject");
+    }
+
+    #[test]
+    fn classification_is_enabled_only_where_the_route_converts() {
+        // AnyDoc detects a presentation whose content types declare a Word
+        // document; the route refuses it, and classification says so.
+        let mismatched =
+            classification_of(Some(DocumentKind::Pptx), Some(DocumentVariant::Docx), 10);
+        assert!(!mismatched.enabled);
+        assert!(matches!(
+            document_route(&mismatched),
+            Err(DocumentError::Unsupported)
+        ));
+        let kinds = [
+            DocumentKind::Pdf,
+            DocumentKind::Docx,
+            DocumentKind::Pptx,
+            DocumentKind::Xlsx,
+            DocumentKind::Epub,
+            DocumentKind::Odt,
+            DocumentKind::Ods,
+            DocumentKind::Odp,
+            DocumentKind::Rtf,
+            DocumentKind::LegacyOffice,
+            DocumentKind::Csv,
+        ];
+        let variants = [
+            DocumentVariant::Pdf,
+            DocumentVariant::Docx,
+            DocumentVariant::Docm,
+            DocumentVariant::Pptx,
+            DocumentVariant::Pptm,
+            DocumentVariant::Ppsx,
+            DocumentVariant::Ppsm,
+            DocumentVariant::Xlsx,
+            DocumentVariant::Xlsm,
+            DocumentVariant::Xlsb,
+            DocumentVariant::Xls,
+            DocumentVariant::Epub,
+            DocumentVariant::Odt,
+            DocumentVariant::Ods,
+            DocumentVariant::Odp,
+            DocumentVariant::Rtf,
+            DocumentVariant::Doc,
+            DocumentVariant::Ppt,
+            DocumentVariant::Pps,
+            DocumentVariant::Pot,
+            DocumentVariant::Csv,
+        ];
+        for kind in kinds {
+            for variant in variants {
+                let classification = classification_of(Some(kind), Some(variant), 10);
+                assert_eq!(
+                    classification.enabled,
+                    document_route(&classification).is_ok(),
+                    "{kind:?} {variant:?}"
+                );
+            }
+        }
     }
 
     #[test]
