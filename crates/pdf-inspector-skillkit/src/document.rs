@@ -9590,23 +9590,57 @@ fn preflight_rejection(kind: DocumentKind, preflight: &PackagePreflight) -> Opti
     incomplete.then_some(DocumentError::IncompleteConversion)
 }
 
-/// Whether a zip archive holds more central directory records than AnyDoc
-/// reads (`MAX_ARCHIVE_ENTRIES`), counted by their signature without
-/// reading the directory. Opening the archive indexes every entry first:
-/// a 43 MB package of empty entries costs a second and 340 MiB before any
-/// bound applies, and AnyDoc then refuses it.
+/// Whether a zip archive may hold more entries than AnyDoc reads
+/// (`MAX_ARCHIVE_ENTRIES`), judged from its end records without reading its
+/// directory. Opening the archive indexes every entry first: a 43 MB
+/// package of empty entries costs a second and 340 MiB before any bound
+/// applies, and AnyDoc then refuses it. The zip reader indexes as many
+/// entries as the end record it accepts counts. A classic end record counts
+/// at most 65,535, under the bound; a ZIP64 one counts in 64 bits, and the
+/// reader takes it only where the ZIP64 locator follows it and a classic
+/// end record follows the locator, and only if the entries it counts fit
+/// before it. Every such record in the file is judged, as the reader may
+/// fall back from one to another and allows bytes before the archive, while
+/// bytes merely like a directory entry's, as inside a stored part, count
+/// for nothing.
 fn zip_past_entry_bound(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"PK\x03\x04") {
-        return false;
-    }
-    let mut records = 0usize;
-    let mut rest = bytes;
-    while let Some(at) = rest.windows(4).position(|window| window == b"PK\x01\x02") {
-        records += 1;
-        if records > MAX_ARCHIVE_ENTRIES {
+    const RECORD: &[u8] = b"PK\x06\x06";
+    const LOCATOR: &[u8] = b"PK\x06\x07";
+    const END: &[u8] = b"PK\x05\x06";
+    const DIRECTORY_ENTRY_BYTES: u64 = 46;
+    let number = |at: usize| {
+        bytes
+            .get(at..at.checked_add(8)?)
+            .and_then(|field| field.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let mut from = 0;
+    while let Some(found) = bytes.get(from..).and_then(|rest| {
+        rest.windows(RECORD.len())
+            .position(|window| window == RECORD)
+    }) {
+        let record = from + found;
+        from = record + 1;
+        // The record's size field counts the bytes after itself, so the
+        // locator starts where the record ends.
+        let Some(locator) = number(record + 4)
+            .and_then(|size| usize::try_from(size).ok())
+            .and_then(|size| (record + 12).checked_add(size))
+        else {
+            continue;
+        };
+        let located = bytes.get(locator..locator + LOCATOR.len()) == Some(LOCATOR)
+            && bytes.get(locator + 20..locator + 20 + END.len()) == Some(END);
+        let (Some(entries), Some(directory)) = (number(record + 32), number(record + 48)) else {
+            continue;
+        };
+        let fits = entries
+            .saturating_mul(DIRECTORY_ENTRY_BYTES)
+            .saturating_add(directory)
+            <= record as u64;
+        if located && fits && entries > MAX_ARCHIVE_ENTRIES as u64 {
             return true;
         }
-        rest = &rest[at + 4..];
     }
     false
 }
@@ -16354,6 +16388,10 @@ mod tests {
             Some("word/numbering.xml")
         );
         assert_eq!(layout.list_parts.anydoc_numbering, "word/numbering.xml");
+    }
+
+    #[test]
+    fn archives_past_the_entry_bound_are_found_from_their_end_records() {
         // A package with more entries than AnyDoc reads is refused.
         let entries: Vec<(String, &[u8])> = (0..=MAX_ARCHIVE_ENTRIES)
             .map(|index| (format!("e{index}"), b"".as_slice()))
@@ -16375,6 +16413,38 @@ mod tests {
         let within = zip_entries(&entries[1..]);
         assert!(!zip_past_entry_bound(&within));
         assert!(!zip_past_entry_bound(b"%PDF-1.7 PK\x01\x02"));
+        // Bytes before the archive, which the zip reader allows, do not hide
+        // its end records.
+        let prefixed = [b"JUNK".as_slice(), &oversized].concat();
+        assert!(zip_past_entry_bound(&prefixed));
+        assert!(matches!(
+            open_package(&prefixed),
+            Err(DocumentError::ResourceLimit)
+        ));
+        // A part holding directory entries' signature counts for nothing:
+        // the archive's end record counts its three entries.
+        let signatures = b"PK\x01\x02".repeat(MAX_ARCHIVE_ENTRIES + 1);
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("[Content_Types].xml", DOCX_TYPES),
+            ("word/document.xml", DOCX_XML),
+            ("word/media/blob.bin", signatures.as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        let stored = writer.finish().unwrap().into_inner();
+        assert!(
+            stored
+                .windows(4)
+                .filter(|window| *window == b"PK\x01\x02")
+                .count()
+                > MAX_ARCHIVE_ENTRIES
+        );
+        assert!(!zip_past_entry_bound(&stored));
+        assert!(open_package(&stored).is_ok());
     }
 
     #[test]
