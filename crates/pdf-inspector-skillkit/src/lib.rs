@@ -145,7 +145,8 @@ pub const PDF_WARNING_VERTICAL_TEXT_MISREAD: &str = "vertical_text_misread";
 /// where a form's labels standing in cells side by side read across.
 const MIN_VERTICAL_PASSAGE_CHARS: usize = 6;
 /// Characters a column of vertical writing holds at most to be taken for a
-/// table's label where the Markdown shows it as a cell.
+/// table's label where the Markdown shows it as a cell beside its
+/// neighbour's.
 const MAX_VERTICAL_LABEL_CHARS: usize = 8;
 /// Characters a text in a hidden layer needs, bare, for the Markdown's
 /// showing it to count.
@@ -1087,9 +1088,10 @@ impl PdfInfo {
     ) {
         let numbers: Vec<[u32; 1]> = readings.iter().map(|(page, _)| [*page]).collect();
         let long = |text: &str, least: usize| text.chars().count() >= least;
-        // Short labels the Markdown shows as cells of a table, as a table's
-        // header labels set vertically are read: its row reads left to
-        // right, as a passage's columns do not.
+        // Short labels the Markdown shows as neighbouring cells of a table's
+        // row, the left one first, as a table's header labels set vertically
+        // are read: its row reads left to right, as a passage's columns do
+        // not.
         let paired = readings.iter().any(|(_, readings)| {
             readings
                 .iter()
@@ -1099,10 +1101,12 @@ impl PdfInfo {
             .markdown
             .as_deref()
             .filter(|_| paired)
-            .map(|markdown| repeated_lines::table_rows(markdown).1)
+            .map(vertical_text::neighbouring_cells)
             .unwrap_or_default();
-        let label = |text: &str| {
-            !long(text, MAX_VERTICAL_LABEL_CHARS + 1) && cells.contains(&repeated_lines::bare(text))
+        let labels = |right: &str, left: &str| {
+            !long(right, MAX_VERTICAL_LABEL_CHARS + 1)
+                && !long(left, MAX_VERTICAL_LABEL_CHARS + 1)
+                && cells.contains(&(repeated_lines::bare(left), repeated_lines::bare(right)))
         };
         let read: Vec<(&[u32], String)> = numbers
             .iter()
@@ -1119,7 +1123,7 @@ impl PdfInfo {
                             let both = format!("{right}{left}");
                             let order = *passage
                                 && long(&both, MIN_VERTICAL_PASSAGE_CHARS)
-                                && !(label(right) && label(left));
+                                && !labels(right, left);
                             [right.clone(), left.clone()]
                                 .into_iter()
                                 .chain(order.then_some(both))
@@ -1778,6 +1782,17 @@ mod tests {
         let mut info = read("支払金額 源泉徴収\n");
         info.check_vertical_text(&labels, None);
         assert_eq!(reported(&info), [(vertical.clone(), vec![1])]);
+        // Cells a table sets apart, in other rows or with a cell between,
+        // as another page's table may hold the same words, do not make a
+        // passage's columns a table's labels.
+        for markdown in [
+            "支払金額 源泉徴収\n\n|一二三四|支払金額|\n|---|---|\n|源泉徴収|五六七八|\n",
+            "支払金額 源泉徴収\n\n|一二三四|支払金額|五六七八|源泉徴収|\n|---|---|---|---|\n",
+        ] {
+            let mut info = read(markdown);
+            info.check_vertical_text(&labels, None);
+            assert_eq!(reported(&info), [(vertical.clone(), vec![1])], "{markdown}");
+        }
         // A passage's short last column, read before the long one.
         let short = [(
             1,

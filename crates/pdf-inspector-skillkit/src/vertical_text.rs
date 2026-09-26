@@ -40,9 +40,37 @@ pub(crate) enum Reading {
     Alone(String),
     /// Two neighbouring columns of one size whose heights overlap, right and
     /// left, as each reads where their fonts can be read: each whole, and,
-    /// where they stand as near as a passage's columns do, the right one's
-    /// text and then the left one's.
+    /// where they stand as near as a passage's columns do and not over a
+    /// row of values, as a table's header labels do, the right one's text
+    /// and then the left one's.
     Pair(Option<(String, String)>, bool),
+}
+
+/// The cells the Markdown's tables set side by side, bare (see
+/// `repeated_lines::bare`): each cell of a row with the next that holds
+/// text, the left one first.
+pub(crate) fn neighbouring_cells(markdown: &str) -> HashSet<(String, String)> {
+    let mut neighbours = HashSet::new();
+    for line in markdown.lines().map(str::trim) {
+        if !(line.starts_with('|') && line.ends_with('|'))
+            || line
+                .chars()
+                .all(|character| matches!(character, '|' | '-' | ':' | ' '))
+        {
+            continue;
+        }
+        let cells: Vec<String> = line
+            .split('|')
+            .map(crate::repeated_lines::bare)
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        neighbours.extend(
+            cells
+                .windows(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone())),
+        );
+    }
+    neighbours
 }
 
 /// The least share of one column's size another's must be to stand beside
@@ -216,6 +244,42 @@ pub(crate) fn readings(runs: &[VerticalRun], across: &[EdgeRun]) -> Vec<Reading>
             .across
             .push((f64::from(run.y) + 0.8 * f64::from(run.size), text));
     }
+    // The horizontal runs showing text, by where they start across the
+    // page: two neighbouring columns each with one starting under it, below
+    // its foot, the two on one baseline, stand over a row of values, as a
+    // table's header labels do, and read left to right as its row does.
+    let mut starts: Vec<(f64, f64)> = across
+        .iter()
+        .enumerate()
+        .filter(|(index, run)| {
+            !vertical.contains(index)
+                && upright(run)
+                && run
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+        })
+        .map(|(_, run)| (f64::from(run.x), f64::from(run.y)))
+        .collect();
+    starts.sort_by(|one, other| one.0.total_cmp(&other.0));
+    let under = |column: &Column| -> Vec<f64> {
+        let (from, bottom) = (
+            starts.partition_point(|(x, _)| *x < column.x - column.size),
+            column.bottom(),
+        );
+        starts[from..]
+            .iter()
+            .take_while(|(x, _)| *x <= column.x + 0.5 * column.size)
+            .filter(|(_, y)| *y < bottom)
+            .map(|(_, y)| *y)
+            .collect()
+    };
+    let over_values = |right: &Column, left: &Column| {
+        let (lefts, near) = (under(left), 0.25 * right.size.max(left.size));
+        under(right)
+            .iter()
+            .any(|y| lefts.iter().any(|other| (other - y).abs() <= near))
+    };
     let mut paired = vec![false; columns.len()];
     let mut readings = Vec::new();
     for (right, column) in columns.iter().enumerate() {
@@ -231,7 +295,8 @@ pub(crate) fn readings(runs: &[VerticalRun], across: &[EdgeRun]) -> Vec<Reading>
         }
         paired[right] = true;
         paired[left] = true;
-        let passage = column.x - neighbour.x <= PASSAGE_PITCH * column.size.max(neighbour.size);
+        let passage = column.x - neighbour.x <= PASSAGE_PITCH * column.size.max(neighbour.size)
+            && !over_values(column, neighbour);
         readings.push(Reading::Pair(column.text().zip(neighbour.text()), passage));
     }
     readings.extend(
@@ -397,7 +462,8 @@ mod tests {
             [Reading::Alone("平成".to_owned())]
         );
         // Values under labels, touching their feet, line up as a row: they
-        // are the table's, not the labels'.
+        // are the table's, not the labels', and the labels stand over them
+        // as a table's header does, not as a passage.
         let labels = [run(230.0, 696.0, "源泉", 0), run(200.0, 696.0, "支払", 0)];
         assert_eq!(
             readings(
@@ -406,9 +472,32 @@ mod tests {
             ),
             [Reading::Pair(
                 Some(("源泉".to_owned(), "支払".to_owned())),
-                true
+                false
             )]
         );
+        // Header labels three sizes apart over a row of values set well
+        // below them are a table's; over lines of text across the page,
+        // or a value under one column alone, they read as a passage.
+        let header = [
+            run(236.0, 696.0, "源泉徴収税額", 0),
+            run(200.0, 696.0, "支払金額", 0),
+        ];
+        let passage = |across: &[EdgeRun]| match readings(&header, across)[..] {
+            [Reading::Pair(_, passage)] => passage,
+            _ => unreachable!("one pair"),
+        };
+        assert!(!passage(&digits(&[
+            (196.0, 590.0, "5,200", 7.0),
+            (232.0, 590.0, "162", 7.0)
+        ])));
+        assert!(passage(&digits(&[
+            (72.0, 590.0, "Line 0 of the notice", 10.0),
+            (72.0, 576.0, "Line 1 of the notice", 10.0)
+        ])));
+        assert!(passage(&digits(&[
+            (196.0, 590.0, "5,200", 7.0),
+            (232.0, 560.0, "162", 7.0)
+        ])));
         // Labels in cells five sizes apart pair, but not as a passage.
         let labels = [
             run(390.0, 630.0, "源泉徴収税額", 0),
