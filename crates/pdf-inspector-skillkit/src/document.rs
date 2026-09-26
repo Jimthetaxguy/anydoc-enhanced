@@ -48,7 +48,7 @@ const FRAME_HEADER_BYTES: usize = 16;
 const PROTOCOL_MAGIC: [u8; 4] = *b"ADW1";
 const PROTOCOL_VERSION: u8 = 2;
 const MAX_IN_FLIGHT_WORKERS: usize = 2;
-const MAX_IN_FLIGHT_PDF_WORKERS: usize = 4;
+pub(crate) const MAX_IN_FLIGHT_PDF_WORKERS: usize = 4;
 /// Parser threads and glibc malloc arenas per worker process.
 const WORKER_PARSER_THREADS: &str = "4";
 /// Largest operation-parameter block (such as PDF regions) a worker frame

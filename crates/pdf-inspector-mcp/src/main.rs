@@ -488,15 +488,25 @@ impl PdfInspectorServer {
         let paths = params.0.paths;
         tracing::debug!(tool = "batch_classify", count = paths.len(), "tool invoked");
         with_timeout("batch_classify", TOOL_TIMEOUT, async move {
+            let mut paths = paths.into_iter().enumerate();
             let mut tasks = tokio::task::JoinSet::new();
-            for (index, path) in paths.into_iter().enumerate() {
-                tasks.spawn(async move {
-                    let result = pdf_worker::run(PdfOperation::Classify, &path, &[]).await;
-                    (index, path, result)
-                });
-            }
-            let mut results = Vec::with_capacity(tasks.len());
-            while let Some(joined) = tasks.join_next().await {
+            let mut results = Vec::new();
+            loop {
+                // Start no more classifications than the worker runs at
+                // once, so a long list neither takes a task per path up
+                // front nor holds the runtime before the timeout can fire.
+                while tasks.len() < pdf_worker::MAX_IN_FLIGHT {
+                    let Some((index, path)) = paths.next() else {
+                        break;
+                    };
+                    tasks.spawn(async move {
+                        let result = pdf_worker::run(PdfOperation::Classify, &path, &[]).await;
+                        (index, path, result)
+                    });
+                }
+                let Some(joined) = tasks.join_next().await else {
+                    break;
+                };
                 let Ok((index, path, result)) = joined else {
                     return json_error("tool 'batch_classify' failed: classification task failed");
                 };

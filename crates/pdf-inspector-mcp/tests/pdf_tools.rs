@@ -136,6 +136,26 @@ fn pdf_tools_return_public_fixture_results() {
     assert_eq!(batch[2]["error"], "File not found or inaccessible");
 }
 
+/// A long batch is read a few files at a time and answered in input order.
+#[test]
+fn batch_classify_answers_a_long_list_in_order() {
+    let mut paths = vec![fixture("source/sample-1.pdf")];
+    paths.extend((0..1_000).map(|index| format!("missing-{index}.pdf")));
+    paths.push(fixture("scanned/sample-1.pdf"));
+    let results = call_tools(
+        &[("batch_classify", serde_json::json!({ "paths": paths }))],
+        None,
+    );
+    let batch = results[0].as_array().expect("batch array");
+    assert_eq!(batch.len(), paths.len());
+    assert_eq!(batch[0]["classification"]["pdf_type"], "TextBased");
+    for (index, entry) in batch[1..=1_000].iter().enumerate() {
+        assert_eq!(entry["path"], format!("missing-{index}.pdf"));
+        assert_eq!(entry["error"], "File not found or inaccessible");
+    }
+    assert_eq!(batch[1_001]["classification"]["pdf_type"], "Scanned");
+}
+
 /// A PDF file holding `objects` as objects 1, 2, …, with object 1 as the
 /// catalog.
 fn pdf_file(objects: &[Vec<u8>]) -> Vec<u8> {

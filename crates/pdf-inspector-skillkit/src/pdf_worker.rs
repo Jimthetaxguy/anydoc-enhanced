@@ -26,6 +26,10 @@ const PDF_WORKER_TIMEOUT: Duration = Duration::from_secs(25);
 /// separate cap, so this bounds only pathological outputs.
 pub(crate) const MAX_PDF_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
+/// How many PDF operations run at once; later calls wait for a slot. A
+/// caller with many files need keep no more than this many in flight.
+pub const MAX_IN_FLIGHT: usize = document::MAX_IN_FLIGHT_PDF_WORKERS;
+
 /// One PDF tool operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdfOperation {
