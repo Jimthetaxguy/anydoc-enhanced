@@ -22,19 +22,21 @@
 //! Glyphs are read as pdf-inspector 1.25.0 reads them: by the font's
 //! ToUnicode map, then the names its differences give, then, for a simple
 //! font, by its encoding (see `Simple`); a composite font without a map, by
-//! the code points its codes are where pdf-inspector reads them so. Words
-//! are made of ASCII letters and digits and the marks numbers and dates are
-//! written with, and a ligature glyph stands for its letters; any other
-//! character ends a word, as does the end of a text object, since a browser
-//! writes each run of text as one, and a glyph that cannot be read drops
-//! the word it is in.
+//! the map its program gives where pdf-inspector collects the font (see
+//! `Programs`), or by the code points its codes are where pdf-inspector
+//! reads them so. Words are made of ASCII letters and digits and the marks
+//! numbers and dates are written with, and a ligature glyph stands for its
+//! letters; any other character ends a word, as does the end of a text
+//! object, since a browser writes each run of text as one, and a glyph that
+//! cannot be read drops the word it is in.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{Dictionary, Document, Object, ObjectId};
 use pdf_inspector::glyph_names::glyph_name_to_string;
 use pdf_inspector::tounicode::ToUnicodeCMap;
 
@@ -285,7 +287,8 @@ impl Simple {
 struct Decoder {
     /// Two bytes per code (a Type0 font).
     two_byte: bool,
-    cmap: Option<ToUnicodeCMap>,
+    /// Its ToUnicode map, or the map its program gives (see `Programs`).
+    cmap: Option<Rc<ToUnicodeCMap>>,
     /// For a simple font, the name its differences give each code.
     names: HashMap<u8, String>,
     /// How a code the map and names leave reads.
@@ -352,13 +355,48 @@ impl Decoder {
     }
 }
 
+/// The maps pdf-inspector reads composite fonts with no ToUnicode map by,
+/// from their programs: by program, the map each gives, where it was read;
+/// the bytes of programs read, as `cjk_fonts` counts them; and the keys
+/// pdf-inspector files maps under, once read.
+#[derive(Default)]
+struct Programs {
+    maps: HashMap<ObjectId, Option<Rc<ToUnicodeCMap>>>,
+    read: usize,
+    collected: Option<HashSet<u32>>,
+}
+
+impl Programs {
+    /// The map pdf-inspector reads `font` by, from its program, where it
+    /// collects the font under the program's key (see
+    /// `cjk_fonts::program_key`): the map it builds from a TrueType or
+    /// OpenType program's `cmap` table. Each program is read once.
+    fn map(&mut self, document: &Document, font: &Dictionary) -> Option<Rc<ToUnicodeCMap>> {
+        let file = crate::cjk_fonts::program_key(document, font)?;
+        if !self
+            .collected
+            .get_or_insert_with(|| crate::cjk_fonts::collected_keys(document))
+            .contains(&file.0)
+        {
+            return None;
+        }
+        if let Some(map) = self.maps.get(&file) {
+            return map.clone();
+        }
+        let map = crate::cjk_fonts::program_map(document, file, &mut self.read).map(Rc::new);
+        self.maps.insert(file, map.clone());
+        map
+    }
+}
+
 /// Fonts read to decode glyph codes, by the address of their dictionary,
-/// and the work spent reading them.
+/// the work spent reading them, and the maps programs give.
 #[derive(Default)]
 pub(crate) struct GlyphFonts {
     known: HashMap<usize, Option<usize>>,
     decoders: Vec<Decoder>,
     steps: usize,
+    programs: Programs,
 }
 
 impl GlyphFonts {
@@ -372,7 +410,7 @@ impl GlyphFonts {
         if self.steps > MAX_FONT_STEPS {
             return None;
         }
-        let found = decoder(document, font, &mut self.steps).map(|decoder| {
+        let found = decoder(document, font, &mut self.steps, &mut self.programs).map(|decoder| {
             self.decoders.push(decoder);
             self.decoders.len() - 1
         });
@@ -468,7 +506,12 @@ impl GlyphFonts {
     }
 }
 
-fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Decoder> {
+fn decoder(
+    document: &Document,
+    font: &Dictionary,
+    steps: &mut usize,
+    programs: &mut Programs,
+) -> Option<Decoder> {
     let subtype = font.get(b"Subtype").ok()?.as_name().ok()?;
     // Whether its codes are two bytes, and whether they are the glyphs'
     // CIDs, which its widths are given by: a UCS-2 or UTF-16 CMap's are
@@ -493,7 +536,11 @@ fn decoder(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<
             *steps += content.len();
             ToUnicodeCMap::parse(&content)
         })
-        .filter(|cmap| usize::from(cmap.code_byte_length) == if two_byte { 2 } else { 1 });
+        .filter(|cmap| usize::from(cmap.code_byte_length) == if two_byte { 2 } else { 1 })
+        .map(Rc::new)
+        // A composite font with no ToUnicode map pdf-inspector reads by
+        // the map its program gives, where it collects the font.
+        .or_else(|| two_byte.then(|| programs.map(document, font)).flatten());
     let unnamed = if !two_byte {
         simple(document, font, cmap.is_some(), steps)
     } else if cmap.is_some() {
@@ -2030,6 +2077,72 @@ mod tests {
         let mut ucs2 = font(code_points);
         ucs2.set("Encoding", "UniJIS-UCS2-H");
         assert_eq!(read(&document, &ucs2, b"\x00I"), None);
+    }
+
+    #[test]
+    fn composite_fonts_read_by_their_programs_where_pdf_inspector_collects_them() {
+        use lopdf::dictionary;
+        let mut document = Document::with_version("1.7");
+        // A font under `Identity-H` with no ToUnicode map, whose program's
+        // map gives glyphs 1 to 95 the printable ASCII characters, in
+        // Adobe's Identity ordering.
+        let font = |document: &mut Document| {
+            let program = crate::cjk_fonts::tests::truetype(&[(0x20, 0x7E, 1)]);
+            let program = document.add_object(lopdf::Stream::new(dictionary! {}, program));
+            let descriptor = document.add_object(dictionary! {
+                "Type" => "FontDescriptor", "FontName" => "Serif", "FontFile2" => program,
+            });
+            let descendant = document.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "Serif",
+                "CIDSystemInfo" => dictionary! {
+                    "Registry" => Object::string_literal("Adobe"),
+                    "Ordering" => Object::string_literal("Identity"), "Supplement" => 0,
+                },
+                "FontDescriptor" => descriptor, "CIDToGIDMap" => "Identity",
+            });
+            document.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "Serif",
+                "Encoding" => "Identity-H", "DescendantFonts" => vec![descendant.into()],
+            })
+        };
+        // One named by the page, which pdf-inspector collects, and one only
+        // a form giving its resources by reference names, which it does not.
+        let shown = font(&mut document);
+        let formed = font(&mut document);
+        let resources =
+            document.add_object(dictionary! { "Font" => dictionary! { "F2" => formed } });
+        let form = document.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form", "Resources" => resources,
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            },
+            b"BT /F2 12 Tf <0035> Tj ET".to_vec(),
+        ));
+        let pages = document.new_object_id();
+        let page = document.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => shown },
+                "XObject" => dictionary! { "Fm1" => form },
+            },
+        });
+        document.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+            }),
+        );
+        let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        document.trailer.set("Root", catalog);
+        let mut fonts = GlyphFonts::default();
+        let shown = fonts
+            .font(&document, document.get_dictionary(shown).unwrap())
+            .expect("a font read by its program");
+        assert_eq!(fonts.text(shown, b"\x00\x35\x00\x50"), Some("To".into()));
+        assert_eq!(fonts.text(shown, b"\x00\x35\x01\x50"), None);
+        let formed = document.get_dictionary(formed).unwrap();
+        assert_eq!(fonts.font(&document, formed), None);
     }
 
     #[test]

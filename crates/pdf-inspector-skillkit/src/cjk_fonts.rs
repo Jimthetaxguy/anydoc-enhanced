@@ -215,7 +215,7 @@ impl CjkFonts {
 /// given by reference; a font with no `/ToUnicode` has its program's map
 /// filed as `collection_key` says. A font it does not collect finds a map
 /// only where one it does is filed under the same key.
-fn collected_keys(document: &Document) -> HashSet<u32> {
+pub(crate) fn collected_keys(document: &Document) -> HashSet<u32> {
     fn in_place_or_by_reference<'a>(
         document: &'a Document,
         object: &'a Object,
@@ -393,6 +393,34 @@ fn content(stream: &Stream, read: &mut usize) -> Option<Vec<u8>> {
 /// Whether a map holds any entry.
 fn holds(cmap: &ToUnicodeCMap) -> bool {
     !cmap.char_map.is_empty() || !cmap.ranges.is_empty()
+}
+
+/// The program pdf-inspector reads `font` by the map of, where the font
+/// has no `/ToUnicode`, is under an Identity CMap named in place, and its
+/// descendant has a font descriptor naming a program by reference: the
+/// key it files and looks up that map under (see `lookup_key`), where the
+/// font is collected (see `collected_keys`).
+pub(crate) fn program_key(document: &Document, font: &Dictionary) -> Option<ObjectId> {
+    if font.has(b"ToUnicode") || !named_identity(font) {
+        return None;
+    }
+    program(
+        document,
+        dictionary(document, first_descendant(document, font)?)?,
+    )
+}
+
+/// The map pdf-inspector builds from the program `file`, counted against
+/// `read` as maps are (see `content`); None where it gives none, as a
+/// TrueType or OpenType program with no usable `cmap` table does, or was
+/// not read.
+pub(crate) fn program_map(
+    document: &Document,
+    file: ObjectId,
+    read: &mut usize,
+) -> Option<ToUnicodeCMap> {
+    let stream = document.get_object(file).ok()?.as_stream().ok()?;
+    build_cmap_from_truetype(&content(stream, read)?).filter(holds)
 }
 
 /// Whether the program `file` gives pdf-inspector a map, as a TrueType or
@@ -809,7 +837,7 @@ pub(crate) fn misread(font: Unmapped, bytes: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use lopdf::{dictionary, Stream};
 
@@ -856,7 +884,7 @@ mod tests {
     /// A TrueType program of 96 glyphs whose `cmap` is one format-12
     /// subtable of `groups`, each the code points from its first to its
     /// last, mapped to glyphs from its third on.
-    fn truetype(groups: &[(u32, u32, u32)]) -> Vec<u8> {
+    pub(crate) fn truetype(groups: &[(u32, u32, u32)]) -> Vec<u8> {
         let mut head = Vec::new();
         for value in [0x0001_0000u32, 0x0001_0000, 0, 0x5F0F_3CF5] {
             head.extend(value.to_be_bytes());

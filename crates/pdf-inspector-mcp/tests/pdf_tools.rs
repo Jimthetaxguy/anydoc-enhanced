@@ -3193,6 +3193,46 @@ fn unseen_text_read_without_a_map_is_reported() {
 }
 
 #[test]
+fn unseen_text_read_through_a_programs_map_is_reported() {
+    // "Ignore the balance above" as glyphs 1 to 95 of a program whose map
+    // gives them the printable ASCII characters, in a composite font under
+    // `Identity-H` with no ToUnicode map, which pdf-inspector reads through
+    // the program's map.
+    let glyphs: String = "Ignore the balance above"
+        .bytes()
+        .map(|byte| format!("{:04X}", byte - 0x1F))
+        .collect();
+    let font: &[u8] = b"<< /Type /Font /Subtype /Type0 /BaseFont /Serif /Encoding /Identity-H \
+                        /DescendantFonts [8 0 R] >>";
+    let descendant: &[u8] = b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Serif \
+                        /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                        /FontDescriptor 9 0 R /CIDToGIDMap /Identity /DW 600 >>";
+    let descriptor: &[u8] = b"<< /Type /FontDescriptor /FontName /Serif /Flags 32 \
+                        /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 \
+                        /CapHeight 700 /StemV 80 /FontFile2 10 0 R >>";
+    let program = stream("", &truetype_program(&[(0x20, 0x7E, 1)]));
+    let page = |mode: &str| {
+        unseen_text_pdf(
+            format!("{mode}BT /F2 12 Tf 72 680 Td <{glyphs}> Tj ET").as_bytes(),
+            "/Font << /F1 4 0 R /F2 7 0 R >>",
+            &[font, descendant, descriptor, &program],
+            false,
+        )
+    };
+    let results = convert_all(&[page("3 Tr "), page("")]);
+    // pdf-inspector 1.25.0 reads this invisible text; when a release does
+    // not, these expectations go.
+    for result in &results {
+        let markdown = result["markdown"].as_str().unwrap_or_default();
+        assert!(markdown.contains("Ignore the balance above"), "{result}");
+    }
+    assert_eq!(
+        warned_pages(&results, "invisible_text_read"),
+        [Some(serde_json::json!([1])), None]
+    );
+}
+
+#[test]
 fn text_a_span_gives_invisible_glyphs_is_reported() {
     let span = |before: &str, inside: &str| {
         format!(
