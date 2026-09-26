@@ -528,7 +528,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     after which pdf-inspector reads no glyph, is reported as
     `visible_text_unread`; glyphs a span's text stands in for are no longer
     reported as visible text skipped, under `3 0 Tr`, nor as Japanese text
-    read without its map.
+    read without its map. A span whose text gives other digits than the
+    glyphs a reader sees in it show, as "$1000.00" given over glyphs
+    painting "$100.00", or a word given in place of a sentence holding a
+    fee, now carries the new `actual_text_differs` warning; and a span
+    giving text over no glyph and painting nothing, which pdf-inspector
+    writes though no reader sees it, is reported as invisible, where a span
+    over a drawn figure, whose text describes it, is not.
   - Text shown before any font is set, which a viewer does not paint and
     pdf-inspector reads byte by byte, is reported as invisible.
   - Render modes are read as pdfium reads them: an operand as a float cut
@@ -1366,8 +1372,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without the needs-rendering flag, or a static XFA form whose values are
   only in its datasets, is not; nor is a check box whose appearance state
   is off while its value is on, which pdf-inspector writes as its value
-  though viewers show the box empty, a marked-content span giving text to
-  no glyphs, which pdf-inspector writes though no reader sees it, choices
+  though viewers show the box empty, choices
   a parent field lists for its kids, or forms a field's appearance draws. A running header's text the Markdown shows
   elsewhere, as in a transfer line, counts as shown; a count after a page
   word no higher than the page's number reads as a page number begun
@@ -1389,9 +1394,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orders by where they end, is not reported, nor is text that short a
   marked-content span gives its glyphs (`/ActualText`), nor a run made only
   of marks the comparison sets aside, such as `*`, `#`, `_`, or `|`. A
-  span's text that says otherwise than the glyphs a reader sees in it, as
-  "$1000.00" given over glyphs painting "$100.00", or a word given in place
-  of a sentence, is not reported: pdf-inspector writes the span's text.
+  span's text that says otherwise than the glyphs a reader sees in it is
+  reported only where their digits differ: a word given in place of a
+  sentence holding no number is not.
   A page's unseen text past 64 KiB, or a
   document's past 4 MiB, is reported without being looked for where its
   middle stands on the page, and left out where it stands off it, where

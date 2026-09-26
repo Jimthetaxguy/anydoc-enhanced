@@ -87,6 +87,9 @@ pub const PDF_WARNING_VISIBLE_TEXT_UNREAD: &str = "visible_text_unread";
 /// Content pdf-inspector 1.25.0 reads nothing of, past a million operators
 /// or 64 MiB, where it shows text or may.
 pub const PDF_WARNING_DENSE_CONTENT_UNREAD: &str = "dense_content_unread";
+/// A marked-content span gives its glyphs text whose digits differ from
+/// those its glyphs show, and pdf-inspector 1.25.0 writes the span's.
+pub const PDF_WARNING_ACTUAL_TEXT_DIFFERS: &str = "actual_text_differs";
 
 /// Pages painting text twice whose text is read again to confirm the
 /// repeat in the Markdown.
@@ -476,6 +479,19 @@ impl PdfInfo {
                 PDF_WARNING_DENSE_CONTENT_UNREAD,
                 "On these pages text is missing from the Markdown: the page's content, or a form it draws, holds more than a million operators or 64 MiB, as a detailed chart or map may, and pdf-inspector 1.25.0 reads nothing of such content, the text it shows included; read these pages another way, such as by OCR.",
                 content_unread,
+            ));
+        }
+        let actual_text_differs: Vec<u32> = found
+            .actual_text_differs
+            .iter()
+            .copied()
+            .filter(|page| only.is_none_or(|only| only.contains(page)))
+            .collect();
+        if !actual_text_differs.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_ACTUAL_TEXT_DIFFERS,
+                "On these pages the Markdown holds the text a marked-content span gives in place of its glyphs (`/ActualText`), whose numbers differ from those the glyphs a reader sees show, as \"$1000.00\" given over glyphs painting \"$100.00\": pdf-inspector 1.25.0 writes the span's text; check these numbers against the page.",
+                actual_text_differs,
             ));
         }
         let painted_twice =

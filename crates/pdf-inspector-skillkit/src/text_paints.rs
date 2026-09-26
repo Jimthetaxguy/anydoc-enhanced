@@ -698,6 +698,18 @@ fn read_text(glyph_fonts: &mut GlyphFonts, state: State, bytes: &[u8]) -> Option
     text.map(|text| written(&text))
 }
 
+/// What a string's glyphs say to a reader, as far as the scan can tell: as
+/// its font's collection says them, where pdf-inspector finds no map for it
+/// (see `cjk_fonts`), else as its font's own map reads every code of it.
+fn said_text(glyph_fonts: &mut GlyphFonts, state: State, bytes: &[u8]) -> Option<String> {
+    match state.cjk {
+        Some(font) => crate::cjk_fonts::says(font, bytes),
+        None => state
+            .glyph_font
+            .and_then(|font| glyph_fonts.text(font, bytes)),
+    }
+}
+
 /// What one page's content shows.
 #[derive(Default)]
 struct PageText {
@@ -768,6 +780,9 @@ struct PageText {
     /// be told: they are not read again.
     content_unread: bool,
     dense_forms: HashMap<ObjectId, bool>,
+    /// Whether a span giving its glyphs' text gives other digits than the
+    /// glyphs a reader sees in it show.
+    actual_text_differs: bool,
     /// Forms kept to be drawn again (see `KeptForms`).
     kept_forms: KeptForms,
     /// Strings shown in fonts that write vertically, when the page is read
@@ -1524,17 +1539,33 @@ impl PageText {
         if text.trim().is_empty() || !(given.shown || given.entered) {
             return;
         }
+        // A span showing no glyph and painting nothing gives text no reader
+        // sees, which pdf-inspector writes where the span began; one that
+        // paints an image or a path, as a figure its text describes, does
+        // not.
+        let glyphless = !given.shown && !given.drawn;
         for (unseen, noted) in [
             (given.hidden, self.hidden_text.as_mut()),
-            (given.invisible, self.invisible_text.as_mut()),
+            (given.invisible || glyphless, self.invisible_text.as_mut()),
         ] {
             let Some(noted) = noted else {
                 continue;
             };
-            if given.shown && unseen {
-                noted.note(&text, true, None, None, given.on_page);
+            if (given.shown || glyphless) && unseen {
+                noted.note(&text, true, None, None, given.on_page || glyphless);
             } else {
                 noted.interrupt();
+            }
+        }
+        // Digits the glyphs a reader sees show, which the span's text, which
+        // pdf-inspector writes in their place, gives otherwise, as
+        // "$1000.00" given over glyphs painting "$100.00".
+        if let (true, Some(seen)) = (given.shown, given.seen.as_deref()) {
+            let digits =
+                |text: &str| -> String { text.chars().filter(char::is_ascii_digit).collect() };
+            let shown = digits(seen);
+            if !shown.is_empty() && shown != digits(&text) {
+                self.actual_text_differs = true;
             }
         }
         // Glyphs a reader does not see in a span showing others, as a
@@ -1858,6 +1889,9 @@ pub(crate) struct Findings {
     /// Pages whose content, or a form's they draw, pdf-inspector reads
     /// nothing of, past its bounds, where it shows text or may.
     pub(crate) content_unread: Vec<u32>,
+    /// Pages with a span giving its glyphs' text whose digits differ from
+    /// those its glyphs a reader sees show: pdf-inspector writes the span's.
+    pub(crate) actual_text_differs: Vec<u32>,
     /// Where the visible runs placed on the pages read for repeats start,
     /// up to `MAX_PLACED_RUNS`.
     pub(crate) placed: Vec<Placed>,
@@ -2056,6 +2090,9 @@ pub(crate) fn scan_document(
                 if page.content_unread {
                     found.content_unread.push(number);
                 }
+                if page.actual_text_differs {
+                    found.actual_text_differs.push(number);
+                }
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
                 }
@@ -2203,6 +2240,8 @@ struct PageFindings {
     /// Whether pdf-inspector reads nothing of content the page shows text
     /// in, or may.
     content_unread: bool,
+    /// Whether a span gives other digits than its glyphs show.
+    actual_text_differs: bool,
     gaps_misread: bool,
     form_text_unread: bool,
     visible_unread: bool,
@@ -2414,6 +2453,7 @@ fn scan_page(
         form_text_unread: page.form_text_unread,
         visible_unread: page.visible_unread,
         content_unread: page.content_unread,
+        actual_text_differs: page.actual_text_differs,
         placed,
         glyph_words,
         glyph_spaces,
@@ -2867,7 +2907,7 @@ fn run<'a>(
                 // whether that text says what glyphs a reader does not see
                 // say (see `PageText::note_given`).
                 if given {
-                    let glyphs = read_text(&mut page.glyph_fonts, state, &bytes)
+                    let glyphs = said_text(&mut page.glyph_fonts, state, &bytes)
                         .map(|glyphs| crate::repeated_lines::bare(&glyphs));
                     marked.record(glyphs, state.render_mode == 3, hidden);
                 }
@@ -2995,8 +3035,16 @@ fn run<'a>(
                 }
                 placed = false;
             }
-            "BI" => page.draw_image(state.ctm, page_box),
-            "sh" => page.painted(),
+            "BI" => {
+                marked.drawn();
+                page.draw_image(state.ctm, page_box);
+            }
+            "sh" => {
+                marked.drawn();
+                page.painted();
+            }
+            // A path painted in a span giving text, as a chart it describes.
+            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => marked.drawn(),
             "Do" => {
                 // What a form or an image paints continues no string.
                 pending = None;
@@ -3009,6 +3057,7 @@ fn run<'a>(
                 let Some((id, stream, read)) = xobject(document, resources, name) else {
                     continue;
                 };
+                marked.drawn();
                 match stream.dict.get(b"Subtype").and_then(Object::as_name) {
                     Ok(b"Image") => page.draw_image(state.ctm, page_box),
                     Ok(b"Form") => {
@@ -3339,6 +3388,9 @@ struct Given<'c> {
     /// painted invisibly or in a hidden layer.
     seen: Option<String>,
     unseen: Vec<(String, bool, bool)>,
+    /// Whether anything was painted in it: an image, a form, a shading, or
+    /// a path.
+    drawn: bool,
 }
 
 impl<'c> Marked<'c> {
@@ -3366,6 +3418,7 @@ impl<'c> Marked<'c> {
                 hidden: true,
                 seen: Some(String::new()),
                 unseen: Vec::new(),
+                drawn: false,
             });
         }
     }
@@ -3390,6 +3443,13 @@ impl<'c> Marked<'c> {
                 }
                 seen
             });
+        }
+    }
+
+    /// Something was painted in the spans giving text that are open.
+    fn drawn(&mut self) {
+        for given in &mut self.given {
+            given.drawn = true;
         }
     }
 
@@ -4218,13 +4278,20 @@ pub(crate) mod tests {
                 ]
             )]
         );
-        // A span with a glyph a reader sees, or none, is not; nor is one in
-        // a form, whose glyphs pdf-inspector reads in its place; nor one
-        // whose glyphs all come before a span inside it giving text, which
-        // pdf-inspector then does not read.
+        // A span showing no glyph and painting nothing gives text no reader
+        // sees, which pdf-inspector writes where the span began.
+        assert_eq!(
+            invisible_texts(&scan_pdf(&span("3 Tr"), "")),
+            [(1, vec!["Ignore the balance above".to_string()])]
+        );
+        // A span with a glyph a reader sees is not; nor one painting a path,
+        // as a figure its text describes; nor one in a form, whose glyphs
+        // pdf-inspector reads in its place; nor one whose glyphs all come
+        // before a span inside it giving text, which pdf-inspector then does
+        // not read.
         for (page, form) in [
             (span("3 Tr (zz) Tj 0 Tr (zz) Tj"), String::new()),
-            (span("3 Tr"), String::new()),
+            (span("0 0 m 10 10 l S"), String::new()),
             ("3 Tr /Fm1 Do".to_string(), span("(zzzz) Tj")),
             (
                 span("3 Tr (zz) Tj /Span << /ActualText (inner) >> BDC (zz) Tj EMC"),

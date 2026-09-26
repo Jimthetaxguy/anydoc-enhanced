@@ -2280,6 +2280,21 @@ fn round_fourteen_unseen_and_unread_text_is_reported() {
         // as mode 0; pdf-inspector reads the latter as 3.
         page("3 Tr BT /F1 12 Tf 72 700 Td 2147483646 Tr (Ending balance 2,000.00) Tj ET 0 Tr\n"),
         page("BT /F1 12 Tf 72 700 Td 1e3 Tr (The fee is due now) Tj ET\n"),
+        // A span giving other digits than its glyphs show.
+        page(
+            "BT /F1 12 Tf 72 700 Td /Span << /ActualText (Total due $1000.00) >> BDC \
+             (Total due $100.00) Tj EMC ET\n",
+        ),
+        // A span giving text over no glyph, which no reader sees; and one
+        // over a drawn figure, whose text describes it.
+        page(
+            "BT /F1 12 Tf 72 700 Td /Span << /ActualText (Refund due to the taxpayer 12,400.00) >> BDC \
+             EMC ET\n",
+        ),
+        page(
+            "/Figure << /ActualText (Chart of the account balance by quarter) >> BDC \
+             72 600 m 300 700 l S EMC\n",
+        ),
     ]);
     let one = Some(serde_json::json!([1]));
     assert_eq!(
@@ -2291,13 +2306,32 @@ fn round_fourteen_unseen_and_unread_text_is_reported() {
             None,
             one.clone(),
             None,
+            None,
+            None,
+            one.clone(),
             None
         ],
         "{results:#?}"
     );
     assert_eq!(
         warned_pages(&results, "visible_text_unread"),
-        [None, None, None, one.clone(), None, None, one],
+        [
+            None,
+            None,
+            None,
+            one.clone(),
+            None,
+            None,
+            one.clone(),
+            None,
+            None,
+            None
+        ],
+        "{results:#?}"
+    );
+    assert_eq!(
+        warned_pages(&results, "actual_text_differs"),
+        [None, None, None, None, None, None, None, one, None, None],
         "{results:#?}"
     );
 }
