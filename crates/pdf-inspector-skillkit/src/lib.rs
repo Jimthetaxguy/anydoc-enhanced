@@ -19,7 +19,7 @@ pub use pdf_inspector::{
 /// Provider records on the wire read this constant; the
 /// `provider_versions_match_lockfile` test fails if a dependency bump leaves
 /// it behind.
-pub const PDF_INSPECTOR_VERSION: &str = "1.24.0";
+pub const PDF_INSPECTOR_VERSION: &str = "1.25.0";
 
 /// Exact Firecrawl AnyDoc release resolved in `Cargo.lock`.
 pub const ANYDOC_VERSION: &str = "0.2.4";
@@ -73,13 +73,13 @@ pub struct PdfWarning {
 
 /// Text a page paints twice over itself, which pdf-inspector repeats.
 pub const PDF_WARNING_TEXT_PAINTED_TWICE: &str = "text_painted_twice";
-/// Pages with gaps between glyphs that pdf-inspector 1.24.0 judges against
+/// Pages with gaps between glyphs that pdf-inspector 1.25.0 judges against
 /// the wrong space width (open upstream #532).
 pub const PDF_WARNING_WORD_GAPS_MISREAD: &str = "word_gaps_misread";
-/// Pages showing text through a form that pdf-inspector 1.24.0 does not
+/// Pages showing text through a form that pdf-inspector 1.25.0 does not
 /// reach or reads without its font (open upstream #312).
 pub const PDF_WARNING_FORM_TEXT_UNREAD: &str = "form_text_unread";
-/// Text a viewer paints that pdf-inspector 1.24.0 skips, taking its render
+/// Text a viewer paints that pdf-inspector 1.25.0 skips, taking its render
 /// mode for invisible from the first operand of `Tr` where a viewer takes
 /// another from the last.
 pub const PDF_WARNING_VISIBLE_TEXT_UNREAD: &str = "visible_text_unread";
@@ -435,14 +435,14 @@ impl PdfInfo {
         if !gaps_misread.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_WORD_GAPS_MISREAD,
-                "On these pages pdf-inspector 1.24.0 misjudges word gaps, so some words or amounts run together or split apart: against the wrong space width, as in \"CBDOffice\" or \"8 5,000 .00\", or at the advances of text a browser printed glyph by glyph, as in \"LIAB ILITIES\"; check amounts against the PDF.",
+                "On these pages pdf-inspector 1.25.0 misjudges word gaps, so some words or amounts run together or split apart: against the wrong space width, as in \"CBDOffice\" or \"8 5,000 .00\", or at the advances of text a browser printed glyph by glyph, as in \"LIAB ILITIES\"; check amounts against the PDF.",
                 gaps_misread,
             ));
         }
         if !found.forms_unread.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_FORM_TEXT_UNREAD,
-                "On these pages pdf-inspector 1.24.0 misses or garbles text drawn through a form: a form drawn by a form without resources of its own is not read, and text a form shows in a font it does not set itself is read byte by byte; read these pages another way.",
+                "On these pages pdf-inspector 1.25.0 misses or garbles text drawn through a form: a form drawn by a form without resources of its own is not read, and text a form shows in a font it does not set itself is read byte by byte; read these pages another way.",
                 found.forms_unread.clone(),
             ));
         }
@@ -455,7 +455,7 @@ impl PdfInfo {
         if !visible_unread.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_VISIBLE_TEXT_UNREAD,
-                "On these pages text a viewer shows is missing from the Markdown: the page sets its render mode with more than one number, or with one that is none, and pdf-inspector 1.24.0 takes the first for invisible where a viewer paints the text by the last, so \"The fee is not refundable\" reads \"The fee is refundable\"; read these pages another way, such as by OCR.",
+                "On these pages text a viewer shows is missing from the Markdown: the page sets its render mode with more than one number, or with one that is none, and pdf-inspector 1.25.0 takes the first for invisible where a viewer paints the text by the last, so \"The fee is not refundable\" reads \"The fee is refundable\"; read these pages another way, such as by OCR.",
                 visible_unread,
             ));
         }
@@ -718,13 +718,13 @@ impl PdfInfo {
                 };
                 self.warnings.push(PdfWarning::new(
                     PDF_WARNING_HEADER_FOOTER_UNCHECKED,
-                    &format!("pdf-inspector 1.24.0 drops lines it takes for running headers or footers, and may drop with them a line that says what the one it keeps does not, as with a second account's number heading its pages; the check for such lines {read}. Read the top and bottom of the pages not checked with extract_text_regions."),
+                    &format!("pdf-inspector 1.25.0 drops lines it takes for running headers or footers, and may drop with them a line that says what the one it keeps does not, as with a second account's number heading its pages; the check for such lines {read}. Read the top and bottom of the pages not checked with extract_text_regions."),
                     Vec::new(),
                 ));
             }
             return;
         }
-        let mut message = "On these pages pdf-inspector 1.24.0 drops a line it takes for a running header or footer, though the line says what the one it keeps on an earlier page does not, as with a second account's number or another person's name heading its pages; read the top and bottom of these pages with extract_text_regions.".to_string();
+        let mut message = "On these pages pdf-inspector 1.25.0 drops a line it takes for a running header or footer, though the line says what the one it keeps on an earlier page does not, as with a second account's number or another person's name heading its pages; read the top and bottom of these pages with extract_text_regions.".to_string();
         if let Some(last) = [read_to, lost.read_to].into_iter().flatten().min() {
             message.push_str(&format!(
                 " Pages after page {last} were not checked; read theirs the same way."
@@ -819,7 +819,7 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_INVISIBLE_TEXT_READ,
-                "On these pages the Markdown holds text the page paints invisibly (text render mode 3), which no viewer shows: pdf-inspector 1.24.0 takes each text object to start visible, though the mode goes on from one to the next and from outside them (upstream #572); such text is not what a reader sees, and may say what the page does not.",
+                "On these pages the Markdown holds text the page paints invisibly (text render mode 3), which no viewer shows: pdf-inspector 1.25.0 takes each text object to start visible, though the mode goes on from one to the next and from outside them (upstream #572); such text is not what a reader sees, and may say what the page does not.",
                 pages,
             ));
         }
@@ -916,7 +916,7 @@ impl PdfInfo {
         self.has_encoding_issues = true;
         self.warnings.push(PdfWarning::new(
             PDF_WARNING_CJK_TEXT_MISREAD,
-            "On these pages text set in a Japanese, Chinese, or Korean font that carries no map of its characters reads as other characters, and its digits and punctuation may drop out, with no sign: pdf-inspector 1.24.0 finds no map for such a font where it cannot parse the Adobe Japan1, GB1, or CNS1 map or looks for none (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
+            "On these pages text set in a Japanese, Chinese, or Korean font that carries no map of its characters reads as other characters, and its digits and punctuation may drop out, with no sign: pdf-inspector 1.25.0 finds no map for such a font where it cannot parse the Adobe Japan1, GB1, or CNS1 map or looks for none (upstream #573), so \"Total 52,000\" reads as \"5PUBM\"; read these pages another way, such as by OCR.",
             reported,
         ));
     }
@@ -998,7 +998,7 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_VERTICAL_TEXT_MISREAD,
-                "On these pages text set in vertical writing reads row by row across its columns, with its columns out of order, or run through by the lines of horizontal text beside it: pdf-inspector 1.24.0 lays vertical text out as if it were horizontal (upstream #575), so a Japanese or Chinese passage set in columns reads scrambled; read these pages another way, such as by OCR.",
+                "On these pages text set in vertical writing reads row by row across its columns, with its columns out of order, or run through by the lines of horizontal text beside it: pdf-inspector 1.25.0 lays vertical text out as if it were horizontal (upstream #575), so a Japanese or Chinese passage set in columns reads scrambled; read these pages another way, such as by OCR.",
                 pages,
             ));
         }
@@ -1015,7 +1015,7 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_HIDDEN_LAYER_TEXT_READ,
-                "On these pages the Markdown holds text set in a layer a reader hides by default, such as a superseded figure or a draft note beside the one shown: pdf-inspector 1.24.0 reads every layer as shown; read these pages another way to see what a reader shows.",
+                "On these pages the Markdown holds text set in a layer a reader hides by default, such as a superseded figure or a draft note beside the one shown: pdf-inspector 1.25.0 reads every layer as shown; read these pages another way to see what a reader shows.",
                 pages,
             ));
         }
@@ -1034,7 +1034,7 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_ANNOTATION_TEXT_UNREAD,
-                "On these pages text shown in an annotation, such as a text box typed onto the page or a stamp drawn in text, is not in the Markdown: pdf-inspector 1.24.0 reads a page's content, links, and form values only; read these pages another way.",
+                "On these pages text shown in an annotation, such as a text box typed onto the page or a stamp drawn in text, is not in the Markdown: pdf-inspector 1.25.0 reads a page's content, links, and form values only; read these pages another way.",
                 pages,
             ));
         }
@@ -1055,7 +1055,7 @@ impl PdfInfo {
         if !pages.is_empty() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_FORM_VALUES_MISREAD,
-                "On these pages pdf-inspector 1.24.0 garbles or leaves out values filled into the form: it reads accented or UTF-16 names and values byte by byte, as in \"S\u{FFFD}o Paulo\", and writes a value only where the field's own widget holds it as text, so the choice of a group of radio buttons, and a value inherited, given by reference, or kept as a stream or rich text, are left out; read the form's values another way.",
+                "On these pages pdf-inspector 1.25.0 garbles or leaves out values filled into the form: it reads accented or UTF-16 names and values byte by byte, as in \"S\u{FFFD}o Paulo\", and writes a value only where the field's own widget holds it as text, so the choice of a group of radio buttons, and a value inherited, given by reference, or kept as a stream or rich text, are left out; read the form's values another way.",
                 pages,
             ));
         }
@@ -1143,7 +1143,7 @@ impl PdfInfo {
             if !pages.is_empty() {
                 self.warnings.push(PdfWarning::new(
                     PDF_WARNING_PAGES_UNCHECKED,
-                    "The checks of what a page paints stopped before these pages, as the document's content ran past the bounds they read within: text painted twice or invisibly, word gaps, and Japanese or Chinese text pdf-inspector 1.24.0 misreads are not reported on them; read them another way where they matter.",
+                    "The checks of what a page paints stopped before these pages, as the document's content ran past the bounds they read within: text painted twice or invisibly, word gaps, and Japanese or Chinese text pdf-inspector 1.25.0 misreads are not reported on them; read them another way where they matter.",
                     pages,
                 ));
             }
@@ -1151,7 +1151,7 @@ impl PdfInfo {
         if found.xfa_dynamic && self.shows_only_a_notice() {
             self.warnings.push(PdfWarning::new(
                 PDF_WARNING_XFA_FORM_UNREAD,
-                "This is a dynamic XFA form: its content and filled values are kept in XFA, which a viewer lays out and pdf-inspector 1.24.0 does not read, so the Markdown shows only what its pages hold without XFA, such as a \"Please wait...\" notice; read the form another way.",
+                "This is a dynamic XFA form: its content and filled values are kept in XFA, which a viewer lays out and pdf-inspector 1.25.0 does not read, so the Markdown shows only what its pages hold without XFA, such as a \"Please wait...\" notice; read the form another way.",
                 Vec::new(),
             ));
         }
@@ -1160,9 +1160,9 @@ impl PdfInfo {
             (files, portfolio) => self.warnings.push(PdfWarning::new(
                 PDF_WARNING_EMBEDDED_FILES_UNREAD,
                 &if portfolio {
-                    format!("This PDF is a portfolio of {files} embedded files, such as a year's tax forms bundled behind a cover page; pdf-inspector 1.24.0 reads only the cover's pages, not the files, so convert each file separately.")
+                    format!("This PDF is a portfolio of {files} embedded files, such as a year's tax forms bundled behind a cover page; pdf-inspector 1.25.0 reads only the cover's pages, not the files, so convert each file separately.")
                 } else {
-                    format!("This PDF carries {files} embedded files as attachments, which pdf-inspector 1.24.0 does not read; convert them separately.")
+                    format!("This PDF carries {files} embedded files as attachments, which pdf-inspector 1.25.0 does not read; convert them separately.")
                 },
                 Vec::new(),
             )),

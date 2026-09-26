@@ -1,4 +1,4 @@
-//! Tables pdf-inspector 1.24.0 may have misread, found in its Markdown.
+//! Tables pdf-inspector 1.25.0 may have misread, found in its Markdown.
 //!
 //! **A first row repeated above its table.** The heuristic table detector
 //! leaves out of a table's region any item within a flat 15 points of a row

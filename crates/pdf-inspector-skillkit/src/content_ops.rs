@@ -2,12 +2,12 @@
 //!
 //! lopdf's decoder holds every operation of a stream at once, so a stream of
 //! a few million operators, a few kilobytes compressed, takes hundreds of
-//! megabytes to decode. pdf-inspector 1.24.0 counts a page's or a form's
+//! megabytes to decode. pdf-inspector 1.25.0 counts a page's or a form's
 //! operators first and reads nothing of one holding more than a million;
 //! the scan counts them the same way before it decodes a stream, to pass
 //! over what pdf-inspector passes over and to charge its work limits first.
 
-/// Operators pdf-inspector 1.24.0 reads in one page's or form's content at
+/// Operators pdf-inspector 1.25.0 reads in one page's or form's content at
 /// most: it reads nothing of a content stream holding more.
 pub(crate) const MAX_READ_OPERATORS: usize = 1_000_000;
 

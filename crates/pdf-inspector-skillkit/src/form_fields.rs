@@ -1,4 +1,4 @@
-//! Form field values pdf-inspector 1.24.0 misreads or never reads.
+//! Form field values pdf-inspector 1.25.0 misreads or never reads.
 //!
 //! pdf-inspector writes each filled form field into the Markdown as its name
 //! and value, "payee_name: José García", from the form's field tree. It

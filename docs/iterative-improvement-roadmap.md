@@ -1,7 +1,7 @@
 # Iterative document-capability roadmap
 
 **Baseline:** `agent/codex-align-firecrawl-20260828`
-**Upstream:** Firecrawl `pdf-inspector 1.24.0` and AnyDoc `0.2.4`
+**Upstream:** Firecrawl `pdf-inspector 1.25.0` and AnyDoc `0.2.4`
 **Status:** Stages 1-9, including the DOCX happy-path slice, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict CSV, strict ODP, and strict EPUB slices, are implemented; the 2026-09-24 upstream refresh is complete; HTML/MHTML, RTF, and OCR remain gated.
 
 ## Objective
@@ -16,7 +16,7 @@ available through MCP.
 
 | Stage | Capability | Primary use cases | Upstream basis | Gate |
 |---|---|---|---|---|
-| 0 | PDF alignment | Preserve existing PDF classification, extraction, tax, IRC, and SEC workflows while tracking Firecrawl improvements | `pdf-inspector 1.24.0` | Complete on this branch; rerun locked verification before merge |
+| 0 | PDF alignment | Preserve existing PDF classification, extraction, tax, IRC, and SEC workflows while tracking Firecrawl improvements | `pdf-inspector 1.25.0` | Complete on this branch; rerun locked verification before merge |
 | 1 | Contract and worker skeleton | One stable interface for multiple parsers; bounded conversion of untrusted bytes | AnyDoc `to_markdown_bytes`, `ConvertError`, local PDF facade | Implemented with versioned worker IPC, caps, sanitizer, process-group cleanup, and typed errors; full hostile-input promotion remains gated |
 | 2 | DOCX | Tax workpapers, client correspondence, engagement letters, operating procedures, research documents | AnyDoc DOC/DOCX parser and shared Markdown renderer | Exact main-part XML preflight plus public happy/adversarial fixtures; broader completeness oracle and platform sandbox evidence remain |
 | 3 | PPTX | Sales/procurement decks, process walkthroughs, post-mortems, training material | AnyDoc PPT/PPTX parser, notes and slide model | Exact `.pptx` only; declared-slide completeness, visible/active/external-content policy, stable output and resource budgets implemented; broader adversarial/platform gates remain |
@@ -299,6 +299,7 @@ came back clean. The evidence and dispositions are in
 | Review 11 | Bypass, false-positive, and cost review of the round-ten fixes and loops 22-25, against pdf-inspector with its header rule read in full | Running headers: lines made as pdf-inspector makes them, glyph-drawn headers and form values read, table rows set aside, and the gate weighed once per place under a budget (a 25 s timeout now 11.9 s); a read cut short by the call's time is disclosed as `header_footer_unchecked`; closing dates, loan and check numbers no longer taken for page numbers; bilingual XFA notices reported; a 1,000-layer membership dictionary in 100,000 spans judged once (a timeout now about 1 s) and layers set from their usage on opening; hidden and invisible text read past ASCII, without a font or a map, and through `/ActualText`; hidden-layer widget values, fields past pdf-inspector's walk bound, export-value choices, and appearance-only values reported; annotation bound, stamp verdicts, inline images, and invisible stamp text read as viewers do |
 | Review 12 | Bypass, false-positive, and cost review of loops 26-28 and the glyph-by-glyph join, against pdfium's rendering | Two memory failures on crafted files removed (32 MB of invisible text, vertical columns off the page); a word or digit slipped invisibly into a line looked for with its line, glyphs read in their line's order, and render modes read as each side reads `Tr`; pages the scan never reached disclosed as `pages_unchecked`, and scans set inline listed for OCR; CJK fonts judged as pdf-inspector looks for a map, Korean included, with the Unicode passthrough and UCS-2 misreadings reported and pages confirmed by the misreading itself; short and lone vertical columns reported, ruby and cell labels not |
 | Review 13 | Bypass, false-positive, and cost review of the round-twelve fixes, against pdfium's rendering | Short invisible insertions looked for as pdf-inspector orders lines (stream order, turned pages, runs drawn last), across unreadable runs, alone on their line, and past Markdown decoration; CJK fonts pdf-inspector never collects or looks up reported, programs read once each to 64 MiB, and fonts past that reported on the Markdown's evidence; wide-leading vertical passages reported and table labels read as cells; a 2-million-operator page no longer aborts the conversion (775 MB to 34 MB); visible text pdf-inspector skips under `3 0 Tr` reported as `visible_text_unread`; invisible spaces take no room; tate-chu-yoko digits read in their column; text-free letterhead forms read once (275 unchecked pages to none) |
+| 29 | `pdf-inspector` 1.24.0 to 1.25.0, whose one library change stops underline detection going quadratic on pages drawn from thin rectangles (#592) | A crafted page of 200,000 thin rectangles from the 25 s deadline to 0.7 s; the Markdown and every warning unchanged on 4,412 PDFs |
 
 ## Next slices
 

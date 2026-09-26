@@ -1,5 +1,5 @@
 //! Composite fonts of Adobe's Japanese, Chinese, and Korean collections
-//! whose text pdf-inspector 1.24.0 reads with no map (upstream issue #573).
+//! whose text pdf-inspector 1.25.0 reads with no map (upstream issue #573).
 //!
 //! A composite font with no `/ToUnicode` map, under `Identity-H` or
 //! `Identity-V`, is read by the map of its embedded TrueType or OpenType
@@ -42,7 +42,7 @@ const MAX_STREAM_BYTES: usize = 64 << 20;
 /// Distinct CIDs of a font's widths pdf-inspector reads, at most.
 const MAX_WIDTH_CIDS: usize = 65_536;
 
-/// A font pdf-inspector 1.24.0 reads with no map.
+/// A font pdf-inspector 1.25.0 reads with no map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Unmapped {
     /// Whether it takes the codes for Unicode, and reads each one as the
@@ -372,7 +372,7 @@ pub(crate) fn ucs2_cmap(encoding: &[u8]) -> bool {
         && (encoding.ends_with(b"-H") || encoding.ends_with(b"-V"))
 }
 
-/// How pdf-inspector 1.24.0 reads `font`, when it is a composite font of
+/// How pdf-inspector 1.25.0 reads `font`, when it is a composite font of
 /// Adobe's Japanese, Chinese, or Korean collections that it finds no map
 /// for, as it looks for one: a `/ToUnicode` stream it parses; one it cannot
 /// parse, under an Identity CMap, the descendant's program or the Korean

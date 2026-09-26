@@ -1,4 +1,4 @@
-//! Layers a reader hides, whose text pdf-inspector 1.24.0 reads anyway.
+//! Layers a reader hides, whose text pdf-inspector 1.25.0 reads anyway.
 //!
 //! A PDF can set content in optional layers and hide some of them by
 //! default: a superseded figure kept beside the current one, a draft stamp,

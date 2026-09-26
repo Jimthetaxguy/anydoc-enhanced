@@ -8,7 +8,7 @@
 //! width does not place, so a line is a run of strings of one glyph or a
 //! few, each placed anew, and a space often opens the string of the glyph
 //! after it. A hinted glyph runs up to a fifth of an em past its declared
-//! width, over pdf-inspector 1.24.0's word-gap thresholds, so the Markdown
+//! width, over pdf-inspector 1.25.0's word-gap thresholds, so the Markdown
 //! splits words and amounts where two strings meet: "LIAB ILITIES", "83,
 //! 476. 03". The painted spaces say where the words end: the scan places
 //! each glyph by the font's widths and collects each word that a font
@@ -19,7 +19,7 @@
 //! pdf-inspector places their text, and reported when their own text splits
 //! it, a page for each split the Markdown shows.
 //!
-//! Glyphs are read as pdf-inspector 1.24.0 reads them: by the font's
+//! Glyphs are read as pdf-inspector 1.25.0 reads them: by the font's
 //! ToUnicode map, then the names its differences give, then, for a simple
 //! font, by its encoding (see `Simple`); a composite font without a map, by
 //! the code points its codes are where pdf-inspector reads them so. Words
@@ -59,7 +59,7 @@ const MAX_GLYPH_GAP_EM: f64 = 0.5;
 /// word may sit.
 const MAX_BASELINE_SHIFT_EM: f64 = 0.2;
 /// The least step past a glyph's advance, in em, where two strings meet,
-/// at which pdf-inspector 1.24.0 may read a word space: under its least
+/// at which pdf-inspector 1.25.0 may read a word space: under its least
 /// threshold, 0.08 em, and the floor it takes from a tracked run's gaps.
 const MIN_WORD_GAP_EM: f64 = 0.04;
 /// Words collected on a page, and bytes in one word.
@@ -814,7 +814,7 @@ fn width(document: &Document, value: &Object) -> Option<f64> {
 }
 
 /// A simple font's widths, from its `/FirstChar` and `/Widths`, scaled by
-/// its `/FontMatrix`, as pdf-inspector 1.24.0 reads them.
+/// its `/FontMatrix`, as pdf-inspector 1.25.0 reads them.
 fn simple_widths(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Widths> {
     let first = code_bound(document, font.get(b"FirstChar").ok()?)?;
     let last = code_bound(document, font.get(b"LastChar").ok()?)?;
@@ -844,7 +844,7 @@ fn simple_widths(document: &Document, font: &Dictionary, steps: &mut usize) -> O
 }
 
 /// A composite font's widths, from its descendant's `/W` and `/DW`, as
-/// pdf-inspector 1.24.0 reads them.
+/// pdf-inspector 1.25.0 reads them.
 fn composite_widths(document: &Document, font: &Dictionary, steps: &mut usize) -> Option<Widths> {
     let descendant = match resolved_array(document, font.get(b"DescendantFonts").ok()?)?.first()? {
         Object::Reference(id) => document.get_dictionary(*id).ok()?,

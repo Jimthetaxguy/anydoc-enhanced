@@ -1,6 +1,6 @@
 //! PDF tools executed in the private worker process.
 //!
-//! pdf-inspector 1.24.0 bounds object streams at load and page content during
+//! pdf-inspector 1.25.0 bounds object streams at load and page content during
 //! extraction, but other streams (the detector's page scan, fonts, CMaps,
 //! form XObjects) still inflate without a limit: a 1 MB page-content Flate
 //! bomb peaks near 2.1 GiB when parsed inside the MCP server. Running the PDF

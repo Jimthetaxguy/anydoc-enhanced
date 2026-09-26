@@ -1,4 +1,4 @@
-//! Text set in vertical writing, which pdf-inspector 1.24.0 lays out as if
+//! Text set in vertical writing, which pdf-inspector 1.25.0 lays out as if
 //! it were horizontal (upstream issue #575).
 //!
 //! A font under a CMap for vertical writing (`Identity-V`, `UniJIS-UCS2-V`,

@@ -43,15 +43,15 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters as a reader and as AnyDoc see them |
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content as AnyDoc's walkers read it |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats as AnyDoc renders them |
-| `crates/pdf-inspector-skillkit/src/text_paints.rs` | PDF pages whose invisible OCR layer pdf-inspector 1.24.0 skips, and text they paint twice |
-| `crates/pdf-inspector-skillkit/src/content_ops.rs` | Operators a PDF content stream holds, counted without decoding it, as pdf-inspector 1.24.0 counts them before reading a stream |
-| `crates/pdf-inspector-skillkit/src/annotations.rs` | Text PDF annotations show that pdf-inspector 1.24.0 never reads |
-| `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form values pdf-inspector 1.24.0 garbles or leaves out |
-| `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.24.0 drops as running headers that differ from the one it keeps, and the page scan's gate on reading pages again for them |
-| `crates/pdf-inspector-skillkit/src/optional_content.rs` | PDF layers a reader hides by default, whose text pdf-inspector 1.24.0 reads anyway |
-| `crates/pdf-inspector-skillkit/src/cjk_fonts.rs` | PDF Japanese, Chinese, and Korean fonts pdf-inspector 1.24.0 finds no map for, and what it reads their text as (upstream #573) |
-| `crates/pdf-inspector-skillkit/src/vertical_text.rs` | PDF text in vertical writing, gathered into columns, whose neighbours pdf-inspector 1.24.0 reads row by row or out of order (upstream #575) |
-| `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF table rows pdf-inspector 1.24.0 repeats, amounts it merges, and amounts it pushes out of their rows |
+| `crates/pdf-inspector-skillkit/src/text_paints.rs` | PDF pages whose invisible OCR layer pdf-inspector 1.25.0 skips, and text they paint twice |
+| `crates/pdf-inspector-skillkit/src/content_ops.rs` | Operators a PDF content stream holds, counted without decoding it, as pdf-inspector 1.25.0 counts them before reading a stream |
+| `crates/pdf-inspector-skillkit/src/annotations.rs` | Text PDF annotations show that pdf-inspector 1.25.0 never reads |
+| `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form values pdf-inspector 1.25.0 garbles or leaves out |
+| `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.25.0 drops as running headers that differ from the one it keeps, and the page scan's gate on reading pages again for them |
+| `crates/pdf-inspector-skillkit/src/optional_content.rs` | PDF layers a reader hides by default, whose text pdf-inspector 1.25.0 reads anyway |
+| `crates/pdf-inspector-skillkit/src/cjk_fonts.rs` | PDF Japanese, Chinese, and Korean fonts pdf-inspector 1.25.0 finds no map for, and what it reads their text as (upstream #573) |
+| `crates/pdf-inspector-skillkit/src/vertical_text.rs` | PDF text in vertical writing, gathered into columns, whose neighbours pdf-inspector 1.25.0 reads row by row or out of order (upstream #575) |
+| `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF table rows pdf-inspector 1.25.0 repeats, amounts it merges, and amounts it pushes out of their rows |
 | `crates/pdf-inspector-mcp/` | MCP server binary, worker mode, and tool registration |
 | `docs/` | Handoff, Sweet demo notes |
 | `docs/anydoc-integration-plan.md` | Dependency-ordered AnyDoc architecture and acceptance gates |
@@ -60,7 +60,7 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 
 ## Real systems
 
-- PDF parsing via released `pdf-inspector 1.24.0` (Firecrawl) + `lopdf 0.45.0` — **offline**, no cloud OCR default
+- PDF parsing via released `pdf-inspector 1.25.0` (Firecrawl) + `lopdf 0.45.0` — **offline**, no cloud OCR default
 - MCP over stdio for Claude/Codex/Cursor/etc.
 - Demo Sweet packages are **synthetic structured examples**, not live client filings
 - AnyDoc `0.2.4` is resolved and used by the bounded DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB worker; strict CSV is a local bounded adapter selected after reviewing AnyDoc `0.2.4` behavior; PDF remains on the dedicated PDF facade

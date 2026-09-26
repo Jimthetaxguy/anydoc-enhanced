@@ -202,7 +202,7 @@ fn rotated_page_pdf() -> Vec<u8> {
 
 /// A scanned page made searchable: a page-sized image, an invisible text
 /// layer in a form as ocrmypdf writes it, and a visible header and Bates
-/// number stamped on top. pdf-inspector 1.24.0 alone reads it as a text page
+/// number stamped on top. pdf-inspector 1.25.0 alone reads it as a text page
 /// holding only the stamps, with no page for OCR: the header is too long
 /// for its sparse-text check.
 fn stamped_scan_pdf() -> Vec<u8> {
@@ -367,7 +367,7 @@ fn text_the_markdown_repeats_is_reported() {
     );
     // Classification reads no text, so it reports nothing of it.
     assert!(results[1].get("warnings").is_none(), "{}", results[1]);
-    // pdf-inspector 1.24.0 leaves a rate table's first row in the paragraph
+    // pdf-inspector 1.25.0 leaves a rate table's first row in the paragraph
     // above it in the public Title 26 sample (#406); when a release fixes
     // that, this expectation goes.
     let warnings = results[2]["warnings"].as_array().expect("warnings");
@@ -446,7 +446,7 @@ fn word_gaps_judged_against_the_wrong_space_are_reported() {
         "{}",
         results[0]
     );
-    // pdf-inspector 1.24.0 splits the kerned price; when a release fixes
+    // pdf-inspector 1.25.0 splits the kerned price; when a release fixes
     // #532, this expectation goes.
     assert!(
         results[0]["markdown"]
@@ -617,7 +617,7 @@ fn words_split_at_hinted_glyph_advances_are_reported() {
         })
     };
     assert!(reported(&results[0]), "{}", results[0]);
-    // pdf-inspector 1.24.0 splits a word at a hinted advance narrower than
+    // pdf-inspector 1.25.0 splits a word at a hinted advance narrower than
     // the glyph; when a release fixes #531, this expectation goes.
     assert!(
         results[0]["markdown"]
@@ -759,7 +759,7 @@ fn text_drawn_through_forms_pdf_inspector_misses_is_reported() {
         })
     };
     assert!(reported(&results[0]), "{}", results[0]);
-    // pdf-inspector 1.24.0 does not read the form the bare form draws; when
+    // pdf-inspector 1.25.0 does not read the form the bare form draws; when
     // a release fixes #312, this expectation goes.
     assert!(
         results[0]["markdown"]
@@ -849,7 +849,7 @@ fn form_text_pdf_inspector_reads_otherwise_than_the_page_is_reported() {
         })
     };
     let markdown = |index: usize| results[index]["markdown"].as_str().unwrap_or_default();
-    // pdf-inspector 1.24.0 finds a page's forms in the page's own resources
+    // pdf-inspector 1.25.0 finds a page's forms in the page's own resources
     // alone, so a form the page inherits is not read; when a release reads
     // inherited resources, this expectation goes.
     assert!(!markdown(0).contains("85,000.00"), "{}", results[0]);
@@ -992,7 +992,7 @@ fn table_amounts_merged_across_columns_are_reported() {
                 .any(|warning| warning["code"] == "table_values_merged")
         })
     };
-    // pdf-inspector 1.24.0 joins the two headings, and each lot's basis and
+    // pdf-inspector 1.25.0 joins the two headings, and each lot's basis and
     // adjustment, into one cell; when a release fixes #424, this
     // expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
@@ -1070,7 +1070,7 @@ fn table_amounts_pushed_out_of_their_rows_are_reported() {
                 .any(|warning| warning["code"] == "table_values_detached")
         })
     };
-    // pdf-inspector 1.24.0 drops the Amount column of the long statement
+    // pdf-inspector 1.25.0 drops the Amount column of the long statement
     // from its table and lists the amounts after it; when a release fixes
     // #424, this expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
@@ -1180,7 +1180,7 @@ fn lines_dropped_as_running_headers_that_differ_are_reported() {
                 .map(|warning| warning["pages"].clone())
         })
     };
-    // pdf-inspector 1.24.0 keeps the first account's number and drops the
+    // pdf-inspector 1.25.0 keeps the first account's number and drops the
     // others' as the same running header; when a release fixes #483, this
     // expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
@@ -1508,7 +1508,7 @@ fn text_painted_invisibly_that_pdf_inspector_reads_is_reported() {
                 .map(|warning| warning["pages"].clone())
         })
     };
-    // pdf-inspector 1.24.0 reads the invisible text as shown; when a release
+    // pdf-inspector 1.25.0 reads the invisible text as shown; when a release
     // fixes #572, these expectations go.
     for result in &results[..4] {
         let markdown = result["markdown"].as_str().unwrap_or_default();
@@ -1703,7 +1703,7 @@ fn cjk_text_read_without_its_collection_map_is_reported() {
     let cid = |byte: u8| format!("{:04X}", byte - 0x1F);
     let unicode = |byte: u8| format!("{byte:04X}");
     let pages = [
-        // Japanese and Chinese collections pdf-inspector 1.24.0 cannot
+        // Japanese and Chinese collections pdf-inspector 1.25.0 cannot
         // parse the map of (upstream #573).
         cjk_statement_pdf("Japan1", "Identity-H", cid, false),
         cjk_statement_pdf("GB1", "Identity-V", cid, false),
@@ -1729,7 +1729,7 @@ fn cjk_text_read_without_its_collection_map_is_reported() {
                 .map(|warning| warning["pages"].clone())
         })
     };
-    // pdf-inspector 1.24.0 reads "Total wages" as "5PUBMXBHFT" and drops
+    // pdf-inspector 1.25.0 reads "Total wages" as "5PUBMXBHFT" and drops
     // the amounts; when a release fixes #573, these expectations go.
     for result in &results[..2] {
         let markdown = result["markdown"].as_str().unwrap_or_default();
@@ -1938,7 +1938,7 @@ fn vertical_text_in_columns_side_by_side_is_reported() {
         "住民税は別に通知されます",
     ];
     let pages = [
-        // pdf-inspector 1.24.0 reads the columns row by row across them, or
+        // pdf-inspector 1.25.0 reads the columns row by row across them, or
         // left to right (upstream #575).
         vertical_text_pdf(&columns, "Identity-V", true),
         vertical_text_pdf(&columns, "Identity-V", false),
@@ -2047,7 +2047,7 @@ fn text_in_layers_a_reader_hides_is_reported() {
                 .map(|warning| warning["pages"].clone())
         })
     };
-    // pdf-inspector 1.24.0 reads no layer settings: the hidden balance and
+    // pdf-inspector 1.25.0 reads no layer settings: the hidden balance and
     // the note are in the Markdown; when a release reads them, this
     // expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
@@ -2210,7 +2210,7 @@ fn layered_field_pdf(shown: bool) -> Vec<u8> {
 #[test]
 fn form_values_in_layers_a_reader_hides_are_reported() {
     let results = convert_all(&[layered_field_pdf(false), layered_field_pdf(true)]);
-    // pdf-inspector 1.24.0 writes every field's value, whatever layer its
+    // pdf-inspector 1.25.0 writes every field's value, whatever layer its
     // widget is in; when a release reads layers, this expectation goes.
     for result in &results {
         let markdown = result["markdown"].as_str().unwrap_or_default();
@@ -2317,7 +2317,7 @@ fn unseen_text_past_ascii_is_reported() {
             false,
         ),
     ]);
-    // pdf-inspector 1.24.0 reads every layer and this invisible line; when
+    // pdf-inspector 1.25.0 reads every layer and this invisible line; when
     // a release reads neither, these expectations go.
     for result in &results {
         let markdown = result["markdown"].as_str().unwrap_or_default();
@@ -2410,7 +2410,7 @@ fn unseen_text_read_without_a_map_is_reported() {
         // The composite font's text shown is not reported.
         composite(identity, descendant, true),
     ]);
-    // pdf-inspector 1.24.0 reads every layer and this invisible text; when
+    // pdf-inspector 1.25.0 reads every layer and this invisible text; when
     // a release reads neither, these expectations go.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(markdown.contains("1,000.00 superseded"), "{markdown}");
@@ -2567,7 +2567,7 @@ fn form_values_pdf_inspector_garbles_or_leaves_out_are_reported() {
                 .map(|warning| warning["pages"].clone())
         })
     };
-    // pdf-inspector 1.24.0 reads the values as UTF-8, and never reads the
+    // pdf-inspector 1.25.0 reads the values as UTF-8, and never reads the
     // group's choice; when a release fixes #504, these expectations go.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(
@@ -2617,7 +2617,7 @@ fn choices_read_as_their_export_values_are_reported() {
                  /V (Single) /Opt [(Single) (Married filing jointly)] \
                  /Rect [300 600 500 620] /P 3 0 R /F 4 >>";
     let results = convert_all(&[one_field_pdf(paired), one_field_pdf(plain)]);
-    // pdf-inspector 1.24.0 writes the export value; when a release writes
+    // pdf-inspector 1.25.0 writes the export value; when a release writes
     // the option's text, this expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(
@@ -2653,7 +2653,7 @@ fn appearance_form_pdf(redrawn: bool) -> Vec<u8> {
 #[test]
 fn form_values_only_an_appearance_draws_are_reported() {
     let results = convert_all(&[appearance_form_pdf(false), appearance_form_pdf(true)]);
-    // pdf-inspector 1.24.0 writes a field's value, and reads no widget's
+    // pdf-inspector 1.25.0 writes a field's value, and reads no widget's
     // appearance; when a release reads appearances, this expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(!markdown.contains("Example Payee"), "{markdown}");
@@ -2680,7 +2680,7 @@ fn padded_form_pdf(entries: usize) -> Vec<u8> {
 
 #[test]
 fn form_values_past_the_bounds_of_pdf_inspectors_walk_are_reported() {
-    // pdf-inspector 1.24.0 counts each entry of the fields against a bound
+    // pdf-inspector 1.25.0 counts each entry of the fields against a bound
     // of 100,000, the field's own among them; a field past the bound it
     // never writes.
     let results = convert_all(&[padded_form_pdf(99_998), padded_form_pdf(99_999)]);
@@ -2794,7 +2794,7 @@ fn annotation_text_pdf_inspector_never_reads_is_reported() {
                 .map(|warning| warning["pages"].clone())
         })
     };
-    // pdf-inspector 1.24.0 reads no annotation but links and form fields;
+    // pdf-inspector 1.25.0 reads no annotation but links and form fields;
     // when a release reads them, this expectation goes.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(
@@ -2915,7 +2915,7 @@ fn dynamic_xfa_forms_pdf_inspector_cannot_read_are_reported() {
                 .any(|warning| warning["code"] == "xfa_form_unread")
         })
     };
-    // pdf-inspector 1.24.0 reads no XFA: the Markdown is the notice alone.
+    // pdf-inspector 1.25.0 reads no XFA: the Markdown is the notice alone.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(
         markdown.contains("Please wait") && !markdown.contains("85000.00"),
@@ -2983,7 +2983,7 @@ fn embedded_files_pdf_inspector_never_reads_are_reported() {
                 .map(str::to_string)
         })
     };
-    // pdf-inspector 1.24.0 reads the cover's page alone.
+    // pdf-inspector 1.25.0 reads the cover's page alone.
     let markdown = results[0]["markdown"].as_str().unwrap_or_default();
     assert!(
         markdown.contains("Year-end tax package") && !markdown.contains("1,250.00"),
@@ -3122,7 +3122,7 @@ fn pdf_tools_run_in_the_worker_and_map_aborts_to_resource_limits() {
 }
 
 /// A page whose content stream inflates to 1 GiB from about 1 MB drove the
-/// in-process server past 2 GiB on pdf-inspector 1.24.0. Behind the worker's
+/// in-process server past 2 GiB on pdf-inspector 1.25.0. Behind the worker's
 /// address-space ceiling it fails alone and the server keeps serving.
 #[cfg(target_os = "linux")]
 #[test]

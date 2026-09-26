@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Moved to `pdf-inspector` 1.25.0 (from 1.24.0), whose one library change
+  (#592) stops underline detection going quadratic on pages drawn from thin
+  rectangles: a crafted page of 200,000 of them converts in 0.7 s where
+  1.24.0 ran to the 25-second deadline. The Markdown and every warning are
+  unchanged on 4,412 PDFs, and each pdf-inspector defect the warnings below
+  describe for 1.24.0 holds on 1.25.0; the warnings' messages now name
+  1.25.0, and their codes are unchanged.
 - Adopted `pdf-inspector` 1.24.0 and `lopdf` 0.45.0 (from 1.17.0 and 0.42.0).
   Every PDF tool now runs in the bounded worker used by the document lanes:
   separate process, 1 GiB address-space ceiling and seccomp network denial on
@@ -1143,7 +1150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `identify_tax_form`: bank-direct 1099-INTs that render as numeric tables only return `Unknown` (no header text in markdown)
 - No OCR engine ships. Scanned pages report that they need OCR and why, and
   return no text for those pages.
-- Other pdf-inspector 1.24.0 defects from its open pull requests are not
+- Other pdf-inspector 1.25.0 defects from its open pull requests are not
   detected: a receipt
   with few text operators and a logo read as a scan (#445); forms with
   indirect resources (#407), reported only through the garbled-text reason

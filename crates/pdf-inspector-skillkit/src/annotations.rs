@@ -1,4 +1,4 @@
-//! Annotation text pdf-inspector 1.24.0 never reads.
+//! Annotation text pdf-inspector 1.25.0 never reads.
 //!
 //! Besides a page's own content, a PDF shows text in its annotations: a text
 //! box typed onto the page (FreeText), as a reviewer adds "Adjusted basis

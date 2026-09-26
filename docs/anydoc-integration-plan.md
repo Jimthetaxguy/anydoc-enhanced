@@ -35,7 +35,7 @@ The upstream AnyDoc CSV and RTF paths remain unexposed because issue #104 docume
 | Public Rust API | `to_markdown`, `to_markdown_bytes`, `to_document`, and content/extension format detection |
 | Local network behavior | No HTTP client, telemetry, update checker, API-key lookup, external service, or ML model in the resolved local runtime |
 | Formats | Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, and PDF variants |
-| PDF behavior | Declares `pdf-inspector 1.14.2` compatibility; this workspace converges that requirement to released `1.24.0`; PDFs bypass AnyDoc's shared document model; image-only PDFs require OCR |
+| PDF behavior | Declares `pdf-inspector 1.14.2` compatibility; this workspace converges that requirement to released `1.25.0`; PDFs bypass AnyDoc's shared document model; image-only PDFs require OCR |
 | Safety controls | Fixed archive, decompression, XML, table, binary-record, and retained-asset limits |
 | Upstream tests | 294 root-crate tests passed and 1 was ignored at the pinned revision; checked-in fixtures and fuzz targets exist, but fuzz targets are not exercised by upstream CI |
 
@@ -76,7 +76,7 @@ promotion remains a separate gate.
                                 +--------+---------+
                                          |
                                          v
-MCP stdio  ->  document service/router  ->  pdf-inspector =1.24.0
+MCP stdio  ->  document service/router  ->  pdf-inspector =1.25.0
                      |
                      | allowlisted non-PDF input bytes
                      v

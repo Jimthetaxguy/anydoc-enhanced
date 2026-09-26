@@ -1,4 +1,4 @@
-//! What pdf-inspector 1.24.0 misreads in the text a page paints.
+//! What pdf-inspector 1.25.0 misreads in the text a page paints.
 //!
 //! **An invisible layer over a scan.** A scanned page made searchable
 //! carries its words as invisible text (render mode 3, or 7, which only adds

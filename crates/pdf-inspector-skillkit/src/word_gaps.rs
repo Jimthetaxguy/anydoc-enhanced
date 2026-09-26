@@ -1,4 +1,4 @@
-//! Gaps between glyphs that pdf-inspector 1.24.0 judges against the wrong
+//! Gaps between glyphs that pdf-inspector 1.25.0 judges against the wrong
 //! space width (open upstream #532).
 //!
 //! pdf-inspector reads the pen travel between glyphs as a word space by a
@@ -31,7 +31,7 @@ use pdf_inspector::glyph_names::glyph_name_to_string;
 use pdf_inspector::tounicode::ToUnicodeCMap;
 
 /// Share of the space width that makes a word gap, and the least word gap,
-/// in thousandths of the font size, as pdf-inspector 1.24.0 sets them.
+/// in thousandths of the font size, as pdf-inspector 1.25.0 sets them.
 const WORD_GAP_SHARE: f32 = 0.4;
 const MIN_WORD_GAP: f32 = 80.0;
 /// A `TJ` offset of this many word gaps ends pdf-inspector's sub-run.
@@ -63,7 +63,7 @@ const MAX_CMAP_BYTES: usize = 1 << 20;
 /// Font array entries and ToUnicode bytes read per document.
 const MAX_FONT_STEPS: usize = 16_000_000;
 
-/// A font whose word gaps pdf-inspector 1.24.0 and its fix judge against
+/// A font whose word gaps pdf-inspector 1.25.0 and its fix judge against
 /// different thresholds, in thousandths of the font size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GapFont {
@@ -349,7 +349,7 @@ impl Metrics {
     }
 }
 
-/// Read a simple font as pdf-inspector 1.24.0 does (`parse_simple_font_widths`)
+/// Read a simple font as pdf-inspector 1.25.0 does (`parse_simple_font_widths`)
 /// and as its fix does: the two thresholds, when they differ, and what the
 /// scan needs of the font.
 fn read_font(

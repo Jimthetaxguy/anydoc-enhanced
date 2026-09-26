@@ -8,9 +8,9 @@ dependency is permissively licensed and compatible with that choice.
 ### pdf-inspector
 
 - **Source:** https://github.com/firecrawl/pdf-inspector
-- **Package:** crates.io `pdf-inspector 1.24.0`
-- **Registry package:** crates.io `1.24.0`, checksum `e22dc125a533d212c847c8c85e4fcb7358f4384869ef76b2b8721f039b1b633a`
-- **Upstream Git context:** tag `v1.24.0` @ `876fe9ac65c1b05512b9a1a182b5c56bcfdd6c39`; `main` @ `f856d3481d41d564c64d20baa2a4796d98aed03c` (release-CI change only after the tag)
+- **Package:** crates.io `pdf-inspector 1.25.0`
+- **Registry package:** crates.io `1.25.0`, checksum `4c7bbb3b63dec43a1c849508e0da95833af6185649f121e41fc3cbd2d3b2e639`
+- **Upstream Git context:** no `v1.25.0` tag; the package matches `main` @ `2dbd16b3ea4ea943af2802bd72e45dd264eacb9f` (release of #592 and #593)
 - **License:** MIT
 - **Transitive core dep:** `lopdf 0.45.0` from crates.io (MIT), checksum `bfffda0fe1ab0157e1a13c14bebd3f28671f2fccb7922f0722ec53926e6922d3`
 

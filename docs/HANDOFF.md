@@ -2,7 +2,7 @@
 
 **Last reconciled:** 2026-09-26
 **Repository:** <https://github.com/Jimthetaxguy/anydoc-enhanced>
-**Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.24.0, and every PDF tool runs in the bounded worker; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion. The 2026-09-24 upstream refresh is recorded in [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md).
+**Status:** PDF MCP baseline is aligned to Firecrawl pdf-inspector 1.25.0, and every PDF tool runs in the bounded worker; generic document tools are live for bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion. The 2026-09-24 upstream refresh is recorded in [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md).
 
 This is the public, repository-relative entry point for future work. Do not add
 home-directory paths, private corpus locations, credentials, internal agent
@@ -27,7 +27,7 @@ pdf-inspector-mcp
         |
 pdf-inspector-skillkit
         |
-firecrawl/pdf-inspector 1.24.0 (released, exact Cargo lock resolution)
+firecrawl/pdf-inspector 1.25.0 (released, exact Cargo lock resolution)
         |
         +-- anydoc 0.2.4 via bounded DOCX/PPTX/XLSX/ODS/ODT/ODP/EPUB worker; local strict CSV adapter shares the worker boundary
 ```
@@ -45,18 +45,18 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 | `crates/pdf-inspector-skillkit/src/epub_css.rs` | EPUB chapters seen by a reading system (CSS, cascade, user-agent rules, how boxes flow, generated content) and by AnyDoc's walker and stylesheet subset |
 | `crates/pdf-inspector-skillkit/src/odf_walk.rs` | ODF content walked as AnyDoc's walkers walk it, including spreadsheet cells and drawings |
 | `crates/pdf-inspector-skillkit/src/xlsx_numfmt.rs` | Spreadsheet number formats read with AnyDoc's grammar, against each cell's value |
-| `crates/pdf-inspector-skillkit/src/text_paints.rs` | What PDF pages paint that pdf-inspector 1.24.0 misreads: an invisible OCR layer over a scan, text painted twice over itself, word gaps (through `word_gaps.rs` and `glyph_words.rs`), text drawn through forms it does not reach or reads without a font, and the unseen, unmapped, and vertical text it reads, kept within a page's and a document's bounds, with the pages its limits never reached |
-| `crates/pdf-inspector-skillkit/src/content_ops.rs` | The operators a PDF content stream holds, counted as lopdf reads them without decoding the stream, so the page scan passes over what pdf-inspector 1.24.0 passes over (more than a million) and charges its limits before decoding |
-| `crates/pdf-inspector-skillkit/src/annotations.rs` | Text PDF annotations show (text boxes, stamps and watermarks drawn in text) that pdf-inspector 1.24.0 never reads |
-| `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form field values pdf-inspector 1.24.0 reads as UTF-8 or never reads, by its own walk of the field tree |
-| `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.24.0 drops as running headers or footers though they differ from the line it keeps, by its own rule over the lines it makes of each page, read again only where the page scan's edge runs may differ |
-| `crates/pdf-inspector-skillkit/src/optional_content.rs` | PDF layers the default configuration hides, by base state, on and off lists, membership policies and visibility expressions, whose text pdf-inspector 1.24.0 reads anyway |
-| `crates/pdf-inspector-skillkit/src/cjk_fonts.rs` | PDF fonts of Adobe's Japanese, Chinese, and Korean collections that pdf-inspector 1.24.0 finds no map for, judged as it looks for one (upstream #573); what it reads their strings as, byte by byte or as Unicode code points, and what their ASCII or UCS-2 codes say |
-| `crates/pdf-inspector-skillkit/src/vertical_text.rs` | PDF fonts under vertical CMaps, their strings gathered into columns of one size by where they start, and what the Markdown must show of them: each column whole, and a passage's neighbouring columns right before left, which pdf-inspector 1.24.0 lays out as horizontal (upstream #575) |
-| `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF tables pdf-inspector 1.24.0 may have misread: a first row repeated above its table, amounts merged into one cell, amounts pushed out of their rows to after the table, judged by where the page sets them |
+| `crates/pdf-inspector-skillkit/src/text_paints.rs` | What PDF pages paint that pdf-inspector 1.25.0 misreads: an invisible OCR layer over a scan, text painted twice over itself, word gaps (through `word_gaps.rs` and `glyph_words.rs`), text drawn through forms it does not reach or reads without a font, and the unseen, unmapped, and vertical text it reads, kept within a page's and a document's bounds, with the pages its limits never reached |
+| `crates/pdf-inspector-skillkit/src/content_ops.rs` | The operators a PDF content stream holds, counted as lopdf reads them without decoding the stream, so the page scan passes over what pdf-inspector 1.25.0 passes over (more than a million) and charges its limits before decoding |
+| `crates/pdf-inspector-skillkit/src/annotations.rs` | Text PDF annotations show (text boxes, stamps and watermarks drawn in text) that pdf-inspector 1.25.0 never reads |
+| `crates/pdf-inspector-skillkit/src/form_fields.rs` | PDF form field values pdf-inspector 1.25.0 reads as UTF-8 or never reads, by its own walk of the field tree |
+| `crates/pdf-inspector-skillkit/src/repeated_lines.rs` | PDF lines pdf-inspector 1.25.0 drops as running headers or footers though they differ from the line it keeps, by its own rule over the lines it makes of each page, read again only where the page scan's edge runs may differ |
+| `crates/pdf-inspector-skillkit/src/optional_content.rs` | PDF layers the default configuration hides, by base state, on and off lists, membership policies and visibility expressions, whose text pdf-inspector 1.25.0 reads anyway |
+| `crates/pdf-inspector-skillkit/src/cjk_fonts.rs` | PDF fonts of Adobe's Japanese, Chinese, and Korean collections that pdf-inspector 1.25.0 finds no map for, judged as it looks for one (upstream #573); what it reads their strings as, byte by byte or as Unicode code points, and what their ASCII or UCS-2 codes say |
+| `crates/pdf-inspector-skillkit/src/vertical_text.rs` | PDF fonts under vertical CMaps, their strings gathered into columns of one size by where they start, and what the Markdown must show of them: each column whole, and a passage's neighbouring columns right before left, which pdf-inspector 1.25.0 lays out as horizontal (upstream #575) |
+| `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF tables pdf-inspector 1.25.0 may have misread: a first row repeated above its table, amounts merged into one cell, amounts pushed out of their rows to after the table, judged by where the page sets them |
 | `crates/pdf-inspector-skillkit/src/doubled_text.rs` | Text the PDF Markdown shows twice, confirming the pages the repeat scan names |
-| `crates/pdf-inspector-skillkit/src/word_gaps.rs` | Word gaps pdf-inspector 1.24.0 judges against the wrong space width (#532): its thresholds and its fix's, compared gap by gap as the page scan shows text |
-| `crates/pdf-inspector-skillkit/src/glyph_words.rs` | Words a browser printed glyph by glyph that pdf-inspector 1.24.0 splits (#531): the words fonts that paint their spaces show, found split in the Markdown and confirmed in each page's own text |
+| `crates/pdf-inspector-skillkit/src/word_gaps.rs` | Word gaps pdf-inspector 1.25.0 judges against the wrong space width (#532): its thresholds and its fix's, compared gap by gap as the page scan shows text |
+| `crates/pdf-inspector-skillkit/src/glyph_words.rs` | Words a browser printed glyph by glyph that pdf-inspector 1.25.0 splits (#531): the words fonts that paint their spaces show, found split in the Markdown and confirmed in each page's own text |
 | `crates/pdf-inspector-skillkit/src/domain/` | Tax, IRC, SEC, and synthetic review logic |
 | `crates/pdf-inspector-mcp/src/main.rs` | MCP schemas, worker mode, tool registration, dispatch, and timeout response handling |
 | `scripts/check-public-hygiene.sh` | Candidate-text obvious-identifier heuristic used locally and in CI |
@@ -73,7 +73,7 @@ MCP handlers and domain modules must depend on the skillkit boundary.
   Image-only PDFs report OCR requirements, while mixed PDFs can produce
   partial extraction with page-level OCR diagnostics; no OCR engine is
   currently shipped.
-- PDF Markdown is pdf-inspector's own. Where 1.24.0 is known to repeat or
+- PDF Markdown is pdf-inspector's own. Where 1.25.0 is known to repeat or
   merge text (a run painted twice, a table's first row left above it, two
   amounts in one cell), the result carries a `warnings` entry instead of a
   repair. A repeated run is named only when the Markdown shows it doubled,
@@ -89,10 +89,10 @@ MCP handlers and domain modules must depend on the skillkit boundary.
   Filesystem isolation and non-Linux memory containment remain follow-up gates
   before broader hostile-format enablement.
 - AnyDoc `v0.2.4` is a native Rust library, MIT licensed, and is resolved
-  alongside the workspace `pdf-inspector 1.24.0` release. Its typed `NeedsOcr`
+  alongside the workspace `pdf-inspector 1.25.0` release. Its typed `NeedsOcr`
   result remains available for future PDF-specific evaluation and is not used to bypass the
   dedicated PDF facade.
-- This workspace now uses released `pdf-inspector 1.24.0` with `lopdf 0.45.0`.
+- This workspace now uses released `pdf-inspector 1.25.0` with `lopdf 0.45.0`.
   The existing 13-tool PDF surface compiles and passes its regression suite.
   The AnyDoc dependency, provider contract, worker, DOCX happy path, strict PPTX path, strict XLSX path, strict ODS path, strict ODT path, strict ODP path, and strict EPUB path are implemented; the local strict CSV adapter is implemented through worker code 6 on Linux.
 - AnyDoc CSV and RTF parsing remain unexposed because upstream issue #104 documents materialization and memory-exhaustion risk; the local strict CSV adapter is separate and Linux-memory-gated.

@@ -1,4 +1,4 @@
-//! Lines pdf-inspector 1.24.0 drops as running headers or footers.
+//! Lines pdf-inspector 1.25.0 drops as running headers or footers.
 //!
 //! In a document of three pages or more, pdf-inspector drops a line from
 //! every page but the first that shows it, as a running header or footer,
