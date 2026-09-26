@@ -11,11 +11,16 @@
 //! whole, but where lines of horizontal text at its glyphs' heights run
 //! through it.
 
+use std::collections::HashSet;
+
 use lopdf::{Dictionary, Object};
+
+use crate::repeated_lines::EdgeRun;
 
 /// A string shown in a font that writes vertically, on an upright line:
 /// where its column stands, the height it spans, its size, what it reads
-/// as where its font can be read, and its place among the page's strings.
+/// as where its font can be read, its place among the page's strings, and
+/// the page's run it was noted in, where it was (see `EdgeRun`).
 #[derive(Clone, Debug)]
 pub(crate) struct VerticalRun {
     pub(crate) x: f64,
@@ -24,6 +29,7 @@ pub(crate) struct VerticalRun {
     pub(crate) size: f64,
     pub(crate) text: Option<String>,
     pub(crate) show: u64,
+    pub(crate) edge: Option<usize>,
 }
 
 /// What the Markdown must show of a page's columns of vertical writing for
@@ -48,6 +54,10 @@ const SIMILAR_SIZE: f64 = 0.75;
 const PASSAGE_PITCH: f64 = 4.0;
 /// Columns of another size passed over to find a column's neighbour.
 const MAX_PASSED_COLUMNS: usize = 3;
+/// Characters a horizontal run holds at most to be read in a column of
+/// vertical writing it stands in, as digits set across the column
+/// (tate-chu-yoko) are.
+const MAX_ACROSS_CHARS: usize = 4;
 
 /// Whether two sizes are near enough for their text to be one passage.
 fn similar(one: f64, other: f64) -> bool {
@@ -62,11 +72,13 @@ pub(crate) fn writes_vertically(font: &Dictionary) -> bool {
         && named(b"Encoding").is_some_and(|encoding| encoding.ends_with(b"-V"))
 }
 
-/// A column of a page's vertical runs.
+/// A column of a page's vertical runs, and the horizontal runs set across
+/// it, each with the height its text reads at.
 struct Column<'a> {
     x: f64,
     size: f64,
     runs: Vec<&'a VerticalRun>,
+    across: Vec<(f64, &'a str)>,
 }
 
 impl Column<'_> {
@@ -84,18 +96,43 @@ impl Column<'_> {
     /// What the column reads as, top to bottom, where every run's font can
     /// be read.
     fn text(&self) -> Option<String> {
-        let mut runs = self.runs.clone();
-        runs.sort_by(|one, other| other.top.total_cmp(&one.top));
-        runs.iter().map(|run| run.text.as_deref()).collect()
+        let mut texts: Vec<(f64, &str)> = self
+            .runs
+            .iter()
+            .map(|run| Some((run.top, run.text.as_deref()?)))
+            .collect::<Option<_>>()?;
+        texts.extend(self.across.iter().copied());
+        texts.sort_by(|one, other| other.0.total_cmp(&one.0));
+        Some(texts.into_iter().map(|(_, text)| text).collect())
+    }
+
+    /// Whether a horizontal run stands across the column: upright, short,
+    /// no larger than its glyphs, starting within its width to the left of
+    /// its line or half of it to the right, between its top and a glyph
+    /// below its bottom.
+    fn holds(&self, run: &EdgeRun) -> bool {
+        let [a, b] = run.direction;
+        let (x, y, size) = (f64::from(run.x), f64::from(run.y), f64::from(run.size));
+        a > 0.0
+            && b.abs() <= 0.1 * a
+            && size <= 1.05 * self.size
+            && (self.x - self.size..=self.x + 0.5 * self.size).contains(&x)
+            && (self.bottom() - self.size..=self.top()).contains(&y)
+            && run.text.as_deref().is_some_and(|text| {
+                let text = text.trim();
+                !text.is_empty() && text.chars().count() <= MAX_ACROSS_CHARS
+            })
     }
 }
 
 /// What the Markdown must show of a page's vertical runs (see `Reading`),
-/// right to left. Runs of one size stand in one column where they start
-/// within half their size of it across the page; a column's neighbour is
-/// the nearest to its left of its size, past up to `MAX_PASSED_COLUMNS` of
-/// another, such as ruby.
-pub(crate) fn readings(runs: &[VerticalRun]) -> Vec<Reading> {
+/// right to left, with the page's horizontal runs set across a column read
+/// in it (see `Column::holds`) among `across`, the page's runs, the
+/// vertical ones among them aside. Runs of one size stand in one column
+/// where they start within half their size of it across the page; a
+/// column's neighbour is the nearest to its left of its size, past up to
+/// `MAX_PASSED_COLUMNS` of another, such as ruby.
+pub(crate) fn readings(runs: &[VerticalRun], across: &[EdgeRun]) -> Vec<Reading> {
     let mut order: Vec<&VerticalRun> = runs.iter().collect();
     order.sort_by(|one, other| other.x.total_cmp(&one.x));
     let mut columns: Vec<Column> = Vec::new();
@@ -110,7 +147,21 @@ pub(crate) fn readings(runs: &[VerticalRun]) -> Vec<Reading> {
                 x: run.x,
                 size: run.size,
                 runs: vec![run],
+                across: Vec::new(),
             }),
+        }
+    }
+    let vertical: HashSet<usize> = runs.iter().filter_map(|run| run.edge).collect();
+    for (index, run) in across.iter().enumerate() {
+        if vertical.contains(&index) {
+            continue;
+        }
+        if let Some(column) = columns.iter_mut().find(|column| column.holds(run)) {
+            let text = run.text.as_deref().unwrap_or_default();
+            // It reads at the top of its glyphs.
+            column
+                .across
+                .push((f64::from(run.y) + 0.8 * f64::from(run.size), text));
         }
     }
     let mut paired = vec![false; columns.len()];
@@ -155,6 +206,7 @@ mod tests {
             size: 12.0,
             text: Some(text.to_owned()),
             show,
+            edge: None,
         }
     }
 
@@ -199,7 +251,7 @@ mod tests {
         }
         runs.push(run(464.0, 300.0, "別紙", 0));
         assert_eq!(
-            readings(&runs),
+            readings(&runs, &[]),
             [
                 Reading::Pair(Some(("源泉徴収".to_owned(), "住民税".to_owned())), true),
                 Reading::Alone("別紙".to_owned()),
@@ -208,12 +260,12 @@ mod tests {
         // A column standing alone reads whole; a column whose font cannot
         // be read pairs as unread, and alone is not read at all.
         assert_eq!(
-            readings(&runs[..4]),
+            readings(&runs[..4], &[]),
             [Reading::Alone("源泉徴収".to_owned())]
         );
         runs[5].text = None;
         assert_eq!(
-            readings(&runs),
+            readings(&runs, &[]),
             [Reading::Pair(None, true), Reading::Alone("別紙".to_owned())]
         );
     }
@@ -226,7 +278,7 @@ mod tests {
         ruby.bottom = 700.0 - 6.0 * 13.0;
         let base = run(400.0, 700.0, "源泉徴収票の支払金額", 0);
         assert_eq!(
-            readings(&[ruby, base]),
+            readings(&[ruby, base], &[]),
             [
                 Reading::Alone("げんせんちょうしゅうひょう".to_owned()),
                 Reading::Alone("源泉徴収票の支払金額".to_owned()),
@@ -238,16 +290,41 @@ mod tests {
             run(464.0, 720.0, "源泉徴収税額は十六万", 0),
         ];
         assert!(matches!(
-            readings(&wide)[..],
+            readings(&wide, &[])[..],
             [Reading::Pair(Some(_), true)]
         ));
+        // Digits set across a column (tate-chu-yoko) read in it, where they
+        // stand: "令和12年5月1日".
+        let date = [
+            run(300.0, 700.0, "令和", 0),
+            run(300.0, 664.0, "年", 0),
+            run(300.0, 640.0, "月", 0),
+            run(300.0, 616.0, "日", 0),
+        ];
+        let across = |x: f32, y: f32, text: &str| EdgeRun {
+            y,
+            x,
+            direction: [1.0, 0.0],
+            size: 10.0,
+            text: Some(text.to_owned()),
+        };
+        let digits = [
+            across(294.0, 668.0, "12"),
+            across(297.0, 644.0, "5"),
+            across(297.0, 620.0, "1"),
+            across(72.0, 460.0, "Line 0 of the notice"),
+        ];
+        assert_eq!(
+            readings(&date, &digits),
+            [Reading::Alone("令和12年5月1日".to_owned())]
+        );
         // Labels in cells five sizes apart pair, but not as a passage.
         let labels = [
             run(390.0, 630.0, "源泉徴収税額", 0),
             run(330.0, 630.0, "支払者の住所", 0),
         ];
         assert_eq!(
-            readings(&labels),
+            readings(&labels, &[]),
             [Reading::Pair(
                 Some(("源泉徴収税額".to_owned(), "支払者の住所".to_owned())),
                 false

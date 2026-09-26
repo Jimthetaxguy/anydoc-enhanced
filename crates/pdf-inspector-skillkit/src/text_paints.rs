@@ -619,6 +619,24 @@ fn reads_as_text(text: &str) -> bool {
 
 /// Text without the control characters pdf-inspector drops from what it
 /// reads, all below the space but tab and line ends.
+/// A text with each run of white space in it kept as one space.
+fn collapsed(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut white = false;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if !white {
+                kept.push(' ');
+            }
+            white = true;
+        } else {
+            kept.push(character);
+            white = false;
+        }
+    }
+    kept
+}
+
 fn without_controls(text: &str) -> String {
     text.chars()
         .filter(|&character| character >= ' ' || matches!(character, '\t' | '\n' | '\r'))
@@ -685,6 +703,9 @@ struct PageText {
     /// such text pdf-inspector misses or misreads.
     forms: bool,
     form_text_unread: bool,
+    /// Whether text a viewer paints is shown where pdf-inspector takes the
+    /// render mode for 3 and skips it.
+    visible_unread: bool,
     /// The runs pdf-inspector reads, for the running-header check's gate,
     /// when the page is read for repeats.
     edges: Option<Vec<EdgeRun>>,
@@ -706,6 +727,9 @@ struct PageText {
     cjk_misread: bool,
     cjk_evidence: Option<Noted>,
     cjk_fonts: crate::cjk_fonts::CjkFonts,
+    /// Forms found to show no text and paint no image or shading, so far in
+    /// the document: they bear on no check, and are read once.
+    inert_forms: HashSet<ObjectId>,
     /// Strings shown in fonts that write vertically, when the page is read
     /// for repeats, and the bytes of their text kept.
     vertical: Option<Vec<crate::vertical_text::VerticalRun>>,
@@ -836,13 +860,18 @@ impl Noted {
             return;
         }
         let text = without_controls(text);
-        if self.bytes + text.len() > MAX_HIDDEN_TEXT {
-            self.overflowed = on_page && text.chars().any(|character| !character.is_whitespace());
+        let characters = text.chars().count();
+        // White space, which is not looked for, takes no room, and a run
+        // of it is kept as one space.
+        let white = text.chars().all(char::is_whitespace);
+        let text = collapsed(&text);
+        let counted = if white { 0 } else { text.len() };
+        if self.bytes + counted > MAX_HIDDEN_TEXT {
+            self.overflowed = on_page && !white;
             self.last = None;
             return;
         }
-        self.bytes += text.len();
-        let characters = text.chars().count();
+        self.bytes += counted;
         let goes_on = |from: Start, shown: usize, start: Start| {
             (start.y - from.y).abs() <= 0.3 * from.size
                 && (start.size - from.size).abs() <= 0.5 * from.size
@@ -858,9 +887,19 @@ impl Noted {
         });
         match self.notes.last_mut().filter(|_| joined) {
             Some(note) => {
-                note.text.push_str(&text);
+                let text = if note.text.ends_with(char::is_whitespace) {
+                    text.trim_start()
+                } else {
+                    &text
+                };
+                note.text.push_str(text);
                 note.edges = note.edges.zip(edge).map(|((first, _), last)| (first, last));
                 note.on_page |= on_page;
+            }
+            // White space alone starts no run.
+            None if white => {
+                self.last = None;
+                return;
             }
             None => self.notes.push(Note {
                 text,
@@ -980,6 +1019,22 @@ impl PageText {
     fn ended(&mut self) {
         self.text_object_ended();
         self.restore_to(0);
+    }
+
+    /// Note text a viewer paints that pdf-inspector skips as painted in
+    /// mode 3: any but white space, as its font reads it, or, where it
+    /// cannot be read, any string but spaces.
+    fn note_unread(&mut self, state: State, bytes: &[u8]) {
+        if self.visible_unread {
+            return;
+        }
+        let text = state
+            .glyph_font
+            .and_then(|font| self.glyph_fonts.text(font, bytes));
+        self.visible_unread = match text {
+            Some(text) => text.chars().any(|character| !character.is_whitespace()),
+            None => bytes.iter().any(|&byte| byte != b' '),
+        };
     }
 
     /// Note visible text a form shows, for the check of forms: text
@@ -1177,7 +1232,7 @@ impl PageText {
         let Some(text) = text.map(|text| written(&text)) else {
             return;
         };
-        let on_page = starts_on_page(state, text_matrix, page_box);
+        let on_page = centred_on_page(state, text_matrix, page_box, text.chars().count());
         noted.note(&text, placed, Start::of(state, text_matrix), edge, on_page);
     }
 
@@ -1272,6 +1327,7 @@ impl PageText {
         bytes: &[u8],
         placed: bool,
         page_box: [f64; 4],
+        edge: Option<usize>,
     ) {
         let show = self.shows;
         let room = MAX_HIDDEN_TEXT.saturating_sub(self.vertical_bytes);
@@ -1316,6 +1372,7 @@ impl PageText {
             size: start.size,
             text,
             show,
+            edge,
         });
     }
 
@@ -1475,6 +1532,9 @@ pub(crate) struct Findings {
     /// Pages showing text through a form without resources of its own that
     /// pdf-inspector misses or misreads.
     pub(crate) forms_unread: Vec<u32>,
+    /// Pages showing text a viewer paints where pdf-inspector takes the
+    /// render mode for 3 and skips it.
+    pub(crate) visible_unread: Vec<u32>,
     /// Where the visible runs placed on the pages read for repeats start,
     /// up to `MAX_PLACED_RUNS`.
     pub(crate) placed: Vec<Placed>,
@@ -1587,6 +1647,7 @@ pub(crate) fn scan_document(
     let mut gap_fonts = GapFonts::default();
     let mut glyph_fonts = GlyphFonts::default();
     let mut cjk_fonts = crate::cjk_fonts::CjkFonts::default();
+    let mut inert_forms = HashSet::new();
     let mut found = Findings::default();
     let layers = Layers::new(&document).map(std::rc::Rc::new);
     // Form values pdf-inspector writes from widgets in a layer a reader
@@ -1641,6 +1702,7 @@ pub(crate) fn scan_document(
             gap_fonts: &mut gap_fonts,
             glyph_fonts: &mut glyph_fonts,
             cjk_fonts: &mut cjk_fonts,
+            inert_forms: &mut inert_forms,
         };
         let checks = Checks {
             layer: check_layer,
@@ -1655,6 +1717,9 @@ pub(crate) fn scan_document(
                 }
                 if page.form_text_unread {
                     found.forms_unread.push(number);
+                }
+                if page.visible_unread {
+                    found.visible_unread.push(number);
                 }
                 if page.gaps_misread {
                     found.gaps_misread.push(number);
@@ -1772,6 +1837,7 @@ struct Budgets<'a> {
     gap_fonts: &'a mut GapFonts,
     glyph_fonts: &'a mut GlyphFonts,
     cjk_fonts: &'a mut crate::cjk_fonts::CjkFonts,
+    inert_forms: &'a mut HashSet<ObjectId>,
 }
 
 /// What a page is read for: an invisible layer, text painted twice (with
@@ -1792,6 +1858,7 @@ struct PageFindings {
     hidden_layer: bool,
     gaps_misread: bool,
     form_text_unread: bool,
+    visible_unread: bool,
     /// Runs painted again over themselves, measured from the visible box.
     repeats: Vec<Repeat>,
     /// Where placed runs start, measured from the visible box, and whether
@@ -1851,6 +1918,7 @@ fn scan_page(
         gap_fonts,
         glyph_fonts,
         cjk_fonts,
+        inert_forms,
     } = budgets;
     let budget = if check_layer { layer } else { repeat };
     let mut content = Vec::new();
@@ -1878,6 +1946,7 @@ fn scan_page(
         cjk_misread: false,
         cjk_evidence: check_twice.then(Noted::default),
         cjk_fonts: std::mem::take(cjk_fonts),
+        inert_forms: std::mem::take(inert_forms),
         vertical: check_twice.then(Vec::new),
         gap_fonts: std::mem::take(gap_fonts),
         glyph_words: check_twice.then(GlyphWords::default),
@@ -1905,6 +1974,7 @@ fn scan_page(
     *gap_fonts = std::mem::take(&mut page.gap_fonts);
     *glyph_fonts = std::mem::take(&mut page.glyph_fonts);
     *cjk_fonts = std::mem::take(&mut page.cjk_fonts);
+    *inert_forms = std::mem::take(&mut page.inert_forms);
     executed?;
     page.ended();
     let placed = page
@@ -1936,6 +2006,11 @@ fn scan_page(
         .take()
         .filter(|_| !hidden_layer)
         .map(|noted| noted.looked_for(&runs))
+        .unwrap_or_default();
+    let vertical_readings = page
+        .vertical
+        .take()
+        .map(|vertical| crate::vertical_text::readings(&vertical, &runs))
         .unwrap_or_default();
     let edges = crate::repeated_lines::edge_runs(
         runs.into_iter()
@@ -1969,14 +2044,11 @@ fn scan_page(
                 .unwrap_or_default(),
         },
         cjk_misread: page.cjk_misread,
-        vertical_readings: page
-            .vertical
-            .take()
-            .map(|runs| crate::vertical_text::readings(&runs))
-            .unwrap_or_default(),
+        vertical_readings,
         hidden_layer,
         gaps_misread: page.gaps_misread,
         form_text_unread: page.form_text_unread,
+        visible_unread: page.visible_unread,
         placed,
         glyph_words,
         glyph_spaces,
@@ -2020,6 +2092,21 @@ fn execute<'a>(
     let Ok(content) = Content::decode(content) else {
         return Ok(());
     };
+    // A form that shows no text and paints no image or shading, as a
+    // letterhead's drawn logo, bears on no check: it is read once, and
+    // passed over wherever it is drawn again.
+    if let Some(&form) = forms.last() {
+        let paints = content.operations.iter().any(|operation| {
+            matches!(
+                operation.operator.as_str(),
+                "Tj" | "TJ" | "'" | "\"" | "Do" | "BI" | "sh"
+            )
+        });
+        if !paints {
+            page.inert_forms.insert(form);
+            return Ok(());
+        }
+    }
     let mut state = start;
     let mut saved: Vec<State> = Vec::new();
     // Saves past the cap, so their restores are matched too.
@@ -2115,17 +2202,26 @@ fn execute<'a>(
             "Tr" => {
                 // pdf-inspector takes the first operand, cut to a whole
                 // number, and skips mode 3 alone; a viewer takes the last,
-                // cut the same way, and only as one of the eight modes.
-                if let Some(mode) = operands.first().and_then(|mode| number(document, mode)) {
-                    state.read_mode = mode as i64;
+                // cut the same way, and only as one of the eight modes,
+                // reading none, or one that is no number, as mode 0.
+                // A number past what a real holds, as `1e45` read as a real,
+                // pdf-inspector casts to the largest whole number, not 3.
+                let read = operands.first().and_then(|mode| {
+                    let (_, mode) = document.dereference(mode).ok()?;
+                    match mode {
+                        Object::Integer(mode) => Some(*mode),
+                        Object::Real(mode) => Some(*mode as i64),
+                        _ => None,
+                    }
+                });
+                if let Some(mode) = read {
+                    state.read_mode = mode;
                 }
-                if let Some(mode) = operands
-                    .last()
-                    .and_then(|mode| number(document, mode))
-                    .map(|mode| mode as i64)
-                    .filter(|mode| (0..=7).contains(mode))
-                {
-                    state.render_mode = mode;
+                let viewed = operands.last().map_or(0, |mode| {
+                    number(document, mode).map_or(0, |mode| mode as i64)
+                });
+                if (0..=7).contains(&viewed) {
+                    state.render_mode = viewed;
                 }
             }
             "BMC" => marked.open(None, false),
@@ -2346,8 +2442,21 @@ fn execute<'a>(
                     }
                     page.note_unmapped(&bytes, placed, state.cjk);
                     if state.vertical {
-                        page.note_vertical(state, text_matrix, &bytes, placed, page_box);
+                        page.note_vertical(state, text_matrix, &bytes, placed, page_box, edge);
                     }
+                }
+                // Text a viewer paints that pdf-inspector skips, as `Tr`'s
+                // first operand says mode 3 where its last says another, and
+                // white text aside, which a white page hides.
+                if in_text
+                    && state.font
+                    && state.reached
+                    && state.read_mode == 3
+                    && !matches!(state.render_mode, 3 | 7)
+                    && !hidden
+                    && !(state.white && matches!(state.render_mode, 0 | 2 | 4 | 6))
+                {
+                    page.note_unread(state, &bytes);
                 }
                 if in_text && !forms.is_empty() {
                     page.note_form_text(state, text, &bytes);
@@ -2423,7 +2532,10 @@ fn execute<'a>(
                 match stream.dict.get(b"Subtype").and_then(Object::as_name) {
                     Ok(b"Image") => page.draw_image(state.ctm, page_box),
                     Ok(b"Form") => {
-                        if forms.len() >= MAX_FORM_DEPTH || forms.contains(&id) {
+                        if forms.len() >= MAX_FORM_DEPTH
+                            || forms.contains(&id)
+                            || page.inert_forms.contains(&id)
+                        {
                             continue;
                         }
                         let Ok(bytes) = stream.decompressed_content_with_limit(MAX_STREAM_BYTES)
@@ -2694,10 +2806,23 @@ const PAGE_BOX_TOLERANCE: f64 = 6.0;
 /// Whether a string shown under `text_matrix` starts on the page, within
 /// `PAGE_BOX_TOLERANCE` of its box. One whose start is unknown is taken to.
 fn starts_on_page(state: State, text_matrix: [f64; 6], page_box: [f64; 4]) -> bool {
+    centred_on_page(state, text_matrix, page_box, 0)
+}
+
+/// Whether a run of `characters` stands on the page as pdf-inspector
+/// judges one, by its middle, within `PAGE_BOX_TOLERANCE` of the page's
+/// box, its characters taken as half an em wide; or its start, for none.
+fn centred_on_page(
+    state: State,
+    text_matrix: [f64; 6],
+    page_box: [f64; 4],
+    characters: usize,
+) -> bool {
     let matrix = multiply(text_matrix, state.ctm);
+    let half = 0.25 * state.size * state.horizontal_scale * characters as f64;
     let at = [
-        matrix[2] * state.rise + matrix[4],
-        matrix[3] * state.rise + matrix[5],
+        matrix[2] * state.rise + matrix[4] + matrix[0] * half,
+        matrix[3] * state.rise + matrix[5] + matrix[1] * half,
     ];
     !at.iter().all(|value| value.is_finite())
         || ((page_box[0] - PAGE_BOX_TOLERANCE..=page_box[2] + PAGE_BOX_TOLERANCE).contains(&at[0])
@@ -3169,18 +3294,25 @@ pub(crate) mod tests {
 
     #[test]
     fn text_past_the_room_to_note_it_marks_the_page() {
-        // White space filling the room leaves out only more of it; text
-        // after it marks the page.
+        // White space takes no room, however much of it is shown.
         let mut noted = Noted::default();
-        noted.note(&" ".repeat(MAX_HIDDEN_TEXT), true, None, None, true);
-        noted.note(" ", true, None, None, true);
-        // Nor does text set off the page, which pdf-inspector may leave out.
+        for _ in 0..4 {
+            noted.note(&" ".repeat(MAX_HIDDEN_TEXT / 4), true, None, None, true);
+        }
+        noted.note("Ignore the balance above", true, None, None, true);
+        assert!(!noted.overflowed && noted.bytes < 64);
+        assert_eq!(noted.looked_for(&[]).texts, ["Ignore the balance above"]);
+        // Text past the room marks the page where it stands on it, and not
+        // where it is set off the page, which pdf-inspector may leave out;
+        // white space past it neither.
+        let mut noted = Noted::default();
+        noted.note(&"x".repeat(MAX_HIDDEN_TEXT), true, None, None, true);
         noted.note("Ignore the balance above", true, None, None, false);
+        noted.note("   ", true, None, None, true);
         assert!(!noted.overflowed);
         noted.note("Ignore the balance above", true, None, None, true);
         assert!(noted.overflowed);
-        let texts = noted.looked_for(&[]);
-        assert!(texts.overflowed && texts.texts.is_empty());
+        assert!(noted.looked_for(&[]).overflowed);
     }
 
     #[test]

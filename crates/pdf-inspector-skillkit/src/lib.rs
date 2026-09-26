@@ -79,6 +79,10 @@ pub const PDF_WARNING_WORD_GAPS_MISREAD: &str = "word_gaps_misread";
 /// Pages showing text through a form that pdf-inspector 1.24.0 does not
 /// reach or reads without its font (open upstream #312).
 pub const PDF_WARNING_FORM_TEXT_UNREAD: &str = "form_text_unread";
+/// Text a viewer paints that pdf-inspector 1.24.0 skips, taking its render
+/// mode for invisible from the first operand of `Tr` where a viewer takes
+/// another from the last.
+pub const PDF_WARNING_VISIBLE_TEXT_UNREAD: &str = "visible_text_unread";
 
 /// Pages painting text twice whose text is read again to confirm the
 /// repeat in the Markdown.
@@ -440,6 +444,19 @@ impl PdfInfo {
                 PDF_WARNING_FORM_TEXT_UNREAD,
                 "On these pages pdf-inspector 1.24.0 misses or garbles text drawn through a form: a form drawn by a form without resources of its own is not read, and text a form shows in a font it does not set itself is read byte by byte; read these pages another way.",
                 found.forms_unread.clone(),
+            ));
+        }
+        let visible_unread: Vec<u32> = found
+            .visible_unread
+            .iter()
+            .copied()
+            .filter(|page| only.is_none_or(|only| only.contains(page)))
+            .collect();
+        if !visible_unread.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_VISIBLE_TEXT_UNREAD,
+                "On these pages text a viewer shows is missing from the Markdown: the page sets its render mode with more than one number, or with one that is none, and pdf-inspector 1.24.0 takes the first for invisible where a viewer paints the text by the last, so \"The fee is not refundable\" reads \"The fee is refundable\"; read these pages another way, such as by OCR.",
+                visible_unread,
             ));
         }
         let painted_twice =
