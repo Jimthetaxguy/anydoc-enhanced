@@ -1878,6 +1878,136 @@ fn cjk_fonts_pdf_inspector_finds_no_map_for_are_reported() {
     assert_eq!(reported(&results[4]), None, "{}", results[4]);
 }
 
+/// A TrueType program of 96 glyphs whose `cmap` is one format-12 subtable
+/// of `groups`, each the code points from its first to its last, mapped to
+/// glyphs from its third on.
+fn truetype_program(groups: &[(u32, u32, u32)]) -> Vec<u8> {
+    let mut head = Vec::new();
+    for value in [0x0001_0000u32, 0x0001_0000, 0, 0x5F0F_3CF5] {
+        head.extend(value.to_be_bytes());
+    }
+    head.extend([0, 0, 0x03, 0xE8]);
+    head.extend([0; 16]);
+    for value in [0i16, -200, 1000, 900, 0, 0, 2, 0, 0] {
+        head.extend(value.to_be_bytes());
+    }
+    let mut hhea = 0x0001_0000u32.to_be_bytes().to_vec();
+    for value in [880i16, -120, 0, 1000] {
+        hhea.extend(value.to_be_bytes());
+    }
+    hhea.extend([0; 22]);
+    hhea.extend(1u16.to_be_bytes());
+    let mut maxp = 0x0000_5000u32.to_be_bytes().to_vec();
+    maxp.extend(96u16.to_be_bytes());
+    let mut cmap = Vec::new();
+    for value in [0u16, 1, 3, 10] {
+        cmap.extend(value.to_be_bytes());
+    }
+    cmap.extend(12u32.to_be_bytes());
+    cmap.extend([0, 12, 0, 0]);
+    let count = u32::try_from(groups.len()).expect("group count");
+    for value in [16 + 12 * count, 0, count] {
+        cmap.extend(value.to_be_bytes());
+    }
+    for (first, last, glyph) in groups {
+        for value in [first, last, glyph] {
+            cmap.extend(value.to_be_bytes());
+        }
+    }
+    let tables = [
+        (b"cmap", cmap),
+        (b"head", head),
+        (b"hhea", hhea),
+        (b"maxp", maxp),
+    ];
+    let mut program = 0x0001_0000u32.to_be_bytes().to_vec();
+    program.extend([0, 4, 0, 64, 0, 2, 0, 0]);
+    let mut data = Vec::new();
+    for (tag, table) in &tables {
+        program.extend(*tag);
+        program.extend(0u32.to_be_bytes());
+        for value in [12 + 16 * tables.len() + data.len(), table.len()] {
+            program.extend(u32::try_from(value).expect("table offset").to_be_bytes());
+        }
+        data.extend(table);
+        data.resize(data.len().next_multiple_of(4), 0);
+    }
+    program.extend(data);
+    program
+}
+
+/// A statement page drawing its lines through a form that gives its
+/// `/Resources` by reference, in a CID font of Adobe-Japan1 under
+/// `Identity-H` with the ToUnicode map `map` and the embedded TrueType
+/// program `program`.
+fn cjk_form_pdf(map: &[u8], program: &[u8]) -> Vec<u8> {
+    let cids = |text: &str| -> String {
+        text.bytes()
+            .map(|byte| format!("{:04X}", byte - 0x1F))
+            .collect()
+    };
+    let form: String = ["Total wages 52,000.00", "Federal tax withheld 6,240.00"]
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            format!(
+                "BT /F1 12 Tf 72 {} Td <{}> Tj ET\n",
+                700 - 20 * index,
+                cids(line)
+            )
+        })
+        .collect();
+    pdf_file(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F2 5 0 R >> /XObject << /Fm1 9 0 R >> >> /Contents 10 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> /FontDescriptor 8 0 R /DW 1000 /CIDToGIDMap /Identity >>".to_vec(),
+        stream("", map),
+        b"<< /Type /FontDescriptor /FontName /KozMinPr6N-Regular /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 /FontFile2 11 0 R >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources 12 0 R",
+            form.as_bytes(),
+        ),
+        stream(
+            "",
+            b"BT /F2 12 Tf 72 740 Td (Statement of account) Tj ET\nq /Fm1 Do Q\n",
+        ),
+        stream("", program),
+        b"<< /Font << /F1 4 0 R >> >>".to_vec(),
+    ])
+}
+
+#[test]
+fn cjk_fonts_pdf_inspector_does_not_collect_are_judged_without_their_programs() {
+    let temporary = tempfile::tempdir().expect("temporary PDF directory");
+    // A map pdf-inspector cannot parse, over a program whose map covers
+    // every code point 2,000 times over, in a font only a form giving its
+    // resources by reference names: pdf-inspector never reads the program
+    // and reads the font byte by byte, where the check had built the
+    // program's map past the worker's deadline.
+    let program = truetype_program(&vec![(0, 0x10_FFFF, 1); 2_000]);
+    let path = temporary.path().join("cjk-form.pdf");
+    std::fs::write(&path, cjk_form_pdf(b"garbage, not a cmap", &program)).expect("write PDF");
+    let path = path.to_str().expect("UTF-8 path").to_string();
+    let results = call_tools(
+        &[("pdf_to_markdown", serde_json::json!({ "path": path }))],
+        None,
+    );
+    let result = &results[0];
+    // When a release reads such a font right, these expectations go.
+    let markdown = result["markdown"].as_str().unwrap_or_default();
+    assert!(markdown.contains("5PUBMXBHFT"), "{result}");
+    let reported = result["warnings"].as_array().and_then(|warnings| {
+        warnings
+            .iter()
+            .find(|warning| warning["code"] == "cjk_text_misread")
+            .map(|warning| warning["pages"].clone())
+    });
+    assert_eq!(reported, Some(serde_json::json!([1])), "{result}");
+}
+
 /// A page of Japanese `columns` set under `encoding` in a CID font with a
 /// ToUnicode map; with `Identity-V`, in columns read right to left from the
 /// top, 18 pt apart, each glyph placed on its own when `glyph_by_glyph`;

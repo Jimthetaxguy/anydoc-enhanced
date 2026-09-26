@@ -7,10 +7,12 @@
 //! but cannot parse the Japanese and Chinese ones (it keeps the Korean one
 //! as a table of its own), and never looks for one where the font names a
 //! `/ToUnicode` that is no map, gives its encoding other than as a name in
-//! place, or sets its descendant in place with no program. With no map, it
-//! reads a string with a byte past 0x7F as U+FFFD, which marks the page
-//! garbled, and any other as its bytes: "Total" as "5PUBM", with its digits
-//! and punctuation dropped as control codes, and nothing marks it. Where
+//! place, or sets its descendant in place with no program, nor for a font
+//! it does not collect from a page's resources or a form's given in place,
+//! whose program it never reads. With no map, it reads a string with a
+//! byte past 0x7F as U+FFFD, which marks the page garbled, and any other as
+//! its bytes: "Total" as "5PUBM", with its digits and punctuation dropped
+//! as control codes, and nothing marks it. Where
 //! the font's widths are given mostly past code 0x41, it takes the codes
 //! for Unicode, as Chromium's fonts' are, and reads every one as the
 //! character of its value: "一壱溢" as "ҰұҲ". A font under a predefined
@@ -103,12 +105,15 @@ impl CjkFonts {
     }
 }
 
-/// The keys pdf-inspector files the maps of fonts with no `/ToUnicode`
-/// under, as `FontCMaps::from_doc` collects fonts: those of each page's
-/// resources, its own and those it inherits, the first of each name; and
-/// those of the forms these resources name, and the forms theirs name,
-/// where a form gives its `/Resources` in place. A font it does not collect
-/// finds a map only where one it does is filed under the same key.
+/// The keys pdf-inspector files maps under, as `FontCMaps::from_doc`
+/// collects fonts: those of each page's resources, its own and those it
+/// inherits, the first of each name; and those of the forms these
+/// resources name, and the forms theirs name, where a form gives its
+/// `/Resources` in place. A font's map, or the fallback it builds from the
+/// font's program, is filed under the object number of its `/ToUnicode`
+/// given by reference; a font with no `/ToUnicode` has its program's map
+/// filed as `collection_key` says. A font it does not collect finds a map
+/// only where one it does is filed under the same key.
 fn collected_keys(document: &Document) -> HashSet<u32> {
     fn in_place_or_by_reference<'a>(
         document: &'a Document,
@@ -209,12 +214,18 @@ fn named_identity(font: &Dictionary) -> bool {
         .is_ok_and(|name| matches!(name, b"Identity-H" | b"Identity-V"))
 }
 
-/// The key pdf-inspector files a map of `font` under as it collects it,
-/// where the font has no `/ToUnicode` and is under an Identity CMap named
-/// in place: its descendant's program given by reference, else the
-/// descendant, where it is given by reference.
+/// The key pdf-inspector files a map of `font` under as it collects it:
+/// the object number of its `/ToUnicode` given by reference; with no
+/// `/ToUnicode`, under an Identity CMap named in place, its descendant's
+/// program given by reference, else the descendant, where it is given by
+/// reference.
 fn collection_key(document: &Document, font: &Dictionary) -> Option<u32> {
-    if font.get(b"ToUnicode").is_ok() || !named_identity(font) {
+    match font.get(b"ToUnicode") {
+        Ok(Object::Reference(id)) => return Some(id.0),
+        Ok(_) => return None,
+        Err(_) => {}
+    }
+    if !named_identity(font) {
         return None;
     }
     let first = first_descendant(document, font)?;
@@ -376,11 +387,11 @@ pub(crate) fn ucs2_cmap(encoding: &[u8]) -> bool {
 /// Adobe's Japanese, Chinese, or Korean collections that it finds no map
 /// for, as it looks for one: a `/ToUnicode` stream it parses; one it cannot
 /// parse, under an Identity CMap, the descendant's program or the Korean
-/// table; with no `/ToUnicode` at all, under an Identity CMap named in
-/// place, the same, and last its widths, taken for Unicode, looked up by
-/// the program or by a descendant given by reference, where the
-/// descendant has a font descriptor and a font it collects is filed under
-/// that key (see `collected_keys`).
+/// table, where it collects the font (see `collected_keys`); with no
+/// `/ToUnicode` at all, under an Identity CMap named in place, the same,
+/// and last its widths, taken for Unicode, looked up by the program or by
+/// a descendant given by reference, where the descendant has a font
+/// descriptor and a font it collects is filed under that key.
 fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Option<Unmapped> {
     fn name(object: &Object) -> Option<&[u8]> {
         object.as_name().ok()
@@ -435,11 +446,17 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
             else {
                 return bytes;
             };
-            let identity = identity(encoding.and_then(|encoding| resolved(document, encoding)));
+            // A map it cannot parse, or that is empty, leaves it the
+            // program's or the table, under an Identity CMap named in place
+            // or by reference, where it collects the font: it builds that
+            // fallback as it files the map, and for a font it does not
+            // collect never reads the program.
+            let fallback = fonts.collected(document, id.0)
+                && identity(encoding.and_then(|encoding| resolved(document, encoding)));
             let Some(map) = content(stream, &mut fonts.read) else {
                 // A map past the bytes read may parse; else, the Korean
                 // table reads the font.
-                return if tabled && identity {
+                return if tabled && fallback {
                     None
                 } else {
                     unmapped(false, false)
@@ -448,10 +465,7 @@ fn unmapped(document: &Document, font: &Dictionary, fonts: &mut CjkFonts) -> Opt
             if ToUnicodeCMap::parse(&map).is_some_and(|cmap| holds(&cmap)) {
                 return None;
             }
-            // A map it cannot parse, or that is empty, leaves it the
-            // program's or the table, under an Identity CMap named in place
-            // or by reference.
-            if !identity {
+            if !fallback {
                 return bytes;
             }
             if let Some(file) = program(document, descendant) {
@@ -684,12 +698,81 @@ mod tests {
         }
     }
 
+    /// A TrueType program of 96 glyphs whose `cmap` is one format-12
+    /// subtable of `groups`, each the code points from its first to its
+    /// last, mapped to glyphs from its third on.
+    fn truetype(groups: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut head = Vec::new();
+        for value in [0x0001_0000u32, 0x0001_0000, 0, 0x5F0F_3CF5] {
+            head.extend(value.to_be_bytes());
+        }
+        head.extend([0, 0, 0x03, 0xE8]);
+        head.extend([0; 16]);
+        for value in [0i16, -200, 1000, 900, 0, 0, 2, 0, 0] {
+            head.extend(value.to_be_bytes());
+        }
+        let mut hhea = 0x0001_0000u32.to_be_bytes().to_vec();
+        for value in [880i16, -120, 0, 1000] {
+            hhea.extend(value.to_be_bytes());
+        }
+        hhea.extend([0; 22]);
+        hhea.extend(1u16.to_be_bytes());
+        let mut maxp = 0x0000_5000u32.to_be_bytes().to_vec();
+        maxp.extend(96u16.to_be_bytes());
+        let mut cmap = Vec::new();
+        for value in [0u16, 1, 3, 10] {
+            cmap.extend(value.to_be_bytes());
+        }
+        cmap.extend(12u32.to_be_bytes());
+        cmap.extend([0, 12, 0, 0]);
+        let groups_len = u32::try_from(groups.len()).unwrap();
+        for value in [16 + 12 * groups_len, 0, groups_len] {
+            cmap.extend(value.to_be_bytes());
+        }
+        for (first, last, glyph) in groups {
+            for value in [first, last, glyph] {
+                cmap.extend(value.to_be_bytes());
+            }
+        }
+        let tables = [
+            (b"cmap", cmap),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"maxp", maxp),
+        ];
+        let mut program = 0x0001_0000u32.to_be_bytes().to_vec();
+        program.extend([0, 4, 0, 64, 0, 2, 0, 0]);
+        let mut offset = 12 + 16 * tables.len();
+        let mut data = Vec::new();
+        for (tag, table) in &tables {
+            program.extend(*tag);
+            program.extend(0u32.to_be_bytes());
+            for value in [offset, table.len()] {
+                program.extend(u32::try_from(value).unwrap().to_be_bytes());
+            }
+            data.extend(table);
+            data.resize(data.len().next_multiple_of(4), 0);
+            offset = 12 + 16 * tables.len() + data.len();
+        }
+        program.extend(data);
+        program
+    }
+
     /// How `font` is judged where a page names it, or, `on_page` false,
     /// where only a form giving its resources by reference names it.
     fn judged_where(
         build: impl FnOnce(&mut Document) -> Dictionary,
         on_page: bool,
     ) -> Option<Unmapped> {
+        judging_where(build, on_page).0
+    }
+
+    /// How `font` is judged (see `judged_where`), with what was read to
+    /// judge it.
+    fn judging_where(
+        build: impl FnOnce(&mut Document) -> Dictionary,
+        on_page: bool,
+    ) -> (Option<Unmapped>, CjkFonts) {
         let mut document = Document::with_version("1.7");
         let font = build(&mut document);
         let font = document.add_object(font);
@@ -727,7 +810,8 @@ mod tests {
         let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
         document.trailer.set("Root", catalog);
         let font = document.get_dictionary(font).unwrap();
-        CjkFonts::default().font(&document, font)
+        let mut fonts = CjkFonts::default();
+        (fonts.font(&document, font), fonts)
     }
 
     fn judged(build: impl FnOnce(&mut Document) -> Dictionary) -> Option<Unmapped> {
@@ -849,6 +933,51 @@ mod tests {
             type0(Object::Array(descendants.clone()), "Identity-H".into())
         });
         assert_eq!(font, BYTES);
+    }
+
+    #[test]
+    fn fonts_pdf_inspector_does_not_collect_are_read_by_no_fallback() {
+        // A map it cannot parse, over a program whose map covers every code
+        // point 2,000 times over: on a page, pdf-inspector reads the font
+        // by the program; named only by a form giving its resources by
+        // reference, it files no map for it and never reads the program,
+        // nor does the check.
+        let groups = vec![(0, 0x10_FFFF, 1); 2_000];
+        let garbled = |document: &mut Document| {
+            let map =
+                document.add_object(Stream::new(dictionary! {}, b"garbage, not a cmap".to_vec()));
+            let program = ("FontFile2", truetype(&groups));
+            let mut font = type0(
+                cid_font(document, "Japan1", Some(program)),
+                "Identity-H".into(),
+            );
+            font.set("ToUnicode", map);
+            font
+        };
+        let (font, fonts) = judging_where(garbled, false);
+        assert_eq!(font, BYTES);
+        assert!(fonts.programs.is_empty());
+        let mapped = |document: &mut Document| {
+            let map = document.add_object(Stream::new(dictionary! {}, b"garbage".to_vec()));
+            let program = ("FontFile2", truetype(&[(0x20, 0x7E, 1)]));
+            let mut font = type0(
+                cid_font(document, "Japan1", Some(program)),
+                "Identity-H".into(),
+            );
+            font.set("ToUnicode", map);
+            font
+        };
+        assert_eq!(judged_where(mapped, true), None);
+        assert_eq!(judged_where(mapped, false), BYTES);
+        // Korean, which its table reads only where it collects the font.
+        let korean = |document: &mut Document| {
+            let map = document.add_object(Stream::new(dictionary! {}, b"garbage".to_vec()));
+            let mut font = type0(cid_font(document, "Korea1", None), "Identity-H".into());
+            font.set("ToUnicode", map);
+            font
+        };
+        assert_eq!(judged_where(korean, true), None);
+        assert_eq!(judged_where(korean, false), BYTES);
     }
 
     #[test]
