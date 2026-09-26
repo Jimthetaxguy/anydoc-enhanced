@@ -7437,6 +7437,7 @@ fn epub_inspect_chapter(
     bytes: &[u8],
     chapter_path: &str,
     archive_names: &HashSet<String>,
+    media: &mut epub_css::MediaQueries,
 ) -> Result<(PackagePreflight, EpubChapterStyles), DocumentError> {
     if !xml_is_well_formed(bytes) {
         return Err(DocumentError::Malformed);
@@ -7487,12 +7488,17 @@ fn epub_inspect_chapter(
                         result.external_relationships = true;
                     }
                 }
-                let media = attributes
+                // Only a stylesheet's `media` decides where it applies; that
+                // of any other element is not read.
+                let media = match attributes
                     .iter()
-                    .filter(|attribute| !attribute.prefixed() && attribute.local() == b"media")
-                    .map(|attribute| epub_css::media_attribute(&attribute.value))
-                    .max()
-                    .unwrap_or(epub_css::Applies::Yes);
+                    .find(|attribute| !attribute.prefixed() && attribute.local() == b"media")
+                {
+                    Some(attribute) if matches!(local.as_slice(), b"link" | b"style") => {
+                        media.attribute(&attribute.value)?
+                    }
+                    _ => epub_css::Applies::Yes,
+                };
                 let unprefixed = |name: &[u8]| {
                     attributes
                         .iter()
@@ -7621,9 +7627,10 @@ fn epub_inspect_chapter(
                             .find(|(name, _)| name == wanted)
                             .map(|(_, value)| value.as_str())
                     };
-                    let media = value("media").map_or(epub_css::Applies::Yes, |media| {
-                        epub_css::media_attribute(media)
-                    });
+                    let media = match value("media") {
+                        Some(query) => media.attribute(query)?,
+                        None => epub_css::Applies::Yes,
+                    };
                     // Chromium reads a type of exactly `text/css`, or none.
                     let css =
                         value("type").is_none_or(|kind| kind.is_empty() || kind == "text/css");
@@ -7727,6 +7734,8 @@ struct EpubStylesheets {
     embedded: HashMap<String, Rc<epub_css::Stylesheet>>,
     rules: usize,
     cascades: Vec<(EpubCascadeKey, Rc<EpubChapterCascade>)>,
+    /// The media query lists of the package's sheets and chapters.
+    media: epub_css::MediaQueries,
 }
 
 impl EpubStylesheets {
@@ -7756,7 +7765,7 @@ impl EpubStylesheets {
                 if epub_css::references_external(&text) {
                     result.external_relationships = true;
                 }
-                let reader = epub_css::parse_stylesheet(&text)?;
+                let reader = epub_css::parse_stylesheet(&text, &mut self.media)?;
                 self.count_rules(&reader)?;
                 let mut imports = Vec::new();
                 for (index, import) in reader.imports.iter().enumerate() {
@@ -7784,7 +7793,7 @@ impl EpubStylesheets {
         if let Some(sheet) = self.embedded.get(text) {
             return Ok(sheet.clone());
         }
-        let sheet = Rc::new(epub_css::parse_stylesheet(text)?);
+        let sheet = Rc::new(epub_css::parse_stylesheet(text, &mut self.media)?);
         self.count_rules(&sheet)?;
         self.embedded.insert(text.to_string(), sheet.clone());
         Ok(sheet)
@@ -8171,7 +8180,7 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
         }
         spine_targets.push(target.clone());
         match epub_read_xml_part(&mut archive, &target).and_then(|chapter| {
-            epub_inspect_chapter(&chapter, &target, &archive_names)
+            epub_inspect_chapter(&chapter, &target, &archive_names, &mut stylesheets.media)
                 .map(|inspected| (chapter, inspected))
         }) {
             Ok((chapter, (chapter_result, styles))) => {
@@ -11312,6 +11321,37 @@ mod tests {
         assert!(!Rc::ptr_eq(&first, &other));
         assert_eq!(stylesheets.linked.len(), 1);
         assert_eq!(stylesheets.rules, 1);
+    }
+
+    #[test]
+    fn epub_media_is_read_only_where_it_applies_a_stylesheet() {
+        let query = "(min-width: 321px) and (max-width: 1256px) and (min-height: 400px)";
+        let inspect = |head: &str, body: &str, media: &mut epub_css::MediaQueries| {
+            let chapter = format!(
+                r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>{head}</head><body><p>{body}</p></body></html>"#
+            );
+            epub_inspect_chapter(
+                chapter.as_bytes(),
+                "OPS/Text/ch1.xhtml",
+                &HashSet::new(),
+                media,
+            )
+            .unwrap();
+        };
+        // Any other element's `media` is not read.
+        let mut media = epub_css::MediaQueries::default();
+        let spans = format!(r#"<span media="{query}">w</span>"#).repeat(2000);
+        inspect("", &spans, &mut media);
+        assert_eq!(media.work(), 0);
+        // A stylesheet's is, once however many links and chapters repeat it.
+        let links = format!(r#"<link rel="stylesheet" href="a.css" media="{query}"/>"#);
+        inspect(&links, "Text", &mut media);
+        let once = media.work();
+        assert!(once > 0);
+        inspect(&links.repeat(500), "Text", &mut media);
+        let styles = format!(r#"<style media="{query}">.x {{ display: none }}</style>"#);
+        inspect(&styles, "Text", &mut media);
+        assert_eq!(media.work(), once);
     }
 
     #[test]

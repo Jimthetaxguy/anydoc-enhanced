@@ -86,7 +86,7 @@ const MAX_STYLESHEET_TOKENS: usize = 500_000;
 // ---------------------------------------------------------------------------
 // Tokenizer (CSS Syntax Level 3, section 4)
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Token {
     Ident(String),
     Function(String),
@@ -630,6 +630,9 @@ const COLOR_BITS: f64 = 8.0;
 /// nest, before it counts as one the check cannot settle.
 const MAX_MEDIA_SAMPLES: usize = 4096;
 const MAX_MEDIA_NESTING: usize = 16;
+/// Tokens of the media query lists a package's reading keeps, to read each
+/// only once, beyond which a list is read again where it comes again.
+const MAX_MEDIA_TOKENS_KEPT: usize = 1_000_000;
 
 /// A media query as Media Queries 4 reads it: its media type, which holds
 /// on a screen or not, and the features it tests.
@@ -776,8 +779,8 @@ impl Outcome {
 /// A query Chromium rejects, such as `screen screen`, `not only print`, or
 /// an empty one, holds nowhere, and a feature it does not know fails. Each
 /// query is tried at the viewport sizes either side of the widths, heights,
-/// and ratios it names.
-fn media_condition(tokens: &[Token]) -> Applies {
+/// and ratios it names, each test at each size a unit of `work`.
+fn media_condition(tokens: &[Token], work: &mut u64) -> Applies {
     let tokens = trim_whitespace(tokens);
     if tokens.is_empty() {
         return Applies::Yes;
@@ -788,25 +791,76 @@ fn media_condition(tokens: &[Token]) -> Applies {
             media_query(trim_whitespace(query)).unwrap_or(MediaTest::Fixed(Outcome::FAILS))
         })
         .collect();
-    media_applies(&MediaTest::Or(queries))
+    media_applies(&MediaTest::Or(queries), work)
 }
 
-/// How a `media` attribute or pseudo-attribute applies on the readers the
-/// check follows; a media list too long to read may apply.
-pub(super) fn media_attribute(value: &str) -> Applies {
-    match tokenize(value) {
-        Ok(tokens) => media_condition(&tokens),
-        Err(_) => Applies::Doubt,
+/// The media query lists a package holds, in the `media` of its links,
+/// `style` elements, and stylesheet instructions and in its `@media` and
+/// `@import` rules, each read once however often it comes (see
+/// [`media_condition`]), and the work reading them has taken, bounded as
+/// matching selectors is (see [`MAX_MATCH_WORK`]).
+#[derive(Default)]
+pub(super) struct MediaQueries {
+    known: HashMap<Vec<Token>, Applies>,
+    tokens_kept: usize,
+    work: u64,
+}
+
+impl MediaQueries {
+    /// How a media query list applies on the readers the check follows.
+    fn condition(&mut self, tokens: &[Token]) -> Result<Applies, DocumentError> {
+        let tokens = trim_whitespace(tokens);
+        if let Some(known) = self.known.get(tokens) {
+            return Ok(*known);
+        }
+        let applies = media_condition(tokens, &mut self.work);
+        if self.work > MAX_MATCH_WORK {
+            return Err(DocumentError::ResourceLimit);
+        }
+        if self.tokens_kept + tokens.len() <= MAX_MEDIA_TOKENS_KEPT {
+            self.tokens_kept += tokens.len();
+            self.known.insert(tokens.to_vec(), applies);
+        }
+        Ok(applies)
+    }
+
+    /// How a `media` attribute or pseudo-attribute applies on the readers
+    /// the check follows; a media list too long to read may apply.
+    pub(super) fn attribute(&mut self, value: &str) -> Result<Applies, DocumentError> {
+        match tokenize(value) {
+            Ok(tokens) => self.condition(&tokens),
+            Err(_) => Ok(Applies::Doubt),
+        }
+    }
+
+    /// The work reading the lists has taken.
+    #[cfg(test)]
+    pub(super) fn work(&self) -> u64 {
+        self.work
+    }
+}
+
+/// The tests a media test holds, itself counted, each tried at every
+/// viewport size (see [`media_applies`]).
+fn media_tests(test: &MediaTest) -> u64 {
+    match test {
+        MediaTest::Not(inner) => 1 + media_tests(inner),
+        MediaTest::And(tests) | MediaTest::Or(tests) => {
+            tests.iter().map(media_tests).fold(1, u64::saturating_add)
+        }
+        MediaTest::Size(..) | MediaTest::Portrait(_) | MediaTest::Fixed(_) => 1,
     }
 }
 
 /// How a media test applies, from what it comes to at the viewport sizes
-/// either side of each bound it names.
-fn media_applies(test: &MediaTest) -> Applies {
+/// either side of each bound it names, each of its tests at each size a
+/// unit of `work`.
+fn media_applies(test: &MediaTest, work: &mut u64) -> Applies {
     let (low, high) = VIEWPORT_SIZES;
     let mut widths = vec![low, high];
     let mut heights = vec![low, high];
     media_bounds(test, &mut widths, &mut heights);
+    *work += (widths.len() + heights.len()) as u64;
     for sizes in [&mut widths, &mut heights] {
         sizes.retain(|size| (low..=high).contains(size));
         sizes.sort_by(f64::total_cmp);
@@ -815,6 +869,7 @@ fn media_applies(test: &MediaTest) -> Applies {
     if widths.len() * heights.len() > MAX_MEDIA_SAMPLES {
         return Applies::Doubt;
     }
+    *work = work.saturating_add((widths.len() * heights.len()) as u64 * media_tests(test));
     let (mut holds, mut fails, mut doubt) = (false, false, false);
     for &width in &widths {
         for &height in &heights {
@@ -4820,8 +4875,12 @@ struct RuleContext {
     layer: Option<u32>,
 }
 
-/// Parse a stylesheet the way a reading system reads it.
-pub(super) fn parse_stylesheet(css: &str) -> Result<Stylesheet, DocumentError> {
+/// Parse a stylesheet the way a reading system reads it, its media query
+/// lists read through `media`.
+pub(super) fn parse_stylesheet(
+    css: &str,
+    media: &mut MediaQueries,
+) -> Result<Stylesheet, DocumentError> {
     let tokens = tokenize(css)?;
     let mut sheet = Stylesheet::default();
     let context = RuleContext {
@@ -4831,7 +4890,7 @@ pub(super) fn parse_stylesheet(css: &str) -> Result<Stylesheet, DocumentError> {
         scoped: false,
         layer: None,
     };
-    parse_rule_list(&tokens, true, context, None, &mut sheet, 0)?;
+    parse_rule_list(&tokens, true, context, None, &mut sheet, media, 0)?;
     Ok(sheet)
 }
 
@@ -4843,6 +4902,7 @@ fn parse_rule_list(
     context: RuleContext,
     scope: Option<&Nest>,
     sheet: &mut Stylesheet,
+    media: &mut MediaQueries,
     nesting: usize,
 ) -> Result<(), DocumentError> {
     let mut index = 0;
@@ -4851,7 +4911,7 @@ fn parse_rule_list(
             Token::Whitespace | Token::Cdo | Token::Cdc | Token::Semicolon => index += 1,
             Token::AtKeyword(name) => {
                 index = parse_at_rule(
-                    tokens, index, name, top_level, context, scope, None, sheet, nesting,
+                    tokens, index, name, top_level, context, scope, None, sheet, media, nesting,
                 )?;
             }
             _ => {
@@ -4871,7 +4931,7 @@ fn parse_rule_list(
                     scope.cloned(),
                     sheet.namespaces.clone(),
                 );
-                parse_style_block(&selectors, block, context, sheet, nesting)?;
+                parse_style_block(&selectors, block, context, sheet, media, nesting)?;
                 index = end;
             }
         }
@@ -4914,6 +4974,7 @@ fn parse_at_rule(
     scope: Option<&Nest>,
     selectors: Option<&RuleSelectors>,
     sheet: &mut Stylesheet,
+    media: &mut MediaQueries,
     nesting: usize,
 ) -> Result<usize, DocumentError> {
     let name = name.to_ascii_lowercase();
@@ -4938,7 +4999,7 @@ fn parse_at_rule(
         let (block, after) = block_at(tokens, end);
         let mut scope = scope.cloned();
         let inner = match name.as_str() {
-            "media" => Some(declaring(media_condition(prelude))),
+            "media" => Some(declaring(media.condition(prelude)?)),
             "supports" => Some(declaring(supports_condition(prelude))),
             // A container's size is not read: its rules may apply inside a
             // size container (see [`Cascade::rule_applies`]).
@@ -4987,9 +5048,17 @@ fn parse_at_rule(
             }
             match selectors {
                 Some(selectors) => {
-                    parse_style_block(selectors, block, inner, sheet, nesting + 1)?;
+                    parse_style_block(selectors, block, inner, sheet, media, nesting + 1)?;
                 }
-                None => parse_rule_list(block, false, inner, scope.as_ref(), sheet, nesting + 1)?,
+                None => parse_rule_list(
+                    block,
+                    false,
+                    inner,
+                    scope.as_ref(),
+                    sheet,
+                    media,
+                    nesting + 1,
+                )?,
             }
         }
         return Ok(after);
@@ -5029,7 +5098,7 @@ fn parse_at_rule(
         }
     }
     if name == "import" && top_level && selectors.is_none() && !sheet.imports_closed {
-        if let Some((target, applies, layer)) = import_target(prelude) {
+        if let Some((target, applies, layer)) = import_target(prelude, media)? {
             let applies = applies.min(context.condition);
             if applies != Applies::No {
                 if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET
@@ -5119,7 +5188,10 @@ fn scope_prelude(prelude: &[Token], namespaces: &[(String, Rc<str>)]) -> Option<
 /// the target's rules in: `Some(None)` for an anonymous one (`layer`), the
 /// names of a named one (`layer(base)`). `None` for a rule Chromium drops.
 #[allow(clippy::type_complexity)]
-fn import_target(prelude: &[Token]) -> Option<(String, Applies, Option<Option<Vec<String>>>)> {
+fn import_target(
+    prelude: &[Token],
+    media: &mut MediaQueries,
+) -> Result<Option<(String, Applies, Option<Option<Vec<String>>>)>, DocumentError> {
     let tokens = trim_whitespace(prelude);
     let (target, rest) = match tokens {
         [Token::Str(target) | Token::Url(target), rest @ ..] => (target.clone(), rest),
@@ -5127,10 +5199,10 @@ fn import_target(prelude: &[Token]) -> Option<(String, Applies, Option<Option<Ve
             let (arguments, end) = block_at(tokens, 0);
             match trim_whitespace(arguments) {
                 [Token::Str(target)] => (target.clone(), &tokens[end..]),
-                _ => return None,
+                _ => return Ok(None),
             }
         }
-        _ => return None,
+        _ => return Ok(None),
     };
     // The layer, then the `supports()` condition, then the media list.
     let mut rest = trim_whitespace(rest);
@@ -5142,7 +5214,10 @@ fn import_target(prelude: &[Token]) -> Option<(String, Applies, Option<Option<Ve
         }
         [Token::Function(function), ..] if function.eq_ignore_ascii_case("layer") => {
             let (arguments, end) = block_at(rest, 0);
-            layer = Some(Some(layer_names(arguments).ok().flatten()?));
+            let Some(names) = layer_names(arguments).ok().flatten() else {
+                return Ok(None);
+            };
+            layer = Some(Some(names));
             rest = trim_whitespace(&rest[end..]);
         }
         _ => {}
@@ -5163,7 +5238,7 @@ fn import_target(prelude: &[Token]) -> Option<(String, Applies, Option<Option<Ve
             rest = trim_whitespace(&rest[end..]);
         }
     }
-    Some((target, supported.min(media_condition(rest)), layer))
+    Ok(Some((target, supported.min(media.condition(rest)?), layer)))
 }
 
 /// A style rule's selectors, read once a declaration or a nested rule
@@ -5242,6 +5317,7 @@ fn parse_style_block(
     block: &[Token],
     context: RuleContext,
     sheet: &mut Stylesheet,
+    media: &mut MediaQueries,
     nesting: usize,
 ) -> Result<(), DocumentError> {
     let mut declarations = Vec::new();
@@ -5261,6 +5337,7 @@ fn parse_style_block(
                     None,
                     Some(selectors),
                     sheet,
+                    media,
                     nesting,
                 )?;
             }
@@ -5282,7 +5359,7 @@ fn parse_style_block(
                         Some(selectors.nest()),
                         selectors.namespaces.clone(),
                     );
-                    parse_style_block(&nested, inner, context, sheet, nesting + 1)?;
+                    parse_style_block(&nested, inner, context, sheet, media, nesting + 1)?;
                     index = end;
                 } else {
                     declarations.extend(
@@ -10363,7 +10440,10 @@ pub(super) fn cascade_for(css: &[&str]) -> (Cascade, AnyDocCascade) {
     let mut reader = Cascade::default();
     let mut anydoc = AnyDocCascade::default();
     for sheet in css {
-        reader.push_sheet(&parse_stylesheet(sheet).expect("stylesheet"), Applies::Yes);
+        reader.push_sheet(
+            &parse_stylesheet(sheet, &mut MediaQueries::default()).expect("stylesheet"),
+            Applies::Yes,
+        );
         anydoc.add(sheet);
     }
     (reader, anydoc)
@@ -12368,7 +12448,7 @@ mod tests {
 
     #[test]
     fn conditions_hold_as_far_as_the_check_can_tell() {
-        let media = |text: &str| media_condition(&tokenize(text).expect("tokens"));
+        let media = |text: &str| media_condition(&tokenize(text).expect("tokens"), &mut 0);
         for (query, holds) in [
             ("", Applies::Yes),
             ("screen", Applies::Yes),
@@ -12455,6 +12535,47 @@ mod tests {
         assert_eq!(supports(&deep), Applies::Doubt);
         let deep = format!("{}(color){}", "(".repeat(100_000), ")".repeat(100_000));
         assert_eq!(media(&deep), Applies::Doubt);
+    }
+
+    /// A media query list with many widths and heights, as a crafted book
+    /// may repeat in every `media` and `@media`.
+    fn crowded_query(base: usize) -> String {
+        (0..40)
+            .map(|at| match (at < 20, at % 2) {
+                (true, 0) => format!("(min-width: {}px)", base + 23 * at),
+                (true, _) => format!("(max-width: {}px)", 1279 - 23 * at),
+                (false, 0) => format!("(min-height: {}px)", base + 29 * at),
+                (false, _) => format!("(max-height: {}px)", 1279 - 29 * at),
+            })
+            .collect::<Vec<_>>()
+            .join(" and ")
+    }
+
+    #[test]
+    fn media_query_lists_are_read_once_within_a_bound() {
+        // A list read again, in a `media` attribute or an `@media` or
+        // `@import` rule, costs a lookup.
+        let mut media = MediaQueries::default();
+        let query = crowded_query(321);
+        assert_eq!(media.attribute(&query).unwrap(), Applies::No);
+        let once = media.work();
+        assert!(once > 0);
+        assert_eq!(media.attribute(&format!(" {query} ")).unwrap(), Applies::No);
+        let imports = format!("@import url(a.css) {query};\n").repeat(100);
+        let blocks = format!("@media {query} {{ .x {{ display: none }} }}\n").repeat(1000);
+        parse_stylesheet(&(imports + &blocks), &mut media).expect("stylesheet");
+        assert_eq!(media.work(), once);
+        // Lists that differ each cost their tries, which are bounded.
+        media.attribute(&crowded_query(322)).unwrap();
+        assert_eq!(media.work(), 2 * once);
+        let mut media = MediaQueries {
+            work: MAX_MATCH_WORK - once / 2,
+            ..MediaQueries::default()
+        };
+        assert!(matches!(
+            media.attribute(&query),
+            Err(DocumentError::ResourceLimit)
+        ));
     }
 
     #[test]
@@ -12700,7 +12821,7 @@ mod tests {
             parent.join(", "),
             ".s { display: block } ".repeat(2_000)
         );
-        let sheet = parse_stylesheet(&css).expect("sheet");
+        let sheet = parse_stylesheet(&css, &mut MediaQueries::default()).expect("sheet");
         assert_eq!(sheet.rules.len(), 2_000);
         let shared = |rule: &StyleRule| match &rule.selector.compounds[0].parts[..] {
             [Simple::Pseudo(PseudoClass::Is(list))] => list.clone(),
@@ -12721,7 +12842,7 @@ mod tests {
             "display: block; & &, & &, & &, & & { ".repeat(12),
             "} ".repeat(12)
         );
-        let sheet = parse_stylesheet(&css).expect("sheet");
+        let sheet = parse_stylesheet(&css, &mut MediaQueries::default()).expect("sheet");
         assert!(sheet
             .rules
             .iter()
@@ -12898,7 +13019,10 @@ mod tests {
             ("@layer b { .q { color: red } }", Applies::Varies),
             (layers("").as_str(), Applies::Yes),
         ] {
-            reader.push_sheet(&parse_stylesheet(sheet).expect("stylesheet"), condition);
+            reader.push_sheet(
+                &parse_stylesheet(sheet, &mut MediaQueries::default()).expect("stylesheet"),
+                condition,
+            );
             anydoc.add(sheet);
         }
         let mut work = 0;
@@ -12915,7 +13039,7 @@ mod tests {
         within: Option<u32>,
         files: &[(&str, &str)],
     ) {
-        let parsed = parse_stylesheet(sheet).expect("stylesheet");
+        let parsed = parse_stylesheet(sheet, &mut MediaQueries::default()).expect("stylesheet");
         let mut open = reader.open_sheet(condition, within);
         for import in &parsed.imports {
             let layer = reader.import_layer(&parsed, &mut open, import);
@@ -13203,24 +13327,26 @@ mod tests {
     fn stylesheets_are_parsed_in_linear_time_and_bounded() {
         let started = std::time::Instant::now();
         let unterminated = "@import a#".repeat(64_000);
-        assert!(parse_stylesheet(&unterminated)
-            .expect("parses")
-            .imports
-            .is_empty());
+        assert!(
+            parse_stylesheet(&unterminated, &mut MediaQueries::default())
+                .expect("parses")
+                .imports
+                .is_empty()
+        );
         let unclosed = "@import url(".repeat(64_000);
-        parse_stylesheet(&unclosed).expect("parses");
+        parse_stylesheet(&unclosed, &mut MediaQueries::default()).expect("parses");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "imports must not be rescanned"
         );
         let many = "@import \"a.css\";".repeat(MAX_IMPORTS_PER_SHEET + 1);
         assert!(matches!(
-            parse_stylesheet(&many),
+            parse_stylesheet(&many, &mut MediaQueries::default()),
             Err(DocumentError::ResourceLimit)
         ));
         let crowded = ".a,".repeat(MAX_STYLESHEET_TOKENS / 2);
         assert!(matches!(
-            parse_stylesheet(&crowded),
+            parse_stylesheet(&crowded, &mut MediaQueries::default()),
             Err(DocumentError::ResourceLimit)
         ));
         let deep = format!(
@@ -13229,7 +13355,7 @@ mod tests {
             "}".repeat(40)
         );
         assert!(matches!(
-            parse_stylesheet(&deep),
+            parse_stylesheet(&deep, &mut MediaQueries::default()),
             Err(DocumentError::ResourceLimit)
         ));
     }
