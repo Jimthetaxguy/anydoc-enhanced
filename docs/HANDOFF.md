@@ -63,6 +63,7 @@ MCP handlers and domain modules must depend on the skillkit boundary.
 | `scripts/check-public-hygiene.sh` | Candidate-text obvious-identifier heuristic used locally and in CI |
 | test-corpus/README.md | Public PDF/PPTX/DOCX/XLSX/ODS/ODT/ODP/CSV/EPUB fixture provenance and contributor gate |
 | `docs/dependency-pr-review-2026-08-22.md` | Live review of dependency PRs #14–#18 |
+| `docs/dependency-pr-review-2026-09-26.md` | Dependabot PRs #23–#27 after the #28 refresh, and the dependency updates to check on |
 | `docs/anydoc-integration-plan.md` | Authoritative dependency-ordered AnyDoc plan |
 | `docs/upstream-drift-audit-2026-09-24.md` | Latest upstream audit, open-PR dispositions, and adoption checklist |
 | `scripts/build-anydoc-hardening-corpus.py` | Deterministic fixtures for pinned-AnyDoc behaviors the contract refuses or discloses |
