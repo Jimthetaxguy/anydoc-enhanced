@@ -15,6 +15,10 @@
 //! text, and annotations hidden or set off their page are not what the
 //! page shows, and are not read.
 //!
+//! At most `MAX_ANNOTATIONS` annotations showing text of their own are
+//! read in a document; past them, each page holding one that may show text,
+//! not hidden, is named as unchecked.
+//!
 //! An appearance is read within bounds: each stream once, however many
 //! annotations share it, to `MAX_APPEARANCE_BYTES` decoded, and a
 //! document's streams to `MAX_APPEARANCE_TOTAL` in all, looking through the
@@ -30,9 +34,9 @@ use std::collections::{HashMap, HashSet};
 
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-/// Annotations of the kinds that can show text of their own read, at most,
-/// across a document; those of other kinds, links above all, are passed
-/// over uncounted.
+/// Annotations showing text of their own read, at most, across a
+/// document; those showing none, as lines without a caption, and those of
+/// other kinds, links above all, are passed over uncounted.
 const MAX_ANNOTATIONS: usize = 10_000;
 /// Bytes an appearance stream may decode to for its text to be looked for.
 const MAX_APPEARANCE_BYTES: usize = 1 << 20;
@@ -48,11 +52,12 @@ const MAX_TREE_DEPTH: usize = 64;
 const HIDDEN: i64 = 2;
 const NO_VIEW: i64 = 32;
 
-/// Text an annotation shows, and its page.
+/// Text an annotation shows, and its page; or, with no text, a page whose
+/// annotations that may show text were not read, past `MAX_ANNOTATIONS`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AnnotationText {
     pub(crate) page: u32,
-    pub(crate) text: String,
+    pub(crate) text: Option<String>,
 }
 
 fn resolve<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
@@ -772,7 +777,8 @@ pub(crate) fn page_box(document: &Document, page: ObjectId) -> Option<[f32; 4]> 
 }
 
 /// The text the annotations of `document` show on its pages, among the
-/// pages `only` names, if any.
+/// pages `only` names, if any, and the pages whose annotations were not
+/// read past the bound (see `AnnotationText`).
 pub(crate) fn unread(
     document: &Document,
     only: Option<&std::collections::HashSet<u32>>,
@@ -781,6 +787,7 @@ pub(crate) fn unread(
     let mut texts = Vec::new();
     let mut appearances = Appearances::new(document);
     let mut read = 0;
+    let unchecked = |page: u32| AnnotationText { page, text: None };
     for (number, page) in document.get_pages() {
         if only.is_some_and(|only| !only.contains(&number)) {
             continue;
@@ -807,10 +814,6 @@ pub(crate) fn unread(
             if !matches!(subtype, b"FreeText" | b"Line" | b"Stamp" | b"Watermark") {
                 continue;
             }
-            read += 1;
-            if read > MAX_ANNOTATIONS {
-                return texts;
-            }
             let flags = annotation
                 .get(b"F")
                 .ok()
@@ -822,6 +825,11 @@ pub(crate) fn unread(
                 || layers.is_some_and(|layers| layers.hide(document, annotation))
             {
                 continue;
+            }
+            // Past the bound, the page is named, its annotations unread.
+            if read > MAX_ANNOTATIONS {
+                texts.push(unchecked(number));
+                break;
             }
             let captioned = || {
                 annotation
@@ -838,6 +846,11 @@ pub(crate) fn unread(
             };
             if !shown {
                 continue;
+            }
+            read += 1;
+            if read > MAX_ANNOTATIONS {
+                texts.push(unchecked(number));
+                break;
             }
             // An annotation set wholly off its page is not shown.
             let on_page = shown_box
@@ -875,7 +888,7 @@ pub(crate) fn unread(
             if let Some(contents) = contents {
                 texts.push(AnnotationText {
                     page: number,
-                    text: contents,
+                    text: Some(contents),
                 });
             }
         }
@@ -957,7 +970,7 @@ mod tests {
         });
         let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
-            .map(|annotation| annotation.text)
+            .filter_map(|annotation| annotation.text)
             .collect();
         assert_eq!(
             texts,
@@ -1037,7 +1050,7 @@ mod tests {
         });
         let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
-            .map(|annotation| annotation.text)
+            .filter_map(|annotation| annotation.text)
             .collect();
         assert_eq!(
             texts,
@@ -1099,7 +1112,7 @@ mod tests {
         });
         let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
-            .map(|annotation| annotation.text)
+            .filter_map(|annotation| annotation.text)
             .collect();
         assert_eq!(texts, ["RECEIVED APR 15 2025", "PAID"]);
     }
@@ -1138,7 +1151,7 @@ mod tests {
         });
         let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
-            .map(|annotation| annotation.text)
+            .filter_map(|annotation| annotation.text)
             .collect();
         assert_eq!(texts, ["Void stamp near"]);
     }
@@ -1176,7 +1189,7 @@ mod tests {
         });
         let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
-            .map(|annotation| annotation.text)
+            .filter_map(|annotation| annotation.text)
             .collect();
         assert_eq!(texts, ["Void stamp reviewed"]);
     }
@@ -1196,9 +1209,52 @@ mod tests {
         });
         let texts: Vec<String> = unread(&found, None, None)
             .into_iter()
-            .map(|annotation| annotation.text)
+            .filter_map(|annotation| annotation.text)
             .collect();
         assert_eq!(texts, ["Adjusted basis 12,500.00 per preparer"]);
+    }
+
+    #[test]
+    fn annotations_showing_no_text_do_not_count_against_the_bound() {
+        // Lines without a caption, which show no text of their own, before
+        // a text box.
+        let found = document(|_| {
+            let mut annotations: Vec<Dictionary> = (0..MAX_ANNOTATIONS)
+                .map(|_| dictionary! { "Subtype" => "Line" })
+                .collect();
+            annotations.push(dictionary! {
+                "Subtype" => "FreeText",
+                "Contents" => Object::string_literal("Adjusted basis 12,500.00 per preparer"),
+            });
+            annotations
+        });
+        assert_eq!(
+            unread(&found, None, None),
+            [AnnotationText {
+                page: 1,
+                text: Some("Adjusted basis 12,500.00 per preparer".to_string()),
+            }]
+        );
+        // Past the bound of text boxes read, their page is named unread.
+        let found = document(|_| {
+            (0..=MAX_ANNOTATIONS)
+                .map(|index| {
+                    dictionary! {
+                        "Subtype" => "FreeText",
+                        "Contents" => Object::string_literal(format!("Box {index}")),
+                    }
+                })
+                .collect()
+        });
+        let read = unread(&found, None, None);
+        assert_eq!(read.len(), MAX_ANNOTATIONS + 1);
+        assert_eq!(
+            read.last(),
+            Some(&AnnotationText {
+                page: 1,
+                text: None
+            })
+        );
     }
 
     #[test]

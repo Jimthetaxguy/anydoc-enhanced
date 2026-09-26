@@ -107,6 +107,9 @@ pub const PDF_WARNING_HEADER_FOOTER_DROPPED: &str = "header_footer_dropped";
 pub const PDF_WARNING_FORM_VALUES_MISREAD: &str = "form_values_misread";
 /// Text an annotation shows on the page is missing from the Markdown.
 pub const PDF_WARNING_ANNOTATION_TEXT_UNREAD: &str = "annotation_text_unread";
+/// The annotation check stopped at its bound, so text annotations show on
+/// the pages past where it stopped went unchecked.
+pub const PDF_WARNING_ANNOTATION_TEXT_UNCHECKED: &str = "annotation_text_unchecked";
 /// A dynamic XFA form's content is not in the Markdown.
 pub const PDF_WARNING_XFA_FORM_UNREAD: &str = "xfa_form_unread";
 /// Words a page, on average, in the Markdown of a dynamic XFA form whose
@@ -1180,13 +1183,21 @@ impl PdfInfo {
     }
 
     /// Report the pages of text annotations show (see `annotations`) that
-    /// the Markdown does not show.
+    /// the Markdown does not show, and the pages whose annotations were not
+    /// read past the check's bound.
     fn check_annotation_texts(&mut self, texts: &[annotations::AnnotationText]) {
+        let mut unchecked: Vec<u32> = texts
+            .iter()
+            .filter(|text| text.text.is_none())
+            .map(|text| text.page)
+            .collect();
+        unchecked.sort_unstable();
+        unchecked.dedup();
         let pages: Vec<[u32; 1]> = texts.iter().map(|text| [text.page]).collect();
         let texts: Vec<(&[u32], &str)> = pages
             .iter()
             .zip(texts)
-            .map(|(page, text)| (page.as_slice(), text.text.as_str()))
+            .filter_map(|(page, text)| Some((page.as_slice(), text.text.as_deref()?)))
             .collect();
         let pages = self.unshown(&texts, None);
         if !pages.is_empty() {
@@ -1194,6 +1205,13 @@ impl PdfInfo {
                 PDF_WARNING_ANNOTATION_TEXT_UNREAD,
                 "On these pages text shown in an annotation, such as a text box typed onto the page or a stamp drawn in text, is not in the Markdown: pdf-inspector 1.25.0 reads a page's content, links, and form values only; read these pages another way.",
                 pages,
+            ));
+        }
+        if !unchecked.is_empty() {
+            self.warnings.push(PdfWarning::new(
+                PDF_WARNING_ANNOTATION_TEXT_UNCHECKED,
+                "On these pages the annotations were not read, as the document holds more than the 10,000 annotations showing text the check reads: text a text box, a line's caption, or a stamp shows on them is not reported, and pdf-inspector 1.25.0 reads none of it; read these pages another way where it matters.",
+                unchecked,
             ));
         }
     }

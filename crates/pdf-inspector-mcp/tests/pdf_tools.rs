@@ -3802,6 +3802,69 @@ fn form_values_past_the_bounds_among_a_fields_widgets_are_reported() {
     );
 }
 
+/// A drawing's two sheets: the first marked up with `lines` lines without
+/// a caption and `boxes` text boxes, the second with one text box.
+fn marked_up_sheets_pdf(lines: usize, boxes: usize) -> Vec<u8> {
+    let first = 9;
+    let annotations: Vec<String> = (0..lines + boxes)
+        .map(|index| format!("{} 0 R", first + index))
+        .collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R /Annots [{}] >>",
+            annotations.join(" ")
+        )
+        .into_bytes(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R /Annots [8 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        stream("", b"BT /F1 12 Tf 72 740 Td (Drawing sheet 1 of 2 with markup) Tj ET"),
+        stream("", b"BT /F1 12 Tf 72 740 Td (Drawing sheet 2 of 2) Tj ET"),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [72 600 400 630] /Contents (Reviewer: replace beam B-12 before sign-off) >>".to_vec(),
+    ];
+    for index in 0..lines + boxes {
+        let (x, y) = (50 + (index % 50) * 10, 100 + (index / 50) % 60 * 10);
+        objects.push(if index < lines {
+            format!(
+                "<< /Type /Annot /Subtype /Line /Rect [{x} {y} {} {}] /L [{x} {y} {} {}] >>",
+                x + 8,
+                y + 8,
+                x + 8,
+                y + 8
+            )
+            .into_bytes()
+        } else {
+            format!(
+                "<< /Type /Annot /Subtype /FreeText /Rect [{x} {y} {} {}] /Contents (Note {index}) >>",
+                x + 8,
+                y + 8
+            )
+            .into_bytes()
+        });
+    }
+    pdf_file(&objects)
+}
+
+#[test]
+fn annotations_past_the_bound_are_named_unchecked() {
+    let results = convert_all(&[
+        // Lines without a caption show no text, and do not count against
+        // the 10,000 annotations the check reads.
+        marked_up_sheets_pdf(10_000, 0),
+        // Past 10,000 text boxes, the pages holding more are named.
+        marked_up_sheets_pdf(0, 10_001),
+    ]);
+    assert_eq!(
+        warned_pages(&results, "annotation_text_unread"),
+        [Some(serde_json::json!([2])), Some(serde_json::json!([1]))]
+    );
+    assert_eq!(
+        warned_pages(&results, "annotation_text_unchecked"),
+        [None, Some(serde_json::json!([1, 2]))]
+    );
+}
+
 /// A statement page a reviewer marked up: a text box typed onto it and a
 /// stamp drawn in text, both annotations; `flattened` also sets their text
 /// in the page's own content.
