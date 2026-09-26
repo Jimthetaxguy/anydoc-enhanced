@@ -155,7 +155,7 @@ def main() -> None:
         "hidden-content.epub",
         chapter_one=(
             "<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\">"
-            "<head/><body><h1>Hidden</h1><p style=\"display:none\">Hidden text</p>"
+            "<head/><body><h1>Hidden</h1><p style=\"visibility:hidden\">Hidden text</p>"
             "</body></html>"
         ).encode(),
     )

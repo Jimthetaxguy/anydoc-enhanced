@@ -8,11 +8,11 @@ dependency is permissively licensed and compatible with that choice.
 ### pdf-inspector
 
 - **Source:** https://github.com/firecrawl/pdf-inspector
-- **Package:** crates.io `pdf-inspector 1.17.0`
-- **Registry package:** crates.io `1.17.0`, checksum `6cdfc6057e1b38a2ae84490c5e64abc5c81738d4d5ac1ccc55cf1a2c9b87334e`
-- **Upstream Git context:** `main` @ `23cf1ad7b37eec6e3a21df61f8e6d5dce66c46bd`; latest visible tag `v1.15.0` @ `06a9bab6b3309309503f2db17851389cee094a62`
+- **Package:** crates.io `pdf-inspector 1.25.0`
+- **Registry package:** crates.io `1.25.0`, checksum `4c7bbb3b63dec43a1c849508e0da95833af6185649f121e41fc3cbd2d3b2e639`
+- **Upstream Git context:** no `v1.25.0` tag; the package matches `main` @ `2dbd16b3ea4ea943af2802bd72e45dd264eacb9f` (release of #592 and #593)
 - **License:** MIT
-- **Transitive core dep:** `lopdf 0.42.0` from crates.io (MIT)
+- **Transitive core dep:** `lopdf 0.45.0` from crates.io (MIT), checksum `bfffda0fe1ab0157e1a13c14bebd3f28671f2fccb7922f0722ec53926e6922d3`
 
 ### anydoc
 
@@ -36,28 +36,32 @@ Revert the dependency and lockfile changes, then rerun the locked verification g
 
 ## Full dependency license audit
 
-Generated with `cargo license --json` on 2026-08-28. The 211-package workspace graph
-(209 external packages plus 2 workspace packages) resolves to:
+Generated with `cargo license --json` (cargo-license 0.7.0) on 2026-09-26. The
+208-package workspace graph (206 external packages plus 2 workspace packages)
+resolves to:
 
 | License set | Crate count | Notes |
 |---|---:|---|
-| `Apache-2.0 OR MIT` | 141 | Bulk of the Rust ecosystem |
-| `MIT` | 35 | Includes `anydoc`, `lopdf`, and `pdf-inspector` |
+| `Apache-2.0 OR MIT` | 138 | Bulk of the Rust ecosystem |
+| `MIT` | 34 | Includes `anydoc`, `lopdf`, `pdf-inspector`, and `pulldown-cmark` |
 | `Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT` | 14 | wasm/wit toolchain crates |
-| `MIT OR Unlicense` | 8 | Permissive dual-license choice |
+| `MIT OR Unlicense` | 6 | Permissive dual-license choice |
 | `Apache-2.0 OR MIT OR Zlib` | 3 | Permissive multi-license choice |
-| `Apache-2.0` | 3 | Includes `rmcp` and `rmcp-macros` |
-| `(Apache-2.0 OR MIT) AND BSD-3-Clause` | 1 | Compatible conjunctive terms |
+| `Apache-2.0` | 3 | `rmcp`, `rmcp-macros`, and `zopfli` |
+| `BSD-3-Clause` | 2 | `alloc-no-stdlib` and `alloc-stdlib`, through `brotli-decompressor` (from `lopdf` 0.45.0) |
+| `Zlib` | 2 | Permissive license |
+| `(Apache-2.0 OR MIT) AND BSD-3-Clause` | 1 | `encoding_rs`; compatible conjunctive terms |
 | `(Apache-2.0 OR MIT) AND Unicode-3.0` | 1 | Compatible conjunctive terms |
 | `0BSD OR Apache-2.0 OR MIT` | 1 | Permissive multi-license choice |
+| `BSD-3-Clause OR MIT` | 1 | `brotli-decompressor`; this project selects MIT |
 | `Apache-2.0 OR BSL-1.0` | 1 | `ryu`; this project selects Apache-2.0 |
 | `Apache-2.0 OR LGPL-2.1-or-later OR MIT` | 1 | `r-efi`; this project selects MIT |
-| `Zlib` | 2 | Permissive license |
 
 **Result:** no resolved package requires GPL, AGPL, LGPL, SSPL, BUSL, or
 proprietary licensing. The graph passes the repository's cargo-deny license
-policy; `r-efi` offers LGPL-or-later or MIT, and this project selects MIT; `ryu`
-offers Apache-2.0 or BSL-1.0, and this project selects Apache-2.0.
+policy, whose allow list includes BSD-3-Clause. `r-efi` offers LGPL-or-later or
+MIT, and this project selects MIT; `ryu` offers Apache-2.0 or BSL-1.0, and this
+project selects Apache-2.0.
 
 To re-run the audit:
 

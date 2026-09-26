@@ -1,6 +1,6 @@
 # Firecrawl AnyDoc integration plan
 
-**Evidence date:** 2026-08-28
+**Evidence date:** 2026-08-28; refreshed 2026-09-24 (see [`upstream-drift-audit-2026-09-24.md`](upstream-drift-audit-2026-09-24.md))
 **Plan status:** parser convergence complete; bounded worker, contract, DOCX happy path, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict CSV, Linux-memory-gated strict ODP, and Linux-memory-gated strict EPUB slices implemented; broader formats remain gated
 **Target:** additive multi-format document support without changing the 13
 existing PDF/domain MCP tools plus additive generic document tools
@@ -14,6 +14,8 @@ the same Rust workspace.
 
 No non-PDF format is enabled merely because `AnyDoc::to_markdown` returns
 `Ok`. The current worker enables DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, exact `.odp`, and strict EPUB through AnyDoc; strict CSV uses a separate local adapter and CSV, ODP, and EPUB are enabled only on Linux where the worker address-space ceiling is enforceable. PPTX requires every declared slide to resolve to a well-formed shape tree and fails closed for hidden slides, external relationships, active content, and incomplete packages. XLSX uses a local cached-value-only policy and fails closed for hidden content, external links, active content, macro-enabled/binary/legacy containers, malformed packages, and uncached formulas. Broader parser paths remain disabled until completeness is observable through a typed signal or the conversion fails closed.
+
+The package preflight reads each package the way the pinned parser does. It decodes every XML part as AnyDoc's `to_utf8` decodes it, and resolves every reference with a port of `package::path::resolve`. It reads the parts AnyDoc reads by their exact names, and requires the officeDocument relationship to name the checked part. A check that saw a different document than the parser would otherwise let unchecked content through as complete output; the 2026-09-24 refresh reproduced five such packages and added them to the hardening corpus.
 
 Do not use the Node CLI, `npx`, Python bindings, WASM wrapper, Docker, or the
 hosted Firecrawl Parse API. The local library path is offline and does not need
@@ -33,7 +35,7 @@ The upstream AnyDoc CSV and RTF paths remain unexposed because issue #104 docume
 | Public Rust API | `to_markdown`, `to_markdown_bytes`, `to_document`, and content/extension format detection |
 | Local network behavior | No HTTP client, telemetry, update checker, API-key lookup, external service, or ML model in the resolved local runtime |
 | Formats | Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, and PDF variants |
-| PDF behavior | Declares `pdf-inspector 1.14.2` compatibility; this workspace converges that requirement to released `1.17.0`; PDFs bypass AnyDoc's shared document model; image-only PDFs require OCR |
+| PDF behavior | Declares `pdf-inspector 1.14.2` compatibility; this workspace converges that requirement to released `1.25.0`; PDFs bypass AnyDoc's shared document model; image-only PDFs require OCR |
 | Safety controls | Fixed archive, decompression, XML, table, binary-record, and retained-asset limits |
 | Upstream tests | 294 root-crate tests passed and 1 was ignored at the pinned revision; checked-in fixtures and fuzz targets exist, but fuzz targets are not exercised by upstream CI |
 
@@ -74,7 +76,7 @@ promotion remains a separate gate.
                                 +--------+---------+
                                          |
                                          v
-MCP stdio  ->  document service/router  ->  pdf-inspector =1.17.0
+MCP stdio  ->  document service/router  ->  pdf-inspector =1.25.0
                      |
                      | allowlisted non-PDF input bytes
                      v
@@ -236,6 +238,9 @@ slide, sheet, or source-offset provenance that upstream does not expose.
   preserved image URL.
 - Treat any observable skipped chapter, slide, sheet, relationship, or package
   part as `incomplete_conversion`; never return partial content as success.
+  A character-level omission that leaves the text usable, such as a dropped
+  DOCX non-breaking hyphen, is returned with `completeness: partial` and a
+  named warning, never as `complete`.
 - Do not log paths, document text, embedded URLs, or filenames. Use an opaque
   request identifier.
 - Verify the resolved production graph contains no HTTP client or two

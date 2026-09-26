@@ -15,13 +15,18 @@ categories = ["text-processing", "command-line-utilities"]
 [dependencies]
 anydoc = { workspace = true }
 pdf-inspector = { workspace = true }
+lopdf = { workspace = true }
 regex = "1"
+aho-corasick = "1"
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 quick-xml = { workspace = true }
+encoding_rs = { workspace = true }
 tokio = { workspace = true }
 zip = { workspace = true }
 tempfile = { workspace = true }
 libc = { workspace = true }
 log = "0.4"
+# Finds the code a Markdown renderer shows, which the sanitizer leaves as written.
+pulldown-cmark = { version = "0.13.4", default-features = false }

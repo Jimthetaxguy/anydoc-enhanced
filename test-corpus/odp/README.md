@@ -33,5 +33,10 @@ fixture:
 | missing-asset.odp | 053fc5a1808b29495b8f8f40011a99cb1070b5f4480df0baf65f8b8171383fba | incomplete_conversion |
 | wrong-mimetype.odp | 2ddb8844bd62327b0db0656e830cf218bfa123ccba220fdac234dccd97950158 | malformed |
 
+`linked-frame.odp` comes from `scripts/build-anydoc-hardening-corpus.py`: a
+slide frame wrapped in `draw:a`, which AnyDoc's shape walk skips, so it must
+return `incomplete_conversion` (SHA-256
+`79bd10da4aea4f66a75a2564bf90fbbca40fc6d3020b0991885eeb88eb8244c7`).
+
 The binary hashes are recorded here and in the top-level corpus manifest. No
 upstream source code is vendored and no new Cargo dependency was added.

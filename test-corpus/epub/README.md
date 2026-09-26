@@ -17,7 +17,7 @@ upstream source.
 | `missing-local-resource.epub` | Manifest declares a missing local stylesheet | `incomplete_conversion` | `8627ab36072c6892ede1bec06b048c0da2527c241487c1f8c2099670cb8372c5` |
 | `external-reference.epub` | Chapter contains an external HTTPS destination | `incomplete_conversion` with external flag | `99f6ff295bcc6c423ab0ffc53e2d6478b6812e6d180b3ec9b85cb805f6b5aab0` |
 | `active-content.epub` | Chapter contains a script element | `active_content_disabled` | `3ed69c8a7bf212babf8cd79dba86e188f1ad97e39a4143012cc288e21cab4f14` |
-| `hidden-content.epub` | Chapter contains CSS-hidden text | `incomplete_conversion` with hidden flag | `27d620444410e09739e86af1227df390423bc43d03503cad03d1552902b43835` |
+| `hidden-content.epub` | Chapter text hidden by an inline `visibility: hidden`, which AnyDoc ignores | `incomplete_conversion` with hidden flag | `ac6abfe041839be366f3d3c8e55fc329069b96103395e1d43657c2b867c9062e` |
 | `encrypted.epub` | Package contains `META-INF/encryption.xml` | `encrypted` | `84722d574c9ee28eb3f680ec9452b736cf220f22ec0c9f2ece39b8bf2cd8cef7` |
 | `archive-amplification.epub` | Seventeen-megabyte highly compressible archive member | `resource_limit` | `2a15349f90c3f4336c9ab4b0871fd2a887bf5bfccfa497e6f01ee665190414ef` |
 
@@ -42,8 +42,27 @@ content. The overlapping `active-content.epub`, `hidden-content.epub`, and
 `encrypted.epub` names now refer to the generator-backed qualification
 fixtures, so their earlier hashes are not listed as separate artifacts.
 
-The directory therefore contains fourteen packages: ten generated
-qualification fixtures and four retained low-level fixtures.
+The directory therefore contains twenty-three packages: ten generated
+qualification fixtures, four retained low-level fixtures, and
+`encoded-chapter-href.epub`, `linked-css-hidden.epub`, `escaped-selector.epub`,
+`list-text-outside-items.epub`, `kindle-media-pair.epub`,
+`minified-blocks.epub`, `indented-blocks.epub`, `display-none-omitted.epub`,
+and `web-address-in-text.epub` from
+`scripts/build-anydoc-hardening-corpus.py`. The first's spine href
+percent-decodes, as AnyDoc resolves it, to a chapter with hidden text beside a
+clean decoy stored under the encoded name. The second and third hide a
+paragraph through a linked stylesheet, with `visibility: hidden` and through
+an escaped class selector; readers hide the text and AnyDoc converts it. The
+fourth and fifth are the reverse: readers show text that AnyDoc drops, placed
+directly in a list, or hidden by the Kindle stylesheet pair, whose second rule
+inside `@media amzn-mobi` AnyDoc applies everywhere. The sixth puts a label
+and its amount in adjacent `div` elements with no white space between them;
+AnyDoc walks them inline and writes "Balance due1,250.00". All six must return
+`incomplete_conversion`. The last three must convert completely: the same
+`div` elements indented, which AnyDoc joins with a space; a `display: none`
+rule that AnyDoc applies as a reader does; and a web address written in the
+text, which the sanitizer removes. Their hashes are recorded in
+the corpus index.
 
 | Legacy fixture | SHA-256 |
 |---|---|

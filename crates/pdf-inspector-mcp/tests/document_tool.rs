@@ -10,7 +10,19 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 fn run_classify_document(path: String, client_name: &str) -> serde_json::Value {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pdf-inspector-mcp"))
+    run_classify_document_with_worker(path, client_name, None)
+}
+
+fn run_classify_document_with_worker(
+    path: String,
+    client_name: &str,
+    worker_bin: Option<&Path>,
+) -> serde_json::Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pdf-inspector-mcp"));
+    if let Some(worker_bin) = worker_bin {
+        command.env("ANYDOC_WORKER_BIN", worker_bin);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -554,7 +566,8 @@ fn epub_is_recognized_and_platform_memory_gated() {
             previous = offset;
         }
         assert!(!document.to_string().contains("https://"));
-        assert!(!document.to_string().contains("</"));
+        // AnyDoc's anchors for link targets are the only markup kept.
+        assert!(!without_anchors(markdown).contains("</"), "{markdown}");
         assert!(!document.to_string().contains(&["/", "Users", "/"].concat()));
     } else {
         let error = run_document_tool(fixture, "epub-disabled-route-test");
@@ -563,12 +576,44 @@ fn epub_is_recognized_and_platform_memory_gated() {
     }
 }
 
+/// Markdown without the anchors AnyDoc writes for link targets,
+/// `<a id="…"></a>` with an id of `[a-z0-9_-]`.
+fn without_anchors(markdown: &str) -> String {
+    let mut output = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(start) = rest.find("<a id=\"") {
+        let after = &rest[start + "<a id=\"".len()..];
+        let id_length = after
+            .bytes()
+            .take_while(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+            .count();
+        let tail = &after[id_length..];
+        output.push_str(&rest[..start]);
+        if id_length > 0 && tail.starts_with("\"></a>") {
+            rest = &tail["\"></a>".len()..];
+        } else {
+            output.push_str("<a id=\"");
+            rest = after;
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn strict_epub_negative_fixtures_fail_closed() {
     for (name, expected_code) in [
         ("missing-spine-chapter.epub", "incomplete_conversion"),
         ("malformed-spine-chapter.epub", "incomplete_conversion"),
+        // From scripts/build-anydoc-hardening-corpus.py: content only
+        // AnyDoc's own reading finds.
+        ("encoded-chapter-href.epub", "incomplete_conversion"),
+        ("linked-css-hidden.epub", "incomplete_conversion"),
+        ("escaped-selector.epub", "incomplete_conversion"),
+        ("list-text-outside-items.epub", "incomplete_conversion"),
+        ("kindle-media-pair.epub", "incomplete_conversion"),
+        ("minified-blocks.epub", "incomplete_conversion"),
         ("nav-spine-mismatch.epub", "incomplete_conversion"),
         ("missing-local-resource.epub", "incomplete_conversion"),
         ("external-reference.epub", "incomplete_conversion"),
@@ -588,6 +633,39 @@ fn strict_epub_negative_fixtures_fail_closed() {
             "{name} leaked a local path"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn epub_text_readers_hide_and_anydoc_omits_converts() {
+    let fixture = |name: &str| {
+        format!(
+            "{}/../../test-corpus/epub/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    };
+    // A `display: none` rule AnyDoc applies too: the text is omitted, as a
+    // reader omits it.
+    let document = run_document_tool(fixture("display-none-omitted.epub"), "epub-omitted-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("VISIBLE-CHAPTER"));
+    assert!(!markdown.contains("OMITTED-LIKE-A-READER"));
+    // Indented blocks AnyDoc walks inline are joined with a space, so no
+    // words run together.
+    let document = run_document_tool(fixture("indented-blocks.epub"), "epub-indented-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("Balance due 1,250.00"), "{markdown}");
+    // A web address written in the text loads nothing; it is sanitized.
+    let document = run_document_tool(fixture("web-address-in-text.epub"), "epub-address-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    assert!(!document.to_string().contains("example.com"));
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "sanitized_output"));
 }
 
 #[test]
@@ -1195,6 +1273,7 @@ fn strict_odp_negative_fixtures_fail_closed() {
         ("malformed-content.odp", "malformed"),
         ("missing-asset.odp", "incomplete_conversion"),
         ("wrong-mimetype.odp", "malformed"),
+        ("linked-frame.odp", "incomplete_conversion"),
     ] {
         let fixture = format!(
             "{}/../../test-corpus/odp/{name}",
@@ -1265,6 +1344,44 @@ fn enabled_lanes_reject_adversarial_public_fixtures() {
         ("ods/external-reference.ods", "incomplete_conversion"),
         ("ods/active-content.ods", "active_content_disabled"),
         ("ods/missing-table.ods", "incomplete_conversion"),
+        // Pinned AnyDoc drops these silently or amplifies them (see
+        // scripts/build-anydoc-hardening-corpus.py).
+        ("docx/symbol-checkbox.docx", "incomplete_conversion"),
+        ("docx/legacy-form-checkbox.docx", "incomplete_conversion"),
+        ("docx/utf16-footnote-symbol.docx", "incomplete_conversion"),
+        ("docx/ruby-text.docx", "incomplete_conversion"),
+        ("docx/alt-chunk.docx", "incomplete_conversion"),
+        ("pptx/fragment-slide-target.pptx", "incomplete_conversion"),
+        (
+            "pptx/case-variant-presentation-rels.pptx",
+            "incomplete_conversion",
+        ),
+        ("docx/namespace-shadowed-main.docx", "malformed"),
+        ("xlsx/binary-workbook.xlsx", "unsupported"),
+        ("xlsx/oversized-number-format.xlsx", "resource_limit"),
+        // Review round four: parts, cells, and values found where AnyDoc
+        // finds them.
+        (
+            "docx/cell-in-compatibility-block.docx",
+            "incomplete_conversion",
+        ),
+        ("pptx/relocated-notes.pptx", "incomplete_conversion"),
+        ("xlsx/xlsb-fallback-decoy.xlsx", "malformed"),
+        (
+            "xlsx/unrendered-formula-cache.xlsx",
+            "incomplete_conversion",
+        ),
+        ("odt/page-anchored-frame.odt", "incomplete_conversion"),
+        ("ods/untyped-formula-value.ods", "incomplete_conversion"),
+        // Number formats AnyDoc renders differently, and drawing text it
+        // never reads.
+        ("xlsx/negative-sign-by-colour.xlsx", "incomplete_conversion"),
+        ("xlsx/format-hidden-value.xlsx", "incomplete_conversion"),
+        ("xlsx/locale-date-format.xlsx", "incomplete_conversion"),
+        ("xlsx/drawing-text-box.xlsx", "incomplete_conversion"),
+        ("ods/negative-sign-by-colour.ods", "incomplete_conversion"),
+        ("ods/format-hidden-value.ods", "incomplete_conversion"),
+        ("ods/cell-anchored-text-box.ods", "incomplete_conversion"),
     ] {
         let fixture = format!(
             "{}/../../test-corpus/{relative_path}",
@@ -1293,4 +1410,507 @@ fn docx_external_relationship_is_contained_and_reported() {
     let text = document.to_string();
     assert!(!text.contains("https://example.invalid"));
     assert!(!text.contains(&["/", "Users", "/"].concat()));
+}
+
+#[test]
+fn docx_hidden_text_is_converted_and_disclosed() {
+    // Hidden directly on a run, and through a style in a UTF-16 styles part.
+    for (fixture, marker) in [
+        ("hidden-text.docx", "HIDDEN-RUN"),
+        ("utf16-hidden-style.docx", "STYLED-HIDDEN"),
+    ] {
+        let path = format!(
+            "{}/../../test-corpus/docx/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let document = run_document_tool(path, "docx-hidden-integration-test");
+        assert_eq!(document["completeness"], "complete", "{fixture}");
+        let markdown = document["markdown"].as_str().expect("markdown");
+        assert!(
+            markdown.contains(marker) && markdown.contains("HARDENING-END"),
+            "{fixture}"
+        );
+        assert!(
+            document["warnings"]
+                .as_array()
+                .expect("warning array")
+                .iter()
+                .any(|warning| warning["code"] == "hidden_content_preserved"),
+            "{fixture}"
+        );
+    }
+}
+
+#[test]
+fn pptx_section_lists_are_not_slides() {
+    let fixture = format!(
+        "{}/../../test-corpus/pptx/section-list.pptx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "pptx-sections-integration-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    assert!(document["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("SECTION-SLIDE")));
+}
+
+#[test]
+fn xlsx_parenthesized_negatives_keep_their_sign() {
+    let fixture = format!(
+        "{}/../../test-corpus/xlsx/red-parenthesized-negative.xlsx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "xlsx-negative-integration-test");
+    assert_eq!(document["completeness"], "complete", "{document}");
+    assert!(document["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("(25,000)")));
+}
+
+#[test]
+fn docx_list_numbers_word_continues_are_reported_as_partial() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/shared-list-definition.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-numbering-integration-test");
+    assert_eq!(document["completeness"], "partial", "{document}");
+    assert!(document["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("LIST-CONTINUES")));
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "list_numbering_differs"));
+}
+
+/// Write a package of these parts to `path`.
+fn write_package(path: &Path, entries: &[(&str, String)]) {
+    let file = std::fs::File::create(path).expect("create package");
+    let mut archive = zip::ZipWriter::new(file);
+    for (name, contents) in entries {
+        archive
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .expect("package part");
+        archive
+            .write_all(contents.as_bytes())
+            .expect("package part bytes");
+    }
+    archive.finish().expect("finish package");
+}
+
+const WORD_NAMESPACE: &str =
+    r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+
+/// A Word package whose main part names these relationships, holding these
+/// further parts.
+fn docx_parts(body: &str, relationships: &str, parts: &[(&str, String)]) -> Vec<(String, String)> {
+    let mut entries = vec![
+        (
+            "[Content_Types].xml".to_string(),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_string(),
+        ),
+        (
+            "_rels/.rels".to_string(),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_string(),
+        ),
+        (
+            "word/document.xml".to_string(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><w:document {WORD_NAMESPACE}><w:body>{body}</w:body></w:document>"#),
+        ),
+        (
+            "word/_rels/document.xml.rels".to_string(),
+            format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{relationships}</Relationships>"#),
+        ),
+    ];
+    entries.extend(
+        parts
+            .iter()
+            .map(|(name, contents)| (name.to_string(), contents.clone())),
+    );
+    entries
+}
+
+#[test]
+fn docx_notes_from_another_part_than_words_are_refused() {
+    let temporary = tempfile::tempdir().expect("temporary DOCX directory");
+    let note = |text: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:footnotes {WORD_NAMESPACE}><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+        )
+    };
+    let footnotes = |id: &str, target: &str| {
+        format!(
+            r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="{target}"/>"#
+        )
+    };
+    let body =
+        r#"<w:p><w:r><w:t>NOTE-CLAUSE</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+    let parts = [
+        ("word/footnotes.xml", note("SHOWN-NOTE pays 100 USD")),
+        ("word/other.xml", note("OTHER-NOTE pays 900 USD")),
+    ];
+    let convert = |name: &str, relationships: String| {
+        let path = temporary.path().join(name);
+        let entries = docx_parts(body, &relationships, &parts);
+        let entries: Vec<(&str, String)> = entries
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.clone()))
+            .collect();
+        write_package(&path, &entries);
+        run_document_tool(path.to_string_lossy().into_owned(), "docx-notes-parts-test")
+    };
+    // Word, as LibreOffice shows it, reads the first footnotes relationship
+    // and AnyDoc the lowest id, which names a part holding other text.
+    let substituted = convert(
+        "substituted.docx",
+        [
+            footnotes("rId8", "footnotes.xml"),
+            footnotes("rId0", "other.xml"),
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        substituted["code"], "incomplete_conversion",
+        "{substituted}"
+    );
+    // With the lowest id first, both read the note Word shows.
+    let same = convert(
+        "same.docx",
+        [
+            footnotes("rId0", "footnotes.xml"),
+            footnotes("rId8", "other.xml"),
+        ]
+        .concat(),
+    );
+    assert_eq!(same["completeness"], "complete", "{same}");
+    let markdown = same["markdown"].as_str().expect("markdown");
+    assert!(
+        markdown.contains("NOTE-CLAUSE") && markdown.contains("SHOWN-NOTE pays 100 USD"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("OTHER-NOTE"), "{markdown}");
+    // Parts that write the note Word shows alike convert, though Word's part
+    // defines it again after, which Word does not show.
+    let restated = temporary.path().join("restated.docx");
+    let stale = note("SHOWN-NOTE pays 100 USD").replace(
+        "</w:footnotes>",
+        r#"<w:footnote w:id="1"><w:p><w:r><w:t>STALE-NOTE</w:t></w:r></w:p></w:footnote></w:footnotes>"#,
+    );
+    let entries = docx_parts(
+        body,
+        &[
+            footnotes("rId8", "footnotes.xml"),
+            footnotes("rId0", "other.xml"),
+        ]
+        .concat(),
+        &[
+            ("word/footnotes.xml", stale),
+            ("word/other.xml", note("SHOWN-NOTE pays 100 USD")),
+        ],
+    );
+    let entries: Vec<(&str, String)> = entries
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.clone()))
+        .collect();
+    write_package(&restated, &entries);
+    let restated = run_document_tool(
+        restated.to_string_lossy().into_owned(),
+        "docx-notes-parts-test",
+    );
+    assert_eq!(restated["completeness"], "complete", "{restated}");
+    let markdown = restated["markdown"].as_str().expect("markdown");
+    assert!(markdown.contains("SHOWN-NOTE pays 100 USD"), "{markdown}");
+    assert!(!markdown.contains("STALE-NOTE"), "{markdown}");
+}
+
+#[test]
+fn docx_notes_are_read_as_word_and_anydoc_read_them() {
+    let temporary = tempfile::tempdir().expect("temporary DOCX directory");
+    let body =
+        r#"<w:p><w:r><w:t>NOTE-CLAUSE</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+    let convert = |name: &str, notes: &str| {
+        let path = temporary.path().join(name);
+        let footnotes = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:footnotes {WORD_NAMESPACE} xmlns:x="urn:x">{notes}</w:footnotes>"#
+        );
+        let entries = docx_parts(
+            body,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#,
+            &[("word/footnotes.xml", footnotes)],
+        );
+        let entries: Vec<(&str, String)> = entries
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.clone()))
+            .collect();
+        write_package(&path, &entries);
+        run_document_tool(
+            path.to_string_lossy().into_owned(),
+            "docx-notes-readings-test",
+        )
+    };
+    // AnyDoc skips a note an unprefixed type makes a separator, which Word,
+    // reading `w:type` alone, shows at its reference.
+    let skipped = convert(
+        "skipped.docx",
+        r#"<w:footnote type="separator" w:id="1"><w:p><w:r><w:t>SHOWN-NOTE</w:t></w:r></w:p></w:footnote>"#,
+    );
+    assert_eq!(skipped["code"], "incomplete_conversion", "{skipped}");
+    // A type in another vocabulary is read by neither side: a note no
+    // reference names converts after the text, disclosed.
+    let rider = convert(
+        "rider.docx",
+        r#"<w:footnote w:id="1"><w:p><w:r><w:t>SHOWN-NOTE</w:t></w:r></w:p></w:footnote><w:footnote x:type="separator" w:id="2"><w:p><w:r><w:t>RIDER-NOTE</w:t></w:r></w:p></w:footnote>"#,
+    );
+    assert_eq!(rider["completeness"], "complete", "{rider}");
+    assert!(
+        rider["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "hidden_content_preserved"),
+        "{rider}"
+    );
+}
+
+#[test]
+fn docx_repeated_level_properties_are_reported_as_partial() {
+    let temporary = tempfile::tempdir().expect("temporary DOCX directory");
+    let numbering = |level: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:numbering {WORD_NAMESPACE}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0">{level}<w:lvlJc w:val="left"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        )
+    };
+    let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>LIST-ITEM</w:t></w:r></w:p>"#.repeat(3);
+    let relationships = r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#;
+    let convert = |name: &str, level: &str| {
+        let path = temporary.path().join(name);
+        let entries = docx_parts(
+            &body,
+            relationships,
+            &[("word/numbering.xml", numbering(level))],
+        );
+        let entries: Vec<(&str, String)> = entries
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.clone()))
+            .collect();
+        write_package(&path, &entries);
+        run_document_tool(
+            path.to_string_lossy().into_owned(),
+            "docx-level-properties-test",
+        )
+    };
+    // LibreOffice numbers this list 7, 8, 9 from the last `w:start`, and
+    // AnyDoc 1, 2, 3 from the first.
+    let repeated = convert(
+        "repeated.docx",
+        r#"<w:start w:val="1"/><w:start w:val="7"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+    );
+    assert_eq!(repeated["completeness"], "partial", "{repeated}");
+    assert!(repeated["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "list_numbering_differs"));
+    let single = convert(
+        "single.docx",
+        r#"<w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+    );
+    assert_eq!(single["completeness"], "complete", "{single}");
+    assert!(single["markdown"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("LIST-ITEM")));
+}
+
+#[test]
+fn docx_dropped_hyphens_are_reported_as_partial() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/non-breaking-hyphen.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-hyphen-integration-test");
+    assert_eq!(document["completeness"], "partial");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    assert!(
+        markdown.contains("HYPHEN-MARKER") && markdown.contains("HARDENING-END"),
+        "{markdown}"
+    );
+    assert!(document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .any(|warning| warning["code"] == "characters_omitted"));
+}
+
+#[test]
+fn docx_external_link_destinations_are_removed() {
+    let fixture = format!(
+        "{}/../../test-corpus/docx/external-link-schemes.docx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = run_document_tool(fixture, "docx-link-schemes-integration-test");
+    assert_eq!(document["completeness"], "complete");
+    let markdown = document["markdown"].as_str().expect("markdown");
+    for index in 0..5 {
+        assert!(markdown.contains(&format!("LINK-{index}")), "{markdown}");
+    }
+    for leaked in [
+        "mailto:",
+        "file:",
+        "data:",
+        "tel:",
+        "fileserver",
+        "etc/passwd",
+    ] {
+        assert!(!markdown.contains(leaked), "{leaked} survived: {markdown}");
+    }
+    let codes: Vec<_> = document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap_or_default())
+        .collect();
+    assert!(codes.contains(&"external_relationships_blocked"));
+    assert!(codes.contains(&"sanitized_output"));
+}
+
+/// A worker that reads its request and answers with a fixed response frame.
+#[cfg(unix)]
+fn answering_worker(directory: &Path, response: &serde_json::Value) -> std::path::PathBuf {
+    let payload = response.to_string().into_bytes();
+    let mut frame = b"ADW1".to_vec();
+    frame.extend_from_slice(&[2, 0, 0, 0]);
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let frame_path = directory.join("response.frame");
+    std::fs::write(&frame_path, frame).expect("write worker frame");
+    let worker = directory.join("answering-worker.sh");
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\ncat '{}'\n",
+            frame_path.to_string_lossy().replace('\'', "'\\''")
+        ),
+    )
+    .expect("write answering worker");
+    let mut permissions = std::fs::metadata(&worker)
+        .expect("answering worker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&worker, permissions).expect("make answering worker executable");
+    worker
+}
+
+#[cfg(unix)]
+#[test]
+fn document_warnings_come_from_the_workers_preflight() {
+    let fixture = || {
+        format!(
+            "{}/../../test-corpus/docx/public-fixture.docx",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    };
+    let answered = |response: serde_json::Value| {
+        let temporary = tempfile::tempdir().expect("temporary worker directory");
+        let worker = answering_worker(temporary.path(), &response);
+        run_document_tool_with_worker(fixture(), "worker-preflight-test", Some(&worker))
+    };
+    // The package preflight runs in the worker, under its deadline and
+    // memory ceiling; the server discloses what it found.
+    let docx = serde_json::json!({ "kind": "docx", "variant": "docx" });
+    let document = answered(serde_json::json!({
+        "markdown": "PREFLIGHT-MARKER",
+        "preflight": { "list_numbering_differs": true, "hidden_content": true },
+        "classified": docx
+    }));
+    assert_eq!(document["completeness"], "partial", "{document}");
+    assert_eq!(document["markdown"], "PREFLIGHT-MARKER");
+    let codes: Vec<_> = document["warnings"]
+        .as_array()
+        .expect("warning array")
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap_or_default())
+        .collect();
+    assert!(codes.contains(&"list_numbering_differs"), "{document}");
+    assert!(codes.contains(&"hidden_content_preserved"), "{document}");
+    // What the worker's preflight rejects is refused, and Markdown without
+    // the preflight's findings is not returned.
+    let document = answered(serde_json::json!({
+        "markdown": "PREFLIGHT-MARKER",
+        "preflight": { "unsupported_content": true },
+        "classified": docx
+    }));
+    assert_eq!(document["code"], "incomplete_conversion", "{document}");
+    let document = answered(serde_json::json!({
+        "markdown": "PREFLIGHT-MARKER",
+        "classified": docx
+    }));
+    assert_eq!(document["code"], "worker_protocol", "{document}");
+}
+
+#[cfg(unix)]
+#[test]
+fn documents_are_classified_in_the_worker() {
+    let temporary = tempfile::tempdir().expect("temporary worker directory");
+    // Plain text, which no signature or extension names: what kind it is
+    // comes from the worker, the server reading no part of it.
+    let text = temporary.path().join("notes.txt");
+    std::fs::write(&text, "WORKER-CLASSIFIED").expect("write text input");
+    let worker = answering_worker(
+        temporary.path(),
+        &serde_json::json!({ "classified": { "kind": "docx", "variant": "docx" } }),
+    );
+    let classification = run_classify_document_with_worker(
+        text.to_string_lossy().into_owned(),
+        "worker-classification-test",
+        Some(&worker),
+    );
+    assert_eq!(classification["kind"], "docx", "{classification}");
+    assert_eq!(classification["variant"], "docx", "{classification}");
+    assert_eq!(
+        classification["size_bytes"],
+        serde_json::Value::from("WORKER-CLASSIFIED".len())
+    );
+    // Converted, it takes the route the worker found, and a route that
+    // converts nothing is no answer.
+    let converted = temporary.path().join("converted");
+    std::fs::create_dir(&converted).expect("worker directory");
+    let worker = answering_worker(
+        &converted,
+        &serde_json::json!({
+            "markdown": "WORKER-CONVERTED",
+            "preflight": {},
+            "classified": { "kind": "docx", "variant": "docx" }
+        }),
+    );
+    let document = run_document_tool_with_worker(
+        text.to_string_lossy().into_owned(),
+        "worker-classification-test",
+        Some(&worker),
+    );
+    assert_eq!(document["kind"], "docx", "{document}");
+    assert_eq!(document["markdown"], "WORKER-CONVERTED", "{document}");
+    let unrouted = temporary.path().join("unrouted");
+    std::fs::create_dir(&unrouted).expect("worker directory");
+    let worker = answering_worker(
+        &unrouted,
+        &serde_json::json!({
+            "markdown": "WORKER-CONVERTED",
+            "preflight": {},
+            "classified": { "kind": "pdf", "variant": "pdf" }
+        }),
+    );
+    let document = run_document_tool_with_worker(
+        text.to_string_lossy().into_owned(),
+        "worker-classification-test",
+        Some(&worker),
+    );
+    assert_eq!(document["code"], "worker_protocol", "{document}");
+    // Without a worker override, plain text is classified as nothing.
+    let classification =
+        run_classify_document(text.to_string_lossy().into_owned(), "plain-text-test");
+    assert!(classification["kind"].is_null(), "{classification}");
+    let document = run_document_tool(text.to_string_lossy().into_owned(), "plain-text-test");
+    assert_eq!(document["code"], "unrecognized", "{document}");
 }

@@ -8,18 +8,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Moved to `pdf-inspector` 1.25.0 (from 1.24.0), whose one library change
+  (#592) stops underline detection going quadratic on pages drawn from thin
+  rectangles: a crafted page of 200,000 of them converts in 0.7 s where
+  1.24.0 ran to the 25-second deadline. The Markdown and every warning are
+  unchanged on 4,412 PDFs, and each pdf-inspector defect the warnings below
+  describe for 1.24.0 holds on 1.25.0; the warnings' messages now name
+  1.25.0, and their codes are unchanged.
+- Adopted `pdf-inspector` 1.24.0 and `lopdf` 0.45.0 (from 1.17.0 and 0.42.0).
+  Every PDF tool now runs in the bounded worker used by the document lanes:
+  separate process, 1 GiB address-space ceiling and seccomp network denial on
+  Linux, a 25-second deadline, and four in-flight slots taken before a file is
+  read. Tool names and input schemas are unchanged.
+- Adopted `rmcp` 3.4.1. Every tool declares read-only, non-destructive,
+  idempotent, closed-world annotations.
+- Every dependency now resolves from crates.io, and cargo-deny rejects Git
+  sources.
 - Consolidated the `anyhow`, `serde_json`, `thiserror`, `regex`, and `tokio`
   lockfile updates after a live review of PRs #14-#18; `thiserror` advances to
   2.0.20 because the proposed 2.0.19 update is already superseded.
 - Replaced home-directory PDF discovery in integration tests with a tracked,
   redistributable U.S. Code fixture.
 - Updated repository identity and documentation for `anydoc-enhanced`, and
-  added a dependency-ordered Firecrawl AnyDoc integration plan. AnyDoc remains
-  planned and is not yet a runtime dependency.
+  added a dependency-ordered Firecrawl AnyDoc integration plan. AnyDoc 0.2.4
+  now runs behind the bounded worker for the enabled document lanes.
 - Limited feature-branch CI to the pull-request event so the same jobs are not
   duplicated by both `push` and `pull_request`.
+- Dependencies build optimized in the dev profile. The integration tests
+  drive the debug server under its 30-second tool timeout, and unoptimized
+  pdf-inspector took 11.6 s of it on the public Title 26 sample, enough to
+  time out on a loaded runner; it now takes 2 s.
+- CI checks the declared minimum Rust (1.88) in a new job. The lockfile pins
+  `aes` 0.9.2: 0.9.3 raised its own minimum to 1.89 and fixed nothing.
+- EPUB text a reader hides is refused only when AnyDoc would convert it. Text
+  that AnyDoc also omits (a `display: none` from a bare tag or class rule, or
+  an inline style) converts, so the Markdown matches what a reader shows. The
+  public `hidden-content.epub` fixture now hides its text with
+  `visibility: hidden`, which AnyDoc ignores.
+- The DOCX `hidden_content_preserved` message now names every case it
+  discloses: hidden text, tracked deletions, and unreferenced notes.
+- XLSX refuses cells, rows, and sheets outside the positions AnyDoc reads.
+  ODS and ODP refuse text in positions AnyDoc's walkers skip, as ODT already
+  refused dropped content. EPUB refuses text a reader shows and AnyDoc drops.
+- DOCX conversion reports `partial` with a new `list_numbering_differs`
+  warning when AnyDoc's list numbers differ from Word's (see Fixed).
+- PDF results list a scanned page for OCR, with upstream's
+  `invisible_text_layer` reason, when its text is mostly an invisible layer
+  that pdf-inspector 1.24.0 does not read (see Fixed).
+- PDF results carry a `warnings` list, absent when empty, naming text the
+  Markdown repeats, pages whose word gaps pdf-inspector misjudges or whose
+  form text it does not read, pages that lose a line it takes for a running
+  header, form values it garbles or leaves out, annotation text, dynamic
+  XFA forms and embedded files it never reads, and tables whose amounts may
+  sit in the wrong row or column or after the table (see Fixed). A full run that yields no Markdown for a text PDF
+  reports confidence 0, and a page whose text looks garbled sets
+  `has_encoding_issues`.
 
 ### Security
+- DOCX conversion refuses content the pinned AnyDoc parser drops silently:
+  symbol-font checkboxes and letters (`w:sym`), legacy form checkbox and
+  drop-down state. Hidden text is converted and disclosed with a
+  `hidden_content_preserved` warning.
+- DOCX conversion also refuses ruby text and imported chunks (`w:altChunk`),
+  whose content the pinned parser drops. A dropped non-breaking hyphen
+  ("Form 1040‑SR" converts as "Form 1040SR") is reported with
+  `completeness: partial` and a `characters_omitted` warning; this is the first
+  lane to emit `partial`.
+- XLSX conversion refuses number-format codes over 4,096 bytes; one 8 MiB code
+  had amplified to 855 MiB in the worker.
+- Markdown sanitization decodes each link destination before classifying it.
+  It removes external and local-path destinations in every spelling found in
+  review, including `mailto:`, `file:`, `data:`, `tel:`, UNC, and `www.` forms.
+- Package checks now read what AnyDoc reads. XML parts are transcoded as AnyDoc
+  transcodes them (UTF-16 and declared encodings). Package references resolve
+  as AnyDoc resolves them, including fragments, queries, percent-encoding, and
+  `..` clamping. The PPTX presentation part is matched by exact name, and the
+  officeDocument relationship must name the checked part. Each hidden-content
+  or dropped-content decoy found in review converted as complete before this
+  change and now fails closed or is disclosed.
+- Package checks read markup as AnyDoc does. Namespace declarations are not
+  attributes: `xmlns:Target` can no longer shadow `Target`. Every attribute is
+  decoded before comparison.
+- XLSX hidden-sheet, hidden-row, and cached-formula checks parse the XML and
+  also treat zero-size rows and columns as hidden. Binary workbook records in
+  `xl/workbook.xml` are refused as `unsupported`. Hidden defined names, which
+  Excel adds for filters, no longer refuse a workbook.
+- PPTX hidden slides and hidden shapes (`cNvPr hidden`) are parsed rather than
+  matched as text, and speaker notes are checked. ODP slides hidden through a
+  drawing-page style are refused. An ODF package whose body belongs to another
+  lane than its mimetype reports missing content.
+- DOCX: only WordprocessingML deletions exempt content, and only where
+  AnyDoc's walker skips them; a deletion inside a drawing does not hide a text
+  box. Table rows wrapped in content controls or custom XML are refused.
+  Hidden list labels in the numbering part are disclosed. Run properties inside
+  `mc:AlternateContent` are read. Embedded objects are found by relationship
+  type, whatever their part name.
+- EPUB hiding is evaluated in inline styles, `<style>` elements, linked
+  stylesheets, and their local imports. Both `display: none` and
+  `visibility: hidden`/`collapse` count, as AnyDoc's declaration parser reads
+  them.
+- Review round four: main parts are found by exact name, as AnyDoc finds
+  them. A case-variant `XL/workbook.xml` decoy no longer passes while AnyDoc
+  falls back to the binary `xl/workbook.bin`. An ODF package's lane follows the
+  first `office:body` in the office namespace; a same-named element elsewhere
+  no longer decides it.
+- EPUB stylesheets are evaluated by a new module that models a reading system
+  and AnyDoc side by side. The reader model uses a CSS Syntax 3 tokenizer, media
+  queries, the full selector grammar, the cascade, and the user-agent rules
+  that hide content. The AnyDoc model is a port of AnyDoc's own subset, applied
+  only to the elements its walker styles. Hiding the old checks missed is now
+  found: comments and escapes in declarations and selectors, namespaced and
+  quoted-attribute selectors, `@import` in any spelling, a second prefixed
+  `rel` or `href`, SVG `display` and `visibility` attributes,
+  `<?xml-stylesheet?>`, `content-visibility`, `hidden`, and closed dialogs.
+- PPTX speaker notes are followed through each slide's notesSlide
+  relationship, wherever they are stored. A slide list inside
+  `mc:AlternateContent` is refused.
+- DOCX refuses a table cell AnyDoc's row walker does not reach (such as one
+  wrapped in `mc:AlternateContent`) and a row outside a WordprocessingML table.
+  It discloses as hidden: a hidden mark on a directly numbered paragraph, which
+  hides its list label; `w:specVanish` runs; tracked-deleted rows; unreferenced
+  footnotes and endnotes; and a drawing's `mc:Choice` that needs a vocabulary
+  outside Office's, which Word replaces with its fallback.
+- XLSX formula caches must render as AnyDoc's `cell_text` renders them. Sheet
+  default row heights and column widths too small to draw, and rows or columns
+  under one pixel, count as hidden. A VML checkbox that Excel hides but
+  AnyDoc's case-sensitive test converts counts as hidden.
+- ODS formula caches must render as AnyDoc's `value_text` renders them. A
+  streaming model of AnyDoc's ODF walkers refuses text in positions they skip:
+  page-anchored frames and `text:numbered-paragraph` in ODT, and frames in
+  `draw:a`, shapes AnyDoc does not walk, and notes stored in shapes in ODP.
+  ODP shapes with `draw:display` set to `none` or `printer`, shapes on hidden
+  layers, and slides hidden through an inherited or default drawing-page style
+  count as hidden. So do ODF rows and columns under half a pixel.
+- EPUB text a reader shows and AnyDoc drops is refused, found from AnyDoc's
+  open pull requests on its HTML walker (#147, #149). AnyDoc reads only `li`
+  children of a list and only row groups, rows, cells, and the first caption
+  of a table, so text or a paragraph placed directly in either was lost, as
+  was `noscript` content. Its stylesheet split applies every rule after the
+  first inside an at-rule block everywhere. So the common Kindle pair,
+  `@media amzn-mobi { .mobi-only {display: block} .kf8-only {display: none} }`,
+  dropped the `.kf8-only` text EPUB readers show, and the book converted as
+  complete. Script, style, and head text inside `pre`, which readers hide and
+  AnyDoc converts, now counts as hidden.
+- A PDF page-content bomb that still peaks at 2.1 GiB in-process under
+  `pdf-inspector` 1.24.0 now returns `resource_limit` from the worker.
+- Replaced the yanked `chacha20` 0.10.0 with 0.10.2.
 - Updated transitive `crossbeam-epoch` to 0.9.20 to resolve
   `RUSTSEC-2026-0204`.
 - Expanded CI policy enforcement to run cargo-deny advisory, license, ban, and
@@ -32,6 +166,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backward-compatible `batch_classify` path echo explicitly.
 
 ### Added
+- PDF results report per-page OCR reasons. Analysis reports layout (pages with
+  tables or columns) and fonts whose text may be garbled (CMap gaps), and
+  omits both when a mode did not compute them. Creation and modification dates
+  are reported when they match the PDF date grammar. Region extraction reports
+  why a region needs OCR.
+- `extract_text_regions` and `extract_table_regions` accept an optional
+  `frame`. `sheet` is the default and the previous behavior: the page as laid
+  out in its content stream, `/Rotate` not applied. `display` reads the
+  rectangles on the rendered page, so boxes from a page image select the right
+  text on rotated pages. This uses pdf-inspector 1.24's region frames.
+- `parse_irc_sections` reads the Markdown pdf-inspector renders. It returns
+  full provision labels such as `(d)(2)(A)(i)`, flags repealed sections, and
+  keeps editorial and statutory notes apart from the operative text.
+- `scripts/build-anydoc-hardening-corpus.py` and forty synthetic
+  fixtures that reproduce pinned-AnyDoc behaviors the local contract does not
+  inherit, or that must convert.
+- `docs/upstream-drift-audit-2026-09-24.md`: the upstream refresh audit, the
+  disposition of all 58 open AnyDoc pull requests, and the pdf-inspector pull
+  requests that reach the PDF tools.
 - Initial Rust workspace with `pdf-inspector-skillkit` library and `pdf-inspector-mcp` server binary
 - 9 MCP tools: `classify_pdf`, `pdf_to_markdown`, `analyze_layout`, `extract_text_regions`, `extract_table_regions`, `batch_classify`, `identify_tax_form`, `parse_irc_sections`, `split_sec_filing`
 - 4 Sweet tax-review demo tools: `list_tax_packages`, `review_tax_package`, `compare_line_items`, `render_review_memo` — deterministic package review, line-item comparison, and Markdown memo rendering over built-in demo packages (1040, 1120, 1065, 1120-S, K-1, 1099 workflows). Bringing the total to 13 MCP tools.
@@ -47,7 +200,1564 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependabot weekly cargo + actions updates
 - README, CHANGELOG, CONTRIBUTING, THIRD_PARTY license audit
 
+### Fixed
+- Japanese and Chinese text set in vertical writing, in columns side by
+  side, is reported. A font under a CMap for vertical writing advances down
+  the page, and its columns read top to bottom, right to left;
+  pdf-inspector 1.24.0 groups glyphs into lines by their height instead
+  (upstream #575), so columns set glyph by glyph read row by row across
+  them ("住源源 民泉泉 税徴徴" for three columns of a withholding notice),
+  and columns set as one string each read left to right, their order
+  reversed, at confidence 1.0 with no sign. The page scan now places the
+  strings such fonts show, gathers them into columns, and pairs the
+  neighbouring columns whose heights overlap; a page where the Markdown
+  does not show each such column whole, or, where both columns of a pair
+  hold six characters or more as a passage's do, in order, the right
+  column and then the left one, or whose font cannot be read to tell,
+  carries the new `vertical_text_misread` warning. The Markdown is not
+  changed. A column standing alone, which pdf-inspector reads in order, and
+  a form's short labels standing in cells side by side, which it reads
+  whole from left to right, are not reported.
+- Japanese and Chinese text that pdf-inspector 1.24.0 reads without its
+  font's map is reported. A font keyed by CID in Adobe's Japan1, GB1, or
+  CNS1 collection, with no ToUnicode map and no embedded program to read a
+  map from, is read through its collection's map, which pdf-inspector
+  bundles but cannot parse (upstream #573); it then reads the codes as the
+  bytes they are made of. A string with a byte past 0x7F reads as U+FFFD,
+  which already marked the page garbled; any other read as other letters,
+  "Total wages 52,000.00" as "5PUBMXBHFT", its digits and punctuation
+  dropped, at confidence 1.0 with no sign. A page showing such a string now
+  carries the new `cjk_text_misread` warning, and the document is marked as
+  having encoding issues; the Markdown is not changed. Where the fonts'
+  letters and digits are long enough to look for and the Markdown shows
+  them all, pdf-inspector read the fonts after all, and nothing is
+  reported. Korean, which pdf-inspector reads through a table of its own,
+  and fonts with a ToUnicode map or a predefined CMap whose codes are
+  Unicode, are not reported.
+- A running header numbering its pages from 0 ("Statement page 0" on the
+  first page) is no longer reported as dropped: its number counted as a
+  page number on every page but the first, which the check held to differ.
+- Invisible text and text in hidden layers are noted a page with a running
+  count of their bytes, where each run noted summed all the runs before: a
+  page of 60,000 glyphs set one by one had taken 0.6 s longer to convert.
+- Invisible text and text in hidden layers set glyph by glyph, each glyph a
+  text object of its own, are reported: runs going on along one line
+  within a glyph of each other, with no other string shown between, are
+  looked for in the Markdown as one text, where each glyph was looked for
+  alone and was too short to tell.
+- Text a page paints invisibly, which pdf-inspector 1.24.0 reads as shown,
+  is reported. Text in render mode 3 paints nothing, and no viewer shows
+  it. pdf-inspector skips it only when the mode is set inside the text
+  object that shows the text: it takes each text object on a page to start
+  visible, though the mode, part of the graphics state, goes on from one
+  text object to the next and from outside them (upstream #572). A
+  statement page that set the mode once, before its text objects, converted
+  "Ignore the balance above" beside the balances a reader sees, with no
+  sign. The page scan now follows the mode both as a viewer paints it and as
+  pdf-inspector reads it, and a page whose invisible text the Markdown shows
+  carries the new `invisible_text_read` warning; the Markdown is not
+  changed. A scan's text layer, on a page images cover and whose text
+  mostly paints nothing, describes what the scan shows and is not reported;
+  a page drawn over a background image is.
+- Text set in a layer a reader hides by default, which pdf-inspector
+  1.24.0 reads anyway, is reported. A PDF can set content in optional
+  layers and hide some of them by default: a superseded figure kept beside
+  the current one, a draft note, text meant only for print. A reader shows
+  the page as the document's default configuration sets its layers;
+  pdf-inspector reads no layer settings, so a statement's Markdown held
+  "Ending balance 1,000.00 superseded" beside the "Ending balance 2,000.00"
+  a reader sees, with no sign. The page scan now reads the default
+  configuration (its base state, the layers it turns on or off, a
+  membership dictionary's policy or visibility expression, and layers meant
+  for design only, which do not affect viewing), and a page whose text in a
+  hidden layer, in a marked-content span or a form the layer holds, the
+  Markdown shows carries the new `hidden_layer_text_read` warning; the
+  Markdown is not changed. An annotation a hidden layer holds is no longer
+  read as text the page shows.
+- Text set off the page, which no viewer shows and pdf-inspector 1.25.0
+  reads, is reported. A viewer shows what a page's crop box keeps of its
+  media box; text set outside it, such as a printer's slug below the crop,
+  the copy of a form beside the one a crop keeps, the rest of a line
+  running past the page's edge, or a line placed far off the page, is never
+  shown. pdf-inspector leaves such text out only where it reads as a
+  neighbouring page's on an imposed sheet: ten runs or more whose middles
+  stand more than 6 points off the box, half their characters or more in
+  runs of four or more, none going on from a line on the page, off a box
+  72 points or more a side. Otherwise it keeps it, so a slug's "Job total
+  85000.00" converted beside a statement's figures, and "Refund due to the
+  taxpayer 12,400.00" set left of the page beside the balances a reader
+  sees, with no sign. The page scan now places each run as pdf-inspector
+  does, by the widths of its glyphs from where the string before it ended,
+  leaves out what pdf-inspector would, and a page whose off-page text the
+  Markdown shows carries the new `offpage_text_read` warning; the Markdown
+  is not changed. Off-page text painted invisibly, or in a layer a reader
+  hides, is reported by those warnings instead. The page's visible box is
+  now found as pdf-inspector finds it: a crop box wholly off the media box
+  gives way to it, where such a page had gone unchecked, and a malformed
+  box to the next one up the page tree.
+- Files a PDF embeds, which pdf-inspector 1.24.0 never reads, are reported.
+  A portfolio bundles documents, such as a year's tax forms, as embedded
+  files behind a cover page, and converted as that cover alone; attachments
+  and file attachment annotations were passed over the same way, with no
+  sign. A PDF embedding files now carries the new `embedded_files_unread`
+  warning, which counts them and says whether the PDF is a portfolio, so
+  each file can be converted on its own; the Markdown is not changed.
+- A dynamic XFA form, whose content pdf-inspector 1.24.0 never reads, is
+  reported. Such a form, marked as needing rendering, keeps its fields and
+  filled values in XFA, which a viewer lays out; its pages hold only the
+  notice a viewer without XFA shows. A filled return made so converted as
+  "Please wait... If this message is not eventually replaced…" alone, at
+  confidence 1.0, with the taxpayer's wages nowhere in it. It now carries
+  the new `xfa_form_unread` warning; the Markdown is not changed. A form
+  with XFA that draws its own pages, as the IRS's static forms do, is not
+  reported: its values are read from its fields (see `form_values_misread`).
+- Text shown in annotations, which pdf-inspector 1.24.0 never reads, is
+  reported. A PDF shows text in annotations besides its page content: a
+  text box a reviewer types onto the page (FreeText), such as "Adjusted
+  basis 12,500.00 per preparer", or a stamp or watermark drawn in text,
+  such as "RECEIVED APR 15 2025". pdf-inspector reads a page's content,
+  links, and form values only, so such text was missing from the Markdown
+  with no sign. Visible text boxes, and stamps and watermarks whose
+  appearance draws text, are now read for their text (`/Contents`, or the
+  plain text of their rich text), and a page whose annotation text the
+  Markdown does not show carries the new `annotation_text_unread` warning;
+  the Markdown is not changed. Notes shown only in a popup, and markup
+  commenting on the page's own text, are not what the page shows and are
+  not read. No PDF among 4,412 corpus, fixture, review, and fuzz files is
+  named (only ten of them hold annotations).
+- Form field values pdf-inspector 1.24.0 garbles or leaves out are reported
+  (upstream issue #504). pdf-inspector writes each filled form field into
+  the Markdown as its name and value, but reads the value as UTF-8, while a
+  PDF writes it in PDFDocEncoding or UTF-16. A payee filled in as UTF-16,
+  "José García", came out as "��\0J\0o\0s…" with control characters in the
+  Markdown, and "São Paulo" as "S�o Paulo". It also reads a value only from
+  a field that is its own widget, so it left out the choice of a group of
+  radio buttons, such as a return's filing status, and the value of any
+  field shown in more than one place. The fields are walked as
+  pdf-inspector walks them, and a page whose values it garbles or leaves
+  out, where the Markdown does not show them, carries the new
+  `form_values_misread` warning; the Markdown is not changed. The walk
+  reuses the document the page scan loads. Values in XFA forms, which
+  pdf-inspector does not read, are not checked. No PDF among 4,412 corpus,
+  fixture, review, and fuzz files is named (only one of them holds a form).
+- Lines pdf-inspector 1.24.0 drops as running headers or footers, though
+  they say what the line it keeps does not, are reported (upstream issue
+  #483). In a document of three pages or more, pdf-inspector drops from
+  every page but the first a line it finds near the top or bottom of three
+  pages, and three in ten, at about the same height. It compares lines with
+  the digits at either end left out, and drops the lines beside such a line
+  with it. So a consolidated statement's second and third accounts lost the
+  "Account number" line heading their pages, and every page read as the
+  first account's; a payroll register's later employees lost their IDs and
+  hour totals, all at confidence 1.0. The pages converted are read again as
+  pdf-inspector groups their lines, and its rule is applied to them. A page
+  where a dropped line says what no kept line says, other than by a page
+  number, and where the Markdown shows the line kept in its place but not
+  the dropped one, carries the new `header_footer_dropped` warning; the
+  Markdown is not changed. Headers repeated as they are, such as a bank's
+  name, and those numbering their pages are dropped by design and not
+  reported. No PDF among 551 corpus, fixture, replica, and review files and
+  3,970 fuzz and review files is named. The pages are read again only where
+  the page scan finds a line repeated at the edges of enough pages that
+  differs from the first page's (see review round ten), up to 2,000 pages,
+  and only while the call is expected to end within 20 seconds; the warning
+  names the last page checked when it stops short.
+- Amounts pdf-inspector 1.24.0 pushes out of a table's rows are reported
+  (open upstream #424). The table grid can drop a column: a 1099-B's sparse
+  wash-sale adjustments, or the Amount column of a long card statement,
+  follow the table instead, an amount a line, so which lot or purchase each
+  belongs to is lost. When the Markdown shows amounts on lines of their own
+  right after a table, amounts its cells do not hold, the page's text is
+  read as pdf-inspector places it, and where the page sets most of them on
+  the lines of the table's rows, beside a whole date or description cell,
+  the result carries the `table_values_detached` warning; the Markdown is
+  not changed. A total set on a line of its own is not reported. Among 551
+  corpus, upstream-fixture, replica, and review PDFs it names ten, each such
+  a dropout: the three #424 replicas, the upstream `tnagriculture_06_12`
+  fixture, and six generated card statements.
+- Text pdf-inspector 1.24.0 misses or garbles when a form XObject draws it
+  is reported (open upstream #312). A form without `/Resources` of its own
+  draws with its invoker's, as renderers read the specification, but
+  pdf-inspector gives it none, so a form such a form draws is never read: a
+  W-2 whose box lines sit in a form drawn through a bare form converted
+  with only its heading, at confidence 1.0. pdf-inspector also starts every
+  form with no font, so text a form shows in the font it was drawn with is
+  read byte by byte, and a subset font's space at code 3 is lost ("Total
+  deposits85,000.00"). A page showing such text now carries the
+  `form_text_unread` warning; the Markdown is not changed. Among 551
+  corpus, upstream-fixture, replica, and review PDFs, only the five
+  reproductions changed.
+- Words pdf-inspector 1.24.0 splits in text a browser printed glyph by glyph
+  (open upstream #531) are reported. Chromium's print to PDF shows each
+  glyph as a string of its own, placed at the whole-pixel advance hinting
+  gave it, while the font's widths keep the unhinted advance; a glyph set
+  wider than its width crosses pdf-inspector's word-gap threshold, so the
+  upstream fixture read "LIAB ILITIES" and a statement "B ALANCE DUE". Where
+  a font paints its word spaces as glyphs anywhere in the document, which
+  say where its words end, the page scan collects the words it shows glyph
+  by glyph. When the
+  Markdown shows one split by a space or a cell edge, the pages showing it
+  are read again as pdf-inspector places their text, and each page whose
+  own text splits it carries the `word_gaps_misread` warning; the Markdown
+  is not changed. On 400 randomized browser-printed pages, it names 203 of
+  the 270 whose Markdown splits such a word and none of the 130 others; 61
+  of the 67 it misses leave their word spaces as gaps. Among 256 corpus,
+  upstream-fixture, and replica PDFs, only the three #531 replicas are
+  reported, and the public samples, which the check reads again, convert
+  about 50-60 ms slower.
+- EPUB selectors that rely on siblings are matched as a reader matches
+  them. Round seven counted a rule with `h2 + p`, `h1 ~ p`,
+  `:first-of-type`, or `:last-child` only where digits met, because one
+  pass through a chapter could not settle it; words it ran together
+  converted. A pass before the walk now counts each element's siblings, and
+  the walk keeps the earlier siblings rules test (the first 32 and the
+  latest 96, with the names, ids, and classes of any let go between).
+  Against Chromium's layout of 800 randomized chapters, the check now
+  refuses all 417 in which AnyDoc runs words together and none of the 383
+  others; round seven missed 13 and refused 1 in error. Selector matching
+  backtracks where a nearer ancestor or sibling fails, within the match
+  budget, and a `~` step for a sibling a chapter lacks costs one lookup.
+  Text that opens with closing punctuation, such as a period a clearfix
+  box sets on a line of its own, no longer counts as run together, except
+  digits meeting across a decimal point ("12." and "5"). A link holding an
+  inline box with a heading inside no longer counts as broken where the
+  reader keeps one line.
+- Words and amounts that pdf-inspector 1.24.0 runs together or splits because
+  it measures word gaps against the wrong space width (open upstream #532)
+  are reported. For a subset font whose differences name the space at a code
+  other than 32, it reads the space width at code 32, or 250 units when code
+  32 has none, so the upstream real-estate fixture read "CBDOffice" and
+  "pricingisliketheweather", and a kerned price "8 5,000 .00". A page whose
+  text has a gap that pdf-inspector judges otherwise than its open fix would
+  now carries a `word_gaps_misread` warning; the Markdown is not changed. The
+  check follows pdf-inspector's rules for the threshold, its fallbacks, its
+  tracked runs of single glyphs, and character spacing that the next run
+  takes back. It reads glyphs with pdf-inspector's own ToUnicode and
+  glyph-name tables. Against pdf-inspector patched with the fix, it names
+  every changed page it checks and no other: 8 pages in 5 of 256 corpus,
+  upstream-fixture, and replica PDFs (the ninth changed page is listed as
+  needing OCR, and not checked), and 212 pages in 900 randomized fonts and
+  layouts.
+- DOCX list numbers are compared as Word writes its labels, found by
+  checking the review fixtures against LibreOffice. A level without number
+  text (`w:lvlText`) shows no number in Word, while AnyDoc numbers it; a
+  composite label (`%1.%2.`) shows the shallower number as each side counts
+  it, so a second list instance's "2.1." converted as "1.1."; a number the
+  label does not show is no longer compared. Paragraph styles are followed
+  along `w:basedOn` to the end of the chain, as AnyDoc follows them, rather
+  than 32 styles; a numbering number written with white space around it,
+  which Word reads and AnyDoc cannot, is disclosed. Fifteen review fixtures
+  now report `list_numbering_differs`; none of the 320 randomized list
+  documents or the 303 public documents changed.
+- An EPUB whose navigation document sits in the spine, as pandoc places it,
+  is no longer refused because the navigation does not list itself. Books
+  whose navigation leaves out a chapter are still refused.
+- A DOCX page number or date that Word fills in where a run shows it
+  (`w:pgNum` and the legacy date blocks), which AnyDoc drops, is disclosed:
+  the document converts as `partial` with the `characters_omitted` warning.
+  LibreOffice does not show them either; in headers and footers, which
+  AnyDoc does not convert, nothing is reported.
+- The Markdown sanitizer keeps the anchors AnyDoc writes for link targets
+  (`<a id="…"></a>`, with ids of its own characters), so a document's own
+  links still land and a bookmark no longer raises `sanitized_output`. A web
+  address or path redacted inside a code span keeps the span's closing
+  backtick; the redaction had swallowed it, turning the text after it into
+  code.
+- Text pdf-inspector 1.24.0 repeats or merges is reported, from its open pull
+  requests (#317, #377, #406, #424, #443, #531). A run painted twice over
+  itself, for emphasis, as an overprint, or as a replayed row, came out twice
+  ("TToottaall", "84.19 84.19") at confidence 1.0. A compact table's first row
+  also ended the paragraph above it, so a statement's opening balance or first
+  deposit appeared twice; a rate table in the public Title 26 sample shows it.
+  Adjacent columns of amounts, such as a 1099-B's wash-sale adjustment beside
+  the basis, merged into one cell. Each is now a warning,
+  `text_painted_twice` by page, `table_row_repeated`, and
+  `table_values_merged`; the Markdown is not changed. A text PDF whose full
+  run yields no Markdown reported confidence 1.0 and now reports 0.
+- Review round five found missed losses and false refusals in the checks
+  added by loops 8-11; all are fixed, and no outcome among 303 public
+  documents changed:
+  - DOCX list numbers are replayed paragraph by paragraph as Word and AnyDoc
+    count them. Lists that match (a deleted bullet, a "Restart at 1" with
+    letters under it, letters counted across restarts) are no longer
+    reported. A level replaced without a start override is, and so is a
+    restart LibreOffice writes on a list's first paragraph only, which
+    LibreOffice numbers 1, 2, 3 and AnyDoc 1, 4, 5.
+  - Spreadsheets: a currency code holding "CR" or "DR" (IDR, SCR, CRC) no
+    longer passes for an accounting sign, so "IDR 25,000" shown in red for
+    -25,000 is refused. A negative with text of its own ("Refund $830",
+    "▼3.1%"), or too small to show a digit, is not. A colour name no longer
+    reads as a date. Built-in percentages 67 and 68, 15% shown as 0.15, are
+    refused. Connector labels are found, and Excel's compatibility fallbacks
+    for charts and slicers are no longer read as text boxes.
+  - ODS: a formula returning a space or an empty string
+    (`=IF(A2="";"";A2*B2)`) is cached, not missing. Chart and formula objects,
+    which AnyDoc shows as images or converts, are no longer refused as active
+    content; OLE objects, by element or manifest entry, are.
+  - PDF: clip-only text an image or a shading is painted through, as in a
+    heading filled with a picture or a gradient, is visible, so such flyers
+    are no longer listed for OCR.
+- The pull request's automated review (Codex) raised three findings. The
+  archive entry count was already fixed in round fifteen (below); the
+  other two:
+  - `batch_classify` started a task for every path before the first
+    classification ran, and held the runtime, so its timeout could not
+    fire, until all were started: 300,000 short paths took the server to
+    578 MiB. It now keeps no more classifications in flight than the
+    worker runs at once, four, and the same request peaks at 304 MiB,
+    what its answer itself takes.
+  - The Markdown sanitizer found code by a scan of its own, which took for
+    code a fence indented four spaces, a fence past the end of the block
+    quote or list item it sat in, a span a GFM table's pipe splits or a
+    list item cuts short, and a fence inside an HTML block; a tag there,
+    which a renderer shows as HTML, was kept. Code is now found by parsing
+    the Markdown as CommonMark does (`pulldown-cmark` 0.13), and as GFM's
+    tables do where it holds a pipe, and only what both show as code,
+    indented code blocks included, is left as written. The slowest input
+    found parses in 1.9 s at the 8 MiB Markdown bound; runs of backticks
+    had taken the scan 8 s.
+- Review round fifteen also checked the EPUB, DOCX, and document-worker
+  fixes of rounds ten and fourteen, against Chromium and LibreOffice:
+  - EPUB: pseudo-class and pseudo-element names are read in the forms
+    Chromium 141 parses, so a rule naming `::scroll-marker-group` hides what
+    Chromium hides, and a name the lists do not hold puts the rule in doubt;
+    only rules Chromium keeps end the imports it reads; media conditions are
+    read together on the screens they tell apart; and media lists are read
+    once per list, within the work bound.
+  - DOCX notes are read as Word and AnyDoc each read them, the note AnyDoc
+    renders compared at each reference; relationships naming one part to
+    Word and another to AnyDoc, by prefixed attributes or targets whose
+    percent-decoding changes them, are refused.
+  - DOCX list numbering reads its attributes and numbers as LibreOffice
+    reads and keeps them, and a label Word and LibreOffice restart apart
+    (`w:lvlRestart`) is disclosed as uncertain.
+  - An archive's entries are counted from its end records, not from every
+    signature in its data; and `classify_document` reports as enabled only
+    what `document_to_markdown` converts.
+  - Open from this round: EPUB grid layout and the remaining EPUB findings,
+    and DOCX start values and levels past 16 bits, repeated level
+    elements, and `w:isLgl` read as LibreOffice reads them.
+- Review round fifteen checked the off-page check (loop 30) and the
+  round-fourteen fixes, against pdfium's rendering and pdf-inspector's own
+  reading:
+  - A form drawn once was kept as the scan acts on it, whatever it held, so
+    100 pages each drawing a form of 5,000 glyphs took the worker past its
+    memory limit, at 834 MB, with no Markdown. A form is now kept only when
+    it is drawn again, as a letterhead is, within 32 MiB of what it holds:
+    the same file converts at 89 MB in 2.8 s.
+  - Off-page and invisible runs of thousands of short strings made texts of
+    tens of kilobytes to look for, and the automaton looking for a hundred
+    or fewer was built as a DFA, whose size grows with their length: a 2 KB
+    line of 4,000 strings running off the page timed out. Texts are looked
+    for with an NFA, and the same line converts in 0.08 s.
+  - Whether content pdf-inspector reads nothing of shows text decoded the
+    forms it draws on the scan's own budget, so two 40 MiB forms on a dense
+    page left the whole document unchecked. It now reads within a bound of
+    its own, looks into forms however deep they are drawn, takes content
+    to show text where it draws more XObjects than it notes, passes over
+    text in render mode 3, which paints nothing, and reads a page past 64
+    MiB stream by stream: such a page with no text is no longer reported.
+  - An inline image's data holding `EI 3 Tr (` was read as operators, so
+    the scan took the `Tr` in it for the viewer's and missed a line a viewer
+    paints and pdf-inspector drops. The data is passed over by the length
+    its entries give, as pdfium and lopdf pass it over, and the mode a
+    viewer sets is found where lopdf reads each `Tr`: `3Tr`, one word to
+    pdfium and a mode of 3 to pdf-inspector, now reports its line as
+    `visible_text_unread`, as does text shown outside a text object, which
+    a viewer paints and pdf-inspector drops.
+  - `Tf` is read as pdfium reads it: a font named by a string, which it
+    finds all the same, is no longer reported as text before any font; a
+    `Tf` of one operand, which sets size 0, and text scaled to no width
+    (`0 Tz`), which paint nothing, are reported as invisible.
+  - An outer span left open after a span inside it ended lost the glyphs it
+    showed first, with no sign; and glyphs a reader does not see were
+    matched to a span's text exactly, so "NOT" painted invisibly under a
+    span saying "not" went unreported. Both are reported.
+  - Text off the page was placed with half an em a glyph for a font naming
+    a standard font without widths, which pdf-inspector and pdfium both
+    give the standard font's: a ReportLab paragraph's line in Times ending
+    in a bold word was reported off the page though every glyph shows, and
+    Courier or Helvetica capitals running past the edge were not. Fonts
+    that name a standard font now take its widths. Strings are placed by
+    the text matrix as a viewer keeps it, moved past each string in text
+    space, so a transformation or a form inside a text object, and `T*`
+    with no leading set, which a viewer leaves where it is, are placed
+    right; and text is judged against the box pdfium shows, which differs
+    from pdf-inspector's where a crop box has no area or lies off the
+    page.
+  - Whether pdf-inspector leaves out text set off a page was judged from
+    the strings shown, where it judges runs it has joined on a line and
+    split at column gaps: a neighbouring page's five lines written word by
+    word, and a slug of eleven words, were taken as left out though
+    pdf-inspector keeps them. Where it may have clipped a page, what it
+    keeps there is now read, and text is reported where it keeps a run off
+    its box or running past its side.
+  - Text in forms pdf-inspector's walk of a page's forms does not reach,
+    drawn more than five deep, past 10,000 forms drawn, or past a million
+    of their operations, is reported as `form_text_unread`.
+- Review round fourteen checked the round-thirteen fixes:
+  - PDF invisible text (#572): round thirteen looked for a short run slipped
+    into a line as the text before it and the text after it, apart; where
+    both ran into digits, as a "0" slipped invisibly between "$10" and
+    "0.00", neither was taken as found, and "$100.00" shown as "$1000.00"
+    went unreported, where it had been reported before. The run is now also
+    looked for whole with the text on either side, and a longer one with a
+    character on either side, so "$1.00" shown as "$10,000,000.00" is
+    reported too.
+  - A page, or a form it draws, of more than a million operators or 64 MiB
+    of content, pdf-inspector 1.25.0 reads nothing of: a chart page of
+    1,050,000 operators converted without "Closing balance 18,250.00", with
+    no sign. A page whose such content shows text, or draws a form that
+    does, now carries the new `dense_content_unread` warning. The scan reads
+    a page's content as pdf-inspector does, its streams together up to 64
+    MiB and a stream that does not decode as it stands, where it had passed
+    over any one stream past 32 MiB with no sign: text painted invisibly in
+    a 34 MB stream is reported.
+  - An inline image written without white space before its data or after
+    `EI`, as `IDx EI`, ended the count of a stream's operators, so a 16 KB
+    file of 2 million path operators again aborted the conversion at 844
+    MB. The count now finds the image's end as pdf-inspector finds it, and
+    goes on where it finds none: 0.25 s within 34 MB.
+  - A marked-content span giving its glyphs' text (`/ActualText`) was
+    looked for only where every glyph in it was unseen: a sentence given
+    whole whose "not" is painted invisibly converted as "The fee is not
+    refundable" with no sign; the span's text is now looked for where it
+    holds what its unseen glyphs say. A span giving text that never ends,
+    after which pdf-inspector reads no glyph, is reported as
+    `visible_text_unread`; glyphs a span's text stands in for are no longer
+    reported as visible text skipped, under `3 0 Tr`, nor as Japanese text
+    read without its map. A span whose text gives other digits than the
+    glyphs a reader sees in it show, as "$1000.00" given over glyphs
+    painting "$100.00", or a word given in place of a sentence holding a
+    fee, now carries the new `actual_text_differs` warning; and a span
+    giving text over no glyph and painting nothing, which pdf-inspector
+    writes though no reader sees it, is reported as invisible, where a span
+    over a drawn figure, whose text describes it, is not.
+  - Text shown before any font is set, which a viewer does not paint and
+    pdf-inspector reads byte by byte, is reported as invisible.
+  - Render modes are read as pdfium reads them: an operand as a float cut
+    to a whole number, one at or past 2^31 as mode 0, and a number written
+    against a letter, as `1e3 Tr`, as an operator of its own, which leaves
+    `Tr` without one. Text so set, which a viewer paints, is no longer
+    reported as invisible; and where pdf-inspector reads `1e3 Tr` as mode 3
+    and drops the text, it is reported as `visible_text_unread`.
+  - A form drawn again, as a letterhead with a line of text on every page,
+    runs as the scan acts on it, its paths left out, and is charged for
+    that alone: a 1,000-page statement is checked through in 9.9 s, where
+    pages 726 to 1,000 had gone unchecked in 15.3 s.
+  - PDF Japanese, Chinese, and Korean fonts (#573): a 2.2 KB file whose
+    font, used only in a form whose `/Resources` is given by reference,
+    embeds a program whose format-12 cmap holds 2,000 groups each covering
+    U+0000 to U+10FFFF ran past the worker's 25-second deadline, and the
+    whole conversion was lost: the check read the program, which
+    pdf-inspector never reads for a font it does not collect. Such a font
+    now gets no program or table fallback; the file converts in 0.1 s, its
+    "5PUBMXBHFT" for "Total wages 52,000.00" reported as
+    `cjk_text_misread`.
+  - Kanji under the UTF-16 CMaps (`UniJIS-UTF16-H`, `UniCNS-UTF16-H`,
+    `UniKS-UTF16-H`, `UniJIS2004-UTF16-H`), which lopdf does not decode, so
+    that pdf-inspector reads them byte by byte ("住民税は中止" as
+    "OOlz0oN-kb"), and under the 7-bit two-byte CMaps `H`, `V`, `GB-H`, and
+    `KSC-H` ("源泉徴収票の支払金額" as "8;@tD'<}I<$N;YJ'6b3["), converted
+    with no warning; both are reported. UTF-16 CMaps are read as UCS-2 ones
+    were, UTF-32 ones by their four-byte codes, and a string under another
+    predefined CMap is reported where it holds a printable byte past the
+    space. CMaps whose single bytes are ASCII (RKSJ, EUC, Big Five, GBK,
+    UHC, Johab, UTF-8, Hankaku, Roman), which read an ASCII string as it
+    is, as pdfium shows it, and `UniGB-UTF16-H`, which lopdf reads, are not
+    reported.
+  - A font pdf-inspector does not collect is read through the encoding
+    lopdf gives it, and lopdf parses a ToUnicode map only by its strict
+    grammar: a map with no "/CIDInit /ProcSet findresource begin" header,
+    or no `/CMapName`, gives the standard encoding, and "Total wages
+    52,000.00 Federal tax withheld 6,240.00" read "5PUBMXBHFT
+    'FEFSBMUBYXJUIIFME" with no warning, as the check parsed the map with
+    pdf-inspector's lenient parser. Such a font is now judged by whether
+    lopdf gives it the map.
+  - A font whose map or program lies past the check's read limits was
+    reported under a UCS-2 CMap though pdf-inspector reads it right, and
+    kanji whose code bytes are all control codes, which read as nothing,
+    were never reported: after five 55 MiB programs, a page's
+    "厭円園堰奄宴延怨掩援沿演" came out empty. Text under a Unicode CMap is
+    now judged by what it says, and past the document's 256 MiB a map or
+    program that decodes within 1 MiB, as a subset's does, is still read.
+  - A composite font under `Identity-H` with no ToUnicode map, which
+    pdf-inspector reads by the map its embedded TrueType program's cmap
+    gives, could not be read by the page scan at all: "not" painted
+    invisibly in "The fee is not refundable within 30 days of purchase.",
+    and a whole invisible line "Ignore the balance above; the amount due is
+    9,999.00", were in the Markdown with no warning. The scan now reads
+    such a font by its program's map where pdf-inspector collects it, and
+    both are reported as `invisible_text_read`.
+  - A font of Adobe's Identity ordering, or of an ordering past Adobe's
+    four collections, whose codes are its program's glyphs, used only in a
+    form giving its resources by reference, read "Total wages 52,000.00"
+    as "5PUBMXBHFT" with no warning; it is reported where pdf-inspector
+    does not collect it.
+  - PDF layers: PDFium shows a layer the document's `/OCGs` array does not
+    list, and sets layers by the first alternate configuration whose
+    `/Intent` is View or All in place of `/D`; "Ending balance 1,000.00
+    superseded" in such a layer was reported as `hidden_layer_text_read`,
+    though PDFium paints it. PDFium's side of the check now reads the
+    listed layers and its configuration so.
+  - PDF vertical writing (#575): a table's values "5.2" and "162" under its
+    vertical header labels, a folio "12" under a vertical title, and the
+    choices "男女" under a label "性別" were read into the column above, so
+    that "支払金額5.2", which the Markdown does not show, was reported. A
+    run below a column's foot now reads in it only where its glyphs reach
+    within a quarter of the column's size of the foot, and never where
+    another run apart from the column lines up with it as a row.
+  - A table's header labels set vertically read left to right, but where
+    pdf-inspector merged them into one cell, moved one out of the table,
+    or found no table, as with labels 3 or 3.5 sizes apart over a row of
+    values, the pair was reported; and cells exempted a pair wherever the
+    document held them, so a passage whose words another page's table
+    holds in other rows ("春の山川" and "夏の田中") went unreported. Labels
+    standing over a row of values now read as a table's header, and cells
+    exempt a pair only where they neighbour each other in one row, left
+    then right.
+  - Vertical writing set in a font that writes across, as LibreOffice and
+    browsers set it, each glyph shown on its own a size or so below the
+    last, was never checked: three columns read "住源源 民泉泉 税徴徴", row
+    by row across them, with no warning. A glyph shown on its own on an
+    upright line is now noted where it starts a column, as a Japanese or
+    Chinese character, or goes on down one: shown right after the last
+    glyph, at its place across the page, up to one and a half sizes below
+    it. A glyph set alone between digits set sideways, as LibreOffice sets
+    "令和12年5月1日", stands in its column up to four sizes below the one
+    before it. Such columns are reported as `vertical_text_misread` as a
+    vertical font's are, and horizontal text set glyph by glyph, let go a
+    glyph at a time, takes no room.
+  - Latin words and digits set sideways in a column of vertical writing,
+    turned a quarter turn to read down it, were left out of the column's
+    text: "源泉徴収票" then "PDF" then "の発行は別に通知", which the Markdown
+    reads in order, was reported, and "源泉徴収票" then "2025" then
+    "年分の発行", from which pdf-inspector drops "2025", was not. Such a run
+    now reads in its column where it starts.
+  - PDF annotations: a stamp or watermark holding no text of its own,
+    whose appearance draws "RECEIVED APR 15 2025", was passed over, as the
+    check looked only for its `/Contents` or rich text. Its appearance is
+    now read for the text it draws, as a form field's appearance is, and
+    through the forms it draws, and the stamp is reported as
+    `annotation_text_unread` where the Markdown does not show that text.
+  - The annotation check counted every text box, line, stamp, and
+    watermark against its bound of 10,000, whether it showed text or not,
+    and then stopped with no sign: a sheet marked up with 10,000 lines
+    without a caption, or 10,000 stamps drawn as pictures, hid "Reviewer:
+    replace beam B-12 before sign-off" on the next sheet. Only annotations
+    showing text now count, and past the bound each page holding one that
+    may show text carries the new `annotation_text_unchecked` warning.
+  - PDF forms: a widget whose box has no area, or stands wholly off its
+    page's box, shows nothing, but a text field drawn only by such a
+    widget's appearance, "Tax year 2025", was reported as a value
+    pdf-inspector leaves out. Such a widget is now passed over as a hidden
+    one is.
+  - pdf-inspector counts each widget of a field as an entry against its
+    walk's bound of 100,000. Where the bound fell before the widget holding
+    the field's value, "Refund 4,815.00", or before the field,
+    pdf-inspector wrote nothing and a viewer showed the refund, with no
+    warning. The widget's value is now reported: with 99,995 entries
+    before the field pdf-inspector writes it, and with 99,996 or more it is
+    reported as `form_values_misread`.
+- Review round thirteen checked the round-twelve fixes:
+  - PDF invisible text (#572): a word or a digit slipped invisibly into a line
+    and set a point or so above or below it opened a line of its own, or
+    sorted after the run it was shown before, where pdf-inspector keeps it in
+    the line, so "not" in "The fee is not refundable." went unreported. The
+    check now makes lines as pdf-inspector does: in the order they are shown
+    unless that order jumps about the page, on a page turned where its runs
+    mostly read up or down it, and, as pdf-inspector may yet set a run drawn
+    last beside the line at its height, from the top as well, so invisible
+    glyphs set one by one along a turned line, which pdf-inspector reads, are
+    reported too. One run the scan cannot read, such as "customer’s" in a font
+    without a map, now ends the text read beside the insertion instead of
+    disabling the line; a run alone on its line ("PAID", or "$0.00" between
+    "Balance due" and "Thank you") is read with the lines before and after;
+    and the text before and after the insertion are looked for apart, with
+    strike, script, and link syntax, superscript digits, ligatures, and the
+    bullets pdf-inspector writes as "-" folded as the Markdown writes them, so
+    a bullet, a footnote marker, a struck price, a link, or a wrapped table
+    cell beside the insertion no longer hides it.
+  - PDF Japanese, Chinese, and Korean fonts (#573): a font pdf-inspector never
+    collects, as one used only in a form whose `/Resources` is given by
+    reference (a page imported as a form), and a descendant with no font
+    descriptor, which it looks up no map for, read "Total wages" as
+    "5PUBMXBHFT" with no warning; both are reported. A program past the 16 MiB
+    read had been taken to hold a map; programs up to 64 MiB, 256 MiB a
+    document, are now read, each once however many fonts embed it, and a font
+    past them is reported where the Markdown shows its text as read with no
+    map, where 153 of 700 pages had gone unreported. Kanji whose codes hold
+    0x7F, and misread text that says nothing to look for, such as kanji alone,
+    are reported. Per-page fonts sharing one program read it once: 20 pages
+    take 1.0 s, not 1.8 s.
+  - PDF vertical writing (#575): two columns of a passage with wide leading,
+    2.6 sizes apart, read left to right, are reported, as passages now stand
+    up to 4 sizes apart; and short labels the Markdown shows as the cells of a
+    table's row are no longer held to a passage's order, where a table's
+    vertical header labels 2.5 sizes apart, read right, had been reported.
+  - A 16 KB file of ten pages with 2 million path operators each aborted the
+    whole conversion at 775 MB, as the scan decoded a stream before it charged
+    its budget. The scan now counts a stream's operators first, passes over a
+    stream of more than a million as pdf-inspector does, and charges the rest
+    before decoding them: 0.23 s within 34 MB, as pdf-inspector alone takes.
+  - PDF render modes (#572): a `Tr` whose first operand says 3 and whose last
+    says another, as `3 0 Tr`, paints text a viewer shows that pdf-inspector
+    skips, so "The fee is not refundable" read "The fee is refundable" with no
+    sign; such pages are reported by the new `visible_text_unread` warning. A
+    last operand that is no number, or none, a viewer takes for mode 0, where
+    such a page had been reported for invisible text pdf-inspector reads; and
+    a first operand past what a real holds, which pdf-inspector casts to no
+    mode it skips, is no longer taken for 3.
+  - Invisible spaces no longer take the room kept for a page's unseen text,
+    where 64 KiB of them had left the text after them unread, and a run counts
+    as on the page by its middle, as pdf-inspector judges it, where text
+    starting 7 points left of the page had gone unreported.
+  - Digits set across a column of vertical writing (tate-chu-yoko), as in
+    "令和12年5月1日", are read in the column, where the column's text without them
+    had been reported.
+  - A form that shows no text and paints no image or shading, as a
+    letterhead's drawn logo, is read once however often it is drawn: a
+    1,000-page statement drawing a 3,000-operator letterhead on every page is
+    checked through in 9.4 s, where pages 726 to 1,000 had gone unchecked in
+    15.0 s.
+  Over 4,412 corpus, fixture, and review PDFs no warning changed and none
+  failed otherwise than before; the review's own files change as above,
+  and its stress files convert as fast as before or faster.
+- Review round twelve checked loops 26 to 28 and the glyph-by-glyph join:
+  - PDF invisible text (#572): a word or a digit slipped invisibly into a
+    line, as "not" in "The fee is not refundable." or a 9 before
+    "1,250.00", was too short to look for alone and was never reported; a
+    run under six characters is now looked for with the eight characters
+    beside it on its line, as pdf-inspector reads the line left to right.
+    Glyphs shown out of order, or with control codes or visible text shown
+    between them, are read in their line's order, where the join of glyphs
+    set one by one had lost such a case. The render mode is taken as each
+    side takes it: pdf-inspector from `Tr`'s first operand, cut to a whole
+    number, a viewer from its last, and only as one of the eight modes, so
+    `3.0 Tr`, `0 3 Tr`, and a mode 3 left in force under `11 Tr` are
+    reported.
+  - Two crafted files that earlier builds converted, one with 32 MB of
+    invisible text and one with vertical columns set off the page, ran out
+    of the worker's memory. The text kept to look for is now held to 4 MiB
+    a document and looked for 1 MiB at a time; a page whose unseen text
+    does not fit, or overruns its own 64 KiB, is reported without being
+    looked for where that text starts on the page, and columns set off the
+    page, which pdf-inspector leaves out, are no longer read. Both convert
+    in about 7 s within 250 MB. Invisible spaces filling a page's room, or
+    65,536 spaces in a Japanese font, no longer hide the text after them.
+  - A page the scan's work limits never reached is named in the new
+    `pages_unchecked` warning, where 8 MB of no-op operators on the pages
+    before had left page 6's invisible text unreported with no sign. A
+    scan set as an inline image, not an image resource, now counts, so
+    `pdf_to_markdown` lists its page for OCR, where the image had only
+    exempted the page's invisible text.
+  - PDF Japanese, Chinese, and Korean fonts (#573): whether pdf-inspector
+    finds a map is judged as it looks for one, parsing the font's
+    ToUnicode map and embedded program as it does. A `/ToUnicode` that is
+    a name, null, or empty, an encoding given by reference or as a stream
+    of its own, an ordering given by reference, and a program with no
+    usable `cmap` table leave it none, Korean included, and none was
+    reported; an OpenType program with no `/Subtype` gives it one, and
+    was. Widths set mostly past 0x41 make it read each code as the
+    character of its value, kanji as Cyrillic ("一壱溢" as "ҰұҲ"), and
+    UCS-2 codes under `UniJIS-UCS2-H` with no map read byte by byte
+    ("住民税" as "OOlz"); both are reported. A page is reported where the
+    Markdown shows its text as pdf-inspector reads it ("5PUBMXBHFT"), even
+    where the same words stand elsewhere, which had kept it from being
+    reported; white text in a form, which pdf-inspector skips, is not
+    read.
+  - PDF vertical writing (#575): a passage's short last or middle column
+    read before the long one, and a column standing alone that lines of
+    horizontal text run through ("源 Instruction 0... 泉 Instruction 1..."),
+    are reported; ruby beside its base, labels in cells set apart, and
+    columns set off the page no longer are, and labels under a UCS-2
+    vertical CMap with a ToUnicode map are read to confirm them, where
+    they had been reported unconfirmed.
+  Over 4,412 corpus, fixture, and review PDFs no warning changed and none
+  timed out; the review's own files change as above, and its stress files
+  convert as fast as before, the longest vertical one in 186 MB from 486.
+- Review round eleven checked the round-ten fixes and loops 22 to 25:
+  - PDF running headers (#483): the gate that decides whether pages are
+    read again grouped a page's runs by height to the point, where
+    pdf-inspector joins runs under 3 points apart into one line, so a
+    bank's name and an account number set a fraction of a point lower, or
+    a name 2 points above a smaller number, read as two lines, neither
+    changing enough to open it, and accounts 2 and 3 lost their numbers
+    with no warning. The gate now makes lines as pdf-inspector does, reads
+    a header drawn a glyph at a time as one text, sets the Markdown's
+    table rows aside before it counts a page's edge lines, and lets a
+    document with form fields, whose values pdf-inspector reads among the
+    lines and the scan does not, be read again whole. Keys that occur in
+    the same places are weighed once, under a work budget, where 400
+    pages of 1,400 runs at their top edge had timed out; 11.9 s now, 13.1 s
+    before round ten.
+  - The reading again is sized to the time the call has left, a part at a
+    time, where it had skipped a 2,000-page statement entirely, and a
+    check that stops short, or reads nothing, says so as the new
+    `header_footer_unchecked` warning, where it had said nothing unless it
+    found a page to name; an 1,800-page statement now reads through page
+    1,385, from 1,024.
+  - Numbers that count pages: "N of M" and "N/M" count only after a page
+    word or standing alone, so a statement's "Closing date 2/28" and a
+    "Loan 2 of 3" heading their pages are no longer taken for page
+    numbers; a number after a label such as "Check", "Invoice No.", or "#"
+    is an identifier, not a folio, so checks 1002 to 1005 heading their
+    pages are named; and a page word joined to its number counts only
+    where it is the page's own, as a form field named "p2.holder" is on
+    page 2, not as "Plan P2" on page 6.
+  - A dynamic XFA form whose notice runs in two languages, 176 words, is
+    reported: the notice Adobe's forms show allows four times the words.
+  - PDF layers (loop 24): a page naming one membership dictionary of 1,000
+    layers in 100,000 marked-content spans judged the layers span by span
+    and ran past the worker's 25-second deadline. Each layer, membership
+    dictionary, and visibility expression is now judged once, within a
+    bound per document past which content is taken to show, and the file
+    converts in about a second. Layers are set as viewers set them on
+    opening, from their usage for viewing (ISO 32000-1, 8.11.4.4): a layer
+    is taken to be hidden only where a viewer following the standard,
+    PDFium, and pdf.js all hide it, and one whose state depends on the
+    reader's magnification, user, or language is taken to show.
+  - PDF hidden-layer and invisible text holding a letter past ASCII in a
+    Windows ANSI font ("remplacé", "Don’t"), or read without a font or a
+    map (fonts a page inherits, a font name no resource defines, a form
+    drawing in its invoker's font, a composite font read as code points,
+    a Japanese, Chinese, or Korean font with no map), was passed over. It
+    is now read as pdf-inspector 1.24.0 reads it, and looked for as it
+    writes it: ligatures spelled out, a symbol font's private-use codes
+    read, soft hyphens and zero-width marks left out; the glyph-by-glyph
+    word check, the running-header gate, and the repeat check read such
+    text the same way. A marked-content span's `/ActualText`, which
+    pdf-inspector reads in place of the span's glyphs whatever the render
+    mode, is reported where every glyph it stands for is painted
+    invisibly or in a hidden layer.
+  - PDF form values (loop 21): a value whose widget is in a hidden layer,
+    which pdf-inspector writes as current ("old_balance: 1,000.00
+    superseded"), is reported as `hidden_layer_text_read`; and a field
+    past pdf-inspector's walk bound of 100,000 `/Fields` and `/Kids`
+    entries, now counted as it counts them, references or not, a choice it
+    writes as its export value ("MFJ" for "Married filing jointly"), and a
+    text field whose only value is the text its appearance draws, which
+    Acrobat and PDFium show and pdf-inspector leaves out, unless the form
+    asks for its appearances to be drawn again, are reported as
+    `form_values_misread`.
+  - PDF annotations (loop 22): only text boxes, lines, stamps, and
+    watermarks count against the 10,000-annotation bound, so a text box
+    after a long table of contents of links is read; a stamp is judged the
+    same whichever is read first, as a verdict the depth read, the budget,
+    or a form met again cut short is no longer kept; an inline image's
+    data in an appearance is passed over for its length, or to the `EI`
+    content follows, as pdf.js finds it; and text painted in render mode 3
+    or 7 in a stamp's appearance no longer counts as drawn.
+  Over the 4,412 corpus PDFs these fixes changed no warning; the review's
+  own files change as above, and its stress files convert as fast as
+  before.
+- Review round ten checked loops 20 to 23 and 25:
+  - PDF running headers (#483): the check re-read every page of every
+    multi-page PDF, 20 to 30% more CPU, under a 4 s budget of its own, so
+    heavy statements near the limit timed out, a warning came and went
+    between runs, and past 2,000 pages or 8,192 texts it stopped without a
+    word. The page scan now keeps the runs at each page's edges, and pages
+    are read again only where a text repeated at the edges of enough pages
+    sits beside one the first page showing it does not show; a document
+    with no such line pays nothing, a 2,000-page control 7.04 s against
+    7.09 s before loop 20. The reading runs a part at a time while the call
+    is expected to end within 20 s, and the warning names the last page
+    checked where it stops short. Lines are ranked without the images,
+    links, and table rows pdf-inspector sets aside first, so a logo, a
+    link, or a tall header over a table no longer hides a dropped account
+    number, and pages listed for OCR are read as pdf-inspector reads them.
+    Numbers count the pages only after a page word, between dashes, in
+    "3 of 7" or "3/7", or as a folio a set distance from the page's own
+    number, roman numerals too, and a clock time's parts say nothing:
+    sequential invoice and check numbers, and one date a page, are
+    reported, while a bundle whose documents number their pages afresh is
+    not. Each line of a band is looked for on its own, and a text ending in
+    a digit is not found where another digit runs on from it.
+  - PDF annotations: a stamp's appearance was inflated without a limit and
+    parsed whole for every annotation, so 60 stamps sharing a 1.8 KB
+    compressed appearance timed out. Each appearance is now read once, to
+    1 MiB decoded and 16 MiB a document, and scanned token by token for an
+    operator that shows a string, through the forms it draws, as Acrobat
+    draws a stamp. A captioned line counts as a text box does, one set off
+    its page does not, and a text box is read from the rich text a viewer
+    draws it from, its character references read.
+  - PDF form values: values pdf-inspector leaves out are found where a
+    group's widgets each hold "Off" of their own, and where a value is
+    given by reference, as a text stream, only as rich text, inherited from
+    a field above, or on a field whose kids are none; a field whose name
+    pdf-inspector garbles is named; and a hidden widget, a widget on no
+    page, and a control character PDFDocEncoding drops no longer are.
+  - PDF XFA and attachments: a dynamic XFA form now also needs XFA in its
+    form and a Markdown of no more than a notice a page, and both checks
+    run in any full run, so a blank placeholder page or a portfolio's blank
+    cover is reported. The embedded-file walk read each name-tree node
+    again for every reference to it, so 20,000 references to one leaf timed
+    out; each node is read once, a file counts once however it is reached,
+    null or dangling entries count none, and an e-invoice's XML, which the
+    document declares another form of its pages, is not counted.
+  Over 4,412 corpus, fixture, review, and fuzz PDFs, no warning of these
+  loops changed but on their reproducers, and none timed out.
+- Review round ten also checked round nine's DOCX, XLSX, and document-worker
+  fixes:
+  - Documents: round nine's "the server reads no package part" held for the
+    package checks only. The server still classified each document itself,
+    on the async executor and ahead of the two-worker bound, and AnyDoc's
+    detection parses the package relationships, the content types, and at
+    times the main part, to 128 MiB and 2 million nodes each: a 44 KB DOCX
+    took the server to 590 MiB, a 7.8 MB one to 1.3 GiB, and a 9.9 MB one to
+    1.8 GiB, and four at once to 4.9 GiB or, capped at 6 GiB of address
+    space, down. `classify_document` did the same. The server now takes a
+    worker slot, reads the file into the worker's frame once, beside its
+    extension, and counts an archive's entries; the worker classifies the
+    document, refuses what its route refuses, runs the package preflight,
+    and converts it, and `classify_document` asks the worker too. The three
+    packages peak at 8 to 19 MiB in the server, and 9 to 31 MiB four at
+    once, with the same `resource_limit`; a normal document costs the
+    server what it did. For the two largest, whose detection passes the
+    worker's 1 GiB ceiling, `classify_document` answers `resource_limit`
+    where it answered `docx`. Without the worker sandbox, a document is
+    still classified in the server, for its refusal, one slot at a time.
+  - DOCX notes: where the main part names two footnotes or endnotes
+    relationships, Word, as LibreOffice shows it, reads the first and
+    AnyDoc the lowest id, so a note could convert with another part's text
+    ("pay 900 USD" for "pay 100 USD") as complete; a notes part no
+    relationship names is read by AnyDoc alone, and LibreOffice does not
+    open such a document where its text references a note. Where the two
+    sides read different parts, each note the text references is compared:
+    other text, or a note only one part holds, is refused as
+    `incomplete_conversion`, and the same text numbered otherwise is
+    disclosed as `list_numbering_differs`; a note no text references, which
+    Word does not show, stays disclosed as hidden. Workbooks need no such
+    check: LibreOffice, like AnyDoc, reads the shared strings and styles of
+    the relationship with the lowest id.
+  - DOCX list levels: a level repeating `w:start`, `w:numFmt`, `w:lvlText`,
+    `w:lvlRestart`, or `w:pStyle` was read first-wins on Word's side, as
+    AnyDoc reads it, while LibreOffice numbers the list from the last: 7, 8,
+    9 where AnyDoc writes 1, 2, 3. Word's side now reads every element, the
+    last winning: numbers as LibreOffice reads integers (`7x` is 7; no
+    value, other text, or a value past `i32` is 0), a format, number text,
+    or style only from an element that gives one, and a format only one
+    ECMA-376 defines. Number text past 1,024 bytes is judged by the value
+    Word reads. LibreOffice applies no `w:lvlRestart`; Word's is read as its
+    other numbers are.
+  - DOCX list levels are found as LibreOffice finds them: by the
+    namespaced `w:ilvl`, read as an integer (`1x` is level 1), an element
+    naming none going into the level named last in its definition or list
+    instance, and dropped where none was; an override's level at its own
+    `w:ilvl` (an override of level 0 holding a level 1 restyles level 1),
+    laid over the definition's level; a start override for the level
+    current when it is read. A paragraph style bound to one list level
+    that names another, or none, is numbered at the binding by AnyDoc and
+    ECMA-376 and at its own level by LibreOffice ("1.1." against "2."); it
+    is disclosed. Lists these readings number otherwise report
+    `list_numbering_differs`.
+  - Of 303 public, 119 review, 58 round-seven, 181 workbook, 320 randomized,
+    and 1,324 round-nine documents, two changed: round-eight fixtures built
+    for a bound style's level (`b2-02`, `b3-04`), which LibreOffice numbers
+    otherwise than AnyDoc and now report `list_numbering_differs`.
+    `classify_document` answers as before on all of them, and round nine's
+    performance reproducers keep their verdicts and costs.
+- Review round ten also checked round nine's EPUB fixes:
+  - EPUB: sizing a margin, padding, or gap from a custom property walked
+    every ancestor for each declaration, parsing its inline style again
+    and trying every rule that sets the property, none of it counted as
+    work. Small books whose elements carry long inline styles or nest
+    deep took 8.8 s or ran past the 15-second deadline, and Bootstrap 5
+    books of 60 and 100 chapters were refused as a resource limit. An
+    element's inline style is now parsed once and counted, what a custom
+    property says is kept at each element it was looked up at, the rules
+    setting one are indexed as other rules are, and a `var()` length is
+    resolved only where it is read. The small books take 0.03-0.08 s and
+    at most 37 MiB, and the Bootstrap books convert in 1.8 s and 2.9 s at
+    93 and 143 MiB, against 1.4 s and 2.4 s before round nine, when
+    `var()` was not read.
+  - EPUB: round nine read a media query testing any feature, `@supports`
+    on anything but `display`, `@container`, `@scope`, and `&` nested
+    eight deep as rules that may apply, and a show that may apply never
+    beat a hide: `.x { display: none }` shown again under `@media
+    (min-width: 0)` converted complete though AnyDoc drops what Chromium
+    shows, and the same text converted was refused. Media queries are now
+    tried on the screens of the readers the check follows, 320 to 1280
+    CSS pixels wide, either way up, at 1 to 3 device pixels to the CSS
+    pixel: `(min-width: 0)` holds on all of them, `(max-width: 1px)` and
+    `print` on none, `(min-width: 768px)` on some, and a query Chromium
+    rejects, such as `screen screen`, on none. `@supports` reads the
+    properties Chromium 141 supports and `selector()`, `@scope` rules
+    match inside their root, `@container` rules apply only under an
+    element that may be a size container, `&` stands for its rule however
+    deep, and a `<link>` or `<style>` element's media and an `@import`'s
+    conditions cap its sheet.
+  - EPUB: a hide that might apply excused AnyDoc's drop, while a show had
+    to apply for certain. Text some readers show is now shown: AnyDoc may
+    convert it, and loses it where it drops it, so a paragraph only
+    narrow screens show (Bootstrap's `d-md-none`), which AnyDoc drops, is
+    refused, and one only wide screens show (`d-none d-md-inline`), which
+    it converts, is not. Text that a rule the check cannot settle may
+    show or hide, as with `:has()`, `:lang()`, or a value set through
+    `var()`, counts both ways: as hidden where AnyDoc converts it and as
+    shown where it drops it. A namespaced attribute selector reads its
+    `@namespace` prefix, so `span[epub|type~="pagebreak"]` hides page
+    numbers for certain.
+  - EPUB: `display: revert` and `revert-layer` were read as values a
+    reader ignores, so the hide they undo still won. `revert` now takes
+    what the user agent's rules give and `revert-layer` what the layers
+    below give, the `hidden` attribute standing below every author layer,
+    as Chromium reads it. A layer is declared only where the `@media` and
+    `@supports` conditions around it hold, and one that some screens
+    declare in another place is in doubt.
+  - EPUB: stylesheets Chromium never applies were applied: an alternate
+    stylesheet, a `<link>` or `<style>` whose type is not CSS, and a
+    disabled link. AnyDoc applies them and drops the text they hide,
+    which Chromium shows; the reader now leaves them out, and of titled
+    sheets takes only the preferred set, so the drop is refused.
+  - EPUB: `@import url(base.css) layer(base)`, and a bare `layer`, were
+    read as unlayered, so the imported sheet's more specific hide beat
+    the importing sheet's show; the imported sheet now stands in the
+    layer its import names. An `@import` after a style rule, which
+    Chromium ignores, is no longer applied, so text it would hide, which
+    Chromium shows and AnyDoc converts, is no longer refused.
+  - EPUB: a dash bullet was refused where its box, not white space or a
+    margin, sets it apart from a list item's text: an inline block wider
+    than the dash, a box `position: relative` moves away, or a `::before`
+    or `::after` box the item lays out as a flex item with a gap or as a
+    grid item. Each now stands for AnyDoc's list marker; a dash touching
+    the text is still a minus.
+  - EPUB: a box that takes room between two numbers without being seen,
+    such as a space with `visibility: hidden`, a dash with `opacity: 0`,
+    or an empty inline block with a width, now keeps "12" and "50" apart
+    as a space does, so AnyDoc's "1250" is refused. So do the quote marks
+    a reader sets around `<q>`: "In 2023<q>15 cases</q>" shows
+    "2023“15", which AnyDoc runs together.
+  - EPUB: flex items a reader sets apart by their size ran together. An
+    item that grows (`flex: 1`, `flex-grow`), has a width, minimum width,
+    or basis, or takes an auto margin now stands apart from the next, so
+    "Units shipped" run into "Returns filed" is refused; an inline flex
+    box, as wide as its items, sets none apart.
+  - EPUB: `content: var(--tw-content)`, as Tailwind v4 writes
+    `before:content-['−']`, was read as unknown, so a minus Chromium
+    shows before an amount, which AnyDoc drops, passed. A `::before` or
+    `::after` box now shows what the custom property its own rules set
+    says.
+  - EPUB: SVG `dy`, `x`, and `y` lists, and `dx` lengths in em,
+    millimetres, or percent, are now read glyph by glyph, as `dx` lists
+    in pixels were, so `dy="0 0 60 0"` on "1250" is two numbers.
+  - EPUB: text in an SVG resource counted as painted where Chromium
+    paints nothing: a marker on a rectangle, a pattern tile sized zero, a
+    `use` scaled to nothing, a pattern fill at zero opacity or on a line,
+    a stroke of zero width, and a `textPath` naming no path. Each now
+    draws nothing, so AnyDoc converting the text is refused. A symbol in
+    a sprite sheet hidden with `display: none` paints where a `use` draws
+    it, and a group's fill, stroke, and markers pass to the shapes it
+    holds, so a visible rectangle in a hidden group paints its pattern.
+  - EPUB: a style rule whose selector list holds a pseudo-class or
+    pseudo-element Chromium cannot read is dropped whole, with the rules
+    nested in it, as Chromium drops it: `.note, .note:bogus { display:
+    none }` no longer hides text Chromium shows. `:is()` and `:where()`
+    still forgive what they cannot read.
+  - Against Chromium's layout, 60 of the review's 104 EPUB fixtures are
+    now refused and 14 refused in error convert, each as Chromium paints
+    it on some screen from 320 to 1280 px wide, the dashes as bullets. Of
+    4,768 EPUBs in the regression sweep four newly refuse, and 13 of the
+    269 fixture-kit EPUBs, each confirmed in Chromium; none newly
+    converts. The earlier reproducers take what they took.
+- Review round nine checked loops 17 to 19, the round-eight fixes, and the
+  document worker:
+  - PDF words split in glyph-by-glyph text (#531): Chrome's Skia keeps a
+    glyph in its open string when its hinted advance equals its declared
+    width, so a word going on in a string of several glyphs was dropped;
+    each glyph is now placed by the font's widths, and on 400 pages written
+    with Skia's grouping the warning names 206 of the 273 whose Markdown
+    splits such a word (126 before) and none of the others. A ligature
+    extends its word; a label and its value set apart by layout no longer
+    read as one word; a split after a hyphen is reported; pages past the 64
+    read again are named, widest gap first; a running header split on
+    every page names its first page only; and a font that never paints a
+    space no longer fills the word cap.
+  - PDF tables and forms: a dense 1099-B whose cost-basis and wash-sale
+    columns pdf-inspector merges is reported again, its header read as the
+    page sets it, while an amount beside its percentage under one heading
+    is not; a dropped column is read wherever pdf-inspector sets it after
+    the table, with a work budget of its own. Text drawn through a form
+    pdf-inspector never reaches is reported where a page inherits its
+    resources or a form's resources are null, dangling, or lack a category
+    pdfium takes from the page; a form's text is compared with the reading
+    pdf-inspector makes without a font. A run painted twice by a `TJ`
+    rewind is found on any page of a long statement.
+  - Documents: the package checks run in the worker, under its 15-second
+    deadline, 1 GiB memory ceiling, and two-worker bound, and come back
+    with the Markdown, and the server reads no package part for them,
+    though it still classified each document itself until round ten (see
+    there). It had run them
+    itself first, with no bound, past the tool's timeout and ahead of the
+    worker bound: a 15 KB DOCX whose list carries 1 MB of level text took
+    the server to 827 MiB with 50 list instances, 3.2 GiB with 200, and
+    down with 500; 10,000 tiny numbering parts held it 48 s; an EPUB's
+    style scan took it to 5.7 GiB and down. The DOCX reproducers now answer
+    in about a second with the server under 20 MiB, and the EPUB ones stop
+    at the worker's bounds with `resource_limit` or `worker_timeout`. A
+    package holding more entries than AnyDoc reads (100,000) is refused
+    with `resource_limit` before it is opened, where indexing a 43 MB
+    package of empty entries cost the server 340 MiB.
+  - DOCX: lists are replayed once, from the numbering and styles parts each
+    side reads (AnyDoc the relationship with the lowest id, else the
+    conventional part; Word, as LibreOffice shows it, the first
+    relationship, and no part without one), rather than once per numbering
+    part: 1,000 numbering parts beside 600,000 paragraphs took 10.2 s and
+    now 0.3 s, and 10,000 no longer time out. A list instance shares its
+    definition's levels instead of copying them, and a level's number text
+    past 1,024 bytes is disclosed rather than kept. Two numbering or styles
+    parts, or one no relationship names, that number a list otherwise on
+    each side are disclosed as `list_numbering_differs`.
+  - DOCX: list numbers are read as each side reads them. A number or id is
+    taken from the attribute AnyDoc reads (`w:val`, else an unprefixed
+    `val`), so a padded `w:val=" 1"` beside an ignorable `x:val="1"`, which
+    Word reads and AnyDoc cannot, no longer passes; a definition or list
+    instance defined twice is kept first by Word and last by AnyDoc; a
+    paragraph is numbered through the style Word finds for it (its exact
+    id, else its name; a character, table, or numbering style's own list;
+    else the default paragraph style); and a paragraph's repeated marks,
+    or a mark inside alternate content, are read as LibreOffice reads them
+    (the last `w:numId`, `w:numPr`, and `w:pPr`, merged) and as AnyDoc
+    does (the first, and only the paragraph's own). A level the list does
+    not define, or past the ninth, which Word shows uncertainly, is
+    disclosed. Twenty-four review fixtures that converted complete now
+    report `list_numbering_differs`.
+  - DOCX: text Word shows in alternate content is compared with the text
+    AnyDoc converts from it. A formula in a choice AnyDoc does not read,
+    such as one requiring `w14` or the math namespace itself, and a
+    fallback holding other text than the choice Word shows ("Pay 900 USD"
+    for "Pay 100 USD"), are refused as `incomplete_conversion`.
+  - XLSX: a section naming General beside date letters, such as
+    `General;[Red]General s`, renders as General in AnyDoc, which ignores
+    the letters, so a negative marked by its colour alone lost its sign
+    and is now refused; `General d`, `General yyyy`, and `[h]General` keep
+    their value and no longer are. A fraction scaled by thousands
+    (`# ?/?,`), which AnyDoc shows a thousandth of and LibreOffice
+    unscaled, is refused.
+  - None of 303 public, 119 review, 58 round-seven, 62 round-eight, and
+    750 randomized documents, nor 181 and 216 regression workbooks,
+    changed; the 210 randomized list documents still agree with
+    LibreOffice.
+  - EPUB: two scans ran in the square of their input or past the tool's
+    timeout. SVG `url(#id)` references are now read once through, as a
+    reader's CSS tokenizer reads them: a 2.4 KB book repeating "url(#"
+    100,000 times in a `fill` attribute had taken 7.5 s and 1 GiB, and one
+    with 200,000 was refused as a resource limit after 18 s and 4 GiB;
+    each now takes 0.01-0.03 s and about 13 MiB. `~` rules whose step requires no id, class, or element name
+    are tried for a parent's children until a sibling settles them: 4,000
+    such rules over 100,000 siblings took 8.8 s, and 16,000 over 400,000
+    ran past the timeout; they now take 0.5 s and 5-6 s. A chapter that
+    runs past the match budget is refused as a resource limit instead of
+    checked with its `~` steps unrecorded.
+  - EPUB: generated content AnyDoc drops passed as converted. A list
+    item's sign ("−1,250.00", "(1,250.00)", "$1,250.00", "12%") now
+    counts; only a hyphen or dash bullet set apart from the item's text
+    stands for AnyDoc's own list marker. Every Unicode currency sign
+    counts, with the full-width, small, and superscript minus, plus,
+    parentheses, and percent signs, the per-mille and Arabic percent
+    signs, and the triangles Japanese accounts mark a loss with; a sign
+    meets an amount that opens with a currency sign or a decimal point.
+    Anything else a box shows between digits, such as a space, a slash, a
+    colon, a raised decimal point, or ", " between page references,
+    counts where the digits on both sides then run together, and
+    characters a reader shows nothing for, which AnyDoc keeps, no longer
+    keep a sign from its digits.
+  - EPUB: every conditional rule was taken as applying. A media query
+    that tests features, `@container`, and `@scope` now may hold, so a
+    rule inside them can neither hide nor show a sign on its own nor lay
+    out a flex row; `print`, `speech`, and unknown media never hold;
+    `@supports` reads `not`, `and`, `or`, and `display` values;
+    `@starting-style` and `@-moz-document` never apply. `@layer` rules
+    are ordered as CSS Cascade 5 orders them: unlayered rules beat
+    layered ones and a later layer an earlier one, the reverse for
+    `!important`.
+  - EPUB: flex items a reader stacks or spaces ran together. A flex
+    item's `width`, `flex-basis`, and `flex` shorthand are read, and in a
+    wrapping row an item taking a whole line stands apart from its
+    neighbors. A margin, padding, or gap written with a custom property
+    (`var(--bs-gutter-x)`, `calc(var(--g) * .5)`) takes its size from
+    the property as the element inherits it, so Bootstrap 5 grid columns
+    that AnyDoc runs together are refused.
+  - EPUB: text in an SVG resource (a symbol, pattern, clip path, mask, or
+    marker) counted as painted wherever anything named it. It now counts
+    only where what refers to it is rendered: shown, not transparent,
+    drawing something, and standing where the image paints; a style rule
+    names a resource only for the elements it matches.
+  - EPUB: CSS nesting was read loosely, `&` as a selector that may match
+    anything. `&` now stands for the elements the enclosing rule
+    matches, as `:is()` takes them with the highest specificity among
+    them, a nested selector without `&` matches inside that rule's
+    elements, and declarations after a nested rule come after it, as
+    Chromium 130 and later order them. Nested rules share their parents'
+    parsed selectors, and a selector standing for more than 4,096
+    compound selectors is undecided, so crafted nesting parses and
+    matches in bounded time.
+  - EPUB: SVG labels moved apart ran together. A `tspan` moved back past
+    half an em (`dx="-190"`), or along its line past half an em with a
+    `y`, stands apart; a `dx` list is read glyph by glyph, as a reader
+    numbers a label's characters, so `dx="0 0 120 0"` on "1250" is two
+    numbers; and a `textPath` stands as a label of its own. `x` and `y`
+    lists are not read.
+  - Against Chromium's layout, 93 of the review's 237 EPUB fixtures are
+    now refused and one refused in error converts, each as Chromium
+    paints it. Of 4,768 EPUBs in the regression sweep two newly refuse,
+    both confirmed in Chromium, and the real books measured check within
+    a few percent of their earlier time and memory.
+- Review round eight checked loops 14 to 17 and the round-seven fixes:
+  - PDF: a statement whose rows repeat a cell of two amounts, such as
+    "0.00 0.00" quarter- and year-to-date, made the merged-cell check time
+    out with no Markdown returned. The page's positioned text is now
+    indexed once and each distinct cell placed once, so the reproducers
+    convert in about a second. Two runs side by side count as merged
+    columns only under a heading over the second, as a 1099-B's "Wash sale"
+    heads its column: an amount set beside its percentage, "1,234.56
+    (9.02%)", is one cell, and a fee of "0.00" on every row no longer joins
+    two rows. On a page whose text reads rotated, the scan's runs are
+    turned as pdf-inspector turns its text, so a rotated 1099-B's merged
+    cells are reported. A first row of three amounts or more repeated at
+    the end of the text before its table is reported whatever precedes it,
+    as upstream #531's equity statement shows. Doubled text holding a lone
+    "-", ":", or "+" ("09/01/2025 - 09/30/2025") is confirmed; a year
+    "2020" or a box "11" confirms only a repeat whose text is that number
+    alone, or one paint of it. The repeat scan also finds a second paint in
+    another subset font, a shadow a fifth of the size off, a second paint
+    split in two strings, a `TJ` array stepping back to show a string
+    again, and text doubled with no space between its copies; past the 64
+    pages read again, a page is named for its own repeated text rather than
+    in order. The word-gap check reads a page as pdf-inspector does: comments
+    between operands stripped, each text object in render mode 0, forms
+    starting with no font or spacing, glyphs in an ActualText span left to
+    its text, and the pen followed over runs whose widths it knows. A
+    sub-run split between digits, or on a vertical baseline, sets two items
+    apart, which a space inside one item does not, as a 1099-B row read
+    under a wide code 32 shows. Against pdf-inspector patched with its fix,
+    over 2,900 randomized files, it names 685 of the 718 changed pages (654
+    before) and 13 unchanged ones (42 before).
+  - DOCX: list numbers are compared by the label each side shows, at the
+    level each reads, as Word and LibreOffice show them. A level bound to a
+    style, a composite label over a shallower level in a format it cannot
+    render (unless the level is legal-style, `isLgl`), words in a level
+    without a number, and paragraphs Word numbers through its default
+    paragraph style, which AnyDoc does not read, are disclosed as
+    `list_numbering_differs`. List ids and numbers are read as each side
+    reads them (Word trims them as schema integers, AnyDoc parses them as
+    written), which replaces loop 14's document-wide padding rule; a style
+    defined twice is read as each side keeps it; and AnyDoc's branch of
+    alternate content stands for Word's only when both number alike. Text
+    Word shows in alternate content where AnyDoc takes no branch is refused.
+    Style chains are read once per style, so a document of many styles that
+    took 12.8 s converts in 0.7 s; the chain budget and its disclosure are
+    gone. None of 303 public, 119 review, and 239 other regression documents
+    changed; among 750 randomized ones, only a bypass the review found did.
+  - XLSX: a slash is a fraction bar only right after an integer
+    placeholder, as AnyDoc parses it; a fixed denominator counts by its
+    value, a fraction's percent signs scale it, and a fraction AnyDoc
+    rejects renders as General. Eight fraction formats that show an unsigned
+    non-zero value for a negative are now refused, and 26 that show zero now
+    convert; all 204 format and value pairs checked agree with LibreOffice.
+  - EPUB: generated content and SVG are read as a reader shows them. A "."
+    or "," a pseudo box sets between digits counts where digits follow it,
+    and more signs count beside digits (the cent to yen signs, the currency
+    block such as the rupee sign, and the dashes), while a sign on a list
+    item AnyDoc numbers itself does not; an `::after` sign meets the text
+    after it, and a pseudo box a reader hides (`opacity: 0`, `visibility:
+    hidden`) or floats off the line no longer counts. SVG text in resources
+    nothing references, in unknown elements, or outside a `text` element is
+    refused as hidden; `switch` renders one child, `foreignObject` holds
+    HTML, and label spans follow the pen through x, y, dx, and dy. A `~`
+    step is matched exactly at any distance. Flex items in a row may touch,
+    as a reader sets them; in a column, reversed, gapped, spread along the
+    line, or set apart by a margin or padding they stand apart, and grid
+    items always do; a line-clamped `-webkit-box` is a block. Fixed-layout
+    runs that continue a line may touch, and a single-figure drop cap is
+    read with its paragraph. Against Chromium's layout, 29 bypasses are now
+    refused and 20 chapters refused in error convert; over 760 randomized
+    chapters, errors of refusal fall from 48 to 10 with no join newly
+    missed, and real books check as fast as before.
+- Review round seven checked the round-six fixes again:
+  - EPUB: a reader sets more boxes apart than the chapter walk knew, and
+    AnyDoc ran their text together with no warning. Each flex or grid
+    item, table cell set by style, and SVG `text` now stands apart, as
+    does a floated or positioned box holding digits:
+    `<p><span style="float:left">10</span>250 units</p>` had converted as
+    "10250 units". So do a block image, a line feed a `::before` box keeps
+    (`content: "\A"; white-space: pre`), a line break alone in a link,
+    which AnyDoc drops, and a display formula in a link, which AnyDoc
+    flattens into the text around it. Text a `::before` or `::after` box
+    shows, from letters, digits, a counter, or `attr()`, is refused as
+    text AnyDoc drops, and so is a sign beside the digits of an amount
+    ("−1,250.00" converted as "1,250.00"); a hyphen bullet is not. The
+    other way, rules that may not apply, such as sibling selectors, now
+    count only where digits meet, which the Markdown reads as one number.
+    Drop caps set by such rules, a drop cap after an opening quote, an
+    InDesign drop cap of three letters going on in lower case, and floated
+    images with alt text no longer refuse the chapter, and neither does a
+    `::before` or `::after` box without `content`. A large book whose
+    stylesheet carries rules for many other sections had run out of match
+    budget since round six read `float` rules; rules whose ancestor
+    classes, ids, and element names a chapter lacks are now set aside by
+    lookup, as browsers filter them.
+  - PDF: the evidence round six required for the table and repeat warnings
+    missed real cases and still passed some by-design layouts. A table cell
+    holding two amounts is now judged by where the page sets them. Separate
+    runs on one baseline, like a 1099-B's wash-sale column in the basis
+    cell, were merged and are reported; this now covers a one-row table and
+    a column merged in every row. Rows the detector merged also count: two
+    lines of amounts where the label cell joins both lines ("Capital gain
+    distributions Total income"). So does one item that a second run starts
+    inside. Amounts stacked by design (federal over state withholding, a
+    discount under its price) and one string the producer wrote ("10.000
+    25.50") are no longer reported. Short values doubled glyph by glyph
+    ("22", "77", "$$55") are confirmed. An unrelated doubled amount elsewhere
+    on the page no longer confirms a repeat: the text at the repeat must
+    show it twice. Past the 64 pages read again, a page is named only while
+    doubled text is left in the Markdown; an 80-page document with a
+    doubled header had named 16 pages its Markdown does not repeat. A
+    first row repeated after a line of form fields ("Acct: 5678 Period:
+    April 2025"), which the detector keeps out of the table, is reported;
+    the upstream #406 fixtures now show it.
+  - DOCX: where Word and AnyDoc take different branches of
+    `mc:AlternateContent` (a drawing canvas or a Word 2010 block Word reads,
+    and the fallback AnyDoc reads), the branches hold the same list, which
+    had been flagged; the first branch AnyDoc takes now stands for Word's.
+    Word's branch still counts where AnyDoc takes none. A paragraph style
+    naming its own list level (`w:numPr/w:ilvl`), with no level bound to
+    the style, is numbered at that level by Word and at the first by
+    AnyDoc ("a)" against "1."); it is disclosed. So is a list running
+    through footnotes or endnotes stored in another order than their ids
+    or their references: AnyDoc numbers them as stored, LibreOffice by id,
+    and Word in the order the text references them.
+  - XLSX and ODS: a negative residue such as -5.55e-17 in a colour-only
+    fraction format shows as 0 in Excel, and is no longer refused; a
+    fraction shows zero below half its smallest step.
+- Review round six found four missed losses and seven false positives in
+  loops 12 and 13 and the round-five fixes; all are fixed:
+  - EPUB: AnyDoc flattens a link's content into the text around it, so
+    `<div>Note:<a id="c1"><h2>Total 1,250.00</h2></a></div>` converted as
+    "Note:Total 1,250.00" with no warning. The chapter walk now splices a
+    link's blocks as AnyDoc does, with the white space and line breaks it
+    drops. The reader model now reads `display`, `float`, and block
+    `::before`/`::after` boxes: a floated drop cap ("O" beside "nce") and an
+    inline `div` no longer refuse a book, while a `span` styled as a block,
+    an `address`, and a line break, rule, or empty paragraph that only
+    AnyDoc's selector quirks hide now count as the reader's line breaks. An
+    image whose alt text its caption repeats, as pandoc 2 writes figures, no
+    longer refuses the book.
+  - DOCX: Word numbers the body, the text boxes, the footnotes, and the
+    endnotes as separate stories, which AnyDoc counts through as one. A
+    footnote list continuing the body's numbers converted as 4, 5 where Word
+    shows 1, 2, without a warning, and a text box written both as a shape
+    and as its VML fallback was counted twice, flagging lists that match.
+    The replay also counts a level a deeper paragraph skips as used ("1.1.1."
+    then "2."), restarts an instance once, at its first overridden level,
+    and starts a level without `w:start` at 0, as Word does. On 320
+    randomized list documents it now agrees with LibreOffice on every one;
+    38 differences had been missed.
+  - PDF: a run painted twice through two font objects was missed; runs are
+    now matched by their bytes alone. `text_painted_twice` no longer names
+    pages whose repeat pdf-inspector drops before its Markdown (a doubled
+    header or footer stripped as furniture, a white copy in a form, a copy
+    its clip hides): the text at each repeat must appear doubled in the
+    Markdown, and a header kept on the first page only names that page.
+    `table_values_merged` needs an empty neighbouring cell or a single
+    amount elsewhere in the column, and `table_row_repeated` no longer
+    fires on a sentence that restates the first row.
+  - ODT and ODP: the embedded-object reference check compared every
+    reference with every archive entry. A 28 MB document held a worker
+    thread for 225 s after its 30 s timeout; the check is now linear.
+  - XLSX and ODS: a negative fraction in a colour-only format (`# ?/?;[Red]#
+    ?/?`) shows as "1/4" however small, and its lost sign is refused.
+- EPUB chapters whose blocks AnyDoc runs together are refused, found from its
+  older EPUB pull request (#4). AnyDoc walks a `div`, `section`, `figure`,
+  `figcaption`, `dd`, or other container without block children inline, so
+  minified markup such as `<div>Balance due</div><div>1,250.00</div>`, which a
+  reader shows on two lines, converted as "Balance due1,250.00", and an
+  image's alt text ran into its caption. Markup with white space between the
+  blocks converts as before. Of 303 public documents, only the three built to
+  reproduce it changed.
+- Converted Markdown keeps line breaks inside table cells. The sanitizer
+  removed AnyDoc's `<br>`, so a cell reading "52,000" over "1,250" came out as
+  "52,0001,250", one wrong number, in DOCX, PPTX, ODT, ODS, ODP, and EPUB
+  tables. It also no longer deletes angle-bracket text AnyDoc escaped
+  (`\<Client name>`) or text inside code spans and code blocks.
+- A scanned PDF made searchable, with its words in an invisible OCR layer and a
+  visible header or Bates number on top, was read by pdf-inspector 1.24.0 as a
+  text page holding only the stamps, at confidence 1.0, with no page listed
+  for OCR (open upstream #479, #501). A bounded local scan of each page's
+  content now lists such pages for OCR. The layer's own text is never copied
+  out, since it need not match the page. On the public corpus it adds 1–5 ms
+  per PDF call and changes no output.
+- XLSX and ODS values whose format AnyDoc renders differently are refused,
+  from its open spreadsheet pull requests (#72, #151). A negative marked only
+  by a colour, as in `#,##0;[Red]#,##0`, rendered as 25,000 for -25,000. A
+  value its format hides (`;;;`) is still held by the workbook, and ODS
+  converted it in place of the empty display; a hidden zero is not counted. A
+  date whose format AnyDoc cannot resolve rendered as its serial number. Text
+  boxes over a sheet, or anchored to an ODS cell, were never read.
+- DOCX list numbers that differ from Word's are disclosed (#129). AnyDoc counts
+  per list instance where Word counts per definition, so a second instance
+  restarted at 1 where Word continues, including headings numbered through a
+  style. AnyDoc's own upstream fixtures show "1." and "I." where Word shows
+  5 and V. It also numbered paragraphs deleted with tracked changes, and
+  rendered ordinals and spelled-out numbers as plain decimals.
+- Password-protected DOCX, XLSX, and PPTX files are reported as `encrypted`
+  rather than `malformed`. The check read their stream names in ASCII, but a
+  compound file stores them in UTF-16LE.
+- Decks using PowerPoint Sections convert again. Section entries
+  (`p14:sldId`) were read as slides without relationships, which refused the
+  deck as incomplete.
+- Matching slides to relationships is a single pass; a crafted deck had made
+  it quadratic. So is a deck that repeats one relationship id for every slide.
+- EPUB books with common publisher CSS convert again. A `[hidden]` reset,
+  print and Kindle media blocks, and user-agent rules for `head` had refused
+  the whole book although nothing they hide would convert.
+- A web address written in an EPUB chapter no longer refuses the book. The
+  external check had matched `http:` anywhere in chapter text, in stylesheet
+  comments, and in `@namespace` identifiers. Stylesheet references are now read
+  from `url()`, `image-set()`, and `@import`, and the Markdown sanitizer still
+  removes addresses from the output.
+- EPUB stylesheet parsing is linear. An `@import` without a closing semicolon
+  had made it quadratic: 16,000 imports took 9.3 s and 2.2 GiB, and 32,000
+  exhausted the server. They now take 0.01 s and 13 MiB, under caps on tokens,
+  imports, import depth, sheet applications, rules, and matching work.
+- The word `macroEnabled` in slide, note, or cell text no longer marks a
+  package as active content; only the content-types part can.
+- A chart's link to an external data workbook is reported as an external
+  relationship rather than refused as active content.
+
 ### Known limitations
-- `parse_irc_sections`: regex captures only the leading section integer, drops decimal/parens (does not handle Treas Reg format) — flagged experimental
+- The DOCX checks keep at most 16,384 styles and 1,024-byte style ids per
+  document and return `resource_limit` beyond them; a styles part that must be
+  transcoded is checked in memory up to 4 MiB.
+- PPTX, XLSX, and EPUB refuse external hyperlinks as incomplete, where DOCX
+  converts them with a warning and removes the destination.
+- `parse_irc_sections` reads U.S. Code Title 26 structure; Treasury Regulation
+  numbering (`§ 1.401(k)-1`) is not parsed.
 - `identify_tax_form`: bank-direct 1099-INTs that render as numeric tables only return `Unknown` (no header text in markdown)
-- OCR fallback for scanned PDFs not yet implemented — first scanned PDF returns empty markdown
+- No OCR engine ships. Scanned pages report that they need OCR and why, and
+  return no text for those pages.
+- Other pdf-inspector 1.25.0 defects from its open pull requests are not
+  detected: a receipt
+  with few text operators and a logo read as a scan (#445); forms with
+  indirect resources (#407), reported only through the garbled-text reason
+  where it applies; rotated column headers scattered
+  into cells (#298); and blank pages that turn the sparse-extraction rule
+  on for every page (#339). The table checks read the Markdown and name no
+  page; the repeat check reads runs whose position is set, and stops after
+  4 million operations per document. A repeat is confirmed in the Markdown
+  on up to 64 pages; a later page is named for its own repeated text when
+  its fonts read it, and otherwise while doubled text is left in the
+  Markdown, so an amount a paragraph legitimately repeats ("0.00 0.00") can
+  name one. A shadow offset along the baseline by less than a third of the
+  size is a repeat only for runs of two glyphs or more. A table cell's
+  amounts are placed from the first 64 pages converted; past them, where
+  the amounts are not read as runs of their own, and where no line above
+  heads a column over the second amount, a cell counts beside an empty cell
+  or in a column whose other rows hold one amount. The word-gap check runs
+  on the same pages; a page listed as needing OCR is not checked, and a
+  dependent sign's placement and return count as two gaps, where
+  pdf-inspector nets them into one. A split between digits on a line
+  outside a table reads the same as a space, but is reported. Tracked runs
+  of single glyphs, such as a letter-spaced heading, are judged with some
+  error either way: over 2,900 randomized files, 13 unchanged pages were
+  named and 33 changed ones missed. Composite (Type0) fonts are not
+  checked: pdf-inspector reads their space width at code 32 or 3, which
+  may be another glyph, so words shown with offsets can run together
+  ("Thebalanceoftheaccountwas") with no warning. Words printed glyph by
+  glyph are read only in a font that paints a word space as a glyph after a
+  word somewhere in the document, so a document whose words all stand
+  alone on their lines, or whose spaces are gaps, is not checked. A split word's pages are read again up to 64
+  pages; past them, a page is named only when the Markdown never shows the
+  word whole. A word set in small capitals, its first letter a glyph of
+  its own and the rest one string, is not read, so the public Title 26
+  chapter 6 sample keeps "(A) L imitations" with no warning.
+- The PDF warnings added since loop 18 disclose what their checks can read,
+  and no more. A doubled run past the first 10,000 doubled occurrences of a
+  document is not found; page text in a font bound only by resources a page
+  inherits as a direct dictionary, which pdf-inspector reads byte by byte, is
+  not reported, as only forms are checked; and a label and its value in one
+  text object, with no space glyph and a gap under half an em, still read as
+  one word. A text box whose text is only in its appearance, with no
+  `/Contents` or rich text, a redaction's overlay text, and text a shape's
+  appearance draws are not read; a stamp's appearance is read for its text
+  only where it holds none of its own, through forms 8 deep within the 16 MiB
+  a document's appearances are read to, its strings in one text object run
+  together, and a form drawn with no font of its own set, or in a font the
+  scan cannot read, gives none. Annotations are read until 10,000 that show
+  text; the pages holding more are named as `annotation_text_unchecked`. A
+  widget is taken to show nothing only where its box has no area or stands
+  wholly off its page's box, not where a clip or its appearance's own box
+  hides it. Past twice pdf-inspector's bound on the form's entries, 200,000,
+  the form walk ends, and values past it are not named. A form value flattened
+  into the page among other text may be named, and an XFA placeholder page
+  without the needs-rendering flag, or a static XFA form whose values are only
+  in its datasets, is not; nor is a check box whose appearance state is off
+  while its value is on, which pdf-inspector writes as its value though
+  viewers show the box empty, choices a parent field lists for its kids, or
+  forms a field's appearance draws. A running header's text the Markdown shows
+  elsewhere, as in a transfer line, counts as shown; a count after a page word
+  no higher than the page's number reads as a page number begun afresh; and
+  where the page scan cannot read a run's text, or runs out of its budget, or
+  the document holds form fields, every page is read again for the
+  running-header rule, within the call's time, and pages left unread are
+  disclosed as `header_footer_unchecked`. Invisible text is looked for on the
+  pages the repeat check reads, but not on a page listed as needing OCR; a
+  page images cover whose text mostly paints nothing is reported for OCR as a
+  scan, and invisible text on it is not looked for, whatever it says, while
+  the OCR layer of a small scanned image, such as a receipt set into a letter,
+  is reported as invisible text; text pdf-inspector reads only through its
+  retry of a document with no visible text, and clip-only text (render mode
+  7), are not reported; and a run too short to look for alone is looked for
+  with the eight characters on either side of it, and with those before it and
+  those after it apart, as pdf-inspector reads the page's lines, so one whose
+  neighbours read otherwise, as across columns pdf-inspector sets apart or on
+  a line of runs set upside down, which it orders by where they end, is not
+  reported, nor is text that short a marked-content span gives its glyphs
+  (`/ActualText`), nor a run made only of marks the comparison sets aside,
+  such as `*`, `#`, `_`, or `|`. A span's text that says otherwise than the
+  glyphs a reader sees in it is reported only where their digits differ: a
+  word given in place of a sentence holding no number is not, nor a word a
+  span adds over glyphs a reader sees, nor text a span gives over a form it
+  draws. A page's unseen text past 64 KiB, or a document's past 4 MiB, is
+  reported without being looked for where its middle stands on the page, and
+  left out where it stands off it, where pdf-inspector may leave out a
+  neighbouring page's text on an imposed sheet. Text set off the box a viewer
+  shows is judged string by string, by the middle of its baseline: a string
+  whose middle stands on the page, though its end runs past the edge, is not
+  reported, nor is one set upside down whose glyphs hang off the page from a
+  baseline on it; a Type 3 font's widths are cut to whole units, as
+  pdf-inspector cuts them, where a viewer places glyphs by their fractions.
+  Whether pdf-inspector left the text out is read from what it keeps on the
+  page, for 64 pages within four seconds; past them it is judged from the
+  strings shown, where pdf-inspector joins them into runs and splits `TJ`
+  arrays at column gaps. Lines pdf-inspector's own clip leaves out though part
+  of them shows are not reported. Off-page text past 64 KiB a page is reported
+  without being looked for, unless pdf-inspector would leave it out, and past
+  100,000 runs a page is taken to be kept. Text in a form pdf-inspector's walk
+  of a page's forms stops inside, past a million operations, is not reported;
+  the forms after it are. Visible text pdf-inspector skips as invisible is
+  reported where `Tr` sets the modes apart (`visible_text_unread`), but not on
+  a page listed as needing OCR; white text on a dark fill in a form, which it
+  drops as white text, is not reported. Past the scan's own limits, the pages
+  it could not reach are disclosed as `pages_unchecked`. A Japanese, Chinese,
+  or Korean font's map is judged as pdf-inspector looks for one, but for the
+  Macintosh glyph order it may read a program by, and a ToUnicode map it
+  parses is taken to read the font however sparse it is; a program past 64
+  MiB, or past 256 MiB read in a document, is not read, and its font is
+  reported only where the Markdown shows its text as read with no map; text
+  under a UTF-8 CMap, or one whose single bytes are ASCII (RKSJ, EUC, Big
+  Five, GBK, UHC, Johab, Hankaku, Roman), is not checked; under another
+  predefined CMap whose codes are not Unicode, such as `H` or `GB-H`, a string
+  is reported wherever it holds a printable byte past the space, without the
+  Markdown to confirm what it says, and a string of an odd number of bytes is
+  not judged; nor is invisible text under a UTF-16 CMap with no ToUnicode map,
+  which pdf-inspector reads as UTF-16, checked. A font pdf-inspector does not
+  collect whose map lopdf's grammar parses is taken to read right; a font of
+  the Identity ordering, or of one past Adobe's four collections, that
+  pdf-inspector collects is not judged; and a font past the read limits whose
+  text reads as nothing with no map is reported only where its map or program
+  decodes within 1 MiB. A page whose own font embeds a program with thousands
+  of format-12 cmap groups over the whole of Unicode still runs past the
+  deadline, in pdf-inspector's own reading; a page whose every such string
+  pdf-inspector marks with U+FFFD is left to its own garbled-text reason; and
+  a page whose misread text is only digits and marks, which drop out, stands
+  where the Markdown shows them elsewhere. Vertical writing is placed a glyph
+  an em down its column, whatever the font's vertical metrics say, and only on
+  upright pages, so columns turned with the page's space are not checked.
+  Columns emulated in a font that writes across are found only where each
+  glyph is shown on its own and the next glyph of the column is shown right
+  after it: a column whose glyphs are shown row by row, a Korean column, and a
+  lone glyph at a column's head, before a word set sideways, are not, and a
+  glyph set more than four sizes below the one before it, past a long word set
+  sideways, starts the column again. Text set sideways reads in a column only
+  where it is turned to read down the page; a column's text the Markdown shows
+  elsewhere, as in a table of the same labels, counts as shown; and columns
+  under a CMap the scan cannot read, which is any predefined vertical CMap but
+  `Identity-V` or a UCS-2 or UTF-16 one with a ToUnicode map, are reported
+  wherever two stand side by side, without the Markdown to confirm it.
+- DOCX conversion reports a dropped non-breaking hyphen as partial but cannot
+  restore it; the Markdown shows the joined words.
+- DOCX list checks follow ECMA-376 where Word and LibreOffice part: a
+  choice requiring the `w` namespace with no fallback is disclosed though
+  LibreOffice shows no numbers there. A later `w:numId` that is not a
+  number, or a `w:pPr` after the paragraph's runs, converts complete where
+  LibreOffice shows none; and a choice requiring VML that holds text, beside
+  a fallback without it, would be refused. An XLSX format code rejected for
+  other reasons whose only date letter is `s` or `A/P` converts complete
+  where LibreOffice shows a time, and `# ?/?,` over a tiny positive value is
+  refused, as a positive cell does not carry its magnitude.
+- Visual concealment (text color, size, opacity, clipping, or off-screen
+  positioning) is not detected in any lane. EPUB text in a closed `<details>`
+  and SVG `<title>` and `<desc>`, which read like image alt text, are not
+  flagged.
+- Spreadsheet pictures and charts are not converted, and a picture's alt text
+  is not flagged; an ODF chart object converts as its replacement image. Text
+  boxes and shapes with text are refused.
+- A spreadsheet format AnyDoc cannot parse, such as `£#,##0.00`, renders as
+  General: the value and its sign are kept, the currency symbol and rounding
+  are not. A value in a cell a merge covers is omitted, as Excel and
+  LibreOffice hide it. Neither is flagged.
+- Comments and notes (DOCX comments, XLSX notes, ODS annotations) are not
+  converted and are not flagged, nor are DOCX headers and footers, so a
+  "DRAFT" marking or client name placed only in a header is missing.
+- EPUB block containers without block children, such as indented `div`s or a
+  `figure` and its caption, are walked inline by AnyDoc and convert as one
+  paragraph, their text joined with spaces. This is not flagged; text that
+  would run together is refused. The reader model reads `display`, `float`,
+  `position`, and flex and grid layout from style rules, and the `display`,
+  `content`, `position`, and `white-space` of `::before` and `::after`
+  boxes. A floated or positioned box keeps the line before it and ends the
+  line after it, unless it holds a drop cap: one or two characters, or
+  three going on in lower case, and no digits.
+  A layout rule the walk cannot settle, with `:has()` or `:lang()`, under a
+  media query that holds on some screens only, or reaching a sibling let go
+  past the first 32 and the latest 96, counts only where digits meet:
+  "Balance due" and "1,250.00" run together under such a rule are not
+  refused. Alt text meeting other text counts the same way. Generated
+  counters refuse a book even where they match AnyDoc's own list numbers.
+  Text widths are not measured: a flex item that grows, has a width, or
+  takes an auto margin stands apart from the next, even where it sets its
+  text at the end of its line against it, and a dash bullet's box sets it
+  apart whatever its width. SVG glyphs are taken as 0.6 em wide, so digits
+  kerned glyph by glyph with `x` lists may read apart where Chromium sets
+  them touching, and `textLength`, which spreads a label's glyphs, is not
+  read.
+- ODP decks whose speaker notes sit in shapes, as LibreOffice writes them when
+  converting from PowerPoint, are refused: AnyDoc reads notes only from frames.
+- EPUB `noscript` content is treated as shown, as readers without scripting
+  show it, and MathML as converted whole. Books using the Kindle stylesheet
+  pair are refused rather than converted without their `.kf8-only` text.
+- EPUB readers are taken to be Chromium 141 on screens 320 to 1280 CSS
+  pixels wide, as tall, either way up, at 1 to 3 device pixels to the CSS
+  pixel. Text any of them shows counts as shown, and a media query none of
+  them meets, such as `(min-width: 1400px)`, never applies. A cascade layer
+  first declared under a query some of them meet, and declared again
+  after, is placed where its rules win the most, so text they may show or
+  hide counts both ways.
+- EPUB SVG: a clip path or mask an HTML element names with `clip-path` or
+  `mask`, and a pattern that takes its tile from another through `href`,
+  are not read as drawn, so their text, which Chromium paints and AnyDoc
+  converts, is refused. `fill-opacity` and `stroke-width` are read from an
+  element's own attributes and style only, not from style rules or its
+  ancestors.
+- EPUB: `content: var()` is read where the `::before` or `::after` box's
+  own rules set the custom property; one it inherits is not known. The
+  `quotes` property is not read, so a `<q>` whose marks `quotes: none`
+  takes away still keeps digits apart. A dash a flex column sets on a line
+  of its own is still read as a minus.
+- EPUB page numbers hidden through attribute or descendant selectors, such as
+  Project Gutenberg's `.x-ebookmaker .pagenum`, refuse the book, because
+  AnyDoc converts them.
+- DOCX: a hidden paragraph mark is disclosed for direct numbering (`w:numPr`)
+  only, not numbering applied through a paragraph style. List numbers are
+  compared as the level's number text shows them, in each level's format
+  or, for legal numbering (`w:isLgl`), in decimal; a format other than
+  decimal, roman, or letters counts as differing. A paragraph style's own
+  `w:ilvl`, which AnyDoc and ECMA-376 ignore and Word and LibreOffice read,
+  is disclosed where no level is bound to the style. Where Word and AnyDoc
+  take different branches of `mc:AlternateContent`, the check assumes the
+  branches hold the same text. A list through notes stored out of id or
+  reference order is disclosed without a verdict; no application at hand
+  settles which order Word numbers them in. A level with
+  `w:lvlRestart="0"` is taken never to restart, as Word does, although
+  LibreOffice restarts it.

@@ -7,12 +7,17 @@
 //! review_tax_package, compare_line_items, render_review_memo, document_capabilities, classify_document, document_to_markdown.
 //!
 //! All tool handlers are wrapped in a 30-second timeout to bound worst-case
-//! latency on pathological PDFs. Logs go to stderr — stdout is reserved for
-//! the JSON-RPC channel and contaminating it would break the MCP protocol.
+//! latency on pathological PDFs. PDF and document parsing runs in a private
+//! worker process that the server kills on timeout and, on Linux, confines to
+//! an address-space ceiling; hosts without the worker sandbox parse PDFs
+//! in-process. Logs go to stderr — stdout is reserved for the JSON-RPC
+//! channel and contaminating it would break the MCP protocol.
 
+use pdf_inspector_skillkit::pdf_worker::{self, PdfOperation, PdfToolError};
+use pdf_inspector_skillkit::RegionFrame;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
@@ -97,10 +102,8 @@ fn join_error_to_json(tool: &'static str, err: tokio::task::JoinError) -> String
 
 /// Common dispatch envelope: log invocation, run the (CPU-bound,
 /// synchronous) work on tokio's blocking thread pool under the timeout,
-/// serialize success or render error. Captures the boilerplate shared by
-/// 12 of the 13 tool handlers (batch_classify is bespoke — it folds
-/// per-item errors into the response array rather than failing the whole
-/// call).
+/// serialize success or render error. Used by the in-process Sweet review
+/// tools; PDF tools go through `dispatch_pdf` and the worker.
 ///
 /// `work` runs inside `tokio::task::spawn_blocking` rather than inline: it
 /// is CPU-bound and can run for a while on pathological PDFs, and running
@@ -125,6 +128,61 @@ where
         }
     })
     .await
+}
+
+/// Dispatch envelope for the PDF tools: the operation runs in the bounded
+/// worker (or in-process where the worker sandbox is unavailable) and returns
+/// its serialized result, or the uniform `{"error": ...}` envelope.
+async fn dispatch_pdf<F>(tool: &'static str, work: F) -> String
+where
+    F: std::future::Future<Output = Result<String, PdfToolError>>,
+{
+    tracing::debug!(tool, "tool invoked");
+    with_timeout(tool, TOOL_TIMEOUT, async move {
+        match work.await {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(tool, error = %error, "tool failed");
+                json_error(error)
+            }
+        }
+    })
+    .await
+}
+
+async fn run_pdf(
+    operation: PdfOperation,
+    path: String,
+    regions: Vec<(u32, Vec<[f32; 4]>)>,
+) -> Result<String, PdfToolError> {
+    run_pdf_regions(operation, path, regions, RegionFrame::Sheet).await
+}
+
+async fn run_pdf_regions(
+    operation: PdfOperation,
+    path: String,
+    regions: Vec<(u32, Vec<[f32; 4]>)>,
+    frame: RegionFrame,
+) -> Result<String, PdfToolError> {
+    pdf_worker::run_in_frame(operation, &path, &regions, frame)
+        .await
+        .map(|json| json.get().to_string())
+}
+
+fn to_pretty_json(value: &impl Serialize) -> Result<String, PdfToolError> {
+    serde_json::to_string_pretty(value).map_err(|_| PdfToolError::Protocol)
+}
+
+/// Parse and serialize worker Markdown on the blocking pool: it can run to
+/// tens of megabytes, and work on an executor thread is work the tool
+/// timeout cannot interrupt.
+async fn on_blocking_pool<F>(work: F) -> Result<String, PdfToolError>
+where
+    F: FnOnce() -> Result<String, PdfToolError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| PdfToolError::Processing)?
 }
 
 fn document_json_error(error: &pdf_inspector_skillkit::document::DocumentError) -> String {
@@ -212,6 +270,30 @@ struct RegionSpec {
     rects: Vec<[f32; 4]>,
 }
 
+/// The coordinate frame region rectangles are given in.
+#[derive(Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RegionFrameInput {
+    /// The page as laid out in its content stream, `/Rotate` not applied: PDF
+    /// points, top-left origin of the visible page box, `y` down. The default,
+    /// and the frame these tools have always used.
+    #[default]
+    Sheet,
+    /// The page as rendered, turned clockwise by its `/Rotate`, with the same
+    /// origin conventions: use it for boxes taken from a page image, such as a
+    /// layout model's detections on a rotated scan.
+    Display,
+}
+
+impl From<RegionFrameInput> for RegionFrame {
+    fn from(frame: RegionFrameInput) -> Self {
+        match frame {
+            RegionFrameInput::Sheet => Self::Sheet,
+            RegionFrameInput::Display => Self::Display,
+        }
+    }
+}
+
 /// Input for extract_text_regions and extract_table_regions tools.
 #[derive(Deserialize, JsonSchema)]
 struct RegionInput {
@@ -219,6 +301,9 @@ struct RegionInput {
     path: String,
     /// Regions to extract from, specified as (page, rects) pairs.
     regions: Vec<RegionSpec>,
+    /// Frame the rectangles are given in: `sheet` (default) or `display`.
+    #[serde(default)]
+    frame: RegionFrameInput,
 }
 
 /// Input for Sweet package review and memo tools.
@@ -263,7 +348,16 @@ impl PdfInspectorServer {
 #[tool_router]
 impl PdfInspectorServer {
     /// Return the generic document contract for one known format.
-    #[tool(description = "Return capabilities and safety boundaries for a generic document format")]
+    #[tool(
+        description = "Return capabilities and safety boundaries for a generic document format",
+        annotations(
+            title = "Document format capabilities",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn document_capabilities(&self, params: Parameters<DocumentCapabilitiesInput>) -> String {
         let kind = params.0.kind;
         dispatch_document_sync("document_capabilities", move || {
@@ -278,19 +372,33 @@ impl PdfInspectorServer {
 
     /// Classify a local document without converting it.
     #[tool(
-        description = "Classify a local document by content signature and report whether its generic route is enabled"
+        description = "Classify a local document by content signature and report whether its generic route is enabled",
+        annotations(
+            title = "Classify document",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn classify_document(&self, params: Parameters<DocumentPathInput>) -> String {
         let path = params.0.path;
-        dispatch_document_sync("classify_document", move || {
-            pdf_inspector_skillkit::document::classify(&path)
+        dispatch_document("classify_document", move || async move {
+            pdf_inspector_skillkit::document::classify(path).await
         })
         .await
     }
 
     /// Convert an enabled DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV package through the supervised document worker.
     #[tool(
-        description = "Convert an enabled local DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, strict EPUB, or bounded CSV input to sanitized Markdown through a bounded worker"
+        description = "Convert an enabled local DOCX, exact `.pptx`, exact `.xlsx`, exact `.ods`, exact `.odt`, exact `.odp`, strict EPUB, or bounded CSV input to sanitized Markdown through a bounded worker. A document whose conversion would lose or misrender what its application shows is refused with a stable code; `completeness: partial` and the warnings name anything the Markdown shows differently",
+        annotations(
+            title = "Document to Markdown",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn document_to_markdown(&self, params: Parameters<DocumentPathInput>) -> String {
         let path = params.0.path;
@@ -302,73 +410,127 @@ impl PdfInspectorServer {
 
     /// Classify a PDF as TextBased, Scanned, ImageBased, or Mixed.
     #[tool(
-        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score and per-page OCR hints"
+        description = "Classify a PDF as TextBased/Scanned/ImageBased/Mixed with confidence score, the pages that need OCR and why, and its recorded creation and modification dates",
+        annotations(
+            title = "Classify PDF",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn classify_pdf(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
-        dispatch("classify_pdf", move || {
-            pdf_inspector_skillkit::classify(&path)
-        })
+        dispatch_pdf(
+            "classify_pdf",
+            run_pdf(PdfOperation::Classify, path, Vec::new()),
+        )
         .await
     }
 
     /// Convert a PDF to clean Markdown.
     #[tool(
-        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks"
+        description = "Convert a PDF to clean Markdown with headings, tables, lists, and code blocks; also reports per-page OCR reasons, layout, and fonts whose text may be garbled. Text on pages listed as needing OCR is missing or unreliable; `warnings` name text the Markdown repeats, pages whose word spacing may be misread, whose text drawn through forms is missed, or that lose a line taken for a running header, form values that are garbled or missing, annotation text, dynamic XFA forms, and embedded files that are never read, text read from layers a reader hides, painted invisibly, or set off the page, visible text left out as invisible or in content too dense to read, numbers a span's replacement text gives otherwise than its glyphs, Japanese, Chinese, or Korean text read without its font's map or set in vertical columns, table amounts that may sit in the wrong row or column or after their table, and pages these checks could not reach",
+        annotations(
+            title = "PDF to Markdown",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn pdf_to_markdown(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
-        dispatch("pdf_to_markdown", move || {
-            pdf_inspector_skillkit::process(&path)
-        })
+        dispatch_pdf(
+            "pdf_to_markdown",
+            run_pdf(PdfOperation::Markdown, path, Vec::new()),
+        )
         .await
     }
 
     /// Analyze layout complexity of a PDF (tables, multi-column, etc.).
     #[tool(
-        description = "Analyze layout complexity of a PDF — returns tables detected, multi-column indicators, and other layout metrics"
+        description = "Analyze layout complexity of a PDF — returns pages with tables, pages with multiple columns, per-page OCR reasons, and fonts whose text may be garbled, without Markdown",
+        annotations(
+            title = "Analyze PDF layout",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn analyze_layout(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
-        dispatch("analyze_layout", move || {
-            pdf_inspector_skillkit::analyze(&path)
-        })
+        dispatch_pdf(
+            "analyze_layout",
+            run_pdf(PdfOperation::Analyze, path, Vec::new()),
+        )
         .await
     }
 
-    /// Batch classify multiple PDFs sequentially.
+    /// Batch classify multiple PDFs.
     ///
     /// Bespoke because per-item errors are folded into the response array
     /// rather than failing the whole call — so the dispatch helper doesn't fit.
+    /// Items run concurrently within the PDF worker bound and are reported in
+    /// input order.
     #[tool(
-        description = "Classify multiple PDFs — returns array of {path, classification} objects"
+        description = "Classify multiple PDFs — returns array of {path, classification} objects",
+        annotations(
+            title = "Batch classify PDFs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn batch_classify(&self, params: Parameters<BatchClassifyInput>) -> String {
         let paths = params.0.paths;
         tracing::debug!(tool = "batch_classify", count = paths.len(), "tool invoked");
         with_timeout("batch_classify", TOOL_TIMEOUT, async move {
-            let work = move || -> Vec<serde_json::Value> {
-                paths
-                    .into_iter()
-                    .map(|path| match pdf_inspector_skillkit::classify(&path) {
-                        Ok(info) => serde_json::json!({
+            let mut paths = paths.into_iter().enumerate();
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut results = Vec::new();
+            loop {
+                // Start no more classifications than the worker runs at
+                // once, so a long list neither takes a task per path up
+                // front nor holds the runtime before the timeout can fire.
+                while tasks.len() < pdf_worker::MAX_IN_FLIGHT {
+                    let Some((index, path)) = paths.next() else {
+                        break;
+                    };
+                    tasks.spawn(async move {
+                        let result = pdf_worker::run(PdfOperation::Classify, &path, &[]).await;
+                        (index, path, result)
+                    });
+                }
+                let Some(joined) = tasks.join_next().await else {
+                    break;
+                };
+                let Ok((index, path, result)) = joined else {
+                    return json_error("tool 'batch_classify' failed: classification task failed");
+                };
+                let entry = match result.and_then(|json| {
+                    serde_json::from_str::<serde_json::Value>(json.get())
+                        .map_err(|_| PdfToolError::Protocol)
+                }) {
+                    Ok(info) => serde_json::json!({
+                        "path": path,
+                        "classification": info
+                    }),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "tool failed");
+                        serde_json::json!({
                             "path": path,
-                            "classification": info
-                        }),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "tool failed");
-                            serde_json::json!({
-                                "path": path,
-                                "error": e.to_string()
-                            })
-                        }
-                    })
-                    .collect()
-            };
-            match tokio::task::spawn_blocking(work).await {
-                Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_else(json_error),
-                Err(join_err) => join_error_to_json("batch_classify", join_err),
+                            "error": e.to_string()
+                        })
+                    }
+                };
+                results.push((index, entry));
             }
+            results.sort_by_key(|(index, _)| *index);
+            let results: Vec<_> = results.into_iter().map(|(_, entry)| entry).collect();
+            serde_json::to_string_pretty(&results).unwrap_or_else(json_error)
         })
         .await
     }
@@ -378,16 +540,26 @@ impl PdfInspectorServer {
     /// Each region is defined by a page number (0-indexed) and a list of
     /// bounding rectangles `[x1, y1, x2, y2]` in PDF points with top-left origin.
     #[tool(
-        description = "Extract text from specified rectangular regions of a PDF — returns text per region with OCR hints"
+        description = "Extract text from specified rectangular regions of a PDF — returns text per region with OCR hints. Rects are PDF points, top-left origin; set frame to display for boxes taken from a rendered page image (rotated pages)",
+        annotations(
+            title = "Extract PDF text regions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn extract_text_regions(&self, params: Parameters<RegionInput>) -> String {
-        let path = params.0.path;
-        let regions = params.0.regions;
-        dispatch("extract_text_regions", move || {
-            let page_regions: Vec<(u32, Vec<[f32; 4]>)> =
-                regions.into_iter().map(|r| (r.page, r.rects)).collect();
-            pdf_inspector_skillkit::extract_text_regions(&path, &page_regions)
-        })
+        let RegionInput {
+            path,
+            regions,
+            frame,
+        } = params.0;
+        let regions = regions.into_iter().map(|r| (r.page, r.rects)).collect();
+        dispatch_pdf(
+            "extract_text_regions",
+            run_pdf_regions(PdfOperation::TextRegions, path, regions, frame.into()),
+        )
         .await
     }
 
@@ -396,58 +568,117 @@ impl PdfInspectorServer {
     /// Similar to extract_text_regions but runs table detection and returns
     /// markdown pipe-tables instead of flat text.
     #[tool(
-        description = "Extract tables from specified rectangular regions of a PDF as markdown pipe-tables"
+        description = "Extract tables from specified rectangular regions of a PDF as markdown pipe-tables. Rects are PDF points, top-left origin; set frame to display for boxes taken from a rendered page image (rotated pages)",
+        annotations(
+            title = "Extract PDF table regions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn extract_table_regions(&self, params: Parameters<RegionInput>) -> String {
-        let path = params.0.path;
-        let regions = params.0.regions;
-        dispatch("extract_table_regions", move || {
-            let page_regions: Vec<(u32, Vec<[f32; 4]>)> =
-                regions.into_iter().map(|r| (r.page, r.rects)).collect();
-            pdf_inspector_skillkit::extract_table_regions(&path, &page_regions)
-        })
+        let RegionInput {
+            path,
+            regions,
+            frame,
+        } = params.0;
+        let regions = regions.into_iter().map(|r| (r.page, r.rects)).collect();
+        dispatch_pdf(
+            "extract_table_regions",
+            run_pdf_regions(PdfOperation::TableRegions, path, regions, frame.into()),
+        )
         .await
     }
 
     /// Identify the type of tax form in a PDF (W-2, 1099, K-1, 1040, schedules).
     #[tool(
-        description = "Identify the type of tax form in a PDF (W-2, 1099, K-1, 1040, schedules)"
+        description = "Identify the type of tax form in a PDF (W-2, 1099, K-1, 1040, schedules)",
+        annotations(
+            title = "Identify tax form",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn identify_tax_form(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
-        dispatch("identify_tax_form", move || {
-            pdf_inspector_skillkit::domain::tax::identify_tax_form(&path)
+        dispatch_pdf("identify_tax_form", async move {
+            let markdown = pdf_worker::markdown(&path).await?;
+            on_blocking_pool(move || {
+                to_pretty_json(
+                    &pdf_inspector_skillkit::domain::tax::identify_tax_form_markdown(&markdown),
+                )
+            })
+            .await
         })
         .await
     }
 
     /// Split a SEC 10-K/10-Q filing into sections by Item number.
     #[tool(
-        description = "Split a SEC 10-K/10-Q filing into sections by Item number — returns array of {name, item_number, content, char_offset}"
+        description = "Split a SEC 10-K/10-Q filing into sections by Item number — returns array of {name, item_number, content, char_offset}",
+        annotations(
+            title = "Split SEC filing",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn split_sec_filing(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
-        dispatch("split_sec_filing", move || {
-            pdf_inspector_skillkit::domain::sec::split_sec_filing(&path)
+        dispatch_pdf("split_sec_filing", async move {
+            let markdown = pdf_worker::markdown(&path).await?;
+            on_blocking_pool(move || {
+                to_pretty_json(&pdf_inspector_skillkit::domain::sec::split_sec_markdown(
+                    &markdown,
+                ))
+            })
+            .await
         })
         .await
     }
 
     /// Parse IRC (Internal Revenue Code) sections from a Title 26 PDF.
     #[tool(
-        description = "Parse IRC (Internal Revenue Code) sections from a Title 26 PDF — returns structured sections with §numbers, titles, and subsections"
+        description = "Parse IRC (Internal Revenue Code) sections from a Title 26 PDF — returns sections with §numbers, titles, provisions labeled by full citation such as (d)(2)(A)(i), repeal flags, and editorial notes kept apart from statutory text",
+        annotations(
+            title = "Parse IRC sections",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn parse_irc_sections(&self, params: Parameters<PathInput>) -> String {
         let path = params.0.path;
-        dispatch("parse_irc_sections", move || {
-            pdf_inspector_skillkit::domain::irc::parse_irc_sections(&path)
+        dispatch_pdf("parse_irc_sections", async move {
+            let markdown = pdf_worker::markdown(&path).await?;
+            on_blocking_pool(move || {
+                to_pretty_json(
+                    &pdf_inspector_skillkit::domain::irc::parse_irc_markdown_with_source(
+                        &markdown,
+                        std::path::Path::new(&path),
+                    ),
+                )
+            })
+            .await
         })
         .await
     }
 
     /// List built-in Sweet tax review demo packages.
     #[tool(
-        description = "List built-in Sweet tax review demo packages across 1040, 1120, 1065, 1120-S, K-1, and 1099 workflows"
+        description = "List built-in Sweet tax review demo packages across 1040, 1120, 1065, 1120-S, K-1, and 1099 workflows",
+        annotations(
+            title = "List Sweet demo packages",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_tax_packages(&self) -> String {
         dispatch("list_tax_packages", || {
@@ -460,7 +691,14 @@ impl PdfInspectorServer {
 
     /// Review a built-in Sweet tax package and return structured findings.
     #[tool(
-        description = "Run deterministic Sweet tax review checks for a built-in demo package and return structured findings"
+        description = "Run deterministic Sweet tax review checks for a built-in demo package and return structured findings",
+        annotations(
+            title = "Review Sweet demo package",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn review_tax_package(&self, params: Parameters<SweetPackageInput>) -> String {
         let package_id = params.0.package_id;
@@ -472,7 +710,14 @@ impl PdfInspectorServer {
 
     /// Compare one return line item against one source document value.
     #[tool(
-        description = "Compare one tax return line against one source document line with an optional tolerance"
+        description = "Compare one tax return line against one source document line with an optional tolerance",
+        annotations(
+            title = "Compare line items",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn compare_line_items(&self, params: Parameters<SweetCompareLineItemsInput>) -> String {
         let input = params.0;
@@ -494,7 +739,16 @@ impl PdfInspectorServer {
     }
 
     /// Render a Markdown review memo for a built-in Sweet demo package.
-    #[tool(description = "Render a Markdown tax review memo for a built-in Sweet demo package")]
+    #[tool(
+        description = "Render a Markdown tax review memo for a built-in Sweet demo package",
+        annotations(
+            title = "Render review memo",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn render_review_memo(&self, params: Parameters<SweetPackageInput>) -> String {
         let package_id = params.0.package_id;
         dispatch("render_review_memo", move || {
@@ -506,12 +760,17 @@ impl PdfInspectorServer {
 
 #[tool_handler]
 impl ServerHandler for PdfInspectorServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "PDF classification, text extraction, and layout analysis. \
-             Local and offline, with no bundled OCR engine. \
+             Local and offline, with no bundled OCR engine; classification \
+             reports which pages need OCR and why. PDF and document parsing \
+             runs in a bounded worker process. \
              Also exposes bounded DOCX, strict PPTX, strict XLSX, strict ODS, strict ODT, Linux-memory-gated strict ODP, Linux-memory-gated strict EPUB, and Linux-memory-gated strict CSV conversion paths. \
+             Document results state their completeness (complete or partial) \
+             and carry fixed warnings; check both before relying on the \
+             Markdown. Content the converter would drop silently fails closed. \
              Includes Sweet tax-review demo tools for deterministic package \
              review, line-item comparison, and Markdown memo rendering.",
             )
