@@ -106,23 +106,49 @@ impl Column<'_> {
         Some(texts.into_iter().map(|(_, text)| text).collect())
     }
 
-    /// Whether a horizontal run stands across the column: upright, short,
-    /// no larger than its glyphs, starting within its width to the left of
-    /// its line or half of it to the right, between its top and a glyph
-    /// below its bottom.
-    fn holds(&self, run: &EdgeRun) -> bool {
-        let [a, b] = run.direction;
+    /// Where a horizontal run stands across the column, if it does:
+    /// upright, short, no larger than its glyphs, starting within its width
+    /// to the left of its line or half of it to the right, with its
+    /// baseline between its top and its foot, or below its foot where the
+    /// top of the run's glyphs reaches within a quarter of the column's
+    /// size of it, as digits set in the column's last cell do.
+    fn holds(&self, run: &EdgeRun) -> Option<Across> {
         let (x, y, size) = (f64::from(run.x), f64::from(run.y), f64::from(run.size));
-        a > 0.0
-            && b.abs() <= 0.1 * a
+        let short = run.text.as_deref().is_some_and(|text| {
+            let text = text.trim();
+            !text.is_empty() && text.chars().count() <= MAX_ACROSS_CHARS
+        });
+        if !(upright(run)
             && size <= 1.05 * self.size
             && (self.x - self.size..=self.x + 0.5 * self.size).contains(&x)
-            && (self.bottom() - self.size..=self.top()).contains(&y)
-            && run.text.as_deref().is_some_and(|text| {
-                let text = text.trim();
-                !text.is_empty() && text.chars().count() <= MAX_ACROSS_CHARS
-            })
+            && short)
+        {
+            return None;
+        }
+        let (top, bottom) = (self.top(), self.bottom());
+        if (bottom..=top).contains(&y) {
+            Some(Across::Within)
+        } else if y < bottom && y + 0.8 * size >= bottom - 0.25 * self.size {
+            Some(Across::Below)
+        } else {
+            None
+        }
     }
+}
+
+/// Where a horizontal run stands across a column (see `Column::holds`).
+#[derive(Clone, Copy, PartialEq)]
+enum Across {
+    /// Between the column's top and its foot.
+    Within,
+    /// Below its foot, in the cell after its last glyph.
+    Below,
+}
+
+/// Whether a run is upright, its line running along the page.
+fn upright(run: &EdgeRun) -> bool {
+    let [a, b] = run.direction;
+    a > 0.0 && b.abs() <= 0.1 * a
 }
 
 /// What the Markdown must show of a page's vertical runs (see `Reading`),
@@ -152,17 +178,43 @@ pub(crate) fn readings(runs: &[VerticalRun], across: &[EdgeRun]) -> Vec<Reading>
         }
     }
     let vertical: HashSet<usize> = runs.iter().filter_map(|run| run.edge).collect();
+    // The baselines of the horizontal runs, low to high, with where each
+    // starts: a run below a column's foot that another, standing apart from
+    // the column, lines up with as a row, as a table's values stand under
+    // its labels, is not read in the column.
+    let mut baselines: Vec<(f64, f64)> = across
+        .iter()
+        .enumerate()
+        .filter(|(index, run)| !vertical.contains(index) && upright(run))
+        .map(|(_, run)| (f64::from(run.y), f64::from(run.x)))
+        .collect();
+    baselines.sort_by(|one, other| one.0.total_cmp(&other.0));
+    let in_row = |run: &EdgeRun, column: &Column| {
+        let (y, near) = (f64::from(run.y), 0.25 * f64::from(run.size));
+        let from = baselines.partition_point(|(baseline, _)| *baseline < y - near);
+        baselines[from..]
+            .iter()
+            .take_while(|(baseline, _)| *baseline <= y + near)
+            .any(|(_, x)| (x - column.x).abs() > column.size)
+    };
     for (index, run) in across.iter().enumerate() {
         if vertical.contains(&index) {
             continue;
         }
-        if let Some(column) = columns.iter_mut().find(|column| column.holds(run)) {
-            let text = run.text.as_deref().unwrap_or_default();
-            // It reads at the top of its glyphs.
-            column
-                .across
-                .push((f64::from(run.y) + 0.8 * f64::from(run.size), text));
+        let Some((column, place)) = columns
+            .iter_mut()
+            .find_map(|column| column.holds(run).map(|place| (column, place)))
+        else {
+            continue;
+        };
+        if place == Across::Below && in_row(run, column) {
+            continue;
         }
+        let text = run.text.as_deref().unwrap_or_default();
+        // It reads at the top of its glyphs.
+        column
+            .across
+            .push((f64::from(run.y) + 0.8 * f64::from(run.size), text));
     }
     let mut paired = vec![false; columns.len()];
     let mut readings = Vec::new();
@@ -317,6 +369,45 @@ mod tests {
         assert_eq!(
             readings(&date, &digits),
             [Reading::Alone("令和12年5月1日".to_owned())]
+        );
+        // Below a column's foot, digits set in the cell after its last glyph
+        // read in it, glyph by glyph too; a folio set further down does not.
+        let era = [run(300.0, 700.0, "平成", 0)];
+        let digits = |runs: &[(f32, f32, &str, f32)]| -> Vec<EdgeRun> {
+            runs.iter()
+                .map(|&(x, y, text, size)| EdgeRun {
+                    size,
+                    ..across(x, y, text)
+                })
+                .collect()
+        };
+        assert_eq!(
+            readings(&era, &digits(&[(295.0, 667.0, "31", 10.0)])),
+            [Reading::Alone("平成31".to_owned())]
+        );
+        assert_eq!(
+            readings(
+                &era,
+                &digits(&[(295.0, 667.0, "3", 10.0), (300.5, 667.0, "1", 10.0)])
+            ),
+            [Reading::Alone("平成31".to_owned())]
+        );
+        assert_eq!(
+            readings(&era, &digits(&[(296.0, 664.0, "12", 9.0)])),
+            [Reading::Alone("平成".to_owned())]
+        );
+        // Values under labels, touching their feet, line up as a row: they
+        // are the table's, not the labels'.
+        let labels = [run(230.0, 696.0, "源泉", 0), run(200.0, 696.0, "支払", 0)];
+        assert_eq!(
+            readings(
+                &labels,
+                &digits(&[(196.0, 665.0, "5.2", 7.0), (226.0, 665.0, "162", 7.0)])
+            ),
+            [Reading::Pair(
+                Some(("源泉".to_owned(), "支払".to_owned())),
+                true
+            )]
         );
         // Labels in cells five sizes apart pair, but not as a passage.
         let labels = [
