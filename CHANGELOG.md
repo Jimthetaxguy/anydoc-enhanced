@@ -469,6 +469,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PDF: clip-only text an image or a shading is painted through, as in a
     heading filled with a picture or a gradient, is visible, so such flyers
     are no longer listed for OCR.
+- Review round thirteen checked the round-twelve fixes:
+  - PDF invisible text (#572): a word or a digit slipped invisibly into a line
+    and set a point or so above or below it opened a line of its own, or
+    sorted after the run it was shown before, where pdf-inspector keeps it in
+    the line, so "not" in "The fee is not refundable." went unreported. The
+    check now makes lines as pdf-inspector does: in the order they are shown
+    unless that order jumps about the page, on a page turned where its runs
+    mostly read up or down it, and, as pdf-inspector may yet set a run drawn
+    last beside the line at its height, from the top as well, so invisible
+    glyphs set one by one along a turned line, which pdf-inspector reads, are
+    reported too. One run the scan cannot read, such as "customer’s" in a font
+    without a map, now ends the text read beside the insertion instead of
+    disabling the line; a run alone on its line ("PAID", or "$0.00" between
+    "Balance due" and "Thank you") is read with the lines before and after;
+    and the text before and after the insertion are looked for apart, with
+    strike, script, and link syntax, superscript digits, ligatures, and the
+    bullets pdf-inspector writes as "-" folded as the Markdown writes them, so
+    a bullet, a footnote marker, a struck price, a link, or a wrapped table
+    cell beside the insertion no longer hides it.
+  - PDF Japanese, Chinese, and Korean fonts (#573): a font pdf-inspector never
+    collects, as one used only in a form whose `/Resources` is given by
+    reference (a page imported as a form), and a descendant with no font
+    descriptor, which it looks up no map for, read "Total wages" as
+    "5PUBMXBHFT" with no warning; both are reported. A program past the 16 MiB
+    read had been taken to hold a map; programs up to 64 MiB, 256 MiB a
+    document, are now read, each once however many fonts embed it, and a font
+    past them is reported where the Markdown shows its text as read with no
+    map, where 153 of 700 pages had gone unreported. Kanji whose codes hold
+    0x7F, and misread text that says nothing to look for, such as kanji alone,
+    are reported. Per-page fonts sharing one program read it once: 20 pages
+    take 1.0 s, not 1.8 s.
+  - PDF vertical writing (#575): two columns of a passage with wide leading,
+    2.6 sizes apart, read left to right, are reported, as passages now stand
+    up to 4 sizes apart; and short labels the Markdown shows as the cells of a
+    table's row are no longer held to a passage's order, where a table's
+    vertical header labels 2.5 sizes apart, read right, had been reported.
+  - A 16 KB file of ten pages with 2 million path operators each aborted the
+    whole conversion at 775 MB, as the scan decoded a stream before it charged
+    its budget. The scan now counts a stream's operators first, passes over a
+    stream of more than a million as pdf-inspector does, and charges the rest
+    before decoding them: 0.23 s within 34 MB, as pdf-inspector alone takes.
+  - PDF render modes (#572): a `Tr` whose first operand says 3 and whose last
+    says another, as `3 0 Tr`, paints text a viewer shows that pdf-inspector
+    skips, so "The fee is not refundable" read "The fee is refundable" with no
+    sign; such pages are reported by the new `visible_text_unread` warning. A
+    last operand that is no number, or none, a viewer takes for mode 0, where
+    such a page had been reported for invisible text pdf-inspector reads; and
+    a first operand past what a real holds, which pdf-inspector casts to no
+    mode it skips, is no longer taken for 3.
+  - Invisible spaces no longer take the room kept for a page's unseen text,
+    where 64 KiB of them had left the text after them unread, and a run counts
+    as on the page by its middle, as pdf-inspector judges it, where text
+    starting 7 points left of the page had gone unreported.
+  - Digits set across a column of vertical writing (tate-chu-yoko), as in
+    "令和12年5月1日", are read in the column, where the column's text without them
+    had been reported.
+  - A form that shows no text and paints no image or shading, as a
+    letterhead's drawn logo, is read once however often it is drawn: a
+    1,000-page statement drawing a 3,000-operator letterhead on every page is
+    checked through in 9.4 s, where pages 726 to 1,000 had gone unchecked in
+    15.0 s.
+  Over 4,412 corpus, fixture, and review PDFs no warning changed and none
+  failed otherwise than before; the review's own files change as above,
+  and its stress files convert as fast as before or faster.
 - Review round twelve checked loops 26 to 28 and the glyph-by-glyph join:
   - PDF invisible text (#572): a word or a digit slipped invisibly into a
     line, as "not" in "The fee is not refundable." or a 9 before
@@ -1125,7 +1189,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and text a shape's appearance draws are not read. A form value flattened
   into the page among other text may be named, and an XFA placeholder page
   without the needs-rendering flag, or a static XFA form whose values are
-  only in its datasets, is not. A running header's text the Markdown shows
+  only in its datasets, is not; nor is a check box whose appearance state
+  is off while its value is on, which pdf-inspector writes as its value
+  though viewers show the box empty, a marked-content span giving text to
+  no glyphs, which pdf-inspector writes though no reader sees it, choices
+  a parent field lists for its kids, or forms a field's appearance draws. A running header's text the Markdown shows
   elsewhere, as in a transfer line, counts as shown; a count after a page
   word no higher than the page's number reads as a page number begun
   afresh; and where the page scan cannot read a run's text, or runs out of
@@ -1137,24 +1205,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invisible text on it is not looked for, whatever it says, while the OCR
   layer of a small scanned image, such as a receipt set into a letter, is
   reported as invisible text; text pdf-inspector reads only through its
-  retry of a document with no visible text, clip-only text (render mode
-  7), and invisible glyphs set one by one along a turned line are not
-  reported; and a run too short to look for alone is looked for with the
-  eight characters beside it on its line, so one whose line reads
-  otherwise, as across columns pdf-inspector sets apart, is not reported.
-  A page's unseen text past 64 KiB, or a document's past 4 MiB, is
-  reported without being looked for where it starts on the page, and left
-  out where it starts off it, as pdf-inspector leaves out a neighbouring
-  page's text on an imposed sheet. Past the scan's own limits, the pages
-  it could not reach are disclosed as `pages_unchecked`. A Japanese,
-  Chinese, or Korean font's map is judged as pdf-inspector looks for one,
-  but for the Macintosh glyph order it may read a program by, and a
-  ToUnicode map it parses is taken to read the font however sparse it is;
+  retry of a document with no visible text, and clip-only text (render
+  mode 7), are not reported; and a run too short to look for alone is
+  looked for with the eight characters before it, and apart with the eight
+  after it, as pdf-inspector reads the page's lines, so one whose
+  neighbours read otherwise, as across columns pdf-inspector sets apart or
+  on a line of runs set upside down, which it orders by where they end, is
+  not reported, nor is text that short a marked-content span gives its
+  glyphs (`/ActualText`). A page's unseen text past 64 KiB, or a
+  document's past 4 MiB, is reported without being looked for where its
+  middle stands on the page, and left out where it stands off it, where
+  pdf-inspector may leave out a neighbouring page's text on an imposed
+  sheet; text set off the page, which no viewer shows and pdf-inspector
+  reads where it is not a neighbouring page's, is not reported. Visible
+  text pdf-inspector skips as invisible is reported where `Tr` sets the
+  modes apart (`visible_text_unread`), but not on a page listed as needing
+  OCR; white text on a dark fill in a form, which it drops as white text,
+  is not reported. Past the scan's own limits, the pages it could not
+  reach are disclosed as `pages_unchecked`. A Japanese, Chinese, or Korean
+  font's map is judged as pdf-inspector looks for one, but for the
+  Macintosh glyph order it may read a program by, and a ToUnicode map it
+  parses is taken to read the font however sparse it is; a program past
+  64 MiB, or past 256 MiB read in a document, is not read, and its font is
+  reported only where the Markdown shows its text as read with no map;
   text under a predefined CMap other than an Identity or UCS-2 one is not
-  checked; a page whose every such string pdf-inspector marks with U+FFFD
-  is left to its own garbled-text reason; and a page whose misread text is
-  only digits and marks, which drop out, stands where the Markdown shows
-  them elsewhere. Vertical writing is placed a glyph an em down its
+  checked, nor is invisible text under a UTF-16 CMap with no ToUnicode
+  map, which pdf-inspector reads as UTF-16; a page whose every such string
+  pdf-inspector marks with U+FFFD is left to its own garbled-text reason;
+  and a page whose misread text is only digits and marks, which drop out,
+  stands where the Markdown shows them elsewhere. Vertical writing is placed a glyph an em down its
   column, whatever the font's vertical metrics say, and only on upright
   pages set in a vertical CMap, so columns emulated in a horizontal font,
   or turned with the page's space, are not checked; a column's text the
