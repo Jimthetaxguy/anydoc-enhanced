@@ -1712,8 +1712,11 @@ impl PageText {
     /// run before when it was the page's last string and the text matrix
     /// was not set since, as its glyphs go on down its column; else a run
     /// of its own where its line is upright and it starts on the page, as
-    /// no column set off the page is seen. Its text is kept to
-    /// `MAX_HIDDEN_TEXT` bytes a page, and past them is not read.
+    /// no column set off the page is seen. A glyph shown on its own in a
+    /// font that writes across, just placed on such a line, is noted as
+    /// one vertical writing emulated in that font may set (see
+    /// `vertical_text::note_glyph`). Its text is kept to `MAX_HIDDEN_TEXT`
+    /// bytes a page, and past them is not read.
     fn note_vertical(
         &mut self,
         state: State,
@@ -1725,6 +1728,43 @@ impl PageText {
     ) {
         let show = self.shows;
         let room = MAX_HIDDEN_TEXT.saturating_sub(self.vertical_bytes);
+        let on_page = |start: &Start| {
+            (page_box[0]..=page_box[2]).contains(&start.x)
+                && (page_box[1]..=page_box[3]).contains(&start.y)
+        };
+        if !state.vertical {
+            let Some(font) = state.glyph_font.filter(|_| placed) else {
+                return;
+            };
+            // One code of the font, of one byte or two.
+            if bytes.len() != 1 + usize::from(self.glyph_fonts.two_byte(font)) {
+                return;
+            }
+            let (Some(start), Some(text)) = (
+                Start::of(state, text_matrix).filter(on_page),
+                self.glyph_fonts
+                    .text(font, bytes)
+                    .filter(|text| text.len() <= room),
+            ) else {
+                return;
+            };
+            let Some(runs) = self
+                .vertical
+                .as_mut()
+                .filter(|runs| runs.len() < MAX_RUNS_PER_PAGE)
+            else {
+                return;
+            };
+            self.vertical_bytes += text.len();
+            let glyph = crate::vertical_text::VerticalRun::glyph(
+                (start.x, start.y, start.size),
+                Some(text),
+                show,
+                edge,
+            );
+            self.vertical_bytes -= crate::vertical_text::note_glyph(runs, glyph);
+            return;
+        }
         let text = state
             .glyph_font
             .and_then(|font| self.glyph_fonts.text(font, bytes))
@@ -1739,7 +1779,7 @@ impl PageText {
         let glyphs = (bytes.len() / 2) as f64;
         if let Some(last) = runs
             .last_mut()
-            .filter(|last| !placed && last.show + 1 == show)
+            .filter(|last| !placed && !last.emulated && last.show + 1 == show)
         {
             last.bottom -= glyphs * last.size;
             last.text = last.text.take().zip(text).map(|(mut before, text)| {
@@ -1750,10 +1790,7 @@ impl PageText {
             last.show = show;
             return;
         }
-        let Some(start) = Start::of(state, text_matrix).filter(|start| {
-            (page_box[0]..=page_box[2]).contains(&start.x)
-                && (page_box[1]..=page_box[3]).contains(&start.y)
-        }) else {
+        let Some(start) = Start::of(state, text_matrix).filter(on_page) else {
             return;
         };
         if let Some(text) = &text {
@@ -1767,6 +1804,7 @@ impl PageText {
             text,
             show,
             edge,
+            emulated: false,
         });
     }
 
@@ -3056,7 +3094,7 @@ fn run<'a>(
                     // neither misread.
                     if !given {
                         page.note_unmapped(&bytes, placed, state.cjk);
-                        if state.vertical {
+                        if state.vertical || state.glyph_font.is_some() {
                             page.note_vertical(state, text_matrix, &bytes, placed, page_box, edge);
                         }
                     }

@@ -2190,11 +2190,22 @@ fn identity_fonts_pdf_inspector_does_not_collect_are_reported() {
     );
 }
 
+/// How `vertical_text_pdf` places the glyphs of its columns.
+#[derive(Clone, Copy)]
+enum Placed {
+    /// A string a column: down the page under `Identity-V`, else across it.
+    Strings,
+    /// Each glyph on its own, a size below the last: under `Identity-H`,
+    /// vertical writing emulated in a font that writes across.
+    Glyphs,
+    /// Each glyph on its own, a size right of the last, along a line.
+    GlyphsAcross,
+}
+
 /// A page of Japanese `columns` set under `encoding` in a CID font with a
-/// ToUnicode map; with `Identity-V`, in columns read right to left from the
-/// top, 18 pt apart, each glyph placed on its own when `glyph_by_glyph`;
-/// otherwise one line a column.
-fn vertical_text_pdf(columns: &[&str], encoding: &str, glyph_by_glyph: bool) -> Vec<u8> {
+/// ToUnicode map, placed as `placed` says: down the page, in columns read
+/// right to left from the top, 18 pt apart; across it, one line a column.
+fn vertical_text_pdf(columns: &[&str], encoding: &str, placed: Placed) -> Vec<u8> {
     let mut glyphs: Vec<char> = columns.iter().flat_map(|column| column.chars()).collect();
     glyphs.sort_unstable();
     glyphs.dedup();
@@ -2207,17 +2218,27 @@ fn vertical_text_pdf(columns: &[&str], encoding: &str, glyph_by_glyph: bool) -> 
     let vertical = encoding == "Identity-V";
     let mut content = String::new();
     for (index, column) in columns.iter().enumerate() {
-        if !vertical {
-            let y = 720 - 20 * index;
-            content += &format!("BT /F1 12 Tf 72 {y} Td <{}> Tj ET\n", codes(column));
-        } else if glyph_by_glyph {
-            for (row, glyph) in column.chars().enumerate() {
-                let (x, y) = (500 - 18 * index, 720 - 12 * row);
-                content += &format!("BT /F1 12 Tf {x} {y} Td <{:04X}> Tj ET\n", cid(glyph));
+        let (x, y) = (500 - 18 * index, 720 - 20 * index);
+        let glyph_at = |x: usize, y: usize, glyph: char| {
+            format!("BT /F1 12 Tf {x} {y} Td <{:04X}> Tj ET\n", cid(glyph))
+        };
+        match placed {
+            Placed::Strings if vertical => {
+                content += &format!("BT /F1 12 Tf {x} 720 Td <{}> Tj ET\n", codes(column));
             }
-        } else {
-            let x = 500 - 18 * index;
-            content += &format!("BT /F1 12 Tf {x} 720 Td <{}> Tj ET\n", codes(column));
+            Placed::Strings => {
+                content += &format!("BT /F1 12 Tf 72 {y} Td <{}> Tj ET\n", codes(column));
+            }
+            Placed::Glyphs => {
+                for (row, glyph) in column.chars().enumerate() {
+                    content += &glyph_at(x, 720 - 12 * row, glyph);
+                }
+            }
+            Placed::GlyphsAcross => {
+                for (place, glyph) in column.chars().enumerate() {
+                    content += &glyph_at(72 + 12 * place, y, glyph);
+                }
+            }
         }
     }
     let entries: String = glyphs
@@ -2252,17 +2273,17 @@ fn vertical_text_in_columns_side_by_side_is_reported() {
     let pages = [
         // pdf-inspector 1.25.0 reads the columns row by row across them, or
         // left to right (upstream #575).
-        vertical_text_pdf(&columns, "Identity-V", true),
-        vertical_text_pdf(&columns, "Identity-V", false),
+        vertical_text_pdf(&columns, "Identity-V", Placed::Glyphs),
+        vertical_text_pdf(&columns, "Identity-V", Placed::Strings),
         // A column standing alone, and the same text set horizontally, read
         // as a reader reads them.
-        vertical_text_pdf(&columns[..1], "Identity-V", true),
-        vertical_text_pdf(&columns, "Identity-H", false),
+        vertical_text_pdf(&columns[..1], "Identity-V", Placed::Glyphs),
+        vertical_text_pdf(&columns, "Identity-H", Placed::Strings),
         // A passage whose last column is short reads it first.
         vertical_text_pdf(
             &["源泉徴収票の支払金額は五百万円", "です"],
             "Identity-V",
-            false,
+            Placed::Strings,
         ),
     ];
     let mut calls = Vec::new();
@@ -2309,6 +2330,47 @@ fn vertical_text_in_columns_side_by_side_is_reported() {
         );
         assert_eq!(reported(result), None, "{result}");
     }
+}
+
+#[test]
+fn vertical_writing_emulated_in_a_font_that_writes_across_is_reported() {
+    let columns = [
+        "源泉徴収票の支払金額は五百万円です",
+        "源泉徴収税額は十六万二千円です",
+        "住民税は別に通知されます",
+    ];
+    let results = convert_all(&[
+        // Columns set glyph by glyph in a font that writes across, each
+        // glyph a size below the last, as LibreOffice sets vertical writing:
+        // pdf-inspector 1.25.0 reads them row by row across the columns.
+        vertical_text_pdf(&columns, "Identity-H", Placed::Glyphs),
+        // A column standing alone, and lines set glyph by glyph across the
+        // page, read as a reader reads them.
+        vertical_text_pdf(&columns[..1], "Identity-H", Placed::Glyphs),
+        vertical_text_pdf(&columns, "Identity-H", Placed::GlyphsAcross),
+    ]);
+    // When a release reads vertical columns in order, these expectations go.
+    let markdown: String = results[0]["markdown"]
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    assert!(markdown.contains("住源源民泉泉"), "{}", results[0]);
+    for result in &results[1..] {
+        let markdown: String = result["markdown"]
+            .as_str()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        assert!(
+            markdown.contains("源泉徴収票の支払金額は五百万円です"),
+            "{result}"
+        );
+    }
+    assert_eq!(
+        warned_pages(&results, "vertical_text_misread"),
+        [Some(serde_json::json!([1])), None, None]
+    );
 }
 
 /// A statement page whose superseded balance sits in a layer that is off

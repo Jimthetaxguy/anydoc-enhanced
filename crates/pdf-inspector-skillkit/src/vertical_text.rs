@@ -19,8 +19,10 @@ use crate::repeated_lines::EdgeRun;
 
 /// A string shown in a font that writes vertically, on an upright line:
 /// where its column stands, the height it spans, its size, what it reads
-/// as where its font can be read, its place among the page's strings, and
-/// the page's run it was noted in, where it was (see `EdgeRun`).
+/// as where its font can be read, its place among the page's strings, the
+/// page's run it was noted in, where it was (see `EdgeRun`), and whether it
+/// is a glyph of a font that writes across, set on its own in a column of
+/// vertical writing emulated glyph by glyph (see `note_glyph`).
 #[derive(Clone, Debug)]
 pub(crate) struct VerticalRun {
     pub(crate) x: f64,
@@ -30,6 +32,106 @@ pub(crate) struct VerticalRun {
     pub(crate) text: Option<String>,
     pub(crate) show: u64,
     pub(crate) edge: Option<usize>,
+    pub(crate) emulated: bool,
+}
+
+impl VerticalRun {
+    /// A glyph of a font that writes across, set on its own on an upright
+    /// line with its origin at `x` and `y`: its box, as a Japanese or
+    /// Chinese font's, reaching nine tenths of its size above its baseline
+    /// and a tenth below, its column standing at its middle.
+    pub(crate) fn glyph(
+        (x, y, size): (f64, f64, f64),
+        text: Option<String>,
+        show: u64,
+        edge: Option<usize>,
+    ) -> Self {
+        VerticalRun {
+            x: x + 0.5 * size,
+            top: y + 0.9 * size,
+            bottom: y - 0.1 * size,
+            size,
+            text,
+            show,
+            edge,
+            emulated: true,
+        }
+    }
+
+    /// Whether `next`, a glyph noted after this one, stands below it in its
+    /// column: of its size, at its place across the page, and below it by
+    /// up to `MAX_COLUMN_GAP` sizes, as a glyph stands past digits or a
+    /// word set sideways in the column between them.
+    fn above(&self, next: &VerticalRun) -> bool {
+        let (size, drop) = (self.size.max(next.size), self.top - next.top);
+        self.emulated
+            && next.emulated
+            && similar(self.size, next.size)
+            && (self.x - next.x).abs() <= 0.5 * size
+            && drop > 0.0
+            && drop <= MAX_COLUMN_GAP * size
+    }
+
+    /// Whether `next`, the glyph shown right after this one, goes on down
+    /// its column: below it by up to one and a half sizes, as a column's
+    /// glyphs are set a size apart, or a little more.
+    fn goes_on(&self, next: &VerticalRun) -> bool {
+        self.show + 1 == next.show
+            && self.above(next)
+            && self.top - next.top <= 1.5 * self.size.max(next.size)
+    }
+}
+
+/// Whether a text is a Japanese or Chinese character: an ideograph, kana,
+/// or a mark of their punctuation.
+fn japanese_or_chinese(text: &str) -> bool {
+    let mut characters = text.chars();
+    matches!(
+        (characters.next(), characters.next()),
+        (
+            Some(
+                '\u{3000}'..='\u{30FF}'
+                | '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{FF01}'..='\u{FF60}',
+            ),
+            None,
+        )
+    )
+}
+
+/// Note `glyph`, a glyph of a font that writes across set on its own (see
+/// `VerticalRun::glyph`), among a page's `runs`: vertical writing emulated
+/// in such a font, as LibreOffice and browsers draw it, places each glyph
+/// of a column a size or so below the last, where horizontal text sets the
+/// next one beside it. It goes on the column the last glyph noted stands
+/// in, where it goes on down it (see `VerticalRun::goes_on`); else it may
+/// start a column of its own where it is a Japanese or Chinese character,
+/// and the last glyph noted is let go where it started none and stands
+/// below none's glyphs (see `VerticalRun::above`). The bytes of text let go
+/// are returned.
+pub(crate) fn note_glyph(runs: &mut Vec<VerticalRun>, glyph: VerticalRun) -> usize {
+    if runs.last().is_some_and(|last| last.goes_on(&glyph)) {
+        runs.push(glyph);
+        return 0;
+    }
+    let alone = match &runs[..] {
+        [.., before, last] => last.emulated && !before.above(last),
+        [last] => last.emulated,
+        [] => false,
+    };
+    let mut let_go = 0;
+    if alone {
+        let_go = runs
+            .pop()
+            .and_then(|last| last.text)
+            .map_or(0, |text| text.len());
+    }
+    if glyph.text.as_deref().is_some_and(japanese_or_chinese) {
+        runs.push(glyph);
+    }
+    let_go
 }
 
 /// What the Markdown must show of a page's columns of vertical writing for
@@ -76,6 +178,10 @@ pub(crate) fn neighbouring_cells(markdown: &str) -> HashSet<(String, String)> {
 /// The least share of one column's size another's must be to stand beside
 /// it in one passage: ruby, set beside its base at half its size, does not.
 const SIMILAR_SIZE: f64 = 0.75;
+/// How far below the glyph before it, in their size, a glyph of vertical
+/// writing emulated in a font that writes across stands at most in its
+/// column, past what is set between them (see `VerticalRun::above`).
+const MAX_COLUMN_GAP: f64 = 4.0;
 /// How far apart, in their size, two columns of a passage stand at most,
 /// its leading wide; labels in the cells of a table may stand nearer (see
 /// `check_vertical_text`).
@@ -182,12 +288,32 @@ fn upright(run: &EdgeRun) -> bool {
 /// What the Markdown must show of a page's vertical runs (see `Reading`),
 /// right to left, with the page's horizontal runs set across a column read
 /// in it (see `Column::holds`) among `across`, the page's runs, the
-/// vertical ones among them aside. Runs of one size stand in one column
-/// where they start within half their size of it across the page; a
-/// column's neighbour is the nearest to its left of its size, past up to
-/// `MAX_PASSED_COLUMNS` of another, such as ruby.
+/// vertical ones among them aside. A glyph of a font that writes across
+/// stands in a column only where the glyph before it goes on down to it or
+/// it goes on down to the next (see `VerticalRun::goes_on`), or it stands
+/// below a glyph of a column noted just before it (see `VerticalRun::above`).
+/// Runs of one size stand in one column where they start within half their
+/// size of it across the page; a column's neighbour is the nearest to its
+/// left of its size, past up to `MAX_PASSED_COLUMNS` of another, such as
+/// ruby.
 pub(crate) fn readings(runs: &[VerticalRun], across: &[EdgeRun]) -> Vec<Reading> {
-    let mut order: Vec<&VerticalRun> = runs.iter().collect();
+    let mut in_column: Vec<bool> = Vec::with_capacity(runs.len());
+    for (index, run) in runs.iter().enumerate() {
+        let before = index.checked_sub(1).map(|before| &runs[before]);
+        in_column.push(
+            !run.emulated
+                || before.is_some_and(|before| before.goes_on(run))
+                || runs.get(index + 1).is_some_and(|next| run.goes_on(next))
+                || (in_column.last() == Some(&true)
+                    && before.is_some_and(|before| before.above(run))),
+        );
+    }
+    let runs: Vec<&VerticalRun> = runs
+        .iter()
+        .zip(in_column)
+        .filter_map(|(run, in_column)| in_column.then_some(run))
+        .collect();
+    let mut order = runs.clone();
     order.sort_by(|one, other| other.x.total_cmp(&one.x));
     let mut columns: Vec<Column> = Vec::new();
     for run in order {
@@ -324,6 +450,7 @@ mod tests {
             text: Some(text.to_owned()),
             show,
             edge: None,
+            emulated: false,
         }
     }
 
@@ -384,6 +511,95 @@ mod tests {
         assert_eq!(
             readings(&runs, &[]),
             [Reading::Pair(None, true), Reading::Alone("別紙".to_owned())]
+        );
+    }
+
+    #[test]
+    fn glyphs_set_down_a_column_in_a_font_that_writes_across_stand_in_it() {
+        let glyphs = |runs: &mut Vec<VerticalRun>, at: &[(f64, f64, &str)], from: u64| {
+            let mut let_go = 0;
+            for (show, &(x, y, glyph)) in (from..).zip(at) {
+                let glyph = VerticalRun::glyph((x, y, 12.0), Some(glyph.to_owned()), show, None);
+                let_go += note_glyph(runs, glyph);
+            }
+            let_go
+        };
+        // Two columns set glyph by glyph, 21 pt apart, as LibreOffice sets
+        // vertical writing in a font that writes across.
+        let mut runs = Vec::new();
+        let column = |x: f64, text: &'static str| -> Vec<(f64, f64, &'static str)> {
+            let glyphs = text
+                .char_indices()
+                .map(|(at, glyph)| &text[at..at + glyph.len_utf8()]);
+            (0..)
+                .zip(glyphs)
+                .map(|(row, glyph)| (x, 710.0 - 12.0 * f64::from(row), glyph))
+                .collect()
+        };
+        let mut both = column(494.0, "源泉徴収");
+        both.extend(column(473.0, "住民税"));
+        assert_eq!(glyphs(&mut runs, &both, 0), 0);
+        assert_eq!(
+            readings(&runs, &[]),
+            [Reading::Pair(
+                Some(("源泉徴収".to_owned(), "住民税".to_owned())),
+                true
+            )]
+        );
+        // A glyph set on its own after them stands in no column; the one
+        // before it is let go when another comes.
+        glyphs(&mut runs, &[(300.0, 400.0, "別")], 7);
+        assert_eq!(runs.len(), 8);
+        assert_eq!(readings(&runs, &[]).len(), 1);
+        assert_eq!(glyphs(&mut runs, &[(100.0, 400.0, "紙")], 8), "別".len());
+        assert_eq!(runs.len(), 8);
+        // Glyphs set one by one along a line across the page, or down one
+        // but shown apart, or starting with no Japanese or Chinese
+        // character, stand in no column: each is let go at the next.
+        let mut line = Vec::new();
+        let across = [
+            (72.0, 700.0, "源"),
+            (84.0, 700.0, "泉"),
+            (96.0, 700.0, "徴"),
+        ];
+        assert_eq!(glyphs(&mut line, &across, 0), 2 * "源".len());
+        assert!(readings(&line, &[]).is_empty());
+        let mut apart = Vec::new();
+        for (show, glyph) in [(0, (72.0, 700.0, "源")), (2, (72.0, 688.0, "泉"))] {
+            glyphs(&mut apart, &[glyph], show);
+        }
+        assert!(readings(&apart, &[]).is_empty());
+        let mut latin = Vec::new();
+        glyphs(&mut latin, &[(72.0, 700.0, "S"), (72.0, 688.0, "a")], 0);
+        assert!(latin.is_empty());
+        // A column standing alone reads whole.
+        let mut alone = Vec::new();
+        glyphs(&mut alone, &column(494.0, "源泉徴収"), 0);
+        assert_eq!(
+            readings(&alone, &[]),
+            [Reading::Alone("源泉徴収".to_owned())]
+        );
+        // A glyph shown apart from the one above it in its column, as past
+        // digits set sideways between them, stands in the column up to four
+        // sizes below it; further down, in none.
+        let mut dated = Vec::new();
+        let date = [
+            (0, (494.0, 700.0, "令")),
+            (1, (494.0, 688.0, "和")),
+            (4, (494.0, 659.2, "年")),
+            (6, (494.0, 636.4, "月")),
+            (8, (494.0, 613.6, "日")),
+            (9, (494.0, 601.6, "に")),
+            (12, (494.0, 540.0, "発")),
+            (14, (100.0, 400.0, "別")),
+        ];
+        for (show, glyph) in date {
+            glyphs(&mut dated, &[glyph], show);
+        }
+        assert_eq!(dated.len(), 7);
+        assert_eq!(
+            readings(&dated, &[]),
+            [Reading::Alone("令和年月日に".to_owned())]
         );
     }
 
