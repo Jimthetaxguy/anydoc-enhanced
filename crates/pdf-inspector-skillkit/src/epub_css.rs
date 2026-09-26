@@ -654,6 +654,14 @@ impl Condition {
         self.screens.min(self.other)
     }
 
+    /// The same, where the check cannot tell whether it holds at all.
+    fn doubted(&self) -> Condition {
+        Condition {
+            other: self.other.min(Applies::Doubt),
+            ..self.clone()
+        }
+    }
+
     /// Where both it and `other` hold: their media query lists together,
     /// read through `queries`.
     pub(super) fn and(
@@ -1771,12 +1779,61 @@ fn chromium_display(words: &[String]) -> bool {
     outer <= 1 && item <= 1 && (item == 0 || matches!(inner, None | Some("flow" | "flow-root")))
 }
 
-/// Whether Chromium drops a style rule for its selector list: a selector
-/// in it names a pseudo-class or pseudo-element Chromium does not know,
-/// outside the lists of `:is()` and `:where()`, which forgive what they
-/// cannot read. A selector list is read whole, so one such selector drops
-/// the rule, and the rules nested in it.
-fn chromium_rejects(tokens: &[Token]) -> bool {
+/// Prefixes of other engines' names, which Chromium parses in no selector.
+const FOREIGN_PREFIXES: [&str; 6] = ["-moz-", "-ms-", "-o-", "-khtml-", "-apple-", "-epub-"];
+
+/// Whether Chromium parses a pseudo-class, or a pseudo-element where
+/// `element` holds, of this name (lower case), as a function where
+/// `function` holds: `Yes` for one its lists hold in that form, and for a
+/// pseudo-element of its own (`::-webkit-scrollbar`) that names none of
+/// its pseudo-classes; `No` for one they hold only in another form (`:not`
+/// without parentheses, `::slotted` without them, `::hover`,
+/// `:-webkit-slider-thumb` after one colon), for one it parses in no form
+/// (see [`CHROMIUM_UNPARSED_PSEUDO`]), and for another engine's
+/// (`:-moz-focusring`); and `Maybe` for a name they do not hold, which a
+/// later Chromium may parse.
+fn pseudo_name(name: &str, element: bool, function: bool) -> Tri {
+    let listed = |list: &str| list.split(' ').any(|known| known == name);
+    let (plain, functions) = if element {
+        (CHROMIUM_PSEUDO_ELEMENTS, CHROMIUM_PSEUDO_ELEMENT_FUNCTIONS)
+    } else {
+        (CHROMIUM_PSEUDO_CLASSES, CHROMIUM_PSEUDO_CLASS_FUNCTIONS)
+    };
+    let webkit = name.starts_with("-webkit-");
+    if listed(if function { functions } else { plain })
+        || element && !function && webkit && !listed(CHROMIUM_PSEUDO_CLASSES)
+    {
+        return Tri::Yes;
+    }
+    let elsewhere = [
+        CHROMIUM_PSEUDO_CLASSES,
+        CHROMIUM_PSEUDO_CLASS_FUNCTIONS,
+        CHROMIUM_PSEUDO_ELEMENTS,
+        CHROMIUM_PSEUDO_ELEMENT_FUNCTIONS,
+        CHROMIUM_UNPARSED_PSEUDO,
+    ]
+    .iter()
+    .any(|list| listed(list));
+    if elsewhere
+        || webkit
+        || FOREIGN_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        Tri::No
+    } else {
+        Tri::Maybe
+    }
+}
+
+/// Whether Chromium parses the pseudo-classes and pseudo-elements a
+/// selector list names (see [`pseudo_name`]), outside the lists of `:is()`
+/// and `:where()`, which forgive what they cannot read: `No` where it
+/// parses one of them in no form, as a selector list is read whole, so
+/// that it drops the rule, and the rules nested in it; `Maybe` where one
+/// is a name the check does not know.
+fn pseudo_names(tokens: &[Token]) -> Tri {
+    let mut parsed = Tri::Yes;
     let mut index = 0;
     while index < tokens.len() {
         if tokens[index] != Token::Colon {
@@ -1788,70 +1845,30 @@ fn chromium_rejects(tokens: &[Token]) -> bool {
         let (name, function) = match tokens.get(at) {
             Some(Token::Ident(name)) => (name.to_ascii_lowercase(), false),
             Some(Token::Function(name)) => (name.to_ascii_lowercase(), true),
-            _ => return true,
+            _ => return Tri::No,
         };
-        let known = if element {
-            name.starts_with("-webkit-")
-                || CHROMIUM_PSEUDO_ELEMENTS
-                    .split(' ')
-                    .any(|known| known == name)
-        } else {
-            CHROMIUM_PSEUDO_CLASSES
-                .split(' ')
-                .any(|known| known == name)
-        };
-        if !known {
-            return true;
+        parsed = parsed.min(pseudo_name(&name, element, function));
+        if parsed == Tri::No {
+            return Tri::No;
         }
-        index = if function && matches!(name.as_str(), "is" | "where") {
+        index = if function && !element && matches!(name.as_str(), "is" | "where") {
             skip_component(tokens, at)
         } else {
             at + 1
         };
     }
-    false
+    parsed
 }
 
 /// Whether Chromium parses the selector in `selector()`: one complex
-/// selector whose pseudo-classes and pseudo-elements it knows. One with
-/// another engine's prefix (`-moz-`, `-ms-`, `-o-`) it rejects; one this
-/// check does not know it may know.
+/// selector whose pseudo-classes and pseudo-elements it parses (see
+/// [`pseudo_names`]); one naming what the check does not know it may.
 fn supports_selector(tokens: &[Token]) -> Applies {
     let tokens = trim_whitespace(tokens);
     if tokens.is_empty() || split_top_level(tokens, &Token::Comma).len() > 1 {
         return Applies::No;
     }
-    let mut applies = Applies::Yes;
-    for (at, token) in tokens.iter().enumerate() {
-        if *token != Token::Colon || at > 0 && tokens[at - 1] == Token::Colon {
-            continue;
-        }
-        let element = tokens.get(at + 1) == Some(&Token::Colon);
-        let name = match tokens.get(at + if element { 2 } else { 1 }) {
-            Some(Token::Ident(name) | Token::Function(name)) => name.to_ascii_lowercase(),
-            _ => return Applies::No,
-        };
-        let known = if element {
-            name.starts_with("-webkit-")
-                || CHROMIUM_PSEUDO_ELEMENTS
-                    .split(' ')
-                    .any(|known| known == name)
-        } else {
-            CHROMIUM_PSEUDO_CLASSES
-                .split(' ')
-                .any(|known| known == name)
-        };
-        if ["-moz-", "-ms-", "-o-"]
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        {
-            return Applies::No;
-        }
-        if !known {
-            applies = Applies::Doubt;
-        }
-    }
-    applies
+    Applies::matched(pseudo_names(tokens))
 }
 
 /// The properties Chromium 141 supports, as `@supports` tests them.
@@ -2002,28 +2019,43 @@ const CHROMIUM_PROPERTIES: &str = "\
     view-transition-name visibility white-space white-space-collapse widows width will-change \
     word-break word-spacing word-wrap writing-mode x y z-index zoom";
 
-/// The pseudo-classes Chromium 141 parses, and the pseudo-elements it
-/// parses after one colon.
+/// The pseudo-classes Chromium 141 parses without arguments, the four
+/// pseudo-elements CSS 2 wrote with one colon among them, and those it
+/// parses only as functions (`:not()`); `:host` it parses either way.
 const CHROMIUM_PSEUDO_CLASSES: &str = "\
-    -webkit-any -webkit-any-link -webkit-autofill -webkit-drag -webkit-full-page-media \
-    -webkit-full-screen active active-view-transition after any-link autofill before checked \
-    corner-present decrement default defined dir disabled double-button empty enabled end \
-    first-child first-letter first-line first-of-type focus focus-visible focus-within \
-    fullscreen future has horizontal host host-context hover in-range increment indeterminate \
-    invalid is lang last-child last-of-type link modal no-button not nth-child nth-last-child \
-    nth-last-of-type nth-of-type only-child only-of-type open optional out-of-range past \
-    picture-in-picture placeholder-shown popover-open read-only read-write required root \
-    scope single-button start state target target-current user-invalid user-valid valid \
-    vertical visited where window-inactive xr-overlay";
+    -webkit-any-link -webkit-autofill -webkit-drag -webkit-full-page-media \
+    -webkit-full-screen -webkit-full-screen-ancestor active active-view-transition after \
+    any-link autofill before checked corner-present decrement default defined disabled \
+    double-button empty enabled end first-child first-letter first-line first-of-type focus \
+    focus-visible focus-within fullscreen future horizontal host hover in-range increment \
+    indeterminate invalid last-child last-of-type link modal no-button only-child \
+    only-of-type open optional out-of-range past picture-in-picture placeholder-shown \
+    popover-open read-only read-write required root scope single-button start target \
+    target-current user-invalid user-valid valid vertical visited window-inactive xr-overlay";
+const CHROMIUM_PSEUDO_CLASS_FUNCTIONS: &str = "\
+    -webkit-any active-view-transition-type dir has host host-context is lang not nth-child \
+    nth-last-child nth-last-of-type nth-of-type state where";
 
-/// The pseudo-elements Chromium 141 parses, besides its own `-webkit-`
-/// ones.
+/// The pseudo-elements Chromium 141 parses without arguments, besides its
+/// own `-webkit-` ones, which it parses whatever their name, and those it
+/// parses only as functions (`::slotted()`); `::cue` it parses either way.
 const CHROMIUM_PSEUDO_ELEMENTS: &str = "\
-    -webkit-inner-spin-button -webkit-input-placeholder -webkit-meter-bar \
-    -webkit-progress-bar -webkit-scrollbar -webkit-search-cancel-button after backdrop before \
-    checkmark column cue details-content file-selector-button first-letter first-line \
-    grammar-error highlight marker part picker picker-icon placeholder scroll-button \
-    scroll-marker selection slotted spelling-error target-text view-transition";
+    after backdrop before checkmark column cue details-content file-selector-button \
+    first-letter first-line grammar-error marker picker-icon placeholder scroll-marker \
+    scroll-marker-group selection spelling-error target-text view-transition";
+const CHROMIUM_PSEUDO_ELEMENT_FUNCTIONS: &str = "\
+    cue highlight part picker scroll-button slotted view-transition-group \
+    view-transition-group-children view-transition-image-pair view-transition-new \
+    view-transition-old";
+
+/// Pseudo-classes and pseudo-elements that CSS specifications or other
+/// engines name, which Chromium 141 parses in no form: the page selectors,
+/// media states, and names it has not shipped.
+const CHROMIUM_UNPARSED_PSEUDO: &str = "\
+    any blank buffering closed cue-region current first first-page footnote-call \
+    footnote-marker has-slotted heading interest-source interest-target left local-link \
+    matches muted nth-col nth-last-col paused playing right search-text seeking stalled \
+    target-within volume-locked";
 
 // ---------------------------------------------------------------------------
 // Declarations
@@ -5193,15 +5225,16 @@ fn parse_rule_list(
                 if index >= tokens.len() {
                     break;
                 }
-                if top_level {
-                    sheet.opened(TopRule::Other, style_rule_kept(&tokens[start..index]));
-                }
                 let (block, end) = block_at(tokens, index);
                 let selectors = RuleSelectors::new(
                     &tokens[start..index],
                     scope.cloned(),
                     sheet.namespaces.clone(),
+                    Tri::Yes,
                 );
+                if top_level {
+                    sheet.opened(TopRule::Other, selectors.kept);
+                }
                 parse_style_block(&selectors, block, context, sheet, media, nesting)?;
                 index = end;
             }
@@ -5409,14 +5442,15 @@ fn parse_at_rule(
     Ok((end + 1).min(tokens.len()))
 }
 
-/// Whether Chromium keeps a style rule for its selector list: not one it
-/// cannot read (see [`chromium_rejects`]), nor an empty one.
+/// Whether Chromium keeps a style rule for its selector list: not an empty
+/// one, nor one naming what it cannot parse, and perhaps one naming what
+/// the check does not know (see [`pseudo_names`]).
 fn style_rule_kept(prelude: &[Token]) -> Tri {
     let prelude = trim_whitespace(prelude);
-    if prelude.is_empty() || chromium_rejects(prelude) {
+    if prelude.is_empty() {
         Tri::No
     } else {
-        Tri::Yes
+        pseudo_names(prelude)
     }
 }
 
@@ -5648,6 +5682,11 @@ struct RuleSelectors<'a> {
     parent: Option<Nest>,
     /// The namespace prefixes the sheet declares.
     namespaces: Rc<[(String, Rc<str>)]>,
+    /// Whether Chromium keeps the rule for its selector list, and for those
+    /// of the rules it is nested in (see [`style_rule_kept`]): one it drops
+    /// matches nothing, with the rules nested in it, and one it may keep is
+    /// in doubt.
+    kept: Tri,
     list: std::cell::OnceCell<Vec<ComplexSelector>>,
     nest: std::cell::OnceCell<Nest>,
 }
@@ -5657,11 +5696,13 @@ impl<'a> RuleSelectors<'a> {
         prelude: &'a [Token],
         parent: Option<Nest>,
         namespaces: Rc<[(String, Rc<str>)]>,
+        parent_kept: Tri,
     ) -> Self {
         RuleSelectors {
             prelude,
             parent,
             namespaces,
+            kept: parent_kept.min(style_rule_kept(prelude)),
             list: std::cell::OnceCell::new(),
             nest: std::cell::OnceCell::new(),
         }
@@ -5669,7 +5710,7 @@ impl<'a> RuleSelectors<'a> {
 
     fn list(&self) -> &[ComplexSelector] {
         self.list.get_or_init(|| {
-            if chromium_rejects(self.prelude) {
+            if self.kept == Tri::No {
                 return Vec::new();
             }
             let context = SelectorContext {
@@ -5758,6 +5799,7 @@ fn parse_style_block(
                         &block[start..index],
                         Some(selectors.nest()),
                         selectors.namespaces.clone(),
+                        selectors.kept,
                     );
                     parse_style_block(&nested, inner, context, sheet, media, nesting + 1)?;
                     index = end;
@@ -5787,9 +5829,11 @@ fn push_style_rule(
 ) -> Result<(), DocumentError> {
     let declarations = std::mem::take(declarations);
     let paintings = std::mem::take(paintings);
-    if context.condition.applies() != Applies::No
-        && !(declarations.is_empty() && paintings.is_empty())
-    {
+    let condition = match selectors.kept {
+        Tri::Maybe => context.condition.doubted(),
+        _ => context.condition.clone(),
+    };
+    if condition.applies() != Applies::No && !(declarations.is_empty() && paintings.is_empty()) {
         let declarations: Rc<[Declaration]> = declarations.into();
         let paintings: Rc<[Painting]> = paintings.into();
         // A `::before` or `::after` box matters for where a reader breaks
@@ -5841,7 +5885,7 @@ fn push_style_rule(
                     declarations: declarations.clone(),
                     paintings: paintings.clone(),
                     ancestor_keys,
-                    condition: context.condition.clone(),
+                    condition: condition.clone(),
                     container: context.container,
                     scoped: context.scoped,
                     layer: context.layer,
@@ -13478,25 +13522,55 @@ mod tests {
     fn a_selector_chromium_cannot_read_drops_its_whole_list() {
         let refund =
             r#"<div class="a"><p>Refund due <span class="x">1,250.00</span> by April.</p></div>"#;
-        // A pseudo-class or pseudo-element Chromium does not know drops the
-        // rule it stands in, read whole, and the rules nested in it: here
-        // the hide AnyDoc takes from the list's other selector.
+        // A pseudo-class or pseudo-element Chromium 141 does not parse drops
+        // the rule it stands in, read whole, and the rules nested in it:
+        // here the hide AnyDoc takes from the list's other selector. So
+        // does one it parses only in another form: a function without its
+        // parentheses, a pseudo-element after one colon.
         for sheet in [
-            ".x, :bogus { display: none }",
             "::-moz-selection, .x { display: none }",
+            ".x, p:not { display: none }",
+            ".x, p:nth-child { display: none }",
+            ".x, p::slotted { display: none }",
+            ".x, p::hover { display: none }",
+            ".x, input:-webkit-slider-thumb { display: none }",
+            ".x, p:playing { display: none }",
         ] {
             assert!(drops_shown(&[sheet], refund), "{sheet}");
         }
         for sheet in [
-            ".x { display: none } .a { .x, :bogus { display: inline } }",
-            ".x { display: none } .x:not(:bogus) { display: inline }",
+            ".x { display: none } .a { .x, :-moz-focusring { display: inline } }",
+            ".x { display: none } .x:not(:-moz-any(b)) { display: inline }",
+            ".x { display: none } .x, :first-child() { display: inline }",
             ".x::-webkit-bogus, .x { display: none }",
         ] {
             assert!(!drops_shown(&[sheet], refund), "{sheet}");
         }
+        // Names Chromium 141 parses keep the rule: here a hide AnyDoc does
+        // not read, as its selectors hold a space.
+        for sheet in [
+            "div .x, p::view-transition-old(root) { display: none }",
+            "div .x, :active-view-transition-type(x) { display: none }",
+            "div .x, :-webkit-full-screen-ancestor p { display: none }",
+            "div .x, p::scroll-marker-group { display: none }",
+            "div .x, p::part(label), p:state(open) { display: none }",
+        ] {
+            assert!(converts_hidden(&[sheet], refund), "{sheet}");
+        }
+        // A name the check does not know may be one Chromium parses: the
+        // rule is in doubt, so what it shows counts as shown where AnyDoc
+        // drops it, and what it hides as hidden where AnyDoc converts it.
+        assert!(drops_shown(
+            &[".x { display: none } .a { .x, :bogus { display: inline } }"],
+            refund
+        ));
+        assert!(converts_hidden(
+            &["div .x, p:bogus { display: none }"],
+            refund
+        ));
         // `:is()` and `:where()` forgive what they cannot read.
         assert!(converts_hidden(
-            &[":is(.x, :bogus) { display: none }"],
+            &[":is(.x, :-moz-any(b)) { display: none }"],
             refund
         ));
     }
