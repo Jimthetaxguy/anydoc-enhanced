@@ -245,21 +245,25 @@ impl Column<'_> {
     /// to the left of its line or half of it to the right, with its
     /// baseline between its top and its foot, or below its foot where the
     /// top of the run's glyphs reaches within a quarter of the column's
-    /// size of it, as digits set in the column's last cell do.
+    /// size of it, as digits set in the column's last cell do. A run turned
+    /// a quarter turn to read down the column, as Latin words and digits
+    /// set sideways in vertical writing are, stands in it where, no larger
+    /// than its glyphs and starting as near its line, it starts between its
+    /// top and a quarter of its size below its foot, whatever its length.
     fn holds(&self, run: &EdgeRun) -> Option<Across> {
         let (x, y, size) = (f64::from(run.x), f64::from(run.y), f64::from(run.size));
-        let short = run.text.as_deref().is_some_and(|text| {
-            let text = text.trim();
-            !text.is_empty() && text.chars().count() <= MAX_ACROSS_CHARS
-        });
-        if !(upright(run)
-            && size <= 1.05 * self.size
-            && (self.x - self.size..=self.x + 0.5 * self.size).contains(&x)
-            && short)
-        {
+        let (top, bottom) = (self.top(), self.bottom());
+        let near = size <= 1.05 * self.size
+            && (self.x - self.size..=self.x + 0.5 * self.size).contains(&x);
+        let text = run.text.as_deref().map(str::trim).unwrap_or_default();
+        if downward(run) {
+            return (near && !text.is_empty() && (bottom - 0.25 * self.size..=top).contains(&y))
+                .then_some(Across::Down);
+        }
+        let short = !text.is_empty() && text.chars().count() <= MAX_ACROSS_CHARS;
+        if !(upright(run) && near && short) {
             return None;
         }
-        let (top, bottom) = (self.top(), self.bottom());
         if (bottom..=top).contains(&y) {
             Some(Across::Within)
         } else if y < bottom && y + 0.8 * size >= bottom - 0.25 * self.size {
@@ -270,19 +274,28 @@ impl Column<'_> {
     }
 }
 
-/// Where a horizontal run stands across a column (see `Column::holds`).
+/// Where a horizontal run stands in a column (see `Column::holds`).
 #[derive(Clone, Copy, PartialEq)]
 enum Across {
-    /// Between the column's top and its foot.
+    /// Across it, between the column's top and its foot.
     Within,
-    /// Below its foot, in the cell after its last glyph.
+    /// Across it, below its foot, in the cell after its last glyph.
     Below,
+    /// Turned to read down it.
+    Down,
 }
 
 /// Whether a run is upright, its line running along the page.
 fn upright(run: &EdgeRun) -> bool {
     let [a, b] = run.direction;
     a > 0.0 && b.abs() <= 0.1 * a
+}
+
+/// Whether a run is turned a quarter turn clockwise, its line running down
+/// the page.
+fn downward(run: &EdgeRun) -> bool {
+    let [a, b] = run.direction;
+    b < 0.0 && a.abs() <= 0.1 * -b
 }
 
 /// What the Markdown must show of a page's vertical runs (see `Reading`),
@@ -365,10 +378,13 @@ pub(crate) fn readings(runs: &[VerticalRun], across: &[EdgeRun]) -> Vec<Reading>
             continue;
         }
         let text = run.text.as_deref().unwrap_or_default();
-        // It reads at the top of its glyphs.
-        column
-            .across
-            .push((f64::from(run.y) + 0.8 * f64::from(run.size), text));
+        // It reads at the top of its glyphs, or, turned to read down the
+        // column, where it starts.
+        let at = match place {
+            Across::Down => f64::from(run.y),
+            Across::Within | Across::Below => f64::from(run.y) + 0.8 * f64::from(run.size),
+        };
+        column.across.push((at, text));
     }
     // The horizontal runs showing text, by where they start across the
     // page: two neighbouring columns each with one starting under it, below
@@ -601,6 +617,58 @@ mod tests {
             readings(&dated, &[]),
             [Reading::Alone("令和年月日に".to_owned())]
         );
+    }
+
+    #[test]
+    fn runs_turned_to_read_down_a_column_read_in_it() {
+        // "PDF" set sideways in a column between "源泉徴収票" and "の発行".
+        let column = [
+            run(500.0, 700.0, "源泉徴収票", 0),
+            run(500.0, 620.0, "の発行は別に通知", 2),
+        ];
+        let turned = |x: f32, y: f32, text: &str, direction: [f32; 2]| EdgeRun {
+            y,
+            x,
+            direction,
+            size: 10.0,
+            text: Some(text.to_owned()),
+        };
+        let read = |runs: &[VerticalRun], across: &[EdgeRun]| match &readings(runs, across)[..] {
+            [Reading::Alone(text)] => text.clone(),
+            _ => unreachable!("one column"),
+        };
+        let down = [0.0, -1.0];
+        assert_eq!(
+            read(&column, &[turned(496.0, 640.0, "PDF", down)]),
+            "源泉徴収票PDFの発行は別に通知"
+        );
+        // Reading up the page, beside the column, or below its foot, it
+        // stands in no column.
+        for elsewhere in [
+            turned(496.0, 640.0, "PDF", [0.0, 1.0]),
+            turned(470.0, 640.0, "PDF", down),
+            turned(496.0, 500.0, "PDF", down),
+        ] {
+            assert_eq!(read(&column, &[elsewhere]), "源泉徴収票の発行は別に通知");
+        }
+        // Digits set sideways one by one in a column set glyph by glyph in
+        // a font that writes across, as LibreOffice sets "令和12年".
+        let mut glyphs = Vec::new();
+        for (show, y, glyph) in [(0, 774.539, "令"), (1, 762.539, "和"), (4, 733.739, "年")] {
+            let glyph = VerticalRun::glyph((502.6, y, 12.0), Some(glyph.to_owned()), show, None);
+            note_glyph(&mut glyphs, glyph);
+        }
+        let digits = [
+            EdgeRun {
+                size: 12.0,
+                ..turned(504.05, 758.689, "1", down)
+            },
+            EdgeRun {
+                size: 12.0,
+                ..turned(504.05, 752.689, "2", down)
+            },
+        ];
+        assert_eq!(read(&glyphs, &digits), "令和12年");
     }
 
     #[test]

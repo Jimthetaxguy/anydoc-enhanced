@@ -2206,28 +2206,22 @@ enum Placed {
 /// ToUnicode map, placed as `placed` says: down the page, in columns read
 /// right to left from the top, 18 pt apart; across it, one line a column.
 fn vertical_text_pdf(columns: &[&str], encoding: &str, placed: Placed) -> Vec<u8> {
-    let mut glyphs: Vec<char> = columns.iter().flat_map(|column| column.chars()).collect();
-    glyphs.sort_unstable();
-    glyphs.dedup();
-    let cid = |glyph: char| glyphs.iter().position(|known| *known == glyph).unwrap_or(0) + 1;
-    let codes = |text: &str| -> String {
-        text.chars()
-            .map(|glyph| format!("{:04X}", cid(glyph)))
-            .collect()
-    };
+    let glyphs = cid_glyphs(columns);
     let vertical = encoding == "Identity-V";
     let mut content = String::new();
     for (index, column) in columns.iter().enumerate() {
         let (x, y) = (500 - 18 * index, 720 - 20 * index);
         let glyph_at = |x: usize, y: usize, glyph: char| {
-            format!("BT /F1 12 Tf {x} {y} Td <{:04X}> Tj ET\n", cid(glyph))
+            let code = cid_codes(&glyphs, &glyph.to_string());
+            format!("BT /F1 12 Tf {x} {y} Td <{code}> Tj ET\n")
         };
+        let codes = cid_codes(&glyphs, column);
         match placed {
             Placed::Strings if vertical => {
-                content += &format!("BT /F1 12 Tf {x} 720 Td <{}> Tj ET\n", codes(column));
+                content += &format!("BT /F1 12 Tf {x} 720 Td <{codes}> Tj ET\n");
             }
             Placed::Strings => {
-                content += &format!("BT /F1 12 Tf 72 {y} Td <{}> Tj ET\n", codes(column));
+                content += &format!("BT /F1 12 Tf 72 {y} Td <{codes}> Tj ET\n");
             }
             Placed::Glyphs => {
                 for (row, glyph) in column.chars().enumerate() {
@@ -2241,6 +2235,30 @@ fn vertical_text_pdf(columns: &[&str], encoding: &str, placed: Placed) -> Vec<u8
             }
         }
     }
+    cid_text_pdf(&glyphs, encoding, &content)
+}
+
+/// The glyphs of `texts`, as `cid_text_pdf` numbers them from 1.
+fn cid_glyphs(texts: &[&str]) -> Vec<char> {
+    let mut glyphs: Vec<char> = texts.iter().flat_map(|text| text.chars()).collect();
+    glyphs.sort_unstable();
+    glyphs.dedup();
+    glyphs
+}
+
+/// The codes of `text`, in hex, in a font of `cid_text_pdf` over `glyphs`.
+fn cid_codes(glyphs: &[char], text: &str) -> String {
+    text.chars()
+        .map(|glyph| {
+            let cid = glyphs.iter().position(|known| *known == glyph).unwrap_or(0) + 1;
+            format!("{cid:04X}")
+        })
+        .collect()
+}
+
+/// A page showing `content` in /F1, a CID font under `encoding` with a
+/// ToUnicode map reading `glyphs`, and /F2, Helvetica.
+fn cid_text_pdf(glyphs: &[char], encoding: &str, content: &str) -> Vec<u8> {
     let entries: String = glyphs
         .iter()
         .enumerate()
@@ -2253,12 +2271,13 @@ fn vertical_text_pdf(columns: &[&str], encoding: &str, placed: Placed) -> Vec<u8
     pdf_file(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 9 0 R >> >> /Contents 6 0 R >>".to_vec(),
         format!("<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /{encoding} /DescendantFonts [5 0 R] /ToUnicode 7 0 R >>").into_bytes(),
         b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R /DW 1000 /DW2 [880 -1000] >>".to_vec(),
         stream("", content.as_bytes()),
         stream("", to_unicode.as_bytes()),
         b"<< /Type /FontDescriptor /FontName /KozMinPr6N-Regular /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
     ])
 }
 
@@ -2370,6 +2389,60 @@ fn vertical_writing_emulated_in_a_font_that_writes_across_is_reported() {
     assert_eq!(
         warned_pages(&results, "vertical_text_misread"),
         [Some(serde_json::json!([1])), None, None]
+    );
+}
+
+#[test]
+fn words_set_sideways_in_a_column_read_in_it() {
+    let texts = ["源泉徴収票", "の発行は別に通知", "年分の発行"];
+    let glyphs = cid_glyphs(&texts);
+    // A column of vertical writing with Latin set sideways, turned to read
+    // down it, between two of its runs, and lines of body text.
+    let column = |sideways: &str, after: &str, below: usize| {
+        let mut content = format!(
+            "BT /F1 12 Tf 500 700 Td <{}> Tj ET\n\
+             BT /F2 10 Tf 0 -1 1 0 496 640 Tm ({sideways}) Tj ET\n\
+             BT /F1 12 Tf 500 {below} Td <{}> Tj ET\n",
+            cid_codes(&glyphs, texts[0]),
+            cid_codes(&glyphs, after),
+        );
+        for line in 0..10 {
+            let y = 460 - 14 * line;
+            content += &format!(
+                "BT /F2 10 Tf 72 {y} Td (Line {line} of the notice body text for the period.) Tj ET\n"
+            );
+        }
+        cid_text_pdf(&glyphs, "Identity-V", &content)
+    };
+    let results = convert_all(&[
+        // A word set sideways, which pdf-inspector reads in its place.
+        column("PDF", texts[1], 620),
+        // Digits set sideways, which pdf-inspector 1.25.0 leaves out: a
+        // reader shows "源泉徴収票2025年分の発行".
+        column("2025", texts[2], 616),
+    ]);
+    let bare = |result: &serde_json::Value| -> String {
+        result["markdown"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .filter(|character| !character.is_whitespace() && *character != '#')
+            .collect()
+    };
+    assert!(
+        bare(&results[0]).contains("源泉徴収票PDFの発行は別に通知"),
+        "{}",
+        results[0]
+    );
+    // When a release reads digits set sideways, these expectations go.
+    assert!(
+        bare(&results[1]).contains("源泉徴収票年分の発行"),
+        "{}",
+        results[1]
+    );
+    assert_eq!(
+        warned_pages(&results, "vertical_text_misread"),
+        [None, Some(serde_json::json!([1]))]
     );
 }
 
