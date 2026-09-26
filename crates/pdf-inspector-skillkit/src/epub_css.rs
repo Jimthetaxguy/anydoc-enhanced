@@ -13,12 +13,16 @@
 //!   positions from a pass over the chapter before the walk, `+` from the
 //!   earlier siblings the walk keeps, and a rule's `~` step from the first
 //!   sibling that fits it, noted as each sibling ends, which costs a lookup
-//!   however far back that sibling is. Text some of the readers show for
-//!   certain counts as shown: AnyDoc may convert it, and loses it where it
-//!   drops it. Where the check cannot decide (`:has()`, an unknown
-//!   pseudo-class, a value set through `var()`, a container's size), text
-//!   counts as hidden where AnyDoc converts it and as shown where AnyDoc
-//!   drops it (see [`hidden`]), so it errs toward finding both.
+//!   however far back that sibling is. Media query lists are read together
+//!   on the screens they tell apart (see [`Cascade::screens`]): rules whose
+//!   conditions cover every screen between them hide what they hide
+//!   everywhere, and a condition inside another holds only where both do.
+//!   Text some of the readers show for certain counts as shown: AnyDoc may
+//!   convert it, and loses it where it drops it. Where the check cannot
+//!   decide (`:has()`, an unknown pseudo-class, a value set through
+//!   `var()`, a container's size), text counts as hidden where AnyDoc
+//!   converts it and as shown where AnyDoc drops it (see [`hidden`]), so it
+//!   errs toward finding both.
 //! - The AnyDoc model ports AnyDoc 0.2.4's own subset (`shared::html`):
 //!   `display` from bare `tag`, `.class`, and `tag.class` rules and from
 //!   inline styles, applied only to the elements its walker styles.
@@ -582,7 +586,7 @@ fn block_contents(part: &[Token]) -> &[Token] {
 
 /// How surely something holds across the readers the check follows (see
 /// [`VIEWPORT_SIZES`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Applies {
     /// On none of them.
     No,
@@ -614,6 +618,130 @@ impl Applies {
         }
     }
 }
+
+/// Where a rule, a stylesheet, or an import applies among the readers the
+/// check follows: the media query lists around it, all of which must hold,
+/// of which only those that hold on some screens and not on others are
+/// kept (see [`MediaList`]); how they hold together, tried at the viewport
+/// sizes either side of every bound they name, so that `(max-width: 600px)`
+/// inside `(min-width: 700px)` holds nowhere; and how the conditions the
+/// check does not tell screen by screen hold (`@supports`, a container's
+/// size, a scope's limits).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Condition {
+    media: Rc<[MediaList]>,
+    screens: Applies,
+    other: Applies,
+}
+
+impl Condition {
+    /// One that holds on every reader.
+    pub(super) fn always() -> Self {
+        Condition::other(Applies::Yes)
+    }
+
+    /// One the check does not tell screen by screen.
+    fn other(applies: Applies) -> Self {
+        Condition {
+            media: Rc::from([]),
+            screens: Applies::Yes,
+            other: applies,
+        }
+    }
+
+    /// How it holds on the readers the check follows.
+    pub(super) fn applies(&self) -> Applies {
+        self.screens.min(self.other)
+    }
+
+    /// Where both it and `other` hold: their media query lists together,
+    /// read through `queries`.
+    pub(super) fn and(
+        &self,
+        other: &Condition,
+        queries: &mut MediaQueries,
+    ) -> Result<Condition, DocumentError> {
+        let rest = self.other.min(other.other);
+        if self.screens == Applies::No || other.screens == Applies::No {
+            return Ok(Condition {
+                media: Rc::from([]),
+                screens: Applies::No,
+                other: rest,
+            });
+        }
+        let mut media: Vec<MediaList> = self
+            .media
+            .iter()
+            .chain(other.media.iter())
+            .cloned()
+            .collect();
+        media.sort_unstable();
+        media.dedup();
+        let (media, screens) = if media.len() == self.media.len() {
+            (self.media.clone(), self.screens)
+        } else if media.len() == other.media.len() {
+            (other.media.clone(), other.screens)
+        } else {
+            let screens = queries.together(&media)?;
+            (Rc::from(media), screens)
+        };
+        Ok(Condition {
+            media: if screens == Applies::No {
+                Rc::from([])
+            } else {
+                media
+            },
+            screens,
+            other: rest,
+        })
+    }
+}
+
+/// A media query list as the check reads it (see [`media_condition`]),
+/// read once however often it comes (see [`MediaQueries`]): what it tests,
+/// how it applies on the readers the check follows, and whether the check
+/// tried it at every viewport size its bounds name, which it does not for
+/// a list naming more than it follows (see [`MAX_MEDIA_SAMPLES`]). Two are
+/// the same list where they were read as one, known by the order they were
+/// read in.
+#[derive(Clone)]
+pub(super) struct MediaList(Rc<ReadList>);
+
+struct ReadList {
+    id: u64,
+    test: MediaTest,
+    applies: Applies,
+}
+
+impl PartialEq for MediaList {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for MediaList {}
+
+impl PartialOrd for MediaList {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MediaList {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.id.cmp(&other.0.id)
+    }
+}
+
+impl std::fmt::Debug for MediaList {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "MediaList({}, {:?})", self.0.id, self.0.applies)
+    }
+}
+
+/// The order media query lists are read in, across every package a
+/// process reads, so that no two lists share one.
+static MEDIA_LISTS_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Media queries
@@ -772,64 +900,106 @@ impl Outcome {
     }
 }
 
-/// Whether a media query list holds on the readers the check follows (see
-/// [`VIEWPORT_SIZES`]): `Yes` where it holds on all of them, as `(min-width:
-/// 0)` does, `No` on none, as `print` and `(max-width: 1px)`, and `Varies`
-/// on some. An empty list holds, and a list where one of its queries does.
-/// A query Chromium rejects, such as `screen screen`, `not only print`, or
-/// an empty one, holds nowhere, and a feature it does not know fails. Each
-/// query is tried at the viewport sizes either side of the widths, heights,
-/// and ratios it names, each test at each size a unit of `work`.
-fn media_condition(tokens: &[Token], work: &mut u64) -> Applies {
+/// A media query list as a test: it holds where one of its queries does,
+/// and an empty list holds. A query Chromium rejects, such as `screen
+/// screen`, `not only print`, or an empty one, holds nowhere, and a
+/// feature it does not know fails.
+fn media_list_test(tokens: &[Token]) -> MediaTest {
     let tokens = trim_whitespace(tokens);
     if tokens.is_empty() {
-        return Applies::Yes;
+        return MediaTest::Fixed(Outcome::HOLDS);
     }
-    let queries = split_top_level(tokens, &Token::Comma)
-        .into_iter()
-        .map(|query| {
-            media_query(trim_whitespace(query)).unwrap_or(MediaTest::Fixed(Outcome::FAILS))
-        })
-        .collect();
-    media_applies(&MediaTest::Or(queries), work)
+    MediaTest::Or(
+        split_top_level(tokens, &Token::Comma)
+            .into_iter()
+            .map(|query| {
+                media_query(trim_whitespace(query)).unwrap_or(MediaTest::Fixed(Outcome::FAILS))
+            })
+            .collect(),
+    )
 }
 
 /// The media query lists a package holds, in the `media` of its links,
 /// `style` elements, and stylesheet instructions and in its `@media` and
-/// `@import` rules, each read once however often it comes (see
-/// [`media_condition`]), and the work reading them has taken, bounded as
-/// matching selectors is (see [`MAX_MATCH_WORK`]).
+/// `@import` rules, each read once however often it comes, and how lists
+/// read together hold (see [`Condition::and`]); with the work reading them
+/// has taken, bounded as matching selectors is (see [`MAX_MATCH_WORK`]).
 #[derive(Default)]
 pub(super) struct MediaQueries {
-    known: HashMap<Vec<Token>, Applies>,
+    known: HashMap<Vec<Token>, Condition>,
+    together: HashMap<Box<[u64]>, Applies>,
     tokens_kept: usize,
     work: u64,
 }
 
+/// Sets of media query lists read together whose outcome a package's
+/// reading keeps.
+const MAX_MEDIA_SETS_KEPT: usize = 65_536;
+
 impl MediaQueries {
-    /// How a media query list applies on the readers the check follows.
-    fn condition(&mut self, tokens: &[Token]) -> Result<Applies, DocumentError> {
+    /// Where a media query list holds on the readers the check follows
+    /// (see [`VIEWPORT_SIZES`]): everywhere, as `(min-width: 0)` does,
+    /// nowhere, as `print` and `(max-width: 1px)`, or on some screens,
+    /// which a condition keeps the list for (see [`Condition`]). It is
+    /// tried at the viewport sizes either side of the widths, heights, and
+    /// ratios it names.
+    fn condition(&mut self, tokens: &[Token]) -> Result<Condition, DocumentError> {
         let tokens = trim_whitespace(tokens);
         if let Some(known) = self.known.get(tokens) {
-            return Ok(*known);
+            return Ok(known.clone());
         }
-        let applies = media_condition(tokens, &mut self.work);
+        let test = media_list_test(tokens);
+        let sampled = media_applies(&[&test], &mut self.work);
         if self.work > MAX_MATCH_WORK {
             return Err(DocumentError::ResourceLimit);
         }
+        let condition = match sampled {
+            Some(applies @ (Applies::Yes | Applies::No)) => Condition {
+                media: Rc::from([]),
+                screens: applies,
+                other: Applies::Yes,
+            },
+            Some(applies) => {
+                let id = MEDIA_LISTS_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Condition {
+                    media: Rc::from([MediaList(Rc::new(ReadList { id, test, applies }))]),
+                    screens: applies,
+                    other: Applies::Yes,
+                }
+            }
+            // A list naming more bounds than the check follows.
+            None => Condition::other(Applies::Doubt),
+        };
         if self.tokens_kept + tokens.len() <= MAX_MEDIA_TOKENS_KEPT {
             self.tokens_kept += tokens.len();
-            self.known.insert(tokens.to_vec(), applies);
+            self.known.insert(tokens.to_vec(), condition.clone());
+        }
+        Ok(condition)
+    }
+
+    /// Where media query lists hold together, all of them at once.
+    fn together(&mut self, lists: &[MediaList]) -> Result<Applies, DocumentError> {
+        let key: Box<[u64]> = lists.iter().map(|list| list.0.id).collect();
+        if let Some(known) = self.together.get(&key) {
+            return Ok(*known);
+        }
+        let tests: Vec<&MediaTest> = lists.iter().map(|list| &list.0.test).collect();
+        let applies = media_applies(&tests, &mut self.work).unwrap_or(Applies::Doubt);
+        if self.work > MAX_MATCH_WORK {
+            return Err(DocumentError::ResourceLimit);
+        }
+        if self.together.len() < MAX_MEDIA_SETS_KEPT {
+            self.together.insert(key, applies);
         }
         Ok(applies)
     }
 
-    /// How a `media` attribute or pseudo-attribute applies on the readers
-    /// the check follows; a media list too long to read may apply.
-    pub(super) fn attribute(&mut self, value: &str) -> Result<Applies, DocumentError> {
+    /// Where a `media` attribute or pseudo-attribute holds on the readers
+    /// the check follows; a media list too long to read may hold.
+    pub(super) fn attribute(&mut self, value: &str) -> Result<Condition, DocumentError> {
         match tokenize(value) {
             Ok(tokens) => self.condition(&tokens),
-            Err(_) => Ok(Applies::Doubt),
+            Err(_) => Ok(Condition::other(Applies::Doubt)),
         }
     }
 
@@ -852,41 +1022,71 @@ fn media_tests(test: &MediaTest) -> u64 {
     }
 }
 
-/// How a media test applies, from what it comes to at the viewport sizes
-/// either side of each bound it names, each of its tests at each size a
-/// unit of `work`.
-fn media_applies(test: &MediaTest, work: &mut u64) -> Applies {
+/// The viewport sizes the check tries media tests at: those either side of
+/// each bound they name, and the smallest and largest it follows (see
+/// [`VIEWPORT_SIZES`]); `None` where they come to more than it follows (see
+/// [`MAX_MEDIA_SAMPLES`]). Each bound is a unit of `work`.
+fn media_samples(tests: &[&MediaTest], work: &mut u64) -> Option<(Vec<f64>, Vec<f64>)> {
     let (low, high) = VIEWPORT_SIZES;
     let mut widths = vec![low, high];
     let mut heights = vec![low, high];
-    media_bounds(test, &mut widths, &mut heights);
-    *work += (widths.len() + heights.len()) as u64;
+    for test in tests {
+        media_bounds(test, &mut widths, &mut heights);
+    }
+    *work = work.saturating_add((widths.len() + heights.len()) as u64);
     for sizes in [&mut widths, &mut heights] {
         sizes.retain(|size| (low..=high).contains(size));
         sizes.sort_by(f64::total_cmp);
         sizes.dedup();
     }
-    if widths.len() * heights.len() > MAX_MEDIA_SAMPLES {
-        return Applies::Doubt;
-    }
-    *work = work.saturating_add((widths.len() * heights.len()) as u64 * media_tests(test));
-    let (mut holds, mut fails, mut doubt) = (false, false, false);
-    for &width in &widths {
-        for &height in &heights {
-            let outcome = media_outcome(test, width, height);
-            let may_hold = outcome.may & HOLDS != 0;
-            let may_fail = outcome.may & (FAILS | UNKNOWN) != 0;
-            doubt |= outcome.doubt && may_hold && may_fail;
-            holds |= may_hold;
-            fails |= may_fail;
-        }
-    }
-    match (doubt, holds, fails) {
+    (widths.len() * heights.len() <= MAX_MEDIA_SAMPLES).then_some((widths, heights))
+}
+
+/// How media tests that must all hold apply at one viewport size: `Yes`
+/// where they hold for every reader of that size, `No` for none, `Varies`
+/// where readers of that size differ, and `Doubt` where the check cannot
+/// tell.
+fn media_applies_at(tests: &[&MediaTest], width: f64, height: f64) -> Applies {
+    let outcome = tests
+        .iter()
+        .map(|test| media_outcome(test, width, height))
+        .reduce(|first, second| first.join(second, true))
+        .unwrap_or(Outcome::HOLDS);
+    let may_hold = outcome.may & HOLDS != 0;
+    let may_fail = outcome.may & (FAILS | UNKNOWN) != 0;
+    match (outcome.doubt && may_hold && may_fail, may_hold, may_fail) {
         (true, _, _) => Applies::Doubt,
         (false, true, false) => Applies::Yes,
         (false, false, _) => Applies::No,
         (false, true, true) => Applies::Varies,
     }
+}
+
+/// How media tests that must all hold apply, from what they come to at the
+/// viewport sizes either side of each bound they name (see
+/// [`media_samples`]), each of their tests at each size a unit of `work`;
+/// `None` where those sizes are more than the check follows.
+fn media_applies(tests: &[&MediaTest], work: &mut u64) -> Option<Applies> {
+    let (widths, heights) = media_samples(tests, work)?;
+    let tried: u64 = tests.iter().map(|test| media_tests(test)).sum();
+    *work = work.saturating_add((widths.len() * heights.len()) as u64 * tried);
+    let (mut holds, mut fails, mut doubt) = (false, false, false);
+    for &width in &widths {
+        for &height in &heights {
+            match media_applies_at(tests, width, height) {
+                Applies::Doubt => doubt = true,
+                Applies::Yes => holds = true,
+                Applies::No => fails = true,
+                Applies::Varies => (holds, fails) = (true, true),
+            }
+        }
+    }
+    Some(match (doubt, holds, fails) {
+        (true, _, _) => Applies::Doubt,
+        (false, true, false) => Applies::Yes,
+        (false, false, _) => Applies::No,
+        (false, true, true) => Applies::Varies,
+    })
 }
 
 /// Add the viewport sizes at and just either side of each bound a test
@@ -4646,9 +4846,9 @@ struct StyleRule {
     /// The classes, ids, and element names its ancestor compounds require
     /// (see [`AncestorKeys`]).
     ancestor_keys: Box<[u64]>,
-    /// How the conditions of the at-rules around it hold, which caps how
+    /// Where the conditions of the at-rules around it hold, which caps how
     /// surely it applies (see [`RuleContext`]).
-    condition: Applies,
+    condition: Condition,
     /// It stands in an `@container` rule, which applies only inside a size
     /// container.
     container: bool,
@@ -4790,26 +4990,26 @@ pub(super) struct Stylesheet {
     namespaces: Rc<[(String, Rc<str>)]>,
 }
 
-/// An `@import` a sheet keeps: its target; how its conditions hold; the
+/// An `@import` a sheet keeps: its target; where its conditions hold; the
 /// cascade layer it puts the target's rules in (`layer`, `layer(name)`),
 /// as an index into [`Stylesheet::layers`]; and how many layers the sheet
 /// has declared up to it.
 #[derive(Debug)]
 pub(super) struct Import {
     pub(super) target: String,
-    pub(super) applies: Applies,
+    pub(super) applies: Condition,
     layer: Option<u32>,
     declared: usize,
 }
 
 /// A cascade layer a sheet declares: its names from the outermost, an
-/// anonymous one's a name no sheet can write; how the `@media` and
+/// anonymous one's a name no sheet can write; where the `@media` and
 /// `@supports` conditions around its first declaration hold; and whether
 /// it is declared again after that.
 #[derive(Debug)]
 struct SheetLayer {
     path: Box<[String]>,
-    declared: Applies,
+    declared: Condition,
     again: bool,
 }
 
@@ -4819,9 +5019,14 @@ impl Stylesheet {
     }
 
     /// The layer named `names` inside `parent` (an anonymous one where
-    /// `names` is `None`), declared where it first comes; `declared` is how
-    /// the conditions around this declaration hold.
-    fn layer(&mut self, parent: Option<u32>, names: Option<Vec<String>>, declared: Applies) -> u32 {
+    /// `names` is `None`), declared where it first comes; `declared` is
+    /// where the conditions around this declaration hold.
+    fn layer(
+        &mut self,
+        parent: Option<u32>,
+        names: Option<Vec<String>>,
+        declared: Condition,
+    ) -> u32 {
         let mut path: Vec<String> = parent.map_or_else(Vec::new, |parent| {
             self.layers[parent as usize].path.to_vec()
         });
@@ -4859,20 +5064,42 @@ const MAX_RULE_NESTING: usize = 32;
 /// Cascade layers one stylesheet may declare.
 const MAX_LAYERS_PER_SHEET: usize = 256;
 
-/// What the at-rules around a rule say of it: how their conditions hold on
-/// the readers the check follows (`@media`, `@supports`, the size of a
-/// container, which is not read, and a scope's limits), and how those of
+/// What the at-rules around a rule say of it: where their conditions hold
+/// on the readers the check follows (`@media`, `@supports`, the size of a
+/// container, which is not read, and a scope's limits), and where those of
 /// `@media` and `@supports` alone do, which decide whether the cascade
 /// layers inside are declared; whether it stands in `@container` or
 /// `@scope`; and the cascade layer it belongs to, as an index into
 /// [`Stylesheet::layers`].
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RuleContext {
-    condition: Applies,
-    declared: Applies,
+    condition: Condition,
+    declared: Condition,
     container: bool,
     scoped: bool,
     layer: Option<u32>,
+}
+
+impl RuleContext {
+    /// The context inside an at-rule whose condition is `condition`, which
+    /// holds where both hold; one around cascade layers it declares
+    /// (`@media`, `@supports`) where `declares`.
+    fn within(
+        &self,
+        condition: &Condition,
+        declares: bool,
+        media: &mut MediaQueries,
+    ) -> Result<RuleContext, DocumentError> {
+        Ok(RuleContext {
+            condition: self.condition.and(condition, media)?,
+            declared: if declares {
+                self.declared.and(condition, media)?
+            } else {
+                self.declared.clone()
+            },
+            ..self.clone()
+        })
+    }
 }
 
 /// Parse a stylesheet the way a reading system reads it, its media query
@@ -4884,13 +5111,13 @@ pub(super) fn parse_stylesheet(
     let tokens = tokenize(css)?;
     let mut sheet = Stylesheet::default();
     let context = RuleContext {
-        condition: Applies::Yes,
-        declared: Applies::Yes,
+        condition: Condition::always(),
+        declared: Condition::always(),
         container: false,
         scoped: false,
         layer: None,
     };
-    parse_rule_list(&tokens, true, context, None, &mut sheet, media, 0)?;
+    parse_rule_list(&tokens, true, &context, None, &mut sheet, media, 0)?;
     Ok(sheet)
 }
 
@@ -4899,7 +5126,7 @@ pub(super) fn parse_stylesheet(
 fn parse_rule_list(
     tokens: &[Token],
     top_level: bool,
-    context: RuleContext,
+    context: &RuleContext,
     scope: Option<&Nest>,
     sheet: &mut Stylesheet,
     media: &mut MediaQueries,
@@ -4970,7 +5197,7 @@ fn parse_at_rule(
     index: usize,
     name: &str,
     top_level: bool,
-    context: RuleContext,
+    context: &RuleContext,
     scope: Option<&Nest>,
     selectors: Option<&RuleSelectors>,
     sheet: &mut Stylesheet,
@@ -4987,42 +5214,33 @@ fn parse_at_rule(
     if top_level && selectors.is_none() && closes_imports(&name, block) {
         sheet.imports_closed = true;
     }
-    let within = |condition: Applies| RuleContext {
-        condition: context.condition.min(condition),
-        ..context
-    };
-    let declaring = |condition: Applies| RuleContext {
-        declared: context.declared.min(condition),
-        ..within(condition)
-    };
     if block {
         let (block, after) = block_at(tokens, end);
         let mut scope = scope.cloned();
+        let doubt = Condition::other(Applies::Doubt);
         let inner = match name.as_str() {
-            "media" => Some(declaring(media.condition(prelude)?)),
-            "supports" => Some(declaring(supports_condition(prelude))),
+            "media" => Some(context.within(&media.condition(prelude)?, true, media)?),
+            "supports" => {
+                Some(context.within(&Condition::other(supports_condition(prelude)), true, media)?)
+            }
             // A container's size is not read: its rules may apply inside a
             // size container (see [`Cascade::rule_applies`]).
             "container" => Some(RuleContext {
                 container: true,
-                ..within(Applies::Doubt)
+                ..context.within(&doubt, false, media)?
             }),
             "scope" => match (selectors, scope_prelude(prelude, &sheet.namespaces)) {
                 (None, Some((root, limited))) => {
                     scope = Some(root);
-                    let limit = if limited {
-                        Applies::Doubt
-                    } else {
-                        Applies::Yes
-                    };
+                    let limit = if limited { doubt } else { Condition::always() };
                     Some(RuleContext {
                         scoped: true,
-                        ..within(limit)
+                        ..context.within(&limit, false, media)?
                     })
                 }
                 // A scope whose root is the parent of the sheet's owner, or
                 // nested in a style rule, may apply.
-                (_, _) => Some(within(Applies::Doubt)),
+                (_, _) => Some(context.within(&doubt, false, media)?),
             },
             "layer" => match layer_names(prelude) {
                 Ok(names) => {
@@ -5030,8 +5248,8 @@ fn parse_at_rule(
                         return Err(DocumentError::ResourceLimit);
                     }
                     Some(RuleContext {
-                        layer: Some(sheet.layer(context.layer, names, context.declared)),
-                        ..context
+                        layer: Some(sheet.layer(context.layer, names, context.declared.clone())),
+                        ..context.clone()
                     })
                 }
                 Err(()) => None,
@@ -5042,18 +5260,18 @@ fn parse_at_rule(
             // `@keyframes`, and unknown at-rules style no elements.
             _ => None,
         };
-        if let Some(inner) = inner.filter(|inner| inner.condition != Applies::No) {
+        if let Some(inner) = inner.filter(|inner| inner.condition.applies() != Applies::No) {
             if nesting >= MAX_RULE_NESTING {
                 return Err(DocumentError::ResourceLimit);
             }
             match selectors {
                 Some(selectors) => {
-                    parse_style_block(selectors, block, inner, sheet, media, nesting + 1)?;
+                    parse_style_block(selectors, block, &inner, sheet, media, nesting + 1)?;
                 }
                 None => parse_rule_list(
                     block,
                     false,
-                    inner,
+                    &inner,
                     scope.as_ref(),
                     sheet,
                     media,
@@ -5063,14 +5281,14 @@ fn parse_at_rule(
         }
         return Ok(after);
     }
-    if name == "layer" && context.declared != Applies::No {
+    if name == "layer" && context.declared.applies() != Applies::No {
         // `@layer a, b;` declares the layers, in that order.
         for names in split_top_level(prelude, &Token::Comma) {
             if let Ok(Some(names)) = layer_names(names) {
                 if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
                     return Err(DocumentError::ResourceLimit);
                 }
-                sheet.layer(context.layer, Some(names), context.declared);
+                sheet.layer(context.layer, Some(names), context.declared.clone());
             }
         }
     }
@@ -5099,8 +5317,8 @@ fn parse_at_rule(
     }
     if name == "import" && top_level && selectors.is_none() && !sheet.imports_closed {
         if let Some((target, applies, layer)) = import_target(prelude, media)? {
-            let applies = applies.min(context.condition);
-            if applies != Applies::No {
+            let applies = applies.and(&context.condition, media)?;
+            if applies.applies() != Applies::No {
                 if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET
                     || (layer.is_some() && sheet.layers.len() >= MAX_LAYERS_PER_SHEET)
                 {
@@ -5108,7 +5326,7 @@ fn parse_at_rule(
                 }
                 // Its layer is declared where it stands, where its
                 // conditions hold.
-                let layer = layer.map(|names| sheet.layer(None, names, applies));
+                let layer = layer.map(|names| sheet.layer(None, names, applies.clone()));
                 sheet.imports.push(Import {
                     target,
                     applies,
@@ -5183,7 +5401,7 @@ fn scope_prelude(prelude: &[Token], namespaces: &[(String, Rc<str>)]) -> Option<
     Some((nest, limited))
 }
 
-/// An `@import`'s target; how its `supports()` condition and media list
+/// An `@import`'s target; where its `supports()` condition and media list
 /// hold on the readers the check follows; and the cascade layer it puts
 /// the target's rules in: `Some(None)` for an anonymous one (`layer`), the
 /// names of a named one (`layer(base)`). `None` for a rule Chromium drops.
@@ -5191,7 +5409,7 @@ fn scope_prelude(prelude: &[Token], namespaces: &[(String, Rc<str>)]) -> Option<
 fn import_target(
     prelude: &[Token],
     media: &mut MediaQueries,
-) -> Result<Option<(String, Applies, Option<Option<Vec<String>>>)>, DocumentError> {
+) -> Result<Option<(String, Condition, Option<Option<Vec<String>>>)>, DocumentError> {
     let tokens = trim_whitespace(prelude);
     let (target, rest) = match tokens {
         [Token::Str(target) | Token::Url(target), rest @ ..] => (target.clone(), rest),
@@ -5238,7 +5456,8 @@ fn import_target(
             rest = trim_whitespace(&rest[end..]);
         }
     }
-    Ok(Some((target, supported.min(media.condition(rest)?), layer)))
+    let applies = Condition::other(supported).and(&media.condition(rest)?, media)?;
+    Ok(Some((target, applies, layer)))
 }
 
 /// A style rule's selectors, read once a declaration or a nested rule
@@ -5315,7 +5534,7 @@ impl<'a> RuleSelectors<'a> {
 fn parse_style_block(
     selectors: &RuleSelectors,
     block: &[Token],
-    context: RuleContext,
+    context: &RuleContext,
     sheet: &mut Stylesheet,
     media: &mut MediaQueries,
     nesting: usize,
@@ -5382,12 +5601,14 @@ fn push_style_rule(
     selectors: &RuleSelectors,
     declarations: &mut Vec<Declaration>,
     paintings: &mut Vec<Painting>,
-    context: RuleContext,
+    context: &RuleContext,
     sheet: &mut Stylesheet,
 ) -> Result<(), DocumentError> {
     let declarations = std::mem::take(declarations);
     let paintings = std::mem::take(paintings);
-    if context.condition != Applies::No && !(declarations.is_empty() && paintings.is_empty()) {
+    if context.condition.applies() != Applies::No
+        && !(declarations.is_empty() && paintings.is_empty())
+    {
         let declarations: Rc<[Declaration]> = declarations.into();
         let paintings: Rc<[Painting]> = paintings.into();
         // A `::before` or `::after` box matters for where a reader breaks
@@ -5439,7 +5660,7 @@ fn push_style_rule(
                     declarations: declarations.clone(),
                     paintings: paintings.clone(),
                     ancestor_keys,
-                    condition: context.condition,
+                    condition: context.condition.clone(),
                     container: context.container,
                     scoped: context.scoped,
                     layer: context.layer,
@@ -5595,11 +5816,75 @@ fn inline_precedence(important: bool) -> Precedence {
 /// from it shows.
 type CustomContent = (Precedence, Applies, u64, Option<Generated>);
 
+/// A declaration of `display`, `visibility`, or `content-visibility`, as
+/// [`hidden`] reads it: where it stands in the cascade, how it applies,
+/// and its effect; for one whose rule's condition keeps media query lists,
+/// the set of them (see [`Cascade::media_sets`]) and how it applies
+/// without them, which the screens they tell apart settle (see
+/// [`Cascade::hidden_by_screen`]).
 #[derive(Clone, Copy)]
 struct Applied {
     precedence: Precedence,
     applies: Applies,
     effect: Effect,
+    media: Option<u32>,
+    base: Applies,
+}
+
+/// How surely something holds on each cell of the screens a chapter's
+/// rules tell apart (see [`Cascade::screens`]), or on all of them alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ByScreen {
+    All(Tri),
+    Each(Rc<[Tri]>),
+}
+
+impl ByScreen {
+    /// One cell to a value, or one for all where they are alike.
+    fn of(cells: Vec<Tri>) -> Self {
+        match cells.first() {
+            Some(first) if cells.iter().any(|cell| cell != first) => ByScreen::Each(cells.into()),
+            Some(first) => ByScreen::All(*first),
+            None => ByScreen::All(Tri::No),
+        }
+    }
+
+    fn at(&self, cell: usize) -> Tri {
+        match self {
+            ByScreen::All(tri) => *tri,
+            ByScreen::Each(cells) => cells.get(cell).copied().unwrap_or(Tri::Maybe),
+        }
+    }
+
+    /// Whether it holds on every screen: `Yes` where it holds on every
+    /// cell for certain, `No` where some cell certainly lacks it. Text
+    /// hidden on some screens and not on others is shown.
+    fn everywhere(&self) -> Tri {
+        match self {
+            ByScreen::All(tri) => *tri,
+            ByScreen::Each(cells) => cells.iter().copied().min().unwrap_or(Tri::No),
+        }
+    }
+
+    /// Where either holds, cell by cell.
+    fn or(&self, other: &ByScreen) -> ByScreen {
+        match (self, other) {
+            (ByScreen::All(first), ByScreen::All(second)) => ByScreen::All((*first).max(*second)),
+            (ByScreen::All(Tri::Yes), _) | (_, ByScreen::All(Tri::No)) => self.clone(),
+            (_, ByScreen::All(Tri::Yes)) | (ByScreen::All(Tri::No), _) => other.clone(),
+            _ => {
+                let cells = match (self, other) {
+                    (ByScreen::Each(cells), _) | (_, ByScreen::Each(cells)) => cells.len(),
+                    _ => 0,
+                };
+                ByScreen::of(
+                    (0..cells)
+                        .map(|cell| self.at(cell).max(other.at(cell)))
+                        .collect(),
+                )
+            }
+        }
+    }
 }
 
 /// A reading of how the declarations that vary between readers, or that
@@ -5701,11 +5986,12 @@ fn hidden(applied: &[Applied], inherited: Tri) -> Tri {
 
 /// What the reader's cascade gives one element.
 pub(super) struct ReaderStyle {
-    /// Whether `display`, `visibility`, and `content-visibility` hide it
-    /// (see [`hidden`]); `visibility` with what it inherits.
-    display: Tri,
-    visibility: Tri,
-    content_visibility: Tri,
+    /// Whether `display`, `visibility`, and `content-visibility` hide it on
+    /// each screen (see [`Cascade::hidden_by_screen`]); `visibility` with
+    /// what it inherits.
+    display: ByScreen,
+    visibility: ByScreen,
+    content_visibility: ByScreen,
     /// Whether the box is inline-level.
     inline: Tri,
     /// Whether it floats beside the lines around it, and whether to their
@@ -5980,6 +6266,23 @@ pub(super) struct Cascade {
     layer_declared: Vec<Applies>,
     layer_unsettled: Vec<bool>,
     layer_ranks: std::cell::OnceCell<Box<[LayerRank]>>,
+    /// The sets of media query lists the rules' conditions keep (see
+    /// [`CascadeRule::media`]), by the lists they hold; and the screens
+    /// those lists tell apart, found the first time an element's style
+    /// needs them (see [`Cascade::screens`]).
+    media_sets: Vec<Rc<[MediaList]>>,
+    media_set_index: HashMap<Box<[u64]>, u32>,
+    screens: std::cell::OnceCell<Option<Screens>>,
+}
+
+/// The screens a chapter's rules tell apart (see [`Cascade::screens`]):
+/// the viewport sizes either side of each bound the media query lists of
+/// their conditions name, gathered into cells where every list comes to
+/// the same; and, for each set of lists a rule's condition keeps (see
+/// [`Cascade::media_sets`]), how they hold together in each cell.
+struct Screens {
+    cells: usize,
+    sets: Vec<Box<[Applies]>>,
 }
 
 /// A cascade layer's places among the author rules, for normal declarations
@@ -5993,13 +6296,16 @@ struct LayerRank {
 }
 
 /// A rule in a chapter's cascade: its place in the cascade order, its
-/// cascade layer, how the conditions around it hold, and the ids of its `~`
-/// steps by combinator.
+/// cascade layer, where the conditions around it hold, those of the link,
+/// `style` element, or import that applies its sheet among them, and the
+/// set of media query lists they keep, if any (see [`Cascade::media_sets`]);
+/// and the ids of its `~` steps by combinator.
 struct CascadeRule {
     rule: Rc<StyleRule>,
     order: u32,
     layer: u32,
-    condition: Applies,
+    condition: Condition,
+    media: Option<u32>,
     recorded: Box<[Option<u32>]>,
 }
 
@@ -6033,12 +6339,12 @@ struct SiblingStep {
     ancestor_keys: Box<[u64]>,
 }
 
-/// A sheet a cascade is taking in (see [`Cascade::open_sheet`]): how the
+/// A sheet a cascade is taking in (see [`Cascade::open_sheet`]): where the
 /// link, `style` element, or import applying it holds; the layer its
 /// unlayered rules stand in; and the nodes of the layers it has declared so
 /// far, by its layers, and of its anonymous ones, by their names.
 pub(super) struct OpenSheet {
-    condition: Applies,
+    condition: Condition,
     within: u32,
     nodes: Vec<u32>,
     anonymous: HashMap<String, u32>,
@@ -6047,17 +6353,18 @@ pub(super) struct OpenSheet {
 impl Cascade {
     /// Take in a sheet that imports none (see [`Cascade::open_sheet`]).
     #[cfg(test)]
-    pub(super) fn push_sheet(&mut self, sheet: &Stylesheet, condition: Applies) {
+    pub(super) fn push_sheet(&mut self, sheet: &Stylesheet, condition: Condition) {
         let open = self.open_sheet(condition, None);
-        self.close_sheet(sheet, open);
+        self.close_sheet(sheet, open, &mut MediaQueries::default())
+            .expect("a sheet within the bounds");
     }
 
-    /// Begin taking in a sheet, its rules' conditions capped by
-    /// `condition`, how the link, `style` element, or import applying it
-    /// holds, in steps that let the sheets it imports come in between, in
-    /// the layers its imports name (see [`Cascade::import_layer`]);
+    /// Begin taking in a sheet, its rules' conditions narrowed to where
+    /// `condition`, that of the link, `style` element, or import applying
+    /// it, holds, in steps that let the sheets it imports come in between,
+    /// in the layers its imports name (see [`Cascade::import_layer`]);
     /// `within` is the layer an import of the sheet itself puts it in.
-    pub(super) fn open_sheet(&mut self, condition: Applies, within: Option<u32>) -> OpenSheet {
+    pub(super) fn open_sheet(&mut self, condition: Condition, within: Option<u32>) -> OpenSheet {
         if self.layer_children.is_empty() {
             self.layer_names.push(String::new());
             self.layer_children.push(Vec::new());
@@ -6080,31 +6387,52 @@ impl Cascade {
         sheet: &Stylesheet,
         open: &mut OpenSheet,
         import: &Import,
-    ) -> u32 {
-        self.declare_layers(sheet, open, import.declared);
-        import
+        media: &mut MediaQueries,
+    ) -> Result<u32, DocumentError> {
+        self.declare_layers(sheet, open, import.declared, media)?;
+        Ok(import
             .layer
-            .map_or(open.within, |layer| open.nodes[layer as usize])
+            .map_or(open.within, |layer| open.nodes[layer as usize]))
+    }
+
+    /// The set of media query lists a condition keeps, by its place among
+    /// those of the cascade's rules; `None` where it keeps none.
+    fn media_set(&mut self, condition: &Condition) -> Option<u32> {
+        if condition.media.is_empty() {
+            return None;
+        }
+        let key: Box<[u64]> = condition.media.iter().map(|list| list.0.id).collect();
+        let next = self.media_sets.len() as u32;
+        let index = *self.media_set_index.entry(key).or_insert(next);
+        if index == next {
+            self.media_sets.push(condition.media.clone());
+            self.screens.take();
+        }
+        Some(index)
     }
 
     /// Finish taking in an open sheet: the rest of its layers, then its
-    /// rules.
-    pub(super) fn close_sheet(&mut self, sheet: &Stylesheet, mut open: OpenSheet) {
-        self.declare_layers(sheet, &mut open, sheet.layers.len());
+    /// rules, each where both its own conditions and the sheet's hold; one
+    /// that holds nowhere is left out.
+    pub(super) fn close_sheet(
+        &mut self,
+        sheet: &Stylesheet,
+        mut open: OpenSheet,
+        media: &mut MediaQueries,
+    ) -> Result<(), DocumentError> {
+        self.declare_layers(sheet, &mut open, sheet.layers.len(), media)?;
         let OpenSheet {
-            condition,
+            condition: sheet_condition,
             within,
             nodes,
             ..
         } = open;
         let layer = |rule: &StyleRule| rule.layer.map_or(within, |layer| nodes[layer as usize]);
-        let ranked = |rule: &Rc<StyleRule>, order: u32| Ranked {
-            rule: rule.clone(),
-            order,
-            layer: layer(rule),
-            condition: rule.condition.min(condition),
-        };
         for rule in &sheet.rules {
+            let condition = rule.condition.and(&sheet_condition, media)?;
+            if condition.applies() == Applies::No {
+                continue;
+            }
             let index = self.rules.len();
             let recorded = rule
                 .selector
@@ -6168,21 +6496,36 @@ impl Cascade {
                 Some(RuleKey::Tag(tag)) => self.by_tag.entry(tag).or_default().push(index),
                 None => self.universal.push(index),
             }
+            let media_set = self.media_set(&condition);
             self.rules.push(CascadeRule {
                 rule: rule.clone(),
                 order: index as u32 + 1,
                 layer: layer(rule),
-                condition: rule.condition.min(condition),
+                condition,
+                media: media_set,
                 recorded,
             });
         }
+        let mut ranked =
+            |rule: &Rc<StyleRule>, order: u32| -> Result<Option<Ranked>, DocumentError> {
+                let condition = rule.condition.and(&sheet_condition, media)?.applies();
+                Ok((condition != Applies::No).then(|| Ranked {
+                    rule: rule.clone(),
+                    order,
+                    layer: layer(rule),
+                    condition,
+                }))
+            };
         for rule in &sheet.spacing {
             let index = self.spacing_rules.len();
+            let Some(ranked) = ranked(rule, index as u32 + 1)? else {
+                continue;
+            };
             match rule.selector.compounds.last().and_then(rarest_key) {
                 Some(key) => self.spacing_by_key.entry(key).or_default().push(index),
                 None => self.spacing_anywhere.push(index),
             }
-            self.spacing_rules.push(ranked(rule, index as u32 + 1));
+            self.spacing_rules.push(ranked);
         }
         for rule in &sheet.customs {
             self.custom_order += 1;
@@ -6196,17 +6539,23 @@ impl Cascade {
             names.dedup();
             let key = rule.selector.compounds.last().and_then(rarest_key);
             for name in names {
+                let Some(ranked) = ranked(rule, self.custom_order)? else {
+                    break;
+                };
                 let rules = self.custom_rules.entry(name).or_default();
                 let index = rules.rules.len() as u32;
                 match key {
                     Some(key) => rules.by_key.entry(key).or_default().push(index),
                     None => rules.anywhere.push(index),
                 }
-                rules.rules.push(ranked(rule, self.custom_order));
+                rules.rules.push(ranked);
             }
         }
         for rule in &sheet.painting {
             let index = self.painting_rules.len();
+            let Some(ranked) = ranked(rule, index as u32 + 1)? else {
+                continue;
+            };
             match rule.selector.compounds.last().and_then(rarest_key) {
                 Some(key) => self.painting_by_key.entry(key).or_default().push(index),
                 None => self.painting_anywhere.push(index),
@@ -6216,23 +6565,30 @@ impl Cascade {
                     .iter()
                     .filter_map(|painting| painting.target.clone()),
             );
-            self.painting_rules.push(ranked(rule, index as u32 + 1));
+            self.painting_rules.push(ranked);
         }
         self.others += sheet.others;
+        Ok(())
     }
 
     /// Take in the cascade layers an open sheet declares, in its order, up
     /// to its `end`th, inside the layer it stands in: a named layer is the
     /// one of that name inside its parent, wherever declared before, and an
     /// anonymous one is new to this sheet.
-    fn declare_layers(&mut self, sheet: &Stylesheet, open: &mut OpenSheet, end: usize) {
+    fn declare_layers(
+        &mut self,
+        sheet: &Stylesheet,
+        open: &mut OpenSheet,
+        end: usize,
+        media: &mut MediaQueries,
+    ) -> Result<(), DocumentError> {
         let start = open.nodes.len();
         if start >= end {
-            return;
+            return Ok(());
         }
         self.layer_ranks.take();
         for layer in &sheet.layers[start..end] {
-            let declared = layer.declared.min(open.condition);
+            let declared = layer.declared.and(&open.condition, media)?.applies();
             let mut node = open.within;
             for name in layer.path.iter() {
                 let known = if name.starts_with(' ') {
@@ -6269,6 +6625,7 @@ impl Cascade {
             }
             open.nodes.push(node);
         }
+        Ok(())
     }
 
     /// Where a rule's cascade layer places it among the author rules (CSS
@@ -6344,6 +6701,129 @@ impl Cascade {
         } else {
             condition
         }
+    }
+
+    /// The screens the rules' media query lists tell apart (see
+    /// [`Screens`]), found once: the viewport sizes either side of every
+    /// bound the lists name, each list tried at each, a unit of `work` for
+    /// each of its tests, and gathered into cells where every list comes
+    /// to the same. `None` where the sizes come to more than the check
+    /// follows (see [`MAX_MEDIA_SAMPLES`]): each condition is then read on
+    /// its own.
+    fn screens(&self, work: &mut u64) -> Result<Option<&Screens>, DocumentError> {
+        if let Some(screens) = self.screens.get() {
+            return Ok(screens.as_ref());
+        }
+        let mut lists: Vec<&MediaList> =
+            self.media_sets.iter().flat_map(|set| set.iter()).collect();
+        lists.sort_unstable();
+        lists.dedup();
+        let tests: Vec<&MediaTest> = lists.iter().map(|list| &list.0.test).collect();
+        let screens = match media_samples(&tests, work) {
+            None => None,
+            Some((widths, heights)) => {
+                let tried: u64 = tests.iter().map(|test| media_tests(test)).sum();
+                *work = work.saturating_add((widths.len() * heights.len()) as u64 * tried);
+                if *work > MAX_MATCH_WORK {
+                    return Err(DocumentError::ResourceLimit);
+                }
+                // Each cell by what every list comes to in it, and what
+                // each list comes to in each cell.
+                let mut cells: HashMap<Vec<Applies>, usize> = HashMap::new();
+                let mut columns: Vec<Vec<Applies>> = vec![Vec::new(); lists.len()];
+                for &width in &widths {
+                    for &height in &heights {
+                        let row: Vec<Applies> = tests
+                            .iter()
+                            .map(|test| media_applies_at(&[*test], width, height))
+                            .collect();
+                        let next = cells.len();
+                        if *cells.entry(row.clone()).or_insert(next) == next {
+                            for (column, applies) in columns.iter_mut().zip(row) {
+                                column.push(applies);
+                            }
+                        }
+                    }
+                }
+                let place: HashMap<u64, usize> = lists
+                    .iter()
+                    .enumerate()
+                    .map(|(at, list)| (list.0.id, at))
+                    .collect();
+                let sets = self
+                    .media_sets
+                    .iter()
+                    .map(|set| {
+                        (0..cells.len())
+                            .map(|cell| {
+                                set.iter()
+                                    .map(|list| columns[place[&list.0.id]][cell])
+                                    .min()
+                                    .unwrap_or(Applies::Yes)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                Some(Screens {
+                    cells: cells.len(),
+                    sets,
+                })
+            }
+        };
+        let _ = self.screens.set(screens);
+        Ok(self.screens.get().and_then(Option::as_ref))
+    }
+
+    /// Whether a property hides an element on each screen the rules tell
+    /// apart (see [`Cascade::screens`]): the declarations that apply there,
+    /// each rule's media query lists settled for the screen, read as
+    /// [`hidden`] reads them, with how the parent's value hides it there.
+    /// Where no declaration's rule keeps media query lists, and the
+    /// parent's value is alike on every screen, it is read once; a cell
+    /// costs a unit of `work` for each set of lists.
+    fn hidden_by_screen(
+        &self,
+        applied: &[Applied],
+        inherited: &ByScreen,
+        work: &mut u64,
+    ) -> Result<ByScreen, DocumentError> {
+        if let ByScreen::All(inherited) = inherited {
+            if applied.iter().all(|entry| entry.media.is_none()) {
+                return Ok(ByScreen::All(hidden(applied, *inherited)));
+            }
+        }
+        let mut sets: Vec<u32> = applied.iter().filter_map(|entry| entry.media).collect();
+        sets.sort_unstable();
+        sets.dedup();
+        let Some(screens) = self.screens(work)? else {
+            return Ok(ByScreen::All(hidden(applied, inherited.everywhere())));
+        };
+        *work = work.saturating_add((screens.cells * (sets.len() + 1)) as u64);
+        let mut settled: HashMap<Vec<u8>, Tri> = HashMap::new();
+        let mut on_screen = applied.to_vec();
+        let mut cells = Vec::with_capacity(screens.cells);
+        for cell in 0..screens.cells {
+            let key: Vec<u8> = sets
+                .iter()
+                .map(|set| screens.sets[*set as usize][cell] as u8)
+                .chain(std::iter::once(inherited.at(cell) as u8))
+                .collect();
+            let hides = match settled.get(&key) {
+                Some(hides) => *hides,
+                None => {
+                    for (entry, declared) in on_screen.iter_mut().zip(applied) {
+                        if let Some(set) = declared.media {
+                            entry.applies = declared.base.min(screens.sets[set as usize][cell]);
+                        }
+                    }
+                    let hides = hidden(&on_screen, inherited.at(cell));
+                    settled.insert(key, hides);
+                    hides
+                }
+            };
+            cells.push(hides);
+        }
+        Ok(ByScreen::of(cells))
     }
 
     /// Where an author rule's declaration stands in the cascade: its tier,
@@ -6904,12 +7384,12 @@ impl Cascade {
     /// The cascade for the element at the top of `stack`: author rules,
     /// its inline style, SVG presentation attributes, and the user-agent
     /// rules that hide content; `inherited_invisible` is how its parent's
-    /// visibility hides it (see [`hidden`]).
+    /// visibility hides it on each screen (see [`hidden`]).
     fn evaluate(
         &self,
         tree: &Tree,
         ancestors: &AncestorKeys,
-        inherited_invisible: Tri,
+        inherited_invisible: &ByScreen,
         work: &mut u64,
     ) -> Result<ReaderStyle, DocumentError> {
         let element = tree.stack.last().expect("an element to style");
@@ -6944,7 +7424,12 @@ impl Cascade {
         let mut layouts: Vec<(Precedence, Applies, Layout)> = Vec::new();
         let mut item_flags: [Vec<(Precedence, Applies, Tri)>; 6] = Default::default();
         let block_by_default = reader_block_by_default(element);
-        let mut add = |declaration: &Declaration, precedence: Precedence, certainty: Applies| {
+        // A rule whose condition keeps media query lists passes the set
+        // of them, and how it applies without them (see [`Applied`]).
+        let mut add = |declaration: &Declaration,
+                       precedence: Precedence,
+                       certainty: Applies,
+                       screens: Option<(u32, Applies)>| {
             let slot = match declaration.property {
                 Property::Display => 0,
                 Property::Visibility => 1,
@@ -7031,15 +7516,20 @@ impl Cascade {
             }
             // A value computed at run time (`var()`) may hide the element
             // or not.
-            let applies = if declaration.effect == Effect::Hide && declaration.flow.is_some() {
-                certainty.min(Applies::Doubt)
-            } else {
-                certainty
+            let computed = declaration.effect == Effect::Hide && declaration.flow.is_some();
+            let settled = |applies: Applies| {
+                if computed {
+                    applies.min(Applies::Doubt)
+                } else {
+                    applies
+                }
             };
             applied[slot].push(Applied {
                 precedence,
-                applies,
+                applies: settled(certainty),
                 effect: declaration.effect,
+                media: screens.map(|(set, _)| set),
+                base: settled(screens.map_or(certainty, |(_, base)| base)),
             });
         };
         // For each of `::before` and `::after`: whether it is a block box,
@@ -7079,17 +7569,26 @@ impl Cascade {
                 order,
                 layer,
                 condition,
+                media,
                 recorded,
             } = &self.rules[index];
             if !ancestors.hold(&rule.ancestor_keys) {
                 *work += 1;
                 continue;
             }
-            let condition = self.with_layer(*condition, *layer);
-            let certainty = rule_applies(rule, condition, recorded, tree, tree.top(), work);
+            // How it applies apart from its media query lists, and with
+            // them, as they hold across the screens.
+            let other = self.with_layer(condition.other, *layer);
+            let base = if condition.screens == Applies::No {
+                Applies::No
+            } else {
+                rule_applies(rule, other, recorded, tree, tree.top(), work)
+            };
+            let certainty = base.min(condition.screens);
             if certainty == Applies::No {
                 continue;
             }
+            let screens = media.map(|set| (set, base));
             let pseudo = match rule.selector.pseudo_element {
                 PseudoElement::None => None,
                 PseudoElement::Before => Some(0),
@@ -7247,6 +7746,7 @@ impl Cascade {
                     &self.resolved(declaration, tree, ancestors, work)?,
                     precedence,
                     certainty,
+                    screens,
                 );
             }
         }
@@ -7299,6 +7799,7 @@ impl Cascade {
                 &self.resolved(declaration, tree, ancestors, work)?,
                 inline_precedence(declaration.important),
                 certainty,
+                None,
             );
         }
         // SVG presentation attributes: author styles that every rule beats.
@@ -7336,6 +7837,7 @@ impl Cascade {
                 },
                 presentation,
                 certainty,
+                None,
             );
         }
         for (prefixed, value) in element.values("visibility") {
@@ -7363,6 +7865,7 @@ impl Cascade {
                 },
                 presentation,
                 certainty,
+                None,
             );
         }
         for (prefixed, value) in element.values("opacity") {
@@ -7386,6 +7889,7 @@ impl Cascade {
                 },
                 presentation,
                 certainty,
+                None,
             );
         }
         // User-agent rules (HTML's rendering section) that hide content,
@@ -7431,10 +7935,10 @@ impl Cascade {
             var: None,
         };
         if hidden_by_user_agent {
-            add(&hide, user_agent, Applies::Yes);
+            add(&hide, user_agent, Applies::Yes, None);
         }
         if has("hidden") {
-            add(&hide, presentation, Applies::Yes);
+            add(&hide, presentation, Applies::Yes, None);
         }
         // How the box lays out its children. Flex items stand apart in a
         // column or in reverse, and with a gap or spread along a block's
@@ -7601,10 +8105,11 @@ impl Cascade {
             }
         };
         let (before, after) = (pseudo(0), pseudo(1));
+        let shown = ByScreen::All(Tri::No);
         Ok(ReaderStyle {
-            display: hidden(&applied[0], Tri::No),
-            visibility: hidden(&applied[1], inherited_invisible),
-            content_visibility: hidden(&applied[2], Tri::No),
+            display: self.hidden_by_screen(&applied[0], &shown, work)?,
+            visibility: self.hidden_by_screen(&applied[1], inherited_invisible, work)?,
+            content_visibility: self.hidden_by_screen(&applied[2], &shown, work)?,
             inline,
             floats: resolve_flow(&flows[1], false),
             floats_to_start: resolve_flow(&flows[3], false),
@@ -7827,11 +8332,12 @@ struct Open {
     /// Whether the element is not rendered: `display: none` on it or an
     /// ancestor, or fallback content of a media element; whether it is
     /// invisible; and whether nothing inside is rendered
-    /// (`content-visibility: hidden`). Each `No` where some reader shows it
-    /// for certain, `Yes` where every reader hides it (see [`hidden`]).
-    undisplayed: Tri,
-    invisible: Tri,
-    contents_hidden: Tri,
+    /// (`content-visibility: hidden`). Each on every screen the rules tell
+    /// apart, `No` where some reader of it shows it for certain, `Yes`
+    /// where every reader hides it (see [`Cascade::hidden_by_screen`]).
+    undisplayed: ByScreen,
+    invisible: ByScreen,
+    contents_hidden: ByScreen,
     /// Children are fallback content a reader replaces.
     fallback: bool,
     /// It is, or may be, transparent (`opacity: 0`), with all it holds.
@@ -9510,7 +10016,7 @@ fn meet_run(
             // AnyDoc skips an element its styles hide as though it were not
             // there, while a reader may show it: a line break, or a block,
             // even an empty one, starts a new line.
-            let shown = style.is_some_and(|style| style.display != Tri::Yes);
+            let shown = style.is_some_and(|style| style.display.everywhere() != Tri::Yes);
             if shown && local == "br" {
                 run.boundary = true;
             } else if shown {
@@ -9576,7 +10082,7 @@ fn meet_run(
             // link holding nothing else loses it with its empty paragraph.
             ("br", Reach::Dropped) => {
                 run.space('\n');
-                if style.is_none_or(|style| style.display != Tri::Yes) {
+                if style.is_none_or(|style| style.display.everywhere() != Tri::Yes) {
                     run.boundary = true;
                 }
             }
@@ -9803,13 +10309,14 @@ pub(super) fn chapter_text(
                 // Hidden from every reader for certain (`Yes`), shown to
                 // some for certain (`No`), or in doubt: text in doubt
                 // counts both where AnyDoc converts it and where it drops
-                // it.
+                // it. Text hidden on some screens and not on others shows.
                 let certainly =
                     state.fallback || state.paint == Paint::No || (state.in_svg && !state.svg_text);
                 let hidden = state
                     .undisplayed
-                    .max(state.invisible)
-                    .max(state.contents_hidden)
+                    .or(&state.invisible)
+                    .or(&state.contents_hidden)
+                    .everywhere()
                     .max(if certainly { Tri::Yes } else { Tri::No });
                 let shown_anyway = match state.exempt {
                     Exempt::None => false,
@@ -9993,8 +10500,12 @@ pub(super) fn chapter_text(
                 .first("id")
                 .is_some_and(|id| facts.used.contains(id))
             && open.last().is_some_and(|parent| {
-                parent.undisplayed.max(parent.contents_hidden) != Tri::No
-                    || parent.invisible != Tri::No
+                parent
+                    .undisplayed
+                    .or(&parent.contents_hidden)
+                    .or(&parent.invisible)
+                    .everywhere()
+                    != Tri::No
                     || parent.fallback
                     || parent.transparent
             });
@@ -10106,8 +10617,8 @@ pub(super) fn chapter_text(
             let inherited_invisible = open
                 .last()
                 .filter(|_| !detached)
-                .map_or(Tri::No, |parent| parent.invisible);
-            Some(reader.evaluate(&tree, &ancestors, inherited_invisible, work)?)
+                .map_or(ByScreen::All(Tri::No), |parent| parent.invisible.clone());
+            Some(reader.evaluate(&tree, &ancestors, &inherited_invisible, work)?)
         } else {
             None
         };
@@ -10249,9 +10760,9 @@ pub(super) fn chapter_text(
             None => Open {
                 reach,
                 caption_seen: false,
-                undisplayed: Tri::No,
-                invisible: Tri::No,
-                contents_hidden: Tri::No,
+                undisplayed: ByScreen::All(Tri::No),
+                invisible: ByScreen::All(Tri::No),
+                contents_hidden: ByScreen::All(Tri::No),
                 fallback: false,
                 transparent: false,
                 in_svg: children_in_svg,
@@ -10298,13 +10809,16 @@ pub(super) fn chapter_text(
                     caption_seen: false,
                     undisplayed: parent
                         .filter(|_| !detached)
-                        .map_or(Tri::No, |parent| {
+                        .map_or(ByScreen::All(Tri::No), |parent| {
                             let fallback = if parent.fallback { Tri::Yes } else { Tri::No };
-                            parent.undisplayed.max(parent.contents_hidden).max(fallback)
+                            parent
+                                .undisplayed
+                                .or(&parent.contents_hidden)
+                                .or(&ByScreen::All(fallback))
                         })
-                        .max(style.display),
-                    invisible: style.visibility,
-                    contents_hidden: style.content_visibility,
+                        .or(&style.display),
+                    invisible: style.visibility.clone(),
+                    contents_hidden: style.content_visibility.clone(),
                     fallback: matches!(element.lower.as_str(), "audio" | "video" | "canvas"),
                     transparent: parent.is_some_and(|parent| parent.transparent && !detached)
                         || style.transparent != Tri::No,
@@ -10338,8 +10852,7 @@ pub(super) fn chapter_text(
         // transparent, drawing something, and standing where the image
         // paints, or in a resource that paints where drawn.
         if !references.is_empty()
-            && state.undisplayed == Tri::No
-            && state.invisible == Tri::No
+            && state.undisplayed.or(&state.invisible).everywhere() == Tri::No
             && !state.transparent
             && svg_draws(element, has_children, fact.has_elements)
         {
@@ -10354,12 +10867,16 @@ pub(super) fn chapter_text(
                 resources.refer(*painting, id, drawn, sized_zero);
             }
         }
-        let hidden =
-            state.undisplayed.max(state.contents_hidden) != Tri::No || state.paint == Paint::No;
+        let hidden = state.undisplayed.or(&state.contents_hidden).everywhere() != Tri::No
+            || state.paint == Paint::No;
         let generated = style
             .as_ref()
             .filter(|_| reach != Reach::Dropped && !hidden && !in_svg && !replaced(&element.lower));
-        let seen = |pseudo: &PseudoBox| !pseudo.unseen.unwrap_or(state.invisible != Tri::No);
+        let seen = |pseudo: &PseudoBox| {
+            !pseudo
+                .unseen
+                .unwrap_or(state.invisible.everywhere() != Tri::No)
+        };
         found.drops_shown |= generated.is_some_and(|style| {
             [style.before, style.after]
                 .iter()
@@ -10442,7 +10959,7 @@ pub(super) fn cascade_for(css: &[&str]) -> (Cascade, AnyDocCascade) {
     for sheet in css {
         reader.push_sheet(
             &parse_stylesheet(sheet, &mut MediaQueries::default()).expect("stylesheet"),
-            Applies::Yes,
+            Condition::always(),
         );
         anydoc.add(sheet);
     }
@@ -12448,7 +12965,12 @@ mod tests {
 
     #[test]
     fn conditions_hold_as_far_as_the_check_can_tell() {
-        let media = |text: &str| media_condition(&tokenize(text).expect("tokens"), &mut 0);
+        let media = |text: &str| {
+            MediaQueries::default()
+                .condition(&tokenize(text).expect("tokens"))
+                .expect("a media query list")
+                .applies()
+        };
         for (query, holds) in [
             ("", Applies::Yes),
             ("screen", Applies::Yes),
@@ -12557,10 +13079,13 @@ mod tests {
         // `@import` rule, costs a lookup.
         let mut media = MediaQueries::default();
         let query = crowded_query(321);
-        assert_eq!(media.attribute(&query).unwrap(), Applies::No);
+        assert_eq!(media.attribute(&query).unwrap().applies(), Applies::No);
         let once = media.work();
         assert!(once > 0);
-        assert_eq!(media.attribute(&format!(" {query} ")).unwrap(), Applies::No);
+        assert_eq!(
+            media.attribute(&format!(" {query} ")).unwrap().applies(),
+            Applies::No
+        );
         let imports = format!("@import url(a.css) {query};\n").repeat(100);
         let blocks = format!("@media {query} {{ .x {{ display: none }} }}\n").repeat(1000);
         parse_stylesheet(&(imports + &blocks), &mut media).expect("stylesheet");
@@ -12633,6 +13158,89 @@ mod tests {
             "</div>".repeat(10)
         );
         assert!(drops_shown(&[&nested], &deep));
+    }
+
+    #[test]
+    fn conditions_are_read_screen_by_screen() {
+        let refund = r#"<p>Refund due <span class="x">1,250.00</span> by April.</p>"#;
+        // Rules that hide text between them on every screen hide it from
+        // every reader, though each alone holds only on some: text AnyDoc
+        // keeps no screen shows.
+        for (sheet, body) in [
+            (
+                "@media (max-width: 800px) { .x { display: none } } @media (min-width: 700px) { .x { display: none } }",
+                refund,
+            ),
+            (
+                "@media (orientation: portrait) { .x { display: none } } @media (orientation: landscape) { .x { display: none } }",
+                refund,
+            ),
+            (
+                "@media (max-width: 767px) { .a { display: none } } @media (min-width: 700px) { .b { display: none } }",
+                r#"<p>Refund due <span class="a b">1,250.00</span> by April.</p>"#,
+            ),
+            // An element hidden on some screens, and inside one hidden on
+            // the others. (Between `max-width: 767px` and `min-width: 768px`
+            // lie screens neither holds on, as a reader's viewport may be
+            // 767.5 pixels wide.)
+            (
+                "@media (max-width: 767px) { .outer { display: none } } @media (min-width: 767px) { .x { visibility: hidden } }",
+                r#"<div class="outer"><p>Refund due <span class="x">1,250.00</span> by April.</p></div>"#,
+            ),
+        ] {
+            assert!(converts_hidden(&[sheet], body), "{sheet}");
+        }
+        // Where the screens they leave between them show the text, it is
+        // shown.
+        assert!(!converts_hidden(
+            &["@media (max-width: 600px) { .x { display: none } } @media (min-width: 700px) { .x { display: none } }"],
+            refund
+        ));
+        // A condition inside another holds where both hold: a show on no
+        // screen leaves the text hidden everywhere, which AnyDoc, reading
+        // the show alone, converts; one on some screens shows it there.
+        for (sheet, hidden) in [
+            (".x { display: none } @media (max-width: 600px) { .d { color: red } @media (min-width: 700px) { .d { color: red } .x { display: inline } } }", true),
+            (".x { display: none } @media (orientation: portrait) { .d { color: red } @media (orientation: landscape) { .d { color: red } .x { display: inline } } }", true),
+            (".x { display: none } @media (max-width: 800px) { .d { color: red } @media (min-width: 700px) { .d { color: red } .x { display: inline } } }", false),
+        ] {
+            assert_eq!(converts_hidden(&[sheet], refund), hidden, "{sheet}");
+        }
+        // A later rule under the same condition wins on every screen it
+        // holds on, as Bootstrap's `d-none d-sm-block d-sm-none` hides.
+        for sheet in [
+            ".x { display: none } @media (min-width: 600px) { .x { display: inline } .x { display: none } }",
+            ".d-none { display: none !important } @media (min-width: 576px) { .d-sm-inline { display: inline !important } .d-sm-block { display: block !important } .d-sm-none { display: none !important } }",
+        ] {
+            let body = r#"<p>Refund due <span class="x d-none d-sm-block d-sm-none">1,250.00</span> by April.</p>"#;
+            assert!(!drops_shown(&[sheet], body), "{sheet}");
+        }
+        // A link's media holds with the conditions inside the sheet it
+        // applies: a show only for screens it leaves out never applies.
+        let hide = ".x { display: none }";
+        let show = "@media (min-width: 768px) { .d { color: red } .x { display: inline } }";
+        let drops_with = |media: &str| {
+            let mut queries = MediaQueries::default();
+            let mut reader = Cascade::default();
+            for (sheet, condition) in [
+                (hide, Condition::always()),
+                (show, queries.attribute(media).expect("a media query list")),
+            ] {
+                let parsed = parse_stylesheet(sheet, &mut queries).expect("stylesheet");
+                let open = reader.open_sheet(condition, None);
+                reader
+                    .close_sheet(&parsed, open, &mut queries)
+                    .expect("a sheet within the bounds");
+            }
+            let mut anydoc = AnyDocCascade::default();
+            anydoc.add(hide);
+            let mut work = 0;
+            chapter_text(&chapter(refund), &reader, &anydoc, &mut work)
+                .expect("walk")
+                .drops_shown
+        };
+        assert!(!drops_with("(max-width: 767px)"));
+        assert!(drops_with("(min-width: 700px)"));
     }
 
     #[test]
@@ -13015,9 +13623,12 @@ mod tests {
         // declares its layers.
         let mut reader = Cascade::default();
         let mut anydoc = AnyDocCascade::default();
+        let wide = MediaQueries::default()
+            .attribute("(min-width: 700px)")
+            .expect("a media query list");
         for (sheet, condition) in [
-            ("@layer b { .q { color: red } }", Applies::Varies),
-            (layers("").as_str(), Applies::Yes),
+            ("@layer b { .q { color: red } }", wide),
+            (layers("").as_str(), Condition::always()),
         ] {
             reader.push_sheet(
                 &parse_stylesheet(sheet, &mut MediaQueries::default()).expect("stylesheet"),
@@ -13035,20 +13646,27 @@ mod tests {
     fn push_importing(
         reader: &mut Cascade,
         sheet: &str,
-        condition: Applies,
+        condition: Condition,
         within: Option<u32>,
         files: &[(&str, &str)],
     ) {
-        let parsed = parse_stylesheet(sheet, &mut MediaQueries::default()).expect("stylesheet");
-        let mut open = reader.open_sheet(condition, within);
+        let mut media = MediaQueries::default();
+        let parsed = parse_stylesheet(sheet, &mut media).expect("stylesheet");
+        let mut open = reader.open_sheet(condition.clone(), within);
         for import in &parsed.imports {
-            let layer = reader.import_layer(&parsed, &mut open, import);
+            let layer = reader
+                .import_layer(&parsed, &mut open, import, &mut media)
+                .expect("layers within the bounds");
             if let Some((_, text)) = files.iter().find(|(name, _)| *name == import.target) {
-                let applies = condition.min(import.applies);
+                let applies = condition
+                    .and(&import.applies, &mut media)
+                    .expect("conditions within the bounds");
                 push_importing(reader, text, applies, Some(layer), files);
             }
         }
-        reader.close_sheet(&parsed, open);
+        reader
+            .close_sheet(&parsed, open, &mut media)
+            .expect("a sheet within the bounds");
     }
 
     #[test]
@@ -13062,7 +13680,7 @@ mod tests {
         ];
         let walk = |sheet: &str| {
             let mut reader = Cascade::default();
-            push_importing(&mut reader, sheet, Applies::Yes, None, &files);
+            push_importing(&mut reader, sheet, Condition::always(), None, &files);
             let mut anydoc = AnyDocCascade::default();
             anydoc.add(sheet);
             let mut work = 0;
