@@ -4980,9 +4980,10 @@ pub(super) struct Stylesheet {
     /// properties.
     others: usize,
     pub(super) imports: Vec<Import>,
-    /// Whether a rule other than `@charset`, `@import`, or `@layer` naming
-    /// layers has come, after which Chromium ignores an `@import`.
-    imports_closed: bool,
+    /// How far the rules at its top have come as Chromium reads them (see
+    /// [`Opening`]): for certain, and as far as rules it may keep take it.
+    opening: Opening,
+    may_open: Opening,
     /// The cascade layers it declares, in the order they are first declared.
     layers: Vec<SheetLayer>,
     /// The namespace prefixes it declares (`@namespace`), by the names
@@ -5013,9 +5014,52 @@ struct SheetLayer {
     again: bool,
 }
 
+/// How far the rules at the top of a sheet have come, as Chromium reads
+/// them in order: `@charset` rules and `@layer` statements first, then
+/// `@import` rules, then `@namespace` rules, then any other. It drops an
+/// `@import` after a rule of a later kind, or after a `@layer` statement
+/// that follows an import, and a `@namespace` after any other rule. A rule
+/// it drops, such as a style rule whose selector list it cannot read or an
+/// at-rule it does not know, moves nothing on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Opening {
+    #[default]
+    Start,
+    Imports,
+    Namespaces,
+    Rules,
+}
+
+/// The rules at the top of a sheet that move it on (see [`Opening`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopRule {
+    LayerStatement,
+    Import,
+    Namespace,
+    Other,
+}
+
 impl Stylesheet {
     pub(super) fn rule_count(&self) -> usize {
         self.rules.len() + self.others
+    }
+
+    /// Take in a rule at the top of the sheet, which Chromium keeps as
+    /// `kept` says: one it may keep moves on only where the sheet may have
+    /// come to, so that an `@import` after it is in doubt.
+    fn opened(&mut self, rule: TopRule, kept: Tri) {
+        let after = |at: Opening| match rule {
+            TopRule::LayerStatement if at == Opening::Start => Opening::Start,
+            TopRule::Import => at.max(Opening::Imports),
+            TopRule::Namespace => at.max(Opening::Namespaces),
+            TopRule::LayerStatement | TopRule::Other => Opening::Rules,
+        };
+        if kept != Tri::No {
+            self.may_open = after(self.may_open);
+        }
+        if kept == Tri::Yes {
+            self.opening = after(self.opening);
+        }
     }
 
     /// The layer named `names` inside `parent` (an anonymous one where
@@ -5150,7 +5194,7 @@ fn parse_rule_list(
                     break;
                 }
                 if top_level {
-                    sheet.imports_closed = true;
+                    sheet.opened(TopRule::Other, style_rule_kept(&tokens[start..index]));
                 }
                 let (block, end) = block_at(tokens, index);
                 let selectors = RuleSelectors::new(
@@ -5211,8 +5255,26 @@ fn parse_at_rule(
     }
     let prelude = &tokens[index + 1..end];
     let block = end < tokens.len() && tokens[end] == Token::OpenCurly;
-    if top_level && selectors.is_none() && closes_imports(&name, block) {
-        sheet.imports_closed = true;
+    let top = top_level && selectors.is_none();
+    // `@layer a, b;` declares the layers, in that order, where it names
+    // each; one Chromium drops declares none.
+    let statement: Option<Vec<Vec<String>>> = (name == "layer" && !block).then(|| {
+        split_top_level(prelude, &Token::Comma)
+            .into_iter()
+            .map(|names| layer_names(names).ok().flatten())
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    });
+    if top {
+        match (name.as_str(), &statement) {
+            // Read below, where Chromium keeps them.
+            ("import" | "namespace" | "charset", _) => {}
+            (_, Some(names)) => {
+                let kept = if names.is_empty() { Tri::No } else { Tri::Yes };
+                sheet.opened(TopRule::LayerStatement, kept);
+            }
+            _ => sheet.opened(TopRule::Other, at_rule_kept(&name, prelude, block)),
+        }
     }
     if block {
         let (block, after) = block_at(tokens, end);
@@ -5281,18 +5343,15 @@ fn parse_at_rule(
         }
         return Ok(after);
     }
-    if name == "layer" && context.declared.applies() != Applies::No {
-        // `@layer a, b;` declares the layers, in that order.
-        for names in split_top_level(prelude, &Token::Comma) {
-            if let Ok(Some(names)) = layer_names(names) {
-                if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
-                    return Err(DocumentError::ResourceLimit);
-                }
-                sheet.layer(context.layer, Some(names), context.declared.clone());
+    if let (Some(statement), true) = (statement, context.declared.applies() != Applies::No) {
+        for names in statement {
+            if sheet.layers.len() >= MAX_LAYERS_PER_SHEET {
+                return Err(DocumentError::ResourceLimit);
             }
+            sheet.layer(context.layer, Some(names), context.declared.clone());
         }
     }
-    if name == "namespace" && top_level && selectors.is_none() {
+    if name == "namespace" && top && sheet.opening <= Opening::Namespaces {
         // `@namespace epub "http://www.idpf.org/2007/ops";` binds a prefix
         // the sheet's selectors name namespaces by.
         let parts = components(trim_whitespace(prelude));
@@ -5312,12 +5371,23 @@ fn parse_at_rule(
                 namespaces.retain(|(declared, _)| declared != prefix);
                 namespaces.push((prefix.clone(), Rc::from(uri)));
                 sheet.namespaces = namespaces.into();
+                sheet.opened(TopRule::Namespace, Tri::Yes);
             }
         }
     }
-    if name == "import" && top_level && selectors.is_none() && !sheet.imports_closed {
+    if name == "import" && top && sheet.opening <= Opening::Imports {
         if let Some((target, applies, layer)) = import_target(prelude, media)? {
+            // One whose `supports()` fails Chromium drops, and one after a
+            // rule it may keep, it may drop.
+            if applies.other != Applies::No {
+                sheet.opened(TopRule::Import, Tri::Yes);
+            }
             let applies = applies.and(&context.condition, media)?;
+            let applies = if sheet.may_open > Opening::Imports {
+                applies.and(&Condition::other(Applies::Doubt), media)?
+            } else {
+                applies
+            };
             if applies.applies() != Applies::No {
                 if sheet.imports.len() >= MAX_IMPORTS_PER_SHEET
                     || (layer.is_some() && sheet.layers.len() >= MAX_LAYERS_PER_SHEET)
@@ -5339,37 +5409,148 @@ fn parse_at_rule(
     Ok((end + 1).min(tokens.len()))
 }
 
-/// At-rules Chromium knows besides `@charset`, `@import`, and `@layer`.
-const KNOWN_AT_RULES: [&str; 17] = [
-    "media",
-    "supports",
-    "container",
-    "scope",
-    "starting-style",
-    "font-face",
-    "page",
-    "keyframes",
-    "-webkit-keyframes",
-    "namespace",
-    "property",
-    "counter-style",
-    "font-feature-values",
-    "font-palette-values",
-    "view-transition",
-    "position-try",
-    "function",
+/// Whether Chromium keeps a style rule for its selector list: not one it
+/// cannot read (see [`chromium_rejects`]), nor an empty one.
+fn style_rule_kept(prelude: &[Token]) -> Tri {
+    let prelude = trim_whitespace(prelude);
+    if prelude.is_empty() || chromium_rejects(prelude) {
+        Tri::No
+    } else {
+        Tri::Yes
+    }
+}
+
+/// Counter style names Chromium does not let a sheet define.
+const FIXED_COUNTER_STYLES: [&str; 7] = [
+    "none",
+    "decimal",
+    "disc",
+    "square",
+    "circle",
+    "disclosure-open",
+    "disclosure-closed",
 ];
 
-/// Whether an at-rule at the top of a sheet, `block` telling whether it
-/// has one, ends the `@import` rules Chromium reads: one it knows other
-/// than `@charset`, `@import`, and `@layer` naming layers. One it does not
-/// know it drops, as if it were not there.
-fn closes_imports(name: &str, block: bool) -> bool {
-    match name {
-        "charset" | "import" => false,
-        "layer" => block,
-        _ => KNOWN_AT_RULES.contains(&name),
+/// Whether Chromium keeps an at-rule other than `@charset`, `@import`,
+/// `@namespace`, and a `@layer` statement, as far as the check can tell:
+/// one it knows, with the block it takes and a prelude it reads, such as
+/// `@media screen { }`, `@font-face { }`, or `@keyframes fade { }`. One it
+/// does not know, such as `@-moz-document`, or one without its block, as
+/// `@media screen;`, it drops, as though it were not there; `@property`
+/// and `@function` it keeps as their contents allow, which is not read.
+fn at_rule_kept(name: &str, prelude: &[Token], block: bool) -> Tri {
+    let parts = components(trim_whitespace(prelude));
+    let kept = |keeps: bool| if keeps { Tri::Yes } else { Tri::No };
+    let dashed = || matches!(parts.as_slice(), [[Token::Ident(name)]] if name.starts_with("--") && name.len() > 2);
+    let keyword = |part: &[Token], words: &[&str]| matches!(part, [Token::Ident(word)] if words.iter().any(|known| word.eq_ignore_ascii_case(known)));
+    let wide = [
+        "initial",
+        "inherit",
+        "unset",
+        "revert",
+        "revert-layer",
+        "default",
+    ];
+    if !block {
+        return Tri::No;
     }
+    match name {
+        "media" => Tri::Yes,
+        "supports" => kept(supports_condition_within(prelude, 0).is_some()),
+        "layer" => kept(layer_names(prelude).is_ok()),
+        "font-face" | "view-transition" | "starting-style" => kept(parts.is_empty()),
+        "font-feature-values" => kept(!parts.is_empty()),
+        "font-palette-values" | "position-try" => kept(dashed()),
+        "keyframes" | "-webkit-keyframes" => match parts.as_slice() {
+            [part] if keyword(part, &wide) => Tri::Maybe,
+            [[Token::Ident(_)]] => Tri::Yes,
+            _ => Tri::No,
+        },
+        "counter-style" => match parts.as_slice() {
+            [part] if keyword(part, &wide) || keyword(part, &FIXED_COUNTER_STYLES) => Tri::No,
+            [[Token::Ident(_)]] => Tri::Yes,
+            _ => Tri::No,
+        },
+        "page" => page_kept(prelude),
+        "scope" => scope_kept(prelude),
+        "container" => {
+            // An optional name, then a condition in parentheses, after
+            // `not`, or in a function (`style()`, `scroll-state()`).
+            let condition = match parts.as_slice() {
+                [first, rest @ ..] if !keyword(first, &["not"]) => match first {
+                    [Token::Ident(_)]
+                        if keyword(first, &["none", "and", "or"]) || keyword(first, &wide) =>
+                    {
+                        return Tri::No
+                    }
+                    [Token::Ident(_)] => rest,
+                    _ => &parts[..],
+                },
+                _ => &parts[..],
+            };
+            match condition.first() {
+                None if parts.is_empty() => Tri::No,
+                Some([Token::OpenParen, ..] | [Token::Function(_), ..]) => Tri::Yes,
+                Some(part) if keyword(part, &["not"]) => Tri::Yes,
+                _ => Tri::Maybe,
+            }
+        }
+        "property" if dashed() => Tri::Maybe,
+        "function" if matches!(parts.first(), Some([Token::Function(_), ..])) => Tri::Yes,
+        "function" if !parts.is_empty() => Tri::Maybe,
+        _ => Tri::No,
+    }
+}
+
+/// Whether Chromium keeps an `@page` rule for its selectors: a page name,
+/// or `:left`, `:right`, `:first`, and `:blank` after one or alone.
+fn page_kept(prelude: &[Token]) -> Tri {
+    let prelude = trim_whitespace(prelude);
+    if prelude.is_empty() {
+        return Tri::Yes;
+    }
+    let reads = split_top_level(prelude, &Token::Comma)
+        .into_iter()
+        .all(|part| {
+            let mut part = trim_whitespace(part);
+            if let [Token::Ident(_), rest @ ..] = part {
+                part = rest;
+            }
+            let mut pseudo = true;
+            while let [Token::Colon, Token::Ident(name), rest @ ..] = part {
+                pseudo &= ["left", "right", "first", "blank"]
+                    .iter()
+                    .any(|known| name.eq_ignore_ascii_case(known));
+                part = rest;
+            }
+            pseudo && part.is_empty()
+        });
+    if reads {
+        Tri::Yes
+    } else {
+        Tri::No
+    }
+}
+
+/// Whether Chromium keeps an `@scope` rule for its prelude: none, a root in
+/// parentheses, limits after `to`, or both, each a selector list it reads.
+fn scope_kept(prelude: &[Token]) -> Tri {
+    let parts = components(trim_whitespace(prelude));
+    let parenthesized = |part: &[Token]| part.first() == Some(&Token::OpenParen);
+    let lists: Vec<&[Token]> = match parts.as_slice() {
+        [] => return Tri::Yes,
+        [root] if parenthesized(root) => vec![block_contents(root)],
+        [to, limit] if is_word(to, "to") && parenthesized(limit) => vec![block_contents(limit)],
+        [root, to, limit] if parenthesized(root) && is_word(to, "to") && parenthesized(limit) => {
+            vec![block_contents(root), block_contents(limit)]
+        }
+        _ => return Tri::No,
+    };
+    lists
+        .into_iter()
+        .map(style_rule_kept)
+        .min()
+        .unwrap_or(Tri::Yes)
 }
 
 /// The root an `@scope` rule's style rules match inside, as what `&` and
@@ -13709,9 +13890,10 @@ mod tests {
             r#"@import url("inner.css") layer(base); @layer z { .d { color: red } .x { display: none } }"#
         )
         .drops_shown);
-        // Chromium ignores an import after any rule but `@charset`, another
-        // import, or `@layer` naming layers, and drops an at-rule it does
-        // not know.
+        // Chromium ignores an import after any rule it keeps but `@charset`,
+        // another import, or `@layer` naming layers before the imports, and
+        // drops an at-rule it does not know, or one it cannot read, as
+        // though it were not there.
         for (sheet, applies) in [
             (r#"@layer a; @import url("hide.css");"#, true),
             (r#"@foo bar; @import url("hide.css");"#, true),
@@ -13724,8 +13906,58 @@ mod tests {
                 r#"@layer a { .d { color: red } } @import url("hide.css");"#,
                 false,
             ),
+            (r#"@media print { } @import url("hide.css");"#, false),
+            (
+                r#"@container (min-width: 1px) { } @import url("hide.css");"#,
+                false,
+            ),
+            (
+                r#"@import url("other.css"); @layer q; @import url("hide.css");"#,
+                false,
+            ),
+            (
+                r#"@layer q; @import url("other.css"); @import url("hide.css");"#,
+                true,
+            ),
+            (
+                r#".d, :bogus { color: red } @import url("hide.css");"#,
+                true,
+            ),
+            (r#"{ color: red } @import url("hide.css");"#, true),
+            (r#"@media screen; @import url("hide.css");"#, true),
+            (r#"@font-face; @import url("hide.css");"#, true),
+            (r#"@namespace; @import url("hide.css");"#, true),
+            (
+                r#"@supports (a) and not (b) { .d { color: red } } @import url("hide.css");"#,
+                true,
+            ),
+            (r#"@layer a b; @import url("hide.css");"#, true),
+            (
+                r#"@container none (min-width: 1px) { } @import url("hide.css");"#,
+                true,
+            ),
+            (r#"@scope (:bogus) { } @import url("hide.css");"#, true),
+            (r#"@page :bogus { } @import url("hide.css");"#, true),
+            (r#"@keyframes "fade" { } @import url("hide.css");"#, true),
+            // After a rule Chromium may keep, the import is in doubt: what
+            // it hides counts as hidden where AnyDoc converts it.
+            (r#"@property --x { } @import url("hide.css");"#, true),
         ] {
             assert_eq!(walk(sheet).converts_hidden, applies, "{sheet}");
+        }
+        // A namespace after another rule is dropped, and binds nothing.
+        let refund = r#"<p>Refund due <span class="x" epub:type="k">1,250.00</span> by April.</p>"#;
+        for (sheet, hidden) in [
+            (
+                r#"@namespace q "urn:q"; @namespace e "http://www.idpf.org/2007/ops"; span[e|type="k"] { visibility: hidden }"#,
+                true,
+            ),
+            (
+                r#"@namespace q "urn:q"; .d { color: red } @namespace e "http://www.idpf.org/2007/ops"; span[e|type="k"] { visibility: hidden }"#,
+                false,
+            ),
+        ] {
+            assert_eq!(converts_hidden(&[sheet], refund), hidden, "{sheet}");
         }
     }
 
