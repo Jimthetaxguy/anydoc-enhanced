@@ -725,7 +725,7 @@ impl<'a> Appearances<'a> {
 }
 
 /// A rectangle given as four numbers, its corners in order.
-fn rectangle(document: &Document, object: &Object) -> Option<[f32; 4]> {
+pub(crate) fn rectangle(document: &Document, object: &Object) -> Option<[f32; 4]> {
     let numbers: Vec<f32> = resolve(document, object)?
         .as_array()
         .ok()?
@@ -738,9 +738,14 @@ fn rectangle(document: &Document, object: &Object) -> Option<[f32; 4]> {
     Some([x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)])
 }
 
+/// Whether two rectangles, their corners in order, share any area.
+pub(crate) fn overlaps(one: [f32; 4], other: [f32; 4]) -> bool {
+    one[0] < other[2] && one[2] > other[0] && one[1] < other[3] && one[3] > other[1]
+}
+
 /// The box a page shows: its crop box within its media box, its own or
 /// inherited.
-fn page_box(document: &Document, page: ObjectId) -> Option<[f32; 4]> {
+pub(crate) fn page_box(document: &Document, page: ObjectId) -> Option<[f32; 4]> {
     let (mut crop, mut media) = (None, None);
     let mut node = document.get_dictionary(page).ok();
     for _ in 0..MAX_TREE_DEPTH {
@@ -843,9 +848,7 @@ pub(crate) fn unread(
                         .ok()
                         .and_then(|rect| rectangle(document, rect)),
                 )
-                .is_none_or(|(page, rect)| {
-                    rect[0] < page[2] && rect[2] > page[0] && rect[1] < page[3] && rect[3] > page[1]
-                });
+                .is_none_or(|(page, rect)| overlaps(rect, page));
             if !on_page {
                 continue;
             }

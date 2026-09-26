@@ -133,9 +133,10 @@ struct Walk<'a> {
     document: &'a Document,
     /// The document's layers, if it has any.
     layers: Option<&'a Layers>,
-    /// Pages by object, and the pages whose annotations hold a widget.
+    /// Pages by object, and the pages, by number and object, whose
+    /// annotations hold a widget.
     pages: HashMap<ObjectId, u32>,
-    annotation_pages: HashMap<ObjectId, u32>,
+    annotation_pages: HashMap<ObjectId, (u32, ObjectId)>,
     visited: HashSet<ObjectId>,
     examined: usize,
     /// Whether pdf-inspector's walk has ended at its bounds: past them, it
@@ -198,24 +199,32 @@ impl<'a> Walk<'a> {
 
     /// The page a viewer shows a widget on: the page whose annotations hold
     /// it, or its `/P`; `None` where it is hidden, by its flags or by a
-    /// layer, or on no page.
+    /// layer, on no page, or where its box has no area or stands wholly off
+    /// its page's box, so that it shows nothing.
     fn page(&self, id: ObjectId, widget: &Dictionary) -> Option<u32> {
+        let document = self.document;
         let flags = widget
             .get(b"F")
             .ok()
-            .and_then(|flags| resolved(self.document, flags))
+            .and_then(|flags| resolved(document, flags))
             .and_then(|flags| flags.as_i64().ok())
             .unwrap_or(0);
         if flags & (HIDDEN | NO_VIEW) != 0 || self.layered(widget) {
             return None;
         }
-        self.annotation_pages.get(&id).copied().or_else(|| {
-            widget
-                .get(b"P")
-                .ok()
-                .and_then(|page| page.as_reference().ok())
-                .and_then(|page| self.pages.get(&page).copied())
-        })
+        let (number, page) = self.annotation_pages.get(&id).copied().or_else(|| {
+            let page = widget.get(b"P").ok()?.as_reference().ok()?;
+            Some((*self.pages.get(&page)?, page))
+        })?;
+        let rect = widget
+            .get(b"Rect")
+            .ok()
+            .and_then(|rect| crate::annotations::rectangle(document, rect));
+        let empty = rect.is_some_and(|rect| rect[0] >= rect[2] || rect[1] >= rect[3]);
+        let off = rect
+            .zip(crate::annotations::page_box(document, page))
+            .is_some_and(|(rect, page)| !crate::annotations::overlaps(rect, page));
+        (!empty && !off).then_some(number)
     }
 
     /// The page pdf-inspector writes a widget's value for: its `/P`, else
@@ -226,7 +235,7 @@ impl<'a> Walk<'a> {
             .ok()
             .and_then(|page| page.as_reference().ok())
             .and_then(|page| self.pages.get(&page).copied())
-            .or_else(|| self.annotation_pages.get(&id).copied())
+            .or_else(|| self.annotation_pages.get(&id).map(|(number, _)| *number))
             .unwrap_or(1)
     }
 
@@ -895,7 +904,7 @@ pub(crate) fn values(document: &Document, layers: Option<&Layers>) -> Values {
         };
         for annotation in annotations {
             if let Ok(id) = annotation.as_reference() {
-                annotation_pages.insert(id, number);
+                annotation_pages.insert(id, (number, page));
             }
         }
     }
@@ -1288,8 +1297,20 @@ mod tests {
                 );
                 let payee = document.add_object(dictionary! {
                     "FT" => "Tx", "T" => Object::string_literal("payee"), "P" => page,
+                    "Rect" => vec![560.into(), 600.into(), 760.into(), 620.into()],
                     "AP" => dictionary! { "N" => shown },
                 });
+                // The same drawn by widgets that show nothing: one with a
+                // box of no area, and one set wholly off the page.
+                let nowhere = |document: &mut Document, name: &str, rect: [i64; 4]| {
+                    document.add_object(dictionary! {
+                        "FT" => "Tx", "T" => Object::string_literal(name), "P" => page,
+                        "Rect" => rect.iter().map(|&side| side.into()).collect::<Vec<Object>>(),
+                        "AP" => dictionary! { "N" => shown },
+                    })
+                };
+                let empty = nowhere(document, "empty", [0, 0, 0, 0]);
+                let off = nowhere(document, "off", [700, 600, 900, 620]);
                 // One drawn invisibly, and a check box, whose appearance
                 // draws a mark, not text.
                 let unseen = drawn(
@@ -1305,7 +1326,10 @@ mod tests {
                     "FT" => "Btn", "T" => Object::string_literal("dependent"), "P" => page,
                     "AS" => "Yes", "AP" => dictionary! { "N" => dictionary! { "Yes" => mark } },
                 });
-                (vec![payee, old, check], vec![payee, old, check])
+                (
+                    vec![payee, old, check, empty, off],
+                    vec![payee, old, check, empty, off],
+                )
             });
             let catalog = document
                 .trailer
