@@ -102,6 +102,63 @@ This places `pdf-inspector-mcp` in your Cargo bin directory (typically
 cargo install --locked --root /usr/local --path crates/pdf-inspector-mcp
 ```
 
+### Agent skill
+
+Users do not need Rust. A release publishes two artifacts for each of
+macOS arm64, macOS x86_64, Linux x86_64, and Linux aarch64:
+
+- A Python wheel. `pip install anydoc-enhanced-<version>-*.whl` or
+  `uv tool install` of that wheel puts `pdf-inspector-mcp` on `PATH` and
+  includes the skill files. The binary is already compiled. Linux wheels
+  are statically linked and tagged manylinux2014, so a glibc host can
+  install them.
+- A skill zip. Unzip it into `.claude/skills/` (or another skills
+  directory) so the folder is `anydoc-enhanced/`. The binary is at
+  `bin/<target>/pdf-inspector-mcp`. Linux zips use the musl triple, for
+  example `bin/x86_64-unknown-linux-musl/`.
+
+From a git checkout, with a wheel already built:
+
+```bash
+pip install dist/anydoc_enhanced-*.whl
+python3 skills/anydoc-enhanced/scripts/classify_pdf.py --help
+```
+
+Or point the scripts at a binary without installing the wheel:
+
+```bash
+PDF_INSPECTOR_MCP_BIN=./target/release/pdf-inspector-mcp \
+  python3 skills/anydoc-enhanced/scripts/pdf_to_markdown.py \
+  --path test-corpus/source/sample-1.pdf
+```
+
+The scripts look for the binary in this order: `PDF_INSPECTOR_MCP_BIN`,
+then `bin/<target>/` inside the skill folder, then next to the running
+Python interpreter, then `PATH`. The same executable is the MCP server and
+the bounded worker, so `ANYDOC_WORKER_BIN` is not set.
+
+PDFs go through pdf-inspector. DOCX, PPTX, XLSX, ODS, and ODT go through
+the AnyDoc worker on macOS and Linux. Strict CSV, ODP, and EPUB are
+Linux-only because they require the address-space ceiling. Windows builds
+are not published. A browser-downloaded macOS zip can be quarantined by
+Gatekeeper; see `skills/anydoc-enhanced/SKILL.md`.
+
+Building a wheel from this repository still needs Rust and maturin. That
+is the release job, not the install path:
+
+```bash
+pip install "maturin>=1.15,<2"
+python3 packaging/skill_build.py
+maturin build --release --locked --out dist
+python3 scripts/package_skill.py \
+  --binary target/release/pdf-inspector-mcp \
+  --target "$(python3 -c 'import json,subprocess; print(json.loads(subprocess.check_output(["target/release/pdf-inspector-mcp","--provenance"]))["target"])')" \
+  --dist dist
+```
+
+`python3 packaging/skill_build.py` copies the skill into the Python
+package before `maturin build`. `pip wheel .` does that copy itself.
+
 ### Wire into an MCP client
 
 For Claude Code, use its CLI so machine-specific paths remain in user-scoped
@@ -190,6 +247,8 @@ the upstream surface.
 | Check candidate text for obvious identifiers | `bash scripts/check-public-hygiene.sh` |
 | Validate domain tool against a PDF | `cargo run --example validate_domain -- <tax\|irc\|sec> <pdf-path>` |
 | Run Sweet review demo | `cargo run -p pdf-inspector-skillkit --example sweet_review_demo -- demo_1040_w2_schedule_c` |
+| Build the skill wheel | `python3 packaging/skill_build.py && maturin build --release --locked --out dist` |
+| Test the skill scripts | `PDF_INSPECTOR_MCP_BIN=target/release/pdf-inspector-mcp python3 skills/anydoc-enhanced/tests/test_scripts.py` |
 
 Server logs and handled errors do not include caller-supplied paths or labels.
 Set `PDF_INSPECTOR_MCP_LOG` to one of `off`, `error`, `warn`, `info`, `debug`,

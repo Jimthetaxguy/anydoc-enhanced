@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Agent skill `skills/anydoc-enhanced`. Its Python scripts call the
+  existing `pdf-inspector-mcp` binary over stdio. PDFs stay on
+  pdf-inspector; office files use the AnyDoc worker. Pages that need OCR
+  exit 3 and keep text from pages that could be read. `pages_needing_ocr`
+  stays 1-based.
+- Wheels and per-platform skill zips for macOS arm64, macOS x86_64, Linux
+  x86_64, and Linux aarch64. Installing a release wheel or unzipping a
+  skill zip does not require Rust. A version tag publishes those
+  artifacts. A manual run of the release workflow builds them and does
+  not publish a release.
+
 ### Changed
 - Moved to `pdf-inspector` 1.25.0 (from 1.24.0), whose one library change
   (#592) stops underline detection going quadratic on pages drawn from thin

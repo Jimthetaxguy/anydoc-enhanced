@@ -44,3 +44,9 @@ test-corpus/results/*.txt
 
 # Local sandbox
 tmp/
+
+# Skill wheels, zips, and the skill copy staged into the Python package
+/dist/
+/python/anydoc_enhanced/skill/
+__pycache__/
+*.pyc

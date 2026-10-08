@@ -1,0 +1,128 @@
+name: Release
+
+# Tag pushes publish wheels and skill zips. workflow_dispatch builds the
+# same artifacts and uploads them as workflow artifacts only. It does not
+# create a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            zig: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            zig: false
+          - os: macos-14
+            target: x86_64-apple-darwin
+            zig: false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            python -m pip install "maturin[zig]>=1.15,<2"
+          else
+            python -m pip install "maturin>=1.15,<2"
+          fi
+      - name: Select the macOS SDK
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Stage the skill into the Python package
+        run: python3 packaging/skill_build.py
+      - name: Build the wheel
+        env:
+          ANYDOC_ENHANCED_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          args=(--release --locked --target "${{ matrix.target }}" --out dist)
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            # Static musl binary, tagged manylinux2014 so pip on glibc can
+            # install it. The zip still uses the musl target triple.
+            args+=(--zig --strip --compatibility manylinux_2_17)
+          fi
+          if [ "$(uname)" = "Darwin" ]; then
+            # Strip once, sign the stripped binary, then package with
+            # `--strip false`. A second strip would drop the ad-hoc signature.
+            # That signature does not satisfy Gatekeeper for a browser download.
+            maturin build "${args[@]}" --strip
+            rm -f dist/*.whl
+            codesign --force --sign - "target/${{ matrix.target }}/release/pdf-inspector-mcp"
+            args+=(--strip false)
+          fi
+          maturin build "${args[@]}"
+      - name: Package the skill zip
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/pdf-inspector-mcp"
+          python3 scripts/package_skill.py \
+            --binary "$binary" \
+            --target "${{ matrix.target }}" \
+            --dist dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.whl
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Write checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/package_skill.py --checksums --dist dist
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.whl \
+            dist/*.zip \
+            dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Offline anydoc-enhanced wheels and per-platform skill zips for macOS arm64, macOS x86_64, Linux x86_64, and Linux aarch64. Installing a wheel or unzipping a skill zip does not require Rust. workflow_dispatch builds these artifacts without publishing a release."

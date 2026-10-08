@@ -53,7 +53,9 @@ Expose [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) ove
 | `crates/pdf-inspector-skillkit/src/cjk_fonts.rs` | PDF Japanese, Chinese, and Korean fonts pdf-inspector 1.25.0 finds no map for, and what it reads their text as (upstream #573) |
 | `crates/pdf-inspector-skillkit/src/vertical_text.rs` | PDF text in vertical writing, gathered into columns, whose neighbours pdf-inspector 1.25.0 reads row by row or out of order (upstream #575) |
 | `crates/pdf-inspector-skillkit/src/markdown_tables.rs` | PDF table rows pdf-inspector 1.25.0 repeats, amounts it merges, and amounts it pushes out of their rows |
-| `crates/pdf-inspector-mcp/` | MCP server binary, worker mode, and tool registration |
+| `crates/pdf-inspector-mcp/` | MCP server binary, worker mode, and tool registration. The same executable is the bounded worker |
+| `skills/anydoc-enhanced/` | Agent skill. Python scripts call the MCP binary; they do not parse documents |
+| `pyproject.toml` | maturin `bindings = "bin"` wheel that installs the compiled `pdf-inspector-mcp` |
 | `docs/` | Handoff, Sweet demo notes |
 | `docs/anydoc-integration-plan.md` | Dependency-ordered AnyDoc architecture and acceptance gates |
 | `test-corpus/` | Public PDF plus public PPTX, DOCX, XLSX, ODS, ODT, ODP, CSV, and EPUB qualification corpus and adversarial inputs for validation |

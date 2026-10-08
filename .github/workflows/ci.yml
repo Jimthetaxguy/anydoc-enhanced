@@ -75,6 +75,55 @@ jobs:
       - name: Run worker containment tests
         run: cargo test -p pdf-inspector-mcp --test document_tool --locked
 
+  skill:
+    name: skill wheel and zip (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: python -m pip install "maturin>=1.15,<2"
+      - name: Stage the skill and build the wheel
+        env:
+          ANYDOC_ENHANCED_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 packaging/skill_build.py
+          maturin build --release --locked --strip --out dist
+      - name: Package the skill zip
+        run: |
+          set -euo pipefail
+          target="$(target/release/pdf-inspector-mcp --provenance | python3 -c 'import json,sys; print(json.load(sys.stdin)["target"])')"
+          python3 scripts/package_skill.py \
+            --binary target/release/pdf-inspector-mcp \
+            --target "$target" \
+            --dist dist
+      - name: Install the wheel and run the skill tests
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/skill-venv
+          /tmp/skill-venv/bin/pip install dist/anydoc_enhanced-*.whl
+          /tmp/skill-venv/bin/pdf-inspector-mcp --provenance
+          /tmp/skill-venv/bin/python -c 'import anydoc_enhanced; path = anydoc_enhanced.skill_directory(); assert path is not None and (path / "SKILL.md").is_file()'
+          PDF_INSPECTOR_MCP_BIN=/tmp/skill-venv/bin/pdf-inspector-mcp \
+            /tmp/skill-venv/bin/python skills/anydoc-enhanced/tests/test_scripts.py
+      - name: Smoke-test the zip without a Rust toolchain on PATH
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          unzip -q dist/anydoc-enhanced-*.zip -d "$work"
+          PATH="/usr/bin:/bin" \
+            python3 "$work/anydoc-enhanced/scripts/classify_pdf.py" \
+            --path test-corpus/source/sample-1.pdf \
+            > "$work/classify.json"
+          python3 -c 'import json,sys; body=json.load(open(sys.argv[1])); assert body["result"]["pdf_type"]=="TextBased"' "$work/classify.json"
+
   deny:
     name: cargo-deny (advisories + licenses + bans + sources)
     runs-on: ubuntu-latest

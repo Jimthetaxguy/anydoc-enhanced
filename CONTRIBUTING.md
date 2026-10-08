@@ -29,6 +29,7 @@ cargo run --example validate_domain -- sec /path/to/10-K.pdf
 - Format: `cargo fmt --all`
 - Lint:   `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - Test:   `cargo test --workspace --locked`
+- Skill:  `PDF_INSPECTOR_MCP_BIN=target/release/pdf-inspector-mcp python3 skills/anydoc-enhanced/tests/test_scripts.py`
 - Candidate-text hygiene: `bash scripts/check-public-hygiene.sh`
 
 All four must pass before a PR is merged.

@@ -781,11 +781,41 @@ impl ServerHandler for PdfInspectorServer {
     }
 }
 
+/// Build identity embedded by `build.rs`. Printed by `--provenance` and
+/// copied into skill-script results. It names this binary, not a path.
+fn provenance() -> serde_json::Value {
+    serde_json::json!({
+        "server": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_commit": env!("PDF_INSPECTOR_MCP_GIT_COMMIT"),
+        "pdf_inspector": pdf_inspector_skillkit::PDF_INSPECTOR_VERSION,
+        "anydoc": pdf_inspector_skillkit::ANYDOC_VERSION,
+        "target": env!("PDF_INSPECTOR_MCP_TARGET"),
+    })
+}
+
+fn print_provenance() {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&provenance()).expect("provenance is JSON")
+    );
+}
+
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--anydoc-worker") {
+    match std::env::args().nth(1).as_deref() {
         // The worker is synchronous. Avoid constructing Tokio before the
         // Linux supervisor applies the worker address-space ceiling.
-        return pdf_inspector_skillkit::document::run_worker().map_err(anyhow::Error::from);
+        // The same executable is the server and the worker: the supervisor
+        // re-executes `current_exe()` with this flag, so a bundled binary
+        // does not need ANYDOC_WORKER_BIN.
+        Some("--anydoc-worker") => {
+            return pdf_inspector_skillkit::document::run_worker().map_err(anyhow::Error::from);
+        }
+        Some("--provenance") => {
+            print_provenance();
+            return Ok(());
+        }
+        _ => {}
     }
 
     tokio::runtime::Builder::new_multi_thread()
