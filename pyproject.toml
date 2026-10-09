@@ -1,0 +1,52 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "skill_build"
+backend-path = ["packaging"]
+
+[project]
+name = "anydoc-enhanced"
+dynamic = ["version"]
+description = "Offline PDF and office-document skill. Installs the pdf-inspector-mcp binary."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["pdf", "markdown", "docx", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Text Processing",
+]
+dependencies = []
+
+[project.urls]
+repository = "https://github.com/Jimthetaxguy/anydoc-enhanced"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/pdf-inspector-mcp/Cargo.toml"
+# The distribution name keeps the hyphen. The importable package does not.
+module-name = "anydoc_enhanced"
+python-source = "python"
+python-packages = ["anydoc_enhanced"]
+# Maturin skips gitignored paths while walking the package. The staged skill
+# copy is gitignored, so include it explicitly. The glob crate does not apply
+# gitignore rules.
+include = [{ path = "anydoc_enhanced/skill/**/*", format = "wheel" }]
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+locked = true
+profile = "release"
+# Strip is not set here. Linux release builds pass `maturin build --strip`;
+# the macOS job strips via CARGO_PROFILE_RELEASE_STRIP so it can sign the
+# binary and rebuild the wheel without Cargo recompiling it.
+sdist-generator = "git"
+compatibility = "pypi"
+
+# cargo-cyclonedx writes absolute crate paths into the wheel SBOM, including
+# the builder's home directory on GitHub Actions. License data lives in
+# THIRD_PARTY.md instead.
+[tool.maturin.sbom]
+rust = false
+auditwheel = false

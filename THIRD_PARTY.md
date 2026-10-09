@@ -69,3 +69,15 @@ To re-run the audit:
 cargo install cargo-license
 cargo license --json
 ```
+
+## Python skill packaging
+
+The agent skill and the `anydoc-enhanced` wheel add no runtime Python
+dependencies and no crates. [maturin](https://github.com/PyO3/maturin)
+(MIT OR Apache-2.0, 1.15 or newer) is a build tool that packages the existing
+`pdf-inspector-mcp` binary into a wheel (`bindings = "bin"`). It is not
+linked into the binary and it is not installed with the wheel. The skill
+scripts use the Python standard library. The wheel does not embed a
+CycloneDX SBOM, because that file would record the build machine's crate
+paths.
+
