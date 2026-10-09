@@ -38,10 +38,9 @@ include = [{ path = "anydoc_enhanced/skill/**/*", format = "wheel" }]
 exclude = ["**/__pycache__/**", "**/*.pyc"]
 locked = true
 profile = "release"
-# Strip is a CLI flag (`maturin build --strip`), not a default. The macOS
-# release job signs the stripped binary and then packages it again; a
-# pyproject `strip = true` would run on that second build and drop the
-# signature.
+# Strip is not set here. Linux release builds pass `maturin build --strip`;
+# the macOS job strips via CARGO_PROFILE_RELEASE_STRIP so it can sign the
+# binary and rebuild the wheel without Cargo recompiling it.
 sdist-generator = "git"
 compatibility = "pypi"
 

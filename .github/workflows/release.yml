@@ -29,7 +29,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             zig: true
-          - os: ubuntu-latest
+          # Native ARM runner: package_skill.py executes the built binary with
+          # --provenance, which an x64 runner cannot do for an aarch64 target.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             zig: true
           - os: macos-14
@@ -75,13 +77,22 @@ jobs:
             args+=(--zig --strip --compatibility manylinux_2_17)
           fi
           if [ "$(uname)" = "Darwin" ]; then
-            # Strip once, sign the stripped binary, then package with
-            # `--strip false`. A second strip would drop the ad-hoc signature.
-            # That signature does not satisfy Gatekeeper for a browser download.
-            maturin build "${args[@]}" --strip
+            # Strip through Cargo's profile instead of `maturin --strip`, so
+            # both builds below share identical compile inputs. Cargo then
+            # leaves the binary alone on the second build and the signature
+            # survives. Maturin's own --strip changes RUSTFLAGS, which would
+            # force a recompile that overwrites the signed binary.
+            export CARGO_PROFILE_RELEASE_STRIP=symbols
+            binary="target/${{ matrix.target }}/release/pdf-inspector-mcp"
+            maturin build "${args[@]}"
             rm -f dist/*.whl
-            codesign --force --sign - "target/${{ matrix.target }}/release/pdf-inspector-mcp"
-            args+=(--strip false)
+            codesign --force --sign - "$binary"
+            signed_sha="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+            maturin build "${args[@]}"
+            test "$(shasum -a 256 "$binary" | cut -d' ' -f1)" = "$signed_sha" \
+              || { echo "final build replaced the signed binary" >&2; exit 1; }
+            codesign --verify "$binary"
+            exit 0
           fi
           maturin build "${args[@]}"
       - name: Package the skill zip
