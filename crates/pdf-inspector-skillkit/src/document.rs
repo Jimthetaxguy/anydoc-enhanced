@@ -511,13 +511,14 @@ pub fn capabilities(kind: DocumentKind) -> DocumentCapabilities {
 
 /// Classify a path using content signatures first and its extension second.
 /// The worker reads the package: the server reads the file, under one of
-/// the worker slots, and counts an archive's entries, and no more.
+/// the worker slots, and counts an archive's entries, and no more. A call
+/// that finds every slot taken returns [`DocumentError::WorkerBusy`]
+/// without opening the file.
 pub async fn classify(path: impl AsRef<Path>) -> Result<DocumentClassification, DocumentError> {
+    // Take a slot before the path is validated or the file is read, so a
+    // call past the in-flight bound returns immediately and holds no input.
+    let permit = try_document_permit()?;
     let canonical = crate::validate_path(path).map_err(map_path_error)?;
-    let permit = worker_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| DocumentError::WorkerBusy)?;
     let frame = read_document_frame(&canonical).await?;
     // An archive past AnyDoc's entry bound is classified by its extension,
     // unopened.
@@ -9772,18 +9773,16 @@ fn document_route(
 
 /// Convert an enabled document through the supervised worker.
 pub async fn to_markdown(path: impl AsRef<Path>) -> Result<DocumentContent, DocumentError> {
+    // A worker slot is taken before the path is validated or the file is
+    // read. A call past the in-flight bound returns [`DocumentError::WorkerBusy`]
+    // at once and holds no document bytes; it does not wait in a queue. The
+    // worker classifies the document, runs the package preflight, and converts
+    // it, under the conversion's deadline, memory ceiling, and in-flight bound,
+    // and returns what it found with the Markdown. Classified here, AnyDoc's
+    // detection parsed a package's relationships, content types, or main part,
+    // to 128 MiB each, in the server: a 9.9 MB package took it to 1.8 GiB.
+    let permit = try_document_permit()?;
     let canonical = crate::validate_path(path).map_err(map_path_error)?;
-    // A worker slot is taken before the file is read, so calls waiting for
-    // one hold no document bytes. The worker classifies the document, runs
-    // the package preflight, and converts it, under the conversion's
-    // deadline, memory ceiling, and in-flight bound, and returns what it
-    // found with the Markdown. Classified here, AnyDoc's detection parsed a
-    // package's relationships, content types, or main part, to 128 MiB
-    // each, in the server: a 9.9 MB package took it to 1.8 GiB.
-    let permit = worker_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| DocumentError::WorkerBusy)?;
     let frame = read_document_frame(&canonical).await?;
     // An archive with more entries than AnyDoc reads is refused unopened,
     // as the worker would refuse it after indexing them all.
@@ -10361,6 +10360,15 @@ async fn terminate_child(child: &mut Child) {
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+/// Take a document-lane slot without waiting. The lane runs
+/// [`MAX_IN_FLIGHT_WORKERS`] conversions at once; a further call returns
+/// [`DocumentError::WorkerBusy`] and must not read its input.
+fn try_document_permit() -> Result<OwnedSemaphorePermit, DocumentError> {
+    worker_semaphore()
+        .try_acquire_owned()
+        .map_err(|_| DocumentError::WorkerBusy)
 }
 
 fn worker_semaphore() -> Arc<Semaphore> {
@@ -11819,6 +11827,9 @@ mod tests {
             (r#"state='hidden'"#, visible_row),
             (r#"state="&#104;idden""#, visible_row),
             (r#"state=" veryHidden ""#, visible_row),
+            // Spaces around `=` and either quote style are still the attribute.
+            (r#"state = "veryHidden""#, visible_row),
+            (r#"state = 'hidden'"#, visible_row),
             ("", r#"<row r="1" hidden='1'><c r="A1"><v>1</v></c></row>"#),
             (
                 "",
@@ -11847,6 +11858,13 @@ mod tests {
         let cached =
             with_sheet("", r#"<row r="1"><c r="A1"><f>1+1</f><v>2</v></c></row>"#).unwrap();
         assert!(!cached.missing_formula_cache && !cached.hidden_content);
+        // The same words inside a cell are text, not a sheet's visibility.
+        let cell_text = with_sheet(
+            "",
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>state="hidden" state='hidden' state = "veryHidden"</t></is></c></row>"#,
+        )
+        .unwrap();
+        assert!(!cell_text.hidden_content);
         // Hidden defined names, which Excel adds for filters, hide nothing.
         let workbook = format!(
             r#"<workbook xmlns:r="{REL_NS}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" hidden="1">Data!$A$1</definedName></definedNames></workbook>"#
@@ -17540,6 +17558,48 @@ mod tests {
     }
 
     #[test]
+    fn epub_prose_urls_are_not_external_resources() {
+        let prose = br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink"><head/><body><p title="See https://example.com for details">See https://example.com for details</p><p><![CDATA[Notes at https://example.com/notes]]></p></body></html>"#;
+        let result = preflight_package(
+            &epub_package(
+                prose,
+                Some(EPUB_CHAPTER_TWO),
+                &[("OPS/images/logo.png", b"png")],
+            ),
+            DocumentKind::Epub,
+            DocumentVariant::Epub,
+        )
+        .unwrap();
+        assert!(!result.external_relationships);
+        assert!(!result.missing_required_content);
+
+        let resources: [&[u8]; 5] = [
+            br#"<html xmlns="http://www.w3.org/1999/xhtml"><head/><body><a href="https://example.com/page">link</a></body></html>"#,
+            br#"<html xmlns="http://www.w3.org/1999/xhtml"><head/><body><img src="https://example.com/pic.png" alt=""/></body></html>"#,
+            br#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink"><head/><body><img xlink:href="https://example.com/pic.png" alt=""/></body></html>"#,
+            br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="https://example.com/a.css"/></head><body><p>Shown</p></body></html>"#,
+            br#"<html xmlns="http://www.w3.org/1999/xhtml"><head/><body><p style="background: url(https://example.com/a.png)">Shown</p></body></html>"#,
+        ];
+        for chapter in resources {
+            let result = preflight_package(
+                &epub_package(
+                    chapter,
+                    Some(EPUB_CHAPTER_TWO),
+                    &[("OPS/images/logo.png", b"png")],
+                ),
+                DocumentKind::Epub,
+                DocumentVariant::Epub,
+            )
+            .unwrap();
+            assert!(
+                result.external_relationships,
+                "{}",
+                String::from_utf8_lossy(chapter)
+            );
+        }
+    }
+
+    #[test]
     fn epub_preflight_rejects_invalid_ocf_identity_and_drm() {
         let wrong_mimetype = zip_entries(&[
             ("mimetype", b"application/octet-stream"),
@@ -18142,6 +18202,61 @@ mod tests {
             .try_wait()
             .expect("reaped child status must be readable")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn conversions_past_the_worker_bound_are_busy_before_reading() {
+        let missing = std::env::temp_dir().join(format!(
+            "anydoc-unreadable-{}-missing.csv",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+
+        let mut held = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while held.len() < MAX_IN_FLIGHT_WORKERS {
+            match worker_semaphore().try_acquire_owned() {
+                Ok(permit) => held.push(permit),
+                Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "document worker slots stayed taken"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let converted = timeout(Duration::from_millis(500), to_markdown(&missing))
+            .await
+            .expect("a conversion past the bound must not wait for a slot");
+        let classified = timeout(Duration::from_millis(500), classify(&missing))
+            .await
+            .expect("a classification past the bound must not wait for a slot");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(converted, Err(DocumentError::WorkerBusy)));
+        assert!(matches!(classified, Err(DocumentError::WorkerBusy)));
+        drop(held);
+
+        let mut saw_missing_input = false;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match to_markdown(&missing).await {
+                Err(DocumentError::InputUnavailable) => {
+                    saw_missing_input = true;
+                    break;
+                }
+                Err(DocumentError::WorkerBusy) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected conversion result: {other:?}"),
+            }
+        }
+        assert!(
+            saw_missing_input,
+            "a free slot must open the path and refuse a missing file"
+        );
     }
 
     #[test]
