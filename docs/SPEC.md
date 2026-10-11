@@ -162,7 +162,7 @@ decided when write tools are actually scoped:
 | **C. lopdf from crates.io** | `lopdf = "0.40"` | Stable release channel | Version may not align with pdf-inspector's pin; dedup risk |
 | **D. `cargo vendor` offline snapshot** | `cargo vendor` + `.cargo/config.toml` | Fully offline reproducible | Large vendor dir; overkill if we don't actually need offline |
 
-**Current parser graph:** the released PDF dependency resolves `lopdf 0.42.0` from crates.io. Write-side dependencies remain out of scope.
+**Current parser graph:** the released PDF dependency resolves `lopdf 0.45.0` from crates.io. Write-side dependencies remain out of scope.
 
 **Decision criterion:** we pick whichever option **(a)** works at the
 same SHA pdf-inspector uses (so there's one lopdf in the dep graph, not

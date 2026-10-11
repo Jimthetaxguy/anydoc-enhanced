@@ -37,10 +37,15 @@ pub fn split_sec_filing(
     path: impl AsRef<std::path::Path>,
 ) -> Result<Vec<SecSection>, SkillkitError> {
     let info = crate::process(&path)?;
-    let text = info.markdown.unwrap_or_default();
+    Ok(split_sec_markdown(
+        info.markdown.as_deref().unwrap_or_default(),
+    ))
+}
 
+/// Split Markdown already produced by `pdf_to_markdown` into filing sections.
+pub fn split_sec_markdown(text: &str) -> Vec<SecSection> {
     if text.is_empty() {
-        return Ok(vec![]);
+        return vec![];
     }
 
     let part_re = part_re();
@@ -125,7 +130,7 @@ pub fn split_sec_filing(
         });
     }
 
-    Ok(sections)
+    sections
 }
 
 #[cfg(test)]

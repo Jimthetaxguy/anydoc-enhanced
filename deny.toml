@@ -32,7 +32,5 @@ unmaintained = "workspace"
 unknown-registry = "deny"
 unknown-git = "deny"
 required-git-spec = "rev"
-allow-git = [
-    "https://github.com/firecrawl/pdf-inspector",
-    "https://github.com/J-F-Liu/lopdf",
-]
+# Every dependency resolves from crates.io; no Git sources are allowed.
+allow-git = []

@@ -44,3 +44,13 @@ test-corpus/results/*.txt
 
 # Local sandbox
 tmp/
+
+# Local agent session notes and worktrees
+_working-files/
+.worktrees/
+
+# Skill wheels, zips, and the skill copy staged into the Python package
+/dist/
+/python/anydoc_enhanced/skill/
+__pycache__/
+*.pyc

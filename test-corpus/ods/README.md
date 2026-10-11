@@ -31,3 +31,15 @@ The strict route also has synthetic derivatives for the promotion gate:
 
 They are derived from the public fixture, contain no identifying metadata, and
 their hashes are recorded in the corpus index.
+
+## Number-format and drawing fixtures
+
+`scripts/build-anydoc-hardening-corpus.py` generates three more synthetic
+spreadsheets, each of which must return `incomplete_conversion`:
+
+- `negative-sign-by-colour.ods`: a negative value displayed without a sign.
+- `format-hidden-value.ods`: a value displayed as an empty paragraph, which
+  AnyDoc would replace with the typed value.
+- `cell-anchored-text-box.ods`: a text box anchored to a cell.
+
+Their hashes are recorded in the corpus index.

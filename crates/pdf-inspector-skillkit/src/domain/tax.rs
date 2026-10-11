@@ -171,10 +171,15 @@ pub fn identify_tax_form(
     path: impl AsRef<std::path::Path>,
 ) -> Result<TaxFormIdentification, crate::SkillkitError> {
     let info = crate::process(path)?;
-    let text = info.markdown.unwrap_or_default();
-    let cut = floor_char_boundary(&text, 5000);
-    let search_text = &text[..cut];
-    Ok(match_rules(search_text))
+    Ok(identify_tax_form_markdown(
+        info.markdown.as_deref().unwrap_or_default(),
+    ))
+}
+
+/// Identify the form from Markdown already produced by `pdf_to_markdown`.
+pub fn identify_tax_form_markdown(markdown: &str) -> TaxFormIdentification {
+    let cut = floor_char_boundary(markdown, 5000);
+    match_rules(&markdown[..cut])
 }
 
 #[cfg(test)]
