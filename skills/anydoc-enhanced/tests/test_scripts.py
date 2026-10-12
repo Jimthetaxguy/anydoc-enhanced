@@ -145,7 +145,7 @@ class CorpusTests(unittest.TestCase):
     def assert_build(self, body: dict) -> None:
         build = body["build"]
         self.assertEqual(build["server"], "pdf-inspector-mcp")
-        self.assertEqual(build["pdf_inspector"], "1.25.0")
+        self.assertEqual(build["pdf_inspector"], "1.25.2")
         self.assertEqual(build["anydoc"], "0.2.4")
         self.assertTrue(build["version"])
         self.assertTrue(build["git_commit"])
@@ -176,7 +176,7 @@ class CorpusTests(unittest.TestCase):
         body = self.payload(completed)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("§1398", body["result"]["markdown"])
-        self.assertEqual(body["build"]["pdf_inspector"], "1.25.0")
+        self.assertEqual(body["build"]["pdf_inspector"], "1.25.2")
 
     def test_pdf_to_markdown_scanned_exits_3_and_keeps_the_result(self) -> None:
         completed = self.run_corpus("pdf_to_markdown.py", "scanned/sample-1.pdf")
