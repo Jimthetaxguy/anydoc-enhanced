@@ -8812,7 +8812,13 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
 
     let (first_name, first_compression) = {
         let first = archive.by_index(0).map_err(|_| DocumentError::Malformed)?;
-        (first.name().to_string(), first.compression())
+        (
+            first
+                .name()
+                .map_err(|_| DocumentError::Malformed)?
+                .to_string(),
+            first.compression(),
+        )
     };
     let mut archive_names = HashSet::new();
     let mut total_declared = 0u64;
@@ -8820,7 +8826,10 @@ fn preflight_epub(bytes: &[u8]) -> Result<PackagePreflight, DocumentError> {
         let file = archive
             .by_index(index)
             .map_err(|_| DocumentError::Malformed)?;
-        let name = file.name().to_string();
+        let name = file
+            .name()
+            .map_err(|_| DocumentError::Malformed)?
+            .to_string();
         if !archive_names.insert(name.clone())
             || name.starts_with('/')
             || name.as_bytes().contains(&0)
@@ -9085,7 +9094,10 @@ fn preflight_package(
         let mut file = archive
             .by_index(index)
             .map_err(|_| DocumentError::Malformed)?;
-        let name = file.name().to_string();
+        let name = file
+            .name()
+            .map_err(|_| DocumentError::Malformed)?
+            .to_string();
         let lower_name = name.to_ascii_lowercase();
         archive_names.insert(name.clone());
         if name.as_bytes().contains(&0)
