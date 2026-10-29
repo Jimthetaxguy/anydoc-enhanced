@@ -840,6 +840,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "lopdf"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43f64cb8c0d673ff84245a6de9e0172c0cc05dc5dd9d263660b5b4a02b6c4ae"
+dependencies = [
+ "aes",
+ "bitflags",
+ "brotli-decompressor",
+ "cbc",
+ "chrono",
+ "ecb",
+ "encoding_rs",
+ "flate2",
+ "getrandom",
+ "indexmap",
+ "itoa",
+ "log",
+ "md-5",
+ "nom",
+ "rand",
+ "rangemap",
+ "rayon",
+ "sha2",
+ "stringprep",
+ "thiserror",
+ "weezl",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,7 +1009,7 @@ dependencies = [
  "env_logger",
  "include_dir",
  "log",
- "lopdf",
+ "lopdf 0.45.0",
  "once_cell",
  "rayon",
  "regex",
@@ -1018,7 +1047,7 @@ dependencies = [
  "encoding_rs",
  "libc",
  "log",
- "lopdf",
+ "lopdf 0.46.0",
  "pdf-inspector",
  "pulldown-cmark",
  "quick-xml",
