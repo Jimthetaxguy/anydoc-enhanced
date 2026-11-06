@@ -76,8 +76,12 @@ jobs:
         run: cargo test -p pdf-inspector-mcp --test document_tool --locked
 
   skill:
-    name: skill wheel and zip (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: skill wheel and zip (ubuntu-24.04)
+    # Pinned: ubuntu-latest is now 26.04, whose glibc is newer than any
+    # manylinux policy, so maturin tags the wheel linux_x86_64 and the
+    # pyproject `compatibility = "pypi"` check rejects it. Release builds use
+    # zig + manylinux_2_17 and are unaffected.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
