@@ -27,6 +27,17 @@ allow-wildcard-paths = true   # path-based intra-workspace deps are fine
 [advisories]
 yanked = "warn"
 unmaintained = "workspace"
+# zip 8.6.0 still comes in through `anydoc` 0.2.4 (latest release), which
+# only reads archives in memory via `ZipArchive::new` and never calls
+# `ZipArchive::extract` / `ZipStreamReader::extract`. These four advisories
+# are all in the extract-to-disk path and are patched in zip >= 9.0.0, which
+# our own crates already use. Drop these once anydoc moves to zip 9.
+ignore = [
+    { id = "RUSTSEC-2026-0367", reason = "zip extract-only; anydoc 0.2.4 never extracts to disk" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract-only; anydoc 0.2.4 never extracts to disk" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract-only; anydoc 0.2.4 never extracts to disk" },
+    { id = "RUSTSEC-2026-0429", reason = "zip extract-only; anydoc 0.2.4 never extracts to disk" },
+]
 
 [sources]
 unknown-registry = "deny"
