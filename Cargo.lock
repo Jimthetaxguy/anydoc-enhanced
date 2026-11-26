@@ -104,9 +104,9 @@ dependencies = [
 
 [[package]]
 name = "anydoc"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf0d78e4cfe3654eb3ea04422ec5a94352000ee56e97902125e68e51f7527062"
+checksum = "ae154cb7eea57f6844f090210f08b3609daf6bceea680daab472c54eb8a9bf56"
 dependencies = [
  "cfb",
  "csv",
@@ -115,7 +115,7 @@ dependencies = [
  "log",
  "pdf-inspector",
  "quick-xml",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -1044,7 +1044,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zip 9.5.1",
+ "zip",
 ]
 
 [[package]]
@@ -1066,7 +1066,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "zip 9.5.1",
+ "zip",
 ]
 
 [[package]]
@@ -1676,12 +1676,6 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typed-path"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
-
-[[package]]
-name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
@@ -2051,20 +2045,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "typed-path 0.12.3",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
 version = "9.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3476fd497ac8af5b1ec7b51acab7bef380f7e8dd8e0487595bafd839417a302"
@@ -2077,7 +2057,7 @@ dependencies = [
  "libc",
  "memchr",
  "nix",
- "typed-path 0.13.0",
+ "typed-path",
  "windows-sys",
  "zeroize",
  "zopfli",
