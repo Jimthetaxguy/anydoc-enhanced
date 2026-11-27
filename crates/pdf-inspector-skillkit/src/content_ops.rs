@@ -402,11 +402,12 @@ fn lopdf_past_image(content: &[u8], at: usize) -> Option<usize> {
 /// outside a string, a name, and a comment, `true`, `false`, and `null`
 /// aside, with an inline image, from its `BI` to where `past_image` says it
 /// ends, one operator, and nothing read past where it says reading stops.
+/// Returns whether the complete stream was visited.
 fn walk(
     content: &[u8],
     past_image: fn(&[u8], usize) -> Option<usize>,
     mut visit: impl FnMut(&[u8], usize, Option<&[u8]>) -> bool,
-) {
+) -> bool {
     let mut at = 0;
     let mut name: Option<(usize, usize)> = None;
     while at < content.len() {
@@ -447,18 +448,19 @@ fn walk(
                     start,
                     name.take().map(|(from, to)| &content[from..to]),
                 ) {
-                    return;
+                    return false;
                 }
                 if word == b"BI" {
                     match past_image(content, at) {
                         Some(end) => at = end,
-                        None => return,
+                        None => return false,
                     }
                 }
             }
             _ => at += 1,
         }
     }
+    true
 }
 
 /// The operators `content` holds, counted up to `limit`, as pdf-inspector
@@ -657,31 +659,116 @@ pub(crate) fn viewer_modes(content: &[u8]) -> Vec<(usize, Option<i64>)> {
     modes
 }
 
-/// The modes a viewer sets at the first `count` `Tr`s lopdf decodes in
-/// `content`, in order, each found where lopdf reads it (see `walk` and
-/// `lopdf_past_image`): the mode pdfium sets at a `Tr` it reads there (see
-/// `viewer_modes`), and none, leaving the mode as it was, at one it does
-/// not read, as in `3Tr`, one word to pdfium, or in data it passes over as
-/// an image's. `None` where fewer are found.
-pub(crate) fn viewer_modes_read(content: &[u8], count: usize) -> Option<Vec<Option<i64>>> {
+/// The viewer's mode and an independently confirmed legacy extractor mode.
+#[derive(Clone, Copy)]
+pub(crate) struct RenderModes {
+    pub(crate) viewer: Option<u8>,
+    pub(crate) extractor: Option<u8>,
+}
+
+pub(crate) fn render_modes_read(
+    content: &[u8],
+    operations: &[lopdf::content::Operation],
+) -> Option<Vec<RenderModes>> {
+    let preceding = operations
+        .iter()
+        .enumerate()
+        .filter(|(_, operation)| operation.operator == "Tr")
+        .map(|(index, operation)| {
+            index
+                .checked_sub(1)
+                .filter(|_| operation.operands.is_empty())
+                .map(|previous| operations[previous].operator.as_str())
+        });
+    align_render_modes(content, preceding.clone().count(), preceding)
+}
+
+/// Align the first `count` decoded Tr operators with their raw locations.
+/// The viewer's mode is absent where PDFium does not see the operator.
+fn align_render_modes<'a>(
+    content: &[u8],
+    count: usize,
+    mut preceding: impl Iterator<Item = Option<&'a str>>,
+) -> Option<Vec<RenderModes>> {
     if count == 0 {
         return Some(Vec::new());
     }
     let viewed: std::collections::HashMap<usize, Option<i64>> =
         viewer_modes(content).into_iter().collect();
-    let mut modes = Vec::with_capacity(count);
-    walk(content, lopdf_past_image, |operator, at, _| {
+    let mut modes: Vec<RenderModes> = Vec::with_capacity(count);
+    let mut previous = None;
+    let mut has_hint = false;
+    let complete = walk(content, lopdf_past_image, |operator, at, _| {
         if operator == b"Tr" {
-            modes.push(viewed.get(&at).copied().flatten());
+            if modes.len() == count {
+                return false;
+            }
+            let extractor = preceding
+                .next()
+                .flatten()
+                .and_then(|operator| extractor_mode_hint(content, previous, at, operator));
+            has_hint |= extractor.is_some();
+            modes.push(RenderModes {
+                viewer: viewed
+                    .get(&at)
+                    .copied()
+                    .flatten()
+                    .and_then(|mode| u8::try_from(mode).ok()),
+                extractor,
+            });
         }
-        modes.len() < count
+        previous = Some((at, at + operator.len()));
+        modes.len() < count || has_hint
     });
+    if has_hint && !complete {
+        // Keep the existing viewer mapping. A legacy hint needs full raw
+        // coverage so an extra Tr cannot shift the decoded alignment.
+        for mode in &mut modes {
+            mode.extractor = None;
+        }
+    }
     (modes.len() == count).then_some(modes)
+}
+
+/// The extractor's lopdf 0.45 leaves a trailing digit out of an operator
+/// that lopdf 0.47 treats as one word. Recover the mode for an operandless
+/// Tr only when the raw boundary confirms that single digit is its operand.
+fn extractor_mode_hint(
+    content: &[u8],
+    previous: Option<(usize, usize)>,
+    tr_at: usize,
+    operator: &str,
+) -> Option<u8> {
+    let (start, end) = previous?;
+    let (&digit, prefix) = operator.as_bytes().split_last()?;
+    let mode = digit.checked_sub(b'0').filter(|mode| *mode <= 7)?;
+    if prefix.is_empty()
+        || !prefix.iter().all(u8::is_ascii_alphabetic)
+        || content.get(start..end)? != prefix
+    {
+        return None;
+    }
+    let (&raw_digit, spacing) = content.get(end..tr_at)?.split_first()?;
+    (raw_digit == digit
+        && !spacing.is_empty()
+        && spacing
+            .iter()
+            .all(|&byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')))
+    .then_some(mode)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn viewer_modes_read(content: &[u8], count: usize) -> Option<Vec<Option<i64>>> {
+        align_render_modes(content, count, std::iter::repeat(None)).map(|modes| {
+            modes
+                .into_iter()
+                .map(|mode| mode.viewer.map(i64::from))
+                .collect()
+        })
+    }
 
     /// The operations lopdf decodes of `content`.
     fn decoded(content: &[u8]) -> usize {
@@ -816,6 +903,21 @@ mod tests {
         // Where lopdf decodes more than are found, none are given.
         assert_eq!(viewer_modes_read(b"BT 3 Tr ET", 2), None);
         assert_eq!(viewer_modes_read(b"BT ET", 0), Some(Vec::new()));
+    }
+
+    #[test]
+    fn extractor_mode_requires_a_confirmed_raw_boundary() {
+        for (content, extractor) in [
+            (&b"e3 Tr"[..], Some(3)),
+            (&b"e3% comment\nTr"[..], None),
+            (&b"e3 Tr q1Tr"[..], None),
+        ] {
+            let decoded = lopdf::content::Content::decode(content).expect("current decoder");
+            let modes = render_modes_read(content, &decoded.operations).expect("aligned modes");
+            assert_eq!(modes.len(), 1);
+            assert_eq!(modes[0].viewer, Some(0));
+            assert_eq!(modes[0].extractor, extractor);
+        }
     }
 
     #[test]
