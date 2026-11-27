@@ -146,7 +146,7 @@ class CorpusTests(unittest.TestCase):
         build = body["build"]
         self.assertEqual(build["server"], "pdf-inspector-mcp")
         self.assertEqual(build["pdf_inspector"], "1.25.2")
-        self.assertEqual(build["anydoc"], "0.2.4")
+        self.assertEqual(build["anydoc"], "0.2.5")
         self.assertTrue(build["version"])
         self.assertTrue(build["git_commit"])
         self.assertRegex(build["target"], r"^[A-Za-z0-9_]+(-[A-Za-z0-9_]+)+$")
@@ -198,7 +198,7 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(body["route"], "anydoc")
         self.assertIn("Public Fixture Heading", body["result"]["markdown"])
         self.assertEqual(body["result"]["provider"]["name"], "anydoc")
-        self.assertEqual(body["result"]["provider"]["version"], "0.2.4")
+        self.assertEqual(body["result"]["provider"]["version"], "0.2.5")
         self.assert_build(body)
 
     def test_pdf_is_not_sent_through_anydoc(self) -> None:

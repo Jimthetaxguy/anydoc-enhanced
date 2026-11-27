@@ -9,7 +9,7 @@ members = [
 pdf-inspector = "=1.25.2"
 # The parser pdf-inspector uses, for the local page scan; kept on its version.
 lopdf = "0.47"
-anydoc = "=0.2.4"
+anydoc = "=0.2.5"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 tempfile = "3"
 libc = "0.2"
