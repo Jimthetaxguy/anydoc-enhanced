@@ -1011,9 +1011,9 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "pdf-inspector"
-version = "1.25.2"
+version = "1.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef5970f05a55de82c8d6d6fd5f8ff162b50fc7828cc1fd0abd965abad6fcbc5b"
+checksum = "bcb35370c3afce30effbfa3bd31f498c499794a69694b930294709f20f9d0a34"
 dependencies = [
  "env_logger",
  "include_dir",
