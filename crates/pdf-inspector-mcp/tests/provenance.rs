@@ -17,7 +17,7 @@ fn provenance_flag_reports_the_pinned_build() {
     assert_eq!(value["server"], "pdf-inspector-mcp");
     assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(value["pdf_inspector"], "1.25.2");
-    assert_eq!(value["anydoc"], "0.2.4");
+    assert_eq!(value["anydoc"], "0.2.5");
     let target = value["target"].as_str().expect("target");
     assert!(!target.is_empty() && target != "unknown");
     let commit = value["git_commit"].as_str().expect("git_commit");

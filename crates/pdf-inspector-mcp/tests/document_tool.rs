@@ -535,7 +535,7 @@ fn epub_is_recognized_and_platform_memory_gated() {
         assert_eq!(document["variant"], "epub");
         assert_eq!(document["schema_version"], 2);
         assert_eq!(document["provider"]["name"], "anydoc");
-        assert_eq!(document["provider"]["version"], "0.2.4");
+        assert_eq!(document["provider"]["version"], "0.2.5");
         assert_eq!(document["provider"]["source"], "firecrawl/anydoc");
         assert_eq!(document["completeness"], "complete");
         let markdown = document["markdown"].as_str().expect("EPUB Markdown output");
@@ -783,7 +783,7 @@ fn document_to_markdown_converts_public_docx_fixture() {
     assert_eq!(document["kind"], "docx");
     assert_eq!(document["schema_version"], 2);
     assert_eq!(document["provider"]["name"], "anydoc");
-    assert_eq!(document["provider"]["version"], "0.2.4");
+    assert_eq!(document["provider"]["version"], "0.2.5");
     assert_eq!(document["provider"]["source"], "firecrawl/anydoc");
     assert_eq!(document["completeness"], "complete");
     assert!(document["markdown"]
@@ -857,7 +857,7 @@ fn document_to_markdown_converts_strict_public_xlsx_fixture() {
     assert_eq!(document["variant"], "xlsx");
     assert_eq!(document["schema_version"], 2);
     assert_eq!(document["provider"]["name"], "anydoc");
-    assert_eq!(document["provider"]["version"], "0.2.4");
+    assert_eq!(document["provider"]["version"], "0.2.5");
     assert_eq!(document["completeness"], "complete");
     let markdown = document["markdown"].as_str().expect("Markdown output");
     assert!(markdown.contains("Inputs"));
@@ -1072,7 +1072,7 @@ fn document_to_markdown_converts_public_pptx_fixture() {
     assert_eq!(document["variant"], "pptx");
     assert_eq!(document["schema_version"], 2);
     assert_eq!(document["provider"]["name"], "anydoc");
-    assert_eq!(document["provider"]["version"], "0.2.4");
+    assert_eq!(document["provider"]["version"], "0.2.5");
     assert_eq!(document["completeness"], "complete");
     let markdown = document["markdown"].as_str().expect("Markdown output");
     assert!(markdown.contains("Inherited Title Slide"));
@@ -1145,7 +1145,7 @@ fn document_to_markdown_converts_strict_public_ods_fixture() {
     assert_eq!(document["variant"], "ods");
     assert_eq!(document["schema_version"], 2);
     assert_eq!(document["provider"]["name"], "anydoc");
-    assert_eq!(document["provider"]["version"], "0.2.4");
+    assert_eq!(document["provider"]["version"], "0.2.5");
     assert_eq!(document["completeness"], "complete");
     let markdown = document["markdown"].as_str().expect("Markdown output");
     assert!(markdown.contains("Values"));
@@ -1239,7 +1239,7 @@ fn document_to_markdown_converts_strict_public_odp_fixture() {
     assert_eq!(document["variant"], "odp");
     assert_eq!(document["schema_version"], 2);
     assert_eq!(document["provider"]["name"], "anydoc");
-    assert_eq!(document["provider"]["version"], "0.2.4");
+    assert_eq!(document["provider"]["version"], "0.2.5");
     assert_eq!(document["provider"]["source"], "firecrawl/anydoc");
     assert_eq!(document["completeness"], "complete");
     let markdown = document["markdown"].as_str().expect("Markdown output");
@@ -1299,7 +1299,7 @@ fn document_to_markdown_converts_strict_public_odt_fixture() {
     assert_eq!(document["variant"], "odt");
     assert_eq!(document["schema_version"], 2);
     assert_eq!(document["provider"]["name"], "anydoc");
-    assert_eq!(document["provider"]["version"], "0.2.4");
+    assert_eq!(document["provider"]["version"], "0.2.5");
     assert_eq!(document["provider"]["source"], "firecrawl/anydoc");
     assert_eq!(document["completeness"], "complete");
     let markdown = document["markdown"].as_str().expect("Markdown output");

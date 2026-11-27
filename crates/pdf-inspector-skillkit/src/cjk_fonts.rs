@@ -213,6 +213,28 @@ impl CjkFonts {
     }
 }
 
+/// The resource dictionaries the pinned extractor considers when it
+/// collects a page's fonts and maps. Its lopdf 0.45 takes an inline
+/// dictionary from the page itself, plus references from the page and
+/// its ancestors. The analyzer's lopdf also returns inline ancestors.
+pub(crate) fn extractor_page_resources(document: &Document, page: ObjectId) -> Vec<&Dictionary> {
+    let Ok((_, references)) = document.get_page_resources(page) else {
+        return Vec::new();
+    };
+    let own = document
+        .get_dictionary(page)
+        .and_then(|page| page.get(b"Resources"))
+        .and_then(Object::as_dict)
+        .ok();
+    own.into_iter()
+        .chain(
+            references
+                .into_iter()
+                .filter_map(|id| document.get_dictionary(id).ok()),
+        )
+        .collect()
+}
+
 /// The keys pdf-inspector files maps under, as `FontCMaps::from_doc`
 /// collects fonts: those of each page's resources, its own and those it
 /// inherits, the first of each name; and those of the forms these
@@ -236,24 +258,22 @@ pub(crate) fn collected_keys(document: &Document) -> HashSet<u32> {
     let mut keys = HashSet::new();
     let mut visited = HashSet::new();
     for page in document.get_pages().into_values() {
-        if let Ok(fonts) = document.get_page_fonts(page) {
-            keys.extend(
-                fonts
-                    .values()
-                    .filter_map(|font| collection_key(document, font)),
-            );
+        let mut pending = extractor_page_resources(document, page);
+        let mut font_names = HashSet::new();
+        for resources in &pending {
+            let fonts = resources
+                .get(b"Font")
+                .ok()
+                .and_then(|fonts| in_place_or_by_reference(document, fonts));
+            for (name, font) in fonts.into_iter().flat_map(Dictionary::iter) {
+                let Some(font) = in_place_or_by_reference(document, font) else {
+                    continue;
+                };
+                if font_names.insert(name) {
+                    keys.extend(collection_key(document, font));
+                }
+            }
         }
-        let Ok((own, inherited)) = document.get_page_resources(page) else {
-            continue;
-        };
-        let mut pending: Vec<&Dictionary> = own
-            .into_iter()
-            .chain(
-                inherited
-                    .into_iter()
-                    .filter_map(|id| document.get_dictionary(id).ok()),
-            )
-            .collect();
         while let Some(resources) = pending.pop() {
             let xobjects = match resources.get(b"XObject") {
                 Ok(Object::Reference(id)) => {

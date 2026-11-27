@@ -4023,19 +4023,7 @@ impl<'a> Resources<'a, '_> {
 /// then each ancestor's, nearest first, each with what pdf-inspector reads
 /// of it.
 fn page_resources(document: &Document, page_id: ObjectId) -> Vec<Scope<'_>> {
-    // lopdf, which pdf-inspector finds a page's fonts with, takes the
-    // page's own resources and those it inherits by reference.
-    let lopdf: Vec<&Dictionary> = match document.get_page_resources(page_id) {
-        Ok((own, inherited)) => own
-            .into_iter()
-            .chain(
-                inherited
-                    .into_iter()
-                    .filter_map(|id| document.get_dictionary(id).ok()),
-            )
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let extractor = crate::cjk_fonts::extractor_page_resources(document, page_id);
     let mut scopes: Vec<Scope> = Vec::new();
     let mut node = document.get_dictionary(page_id).ok();
     for depth in 0..MAX_PAGE_TREE_DEPTH {
@@ -4053,7 +4041,9 @@ fn page_resources(document: &Document, page_id: ObjectId) -> Vec<Scope<'_>> {
             {
                 scopes.push(Scope {
                     dictionary: resources,
-                    fonts: lopdf.iter().any(|known| std::ptr::eq(*known, resources)),
+                    fonts: extractor
+                        .iter()
+                        .any(|known| std::ptr::eq(*known, resources)),
                     xobjects: depth == 0,
                 });
             }

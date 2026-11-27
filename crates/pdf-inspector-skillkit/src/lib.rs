@@ -22,7 +22,7 @@ pub use pdf_inspector::{
 pub const PDF_INSPECTOR_VERSION: &str = "1.25.2";
 
 /// Exact Firecrawl AnyDoc release resolved in `Cargo.lock`.
-pub const ANYDOC_VERSION: &str = "0.2.4";
+pub const ANYDOC_VERSION: &str = "0.2.5";
 
 /// Unified result for classification + optional extraction.
 ///

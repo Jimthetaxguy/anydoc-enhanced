@@ -76,14 +76,8 @@ fn past_counted_image(content: &[u8], mut at: usize) -> Option<usize> {
     )
 }
 
-/// Whether a byte is white space between the parts of an operation, as
-/// lopdf reads a content stream: it takes no other there.
-fn lopdf_white(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
-}
-
-fn past_lopdf_white(content: &[u8], mut at: usize) -> usize {
-    while content.get(at).copied().is_some_and(lopdf_white) {
+fn past_whitespace(content: &[u8], mut at: usize) -> usize {
+    while content.get(at).copied().is_some_and(white) {
         at += 1;
     }
     at
@@ -293,7 +287,7 @@ impl<'c> ImageEntries<'c> {
             .checked_mul(whole(self.height)?)
     }
 
-    /// The bytes of data lopdf reads: for an image not filtered, of whole
+    /// The bytes of data lopdf 0.47 reads: for an image not filtered, of whole
     /// numbers of width, height, and bits, and a device colour space it
     /// names as lopdf spells one, or a mask, its rows. `None` where it
     /// looks for `EI` instead.
@@ -305,16 +299,22 @@ impl<'c> ImageEntries<'c> {
             Some(Token::Number(value, true)) if value >= 0.0 => Some(value as usize),
             _ => None,
         };
-        let components = match (self.mask, self.colour) {
-            (Some(Token::True), _) => 1,
-            (_, Some(Token::Name(b"DeviceGray" | b"Gray"))) => 1,
+        let mask = self.mask == Some(Token::True);
+        let components = match (mask, self.colour) {
+            (true, _) => 1,
+            (_, Some(Token::Name(b"DeviceGray" | b"G" | b"Gray"))) => 1,
+            (_, Some(Token::Array(Some(b"Indexed" | b"I")))) => 1,
             (_, Some(Token::Name(b"DeviceRGB" | b"RGB"))) => 3,
             (_, Some(Token::Name(b"DeviceRGBA" | b"RGBA" | b"DeviceCMYK" | b"CMYK"))) => 4,
             _ => return None,
         };
+        let bits = match self.bits {
+            None if mask => 1,
+            bits => integer(bits)?,
+        };
         integer(self.width)?
             .checked_mul(components)?
-            .checked_mul(integer(self.bits)?)?
+            .checked_mul(bits)?
             .div_ceil(8)
             .checked_mul(integer(self.height)?)
     }
@@ -359,14 +359,13 @@ fn viewer_past_image(content: &[u8], mut at: usize) -> Option<usize> {
 }
 
 /// Where an inline image whose `BI` ends at `at` ends, as lopdf decodes
-/// one: its entries up to `ID` and the white space after; the data, as
+/// one: its entries up to `ID` and one separator (CRLF counts as one); the data, as
 /// many bytes as `ImageEntries::lopdf_length` gives, and `EI`; or, where
-/// its length is not told, up to the first `EI` with a space, a carriage
-/// return, or a line feed on either side. `None` where lopdf decodes no
-/// further.
+/// its length is not told, up to the first `EI` preceded by white space and
+/// followed by white space or end of stream. `None` where decoding stops.
 fn lopdf_past_image(content: &[u8], at: usize) -> Option<usize> {
     let mut entries = ImageEntries::default();
-    let mut at = past_lopdf_white(content, at);
+    let mut at = past_whitespace(content, at);
     while content.get(at) == Some(&b'/') {
         let (Token::Name(key), _, end) = viewer_token(content, at) else {
             return None;
@@ -378,22 +377,30 @@ fn lopdf_past_image(content: &[u8], at: usize) -> Option<usize> {
     if !content[at..].starts_with(b"ID") {
         return None;
     }
-    let data = past_lopdf_white(content, at + 2);
+    let data = at + 2;
+    let data = match content.get(data..) {
+        Some([b'\r', b'\n', ..]) => data + 2,
+        Some([first, ..]) if white(*first) => data + 1,
+        _ => data,
+    };
     if let Some(end) = entries
         .lopdf_length()
         .and_then(|length| data.checked_add(length))
         .filter(|&end| end <= content.len())
     {
-        let end = past_lopdf_white(content, end);
+        let end = past_whitespace(content, end);
         return content[end..]
             .starts_with(b"EI")
-            .then(|| past_lopdf_white(content, end + 2));
+            .then(|| past_whitespace(content, end + 2));
     }
-    let spaced = |byte: u8| matches!(byte, b' ' | b'\r' | b'\n');
-    content[data..]
-        .windows(4)
-        .position(|word| spaced(word[0]) && word[1..3] == *b"EI" && spaced(word[3]))
-        .map(|found| past_lopdf_white(content, data + found + 3))
+    let bytes = &content[data..];
+    bytes
+        .windows(3)
+        .enumerate()
+        .find(|(index, word)| {
+            white(word[0]) && word[1..] == *b"EI" && bytes.get(index + 3).copied().is_none_or(white)
+        })
+        .map(|(index, _)| past_whitespace(content, data + index + 3))
 }
 
 /// Hand `visit` each operator `content` holds, as lopdf reads one, where it
@@ -698,7 +705,9 @@ fn align_render_modes<'a>(
     let mut modes: Vec<RenderModes> = Vec::with_capacity(count);
     let mut previous = None;
     let mut has_hint = false;
+    let mut has_image = false;
     let complete = walk(content, lopdf_past_image, |operator, at, _| {
+        has_image |= operator == b"BI";
         if operator == b"Tr" {
             if modes.len() == count {
                 return false;
@@ -720,9 +729,10 @@ fn align_render_modes<'a>(
         previous = Some((at, at + operator.len()));
         modes.len() < count || has_hint
     });
-    if has_hint && !complete {
+    if has_hint && (!complete || has_image) {
         // Keep the existing viewer mapping. A legacy hint needs full raw
-        // coverage so an extra Tr cannot shift the decoded alignment.
+        // coverage. An inline image can shift the legacy alignment because
+        // its boundaries can differ between the two lopdf versions.
         for mode in &mut modes {
             mode.extractor = None;
         }
@@ -863,9 +873,7 @@ mod tests {
             [Some(0)]
         );
         assert_eq!(viewer_modes_read(&content, 1), Some(vec![Some(0)]));
-        // pdfium reads `/G` as gray; lopdf, which does not, looks for the
-        // first `EI` with white space around it, and reads the `Tr` in the
-        // data, which pdfium does not.
+        // The current lopdf reads the abbreviated gray color space too.
         let data = [&b"x\nEI 3 Tr ("[..], &[b'x'; 29]].concat();
         let spelled = [
             &b"q BI /W 40 /H 1 /BPC 8 /CS /G ID "[..],
@@ -873,16 +881,32 @@ mod tests {
             b" EI Q BT 3 0 Tr (The fee) Tj ET",
         ]
         .concat();
-        let read: Vec<Vec<lopdf::Object>> = lopdf::content::Content::decode(&spelled)
-            .unwrap()
-            .operations
-            .into_iter()
-            .filter(|operation| operation.operator == "Tr")
-            .map(|operation| operation.operands)
-            .collect();
-        assert_eq!(read, [vec![lopdf::Object::Integer(3)]]);
+        let read = |content: &[u8]| {
+            lopdf::content::Content::decode(content)
+                .unwrap()
+                .operations
+                .into_iter()
+                .filter(|operation| operation.operator == "Tr")
+                .map(|operation| operation.operands)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read(&spelled),
+            [vec![lopdf::Object::Integer(3), lopdf::Object::Integer(0)]]
+        );
         assert_eq!(viewer_modes(&spelled).len(), 1);
-        assert_eq!(viewer_modes_read(&spelled, 1), Some(vec![None]));
+        assert_eq!(viewer_modes_read(&spelled, 1), Some(vec![Some(0)]));
+        // PDFium knows the calibrated gray space. Lopdf falls back to an
+        // `EI` search and decodes the `Tr` within the image data.
+        let calibrated = [
+            &b"q BI /W 40 /H 1 /BPC 8 /CS [/CalGray <<>>] ID "[..],
+            &data,
+            b" EI Q BT 3 0 Tr (The fee) Tj ET",
+        ]
+        .concat();
+        assert_eq!(read(&calibrated), [vec![lopdf::Object::Integer(3)]]);
+        assert_eq!(viewer_modes(&calibrated).len(), 1);
+        assert_eq!(viewer_modes_read(&calibrated, 1), Some(vec![None]));
         // A filtered image's data is read as tokens up to `EI`.
         let filtered = b"BI /W 4 /H 4 /F /AHx ID 00ff00ff> EI 3 Tr";
         assert_eq!(viewer_modes(filtered).len(), 1);
@@ -911,6 +935,7 @@ mod tests {
             (&b"e3 Tr"[..], Some(3)),
             (&b"e3% comment\nTr"[..], None),
             (&b"e3 Tr q1Tr"[..], None),
+            (&b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI e3 Tr"[..], None),
         ] {
             let decoded = lopdf::content::Content::decode(content).expect("current decoder");
             let modes = render_modes_read(content, &decoded.operations).expect("aligned modes");
