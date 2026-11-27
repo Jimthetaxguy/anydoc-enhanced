@@ -45,6 +45,7 @@
 //! is reported when it shows text in a form pdf-inspector does not reach,
 //! or text read byte by byte that its font reads otherwise.
 
+use crate::content_ops::RenderModes;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -2622,14 +2623,7 @@ fn execute<'a>(
             return Ok(());
         }
     }
-    // The modes a viewer sets at each `Tr` lopdf decodes, as it reads the
-    // stream (see `content_ops::viewer_modes_read`), where they are found.
-    let tr_count = decoded
-        .operations
-        .iter()
-        .filter(|operation| operation.operator == "Tr")
-        .count();
-    let viewer_modes = crate::content_ops::viewer_modes_read(content, tr_count);
+    let render_modes = crate::content_ops::render_modes_read(content, &decoded.operations);
     // A form drawn again is kept as the scan acts on it, to be drawn after
     // at the cost of that alone, as a letterhead with a line of text is on
     // every page.
@@ -2645,13 +2639,13 @@ fn execute<'a>(
         let kept = std::rc::Rc::new(KeptForm {
             operations,
             total: operators,
-            viewer_modes,
+            render_modes,
         });
         page.kept_forms.keep(form, &kept);
         return run(
             document,
             &kept.operations,
-            kept.viewer_modes.as_deref(),
+            kept.render_modes.as_deref(),
             resources,
             start,
             page_box,
@@ -2663,7 +2657,7 @@ fn execute<'a>(
     run(
         document,
         &decoded.operations,
-        viewer_modes.as_deref(),
+        render_modes.as_deref(),
         resources,
         start,
         page_box,
@@ -2673,14 +2667,12 @@ fn execute<'a>(
     )
 }
 
-/// Run `operations`, a page's or a form's content, with `viewer_modes`,
-/// the modes a viewer sets at each `Tr` in them where they are known (see
-/// `execute`).
+/// Run a page's or a form's operations with the render modes found by `execute`.
 #[allow(clippy::too_many_arguments)]
 fn run<'a>(
     document: &'a Document,
     operations: &[Operation],
-    viewer_modes: Option<&[Option<i64>]>,
+    render_modes: Option<&[RenderModes]>,
     resources: Resources<'a, '_>,
     start: State,
     page_box: [f64; 4],
@@ -2804,11 +2796,14 @@ fn run<'a>(
                         _ => None,
                     }
                 });
-                if let Some(mode) = read {
+                let modes = render_modes.and_then(|modes| modes.get(trs));
+                if let Some(mode) =
+                    read.or_else(|| modes.and_then(|modes| modes.extractor).map(i64::from))
+                {
                     state.read_mode = mode;
                 }
-                let viewed = match viewer_modes.and_then(|modes| modes.get(trs)) {
-                    Some(&mode) => mode,
+                let viewed = match modes {
+                    Some(modes) => modes.viewer.map(i64::from),
                     None => crate::content_ops::viewer_mode(
                         operands
                             .last()
@@ -3314,7 +3309,7 @@ fn run<'a>(
                                         run(
                                             document,
                                             &kept.operations,
-                                            kept.viewer_modes.as_deref(),
+                                            kept.render_modes.as_deref(),
                                             form_resources,
                                             inner,
                                             page_box,
@@ -3379,7 +3374,7 @@ impl FormWalk {
 struct KeptForm {
     operations: Vec<Operation>,
     total: usize,
-    viewer_modes: Option<Vec<Option<i64>>>,
+    render_modes: Option<Vec<RenderModes>>,
 }
 
 impl KeptForm {
@@ -3387,9 +3382,9 @@ impl KeptForm {
     /// operands', strings, names, and arrays among them.
     fn bytes(&self) -> usize {
         let mut bytes = self
-            .viewer_modes
+            .render_modes
             .as_ref()
-            .map_or(0, |modes| modes.len() * std::mem::size_of::<Option<i64>>());
+            .map_or(0, |modes| modes.len() * std::mem::size_of::<RenderModes>());
         let mut objects: Vec<&Object> = Vec::new();
         for operation in &self.operations {
             bytes += std::mem::size_of::<Operation>() + operation.operator.len();
@@ -4028,19 +4023,7 @@ impl<'a> Resources<'a, '_> {
 /// then each ancestor's, nearest first, each with what pdf-inspector reads
 /// of it.
 fn page_resources(document: &Document, page_id: ObjectId) -> Vec<Scope<'_>> {
-    // lopdf, which pdf-inspector finds a page's fonts with, takes the
-    // page's own resources and those it inherits by reference.
-    let lopdf: Vec<&Dictionary> = match document.get_page_resources(page_id) {
-        Ok((own, inherited)) => own
-            .into_iter()
-            .chain(
-                inherited
-                    .into_iter()
-                    .filter_map(|id| document.get_dictionary(id).ok()),
-            )
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let extractor = crate::cjk_fonts::extractor_page_resources(document, page_id);
     let mut scopes: Vec<Scope> = Vec::new();
     let mut node = document.get_dictionary(page_id).ok();
     for depth in 0..MAX_PAGE_TREE_DEPTH {
@@ -4058,7 +4041,9 @@ fn page_resources(document: &Document, page_id: ObjectId) -> Vec<Scope<'_>> {
             {
                 scopes.push(Scope {
                     dictionary: resources,
-                    fonts: lopdf.iter().any(|known| std::ptr::eq(*known, resources)),
+                    fonts: extractor
+                        .iter()
+                        .any(|known| std::ptr::eq(*known, resources)),
                     xobjects: depth == 0,
                 });
             }

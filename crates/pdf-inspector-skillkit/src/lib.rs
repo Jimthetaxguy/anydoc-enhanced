@@ -19,10 +19,10 @@ pub use pdf_inspector::{
 /// Provider records on the wire read this constant; the
 /// `provider_versions_match_lockfile` test fails if a dependency bump leaves
 /// it behind.
-pub const PDF_INSPECTOR_VERSION: &str = "1.25.2";
+pub const PDF_INSPECTOR_VERSION: &str = "1.27.0";
 
 /// Exact Firecrawl AnyDoc release resolved in `Cargo.lock`.
-pub const ANYDOC_VERSION: &str = "0.2.4";
+pub const ANYDOC_VERSION: &str = "0.2.5";
 
 /// Unified result for classification + optional extraction.
 ///
